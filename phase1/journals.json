@@ -1,0 +1,78 @@
+{
+  "mailto": "dev@cowpaper.local",
+  "lookbackDays": 30,
+  "journals": [
+    {
+      "name": "Management Science",
+      "printISSN": "0025-1909",
+      "onlineISSN": "1526-5501",
+      "publisherHint": "INFORMS",
+      "rssCandidates": [
+        "https://pubsonline.informs.org/action/showFeed?type=etoc&feed=rss&jc=mnsc"
+      ]
+    },
+    {
+      "name": "Marketing Science",
+      "printISSN": "0732-2399",
+      "onlineISSN": "1526-548X",
+      "publisherHint": "INFORMS",
+      "rssCandidates": [
+        "https://pubsonline.informs.org/action/showFeed?type=etoc&feed=rss&jc=mksc"
+      ]
+    },
+    {
+      "name": "American Economic Review",
+      "printISSN": "0002-8282",
+      "onlineISSN": "1944-7981",
+      "publisherHint": "AEA",
+      "rssCandidates": [
+        "https://www.aeaweb.org/journals/aer/rss"
+      ]
+    },
+    {
+      "name": "Journal of Marketing",
+      "printISSN": "0022-2429",
+      "onlineISSN": "1547-7185",
+      "publisherHint": "AMA (SAGE)",
+      "rssCandidates": [
+        "https://journals.sagepub.com/action/showFeed?type=etoc&feed=rss&jc=jmxa"
+      ]
+    },
+    {
+      "name": "Information Systems Research",
+      "printISSN": "1047-7047",
+      "onlineISSN": "1526-5536",
+      "publisherHint": "INFORMS",
+      "rssCandidates": [
+        "https://pubsonline.informs.org/action/showFeed?type=etoc&feed=rss&jc=isre"
+      ]
+    },
+    {
+      "name": "Journal of Political Economy",
+      "printISSN": "0022-3808",
+      "onlineISSN": "1537-534X",
+      "publisherHint": "University of Chicago Press",
+      "rssCandidates": [
+        "https://www.journals.uchicago.edu/action/showFeed?type=etoc&feed=rss&jc=jpe"
+      ]
+    },
+    {
+      "name": "Journal of Management Information Systems",
+      "printISSN": "0742-1222",
+      "onlineISSN": "1557-928X",
+      "publisherHint": "Taylor & Francis",
+      "rssCandidates": [
+        "https://www.tandfonline.com/feed/rss/mmis20"
+      ]
+    },
+    {
+      "name": "Econometrica",
+      "printISSN": "0012-9682",
+      "onlineISSN": "1468-0262",
+      "publisherHint": "Wiley (Econometric Society)",
+      "rssCandidates": [
+        "https://onlinelibrary.wiley.com/action/showFeed?type=etoc&feed=rss&jc=ecta"
+      ]
+    }
+  ]
+}

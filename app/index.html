@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>CowPaper 论文工作台</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+  <body>
+    <div class="app">
+      <aside class="sidebar">
+        <div class="brand">CowPaper<span class="muted">论文工作台</span></div>
+        <nav class="nav">
+          <button class="nav-item active" data-view="recommend">今日推荐</button>
+          <button class="nav-item" data-view="papers">所有论文</button>
+          <button class="nav-item" data-view="favorites">收藏</button>
+          <button class="nav-item" data-view="journals">期刊订阅</button>
+          <button class="nav-item" data-view="tags">标签</button>
+          <button class="nav-item" data-view="settings">设置</button>
+        </nav>
+        <div class="sidebar-foot">
+          <button id="btn-sync" class="ghost full">检查新论文</button>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div class="topbar-title" id="view-title">今日推荐</div>
+          <div class="topbar-actions">
+            <button id="btn-ai-manual" class="primary small">AI 分析</button>
+            <button id="ai-badge" class="ai-badge idle" title="AI 分析状态详情">AI</button>
+            <span id="status" class="status idle">就绪</span>
+          </div>
+        </header>
+
+        <div id="ai-panel" class="ai-panel hidden"></div>
+
+        <section id="view-recommend" class="view active">
+          <div id="backlog-banner" class="banner hidden"></div>
+          <ul id="recommend-list" class="list"></ul>
+        </section>
+
+        <section id="view-papers" class="view">
+          <div class="filter">
+            <select id="journal-filter"><option value="">全部期刊</option></select>
+            <select id="ai-filter">
+              <option value="">全部状态</option>
+              <option value="analysisSucceeded">已分析</option>
+              <option value="pendingAnalysis">待分析</option>
+              <option value="analysisFailed">分析失败</option>
+              <option value="waitingForAbstract">等待摘要</option>
+            </select>
+            <select id="flag-filter">
+              <option value="">全部</option>
+              <option value="unread">未读</option>
+              <option value="favorite">已收藏</option>
+              <option value="ignored">已忽略</option>
+            </select>
+            <button id="btn-refresh" class="ghost">刷新</button>
+          </div>
+          <ul id="paper-list" class="list"></ul>
+        </section>
+
+        <section id="view-favorites" class="view">
+          <ul id="favorites-list" class="list"></ul>
+        </section>
+
+        <section id="view-journals" class="view">
+          <form id="add-form" class="add-form">
+            <input id="add-name" type="text" placeholder="期刊名称（可选）" />
+            <input id="add-issn" type="text" placeholder="ISSN，如 0025-1909" />
+            <button type="submit" class="primary">添加</button>
+          </form>
+          <p id="add-error" class="error"></p>
+          <ul id="journal-list" class="list"></ul>
+        </section>
+
+        <section id="view-tags" class="view">
+          <form id="tag-form" class="add-form">
+            <input id="tag-name" type="text" placeholder="标签名，如 平台经济" />
+            <input id="tag-desc" type="text" placeholder="说明（可选）" />
+            <button type="submit" class="primary">添加标签</button>
+          </form>
+          <p id="tag-error" class="error"></p>
+          <ul id="tag-list" class="list"></ul>
+        </section>
+
+        <section id="view-settings" class="view">
+          <div class="settings">
+            <h3>DeepSeek</h3>
+            <div class="settings-row">
+              <label for="api-key">API Key</label>
+              <input id="api-key" type="password" placeholder="sk-..." autocomplete="off" />
+            </div>
+            <div class="settings-row">
+              <label for="model">模型</label>
+              <input id="model" type="text" />
+            </div>
+            <div class="settings-row actions">
+              <button id="btn-save-key" class="primary">保存</button>
+              <button id="btn-test" class="ghost">测试连接</button>
+              <button id="btn-clear-key" class="ghost danger">删除 Key</button>
+            </div>
+
+            <h3>AI 分析</h3>
+            <div class="settings-row">
+              <label class="check">
+                <input type="checkbox" id="set-auto-analyze" /> 同步后自动分析新论文
+              </label>
+              <p class="muted small">仅自动分析新同步且有摘要的论文。历史待分析论文不会在后台自动全部处理。</p>
+            </div>
+            <div class="settings-row">
+              <span class="muted small" id="pending-count"></span>
+              <button id="btn-analyze-backlog" class="ghost">分析历史待处理论文</button>
+              <button id="btn-retry-failed" class="ghost">重试失败论文</button>
+            </div>
+
+            <h3>摘要</h3>
+            <div class="settings-row">
+              <label for="set-abstract-lang">默认摘要语言</label>
+              <select id="set-abstract-lang">
+                <option value="zh">中文</option>
+                <option value="en">English</option>
+              </select>
+            </div>
+
+            <h3>同步</h3>
+            <div class="settings-row">
+              <label class="check"><input type="checkbox" id="set-startup-sync" /> 启动时自动检查新论文</label>
+            </div>
+            <div class="settings-row">
+              <label class="check"><input type="checkbox" id="set-daily-sync" /> 每日自动检查</label>
+            </div>
+            <div class="settings-row">
+              <label for="set-daily-time">每日检查时间</label>
+              <input id="set-daily-time" type="time" value="09:00" />
+            </div>
+            <p class="muted small">CowPaper 运行时按计划自动检查；完全退出后将在下次启动时补同步。</p>
+
+            <button id="btn-save-settings" class="primary">保存设置</button>
+            <p id="settings-msg" class="muted small"></p>
+          </div>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>

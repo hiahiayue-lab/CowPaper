@@ -1,0 +1,7 @@
+.rustup/
+.cargo/
+.npm-cache/
+node_modules/
+app/node_modules/
+app/src-tauri/target/
+app/dist/

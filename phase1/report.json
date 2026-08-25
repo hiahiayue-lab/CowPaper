@@ -1,0 +1,566 @@
+{
+  "generatedAt": "2026-08-21T13:47:42.128Z",
+  "window": {
+    "from30": "2026-07-22",
+    "from1y": "2025-08-21",
+    "to": "2026-08-21"
+  },
+  "mailto": "dev@cowpaper.local",
+  "journals": [
+    {
+      "name": "Management Science",
+      "printISSN": "0025-1909",
+      "onlineISSN": "1526-5501",
+      "publisherHint": "INFORMS",
+      "crossref": {
+        "title": "Management Science",
+        "publisher": "Institute for Operations Research and the Management Sciences",
+        "issnType": [
+          {
+            "type": "print",
+            "value": "0025-1909"
+          },
+          {
+            "type": "electronic",
+            "value": "1526-5501"
+          }
+        ],
+        "status": 200,
+        "recent30": {
+          "total": 91,
+          "sampleCount": 91,
+          "abstractCoverage": 0.989010989010989,
+          "fieldCoverage": {
+            "title": 1,
+            "author": 0.989010989010989,
+            "date": 0,
+            "doi": 1
+          }
+        },
+        "year": {
+          "total": 852,
+          "sampleCount": 100,
+          "abstractCoverage": 0.99
+        },
+        "maxRecentDate": null
+      },
+      "openalex": {
+        "id": "https://openalex.org/S33323087",
+        "displayName": "Management Science",
+        "worksCount": 13799,
+        "status": 200,
+        "recent30": {
+          "total": 36,
+          "sampleCount": 36,
+          "abstractCoverage": 0.9722222222222222
+        },
+        "year": {
+          "total": 494,
+          "sampleCount": 100,
+          "abstractCoverage": 0.96
+        }
+      },
+      "rss": [
+        {
+          "url": "https://pubsonline.informs.org/action/showFeed?type=etoc&feed=rss&jc=mnsc",
+          "status": 200,
+          "looksFeed": true,
+          "contentType": "application/xml"
+        }
+      ],
+      "hasRSS": true,
+      "doiIntersection": {
+        "crossrefDoiCount": 91,
+        "openalexDoiCount": 36,
+        "intersectionCount": 36
+      },
+      "provisionalStatus": "fullySupported"
+    },
+    {
+      "name": "Marketing Science",
+      "printISSN": "0732-2399",
+      "onlineISSN": "1526-548X",
+      "publisherHint": "INFORMS",
+      "crossref": {
+        "title": "Marketing Science",
+        "publisher": "Institute for Operations Research and the Management Sciences",
+        "issnType": [
+          {
+            "type": "print",
+            "value": "0732-2399"
+          },
+          {
+            "type": "electronic",
+            "value": "1526-548X"
+          }
+        ],
+        "status": 200,
+        "recent30": {
+          "total": 6,
+          "sampleCount": 6,
+          "abstractCoverage": 1,
+          "fieldCoverage": {
+            "title": 1,
+            "author": 1,
+            "date": 0,
+            "doi": 1
+          }
+        },
+        "year": {
+          "total": 96,
+          "sampleCount": 96,
+          "abstractCoverage": 0.8541666666666666
+        },
+        "maxRecentDate": null
+      },
+      "openalex": {
+        "id": "https://openalex.org/S163534328",
+        "displayName": "Marketing Science",
+        "worksCount": 2537,
+        "status": 200,
+        "recent30": {
+          "total": 5,
+          "sampleCount": 5,
+          "abstractCoverage": 1
+        },
+        "year": {
+          "total": 60,
+          "sampleCount": 60,
+          "abstractCoverage": 0.7666666666666667
+        }
+      },
+      "rss": [
+        {
+          "url": "https://pubsonline.informs.org/action/showFeed?type=etoc&feed=rss&jc=mksc",
+          "status": 200,
+          "looksFeed": true,
+          "contentType": "application/xml"
+        }
+      ],
+      "hasRSS": true,
+      "doiIntersection": {
+        "crossrefDoiCount": 6,
+        "openalexDoiCount": 5,
+        "intersectionCount": 5
+      },
+      "provisionalStatus": "fullySupported"
+    },
+    {
+      "name": "American Economic Review",
+      "printISSN": "0002-8282",
+      "onlineISSN": "1944-7981",
+      "publisherHint": "AEA",
+      "crossref": {
+        "title": "American Economic Review",
+        "publisher": "American Economic Association",
+        "issnType": [
+          {
+            "type": "print",
+            "value": "0002-8282"
+          },
+          {
+            "type": "electronic",
+            "value": "1944-7981"
+          }
+        ],
+        "status": 200,
+        "recent30": {
+          "total": 12,
+          "sampleCount": 12,
+          "abstractCoverage": 0.9166666666666666,
+          "fieldCoverage": {
+            "title": 1,
+            "author": 0.9166666666666666,
+            "date": 0,
+            "doi": 1
+          }
+        },
+        "year": {
+          "total": 141,
+          "sampleCount": 100,
+          "abstractCoverage": 0.88
+        },
+        "maxRecentDate": null
+      },
+      "openalex": {
+        "id": "https://openalex.org/S23254222",
+        "displayName": "American Economic Review",
+        "worksCount": 10001,
+        "status": 200,
+        "recent30": {
+          "total": 7,
+          "sampleCount": 7,
+          "abstractCoverage": 0.8571428571428571
+        },
+        "year": {
+          "total": 126,
+          "sampleCount": 100,
+          "abstractCoverage": 0.87
+        }
+      },
+      "rss": [
+        {
+          "url": "https://www.aeaweb.org/journals/aer/rss",
+          "status": 404,
+          "looksFeed": false,
+          "contentType": "text/html"
+        }
+      ],
+      "hasRSS": false,
+      "doiIntersection": {
+        "crossrefDoiCount": 12,
+        "openalexDoiCount": 7,
+        "intersectionCount": 7
+      },
+      "provisionalStatus": "fullySupported"
+    },
+    {
+      "name": "Journal of Marketing",
+      "printISSN": "0022-2429",
+      "onlineISSN": "1547-7185",
+      "publisherHint": "AMA (SAGE)",
+      "crossref": {
+        "title": "Journal of Marketing",
+        "publisher": "SAGE Publications",
+        "issnType": [
+          {
+            "type": "print",
+            "value": "0022-2429"
+          },
+          {
+            "type": "electronic",
+            "value": "0022-2429"
+          },
+          {
+            "type": null,
+            "value": "1547-7185"
+          }
+        ],
+        "status": 200,
+        "recent30": {
+          "total": 5,
+          "sampleCount": 5,
+          "abstractCoverage": 0.8,
+          "fieldCoverage": {
+            "title": 1,
+            "author": 1,
+            "date": 0,
+            "doi": 1
+          }
+        },
+        "year": {
+          "total": 94,
+          "sampleCount": 94,
+          "abstractCoverage": 0.9468085106382979
+        },
+        "maxRecentDate": null
+      },
+      "openalex": {
+        "id": "https://openalex.org/S142990027",
+        "displayName": "Journal of Marketing",
+        "worksCount": 15186,
+        "status": 200,
+        "recent30": {
+          "total": 5,
+          "sampleCount": 5,
+          "abstractCoverage": 0.8
+        },
+        "year": {
+          "total": 77,
+          "sampleCount": 77,
+          "abstractCoverage": 0.948051948051948
+        }
+      },
+      "rss": [
+        {
+          "url": "https://journals.sagepub.com/action/showFeed?type=etoc&feed=rss&jc=jmxa",
+          "status": 0,
+          "error": "TypeError: fetch failed"
+        }
+      ],
+      "hasRSS": false,
+      "doiIntersection": {
+        "crossrefDoiCount": 5,
+        "openalexDoiCount": 5,
+        "intersectionCount": 5
+      },
+      "provisionalStatus": "fullySupported"
+    },
+    {
+      "name": "Information Systems Research",
+      "printISSN": "1047-7047",
+      "onlineISSN": "1526-5536",
+      "publisherHint": "INFORMS",
+      "crossref": {
+        "title": "Information Systems Research",
+        "publisher": "Institute for Operations Research and the Management Sciences",
+        "issnType": [
+          {
+            "type": "print",
+            "value": "1047-7047"
+          },
+          {
+            "type": "electronic",
+            "value": "1526-5536"
+          }
+        ],
+        "status": 200,
+        "recent30": {
+          "total": 22,
+          "sampleCount": 22,
+          "abstractCoverage": 1,
+          "fieldCoverage": {
+            "title": 1,
+            "author": 1,
+            "date": 0,
+            "doi": 1
+          }
+        },
+        "year": {
+          "total": 252,
+          "sampleCount": 100,
+          "abstractCoverage": 0.97
+        },
+        "maxRecentDate": null
+      },
+      "openalex": {
+        "id": "https://openalex.org/S202812398",
+        "displayName": "Information Systems Research",
+        "worksCount": 2002,
+        "status": 200,
+        "recent30": {
+          "total": 9,
+          "sampleCount": 9,
+          "abstractCoverage": 1
+        },
+        "year": {
+          "total": 160,
+          "sampleCount": 100,
+          "abstractCoverage": 0.94
+        }
+      },
+      "rss": [
+        {
+          "url": "https://pubsonline.informs.org/action/showFeed?type=etoc&feed=rss&jc=isre",
+          "status": 200,
+          "looksFeed": true,
+          "contentType": "application/xml"
+        }
+      ],
+      "hasRSS": true,
+      "doiIntersection": {
+        "crossrefDoiCount": 22,
+        "openalexDoiCount": 9,
+        "intersectionCount": 9
+      },
+      "provisionalStatus": "fullySupported"
+    },
+    {
+      "name": "Journal of Political Economy",
+      "printISSN": "0022-3808",
+      "onlineISSN": "1537-534X",
+      "publisherHint": "University of Chicago Press",
+      "crossref": {
+        "title": "Journal of Political Economy",
+        "publisher": "The University of Chicago Press",
+        "issnType": [
+          {
+            "type": "print",
+            "value": "0022-3808"
+          },
+          {
+            "type": "electronic",
+            "value": "1537-534X"
+          }
+        ],
+        "status": 200,
+        "recent30": {
+          "total": 14,
+          "sampleCount": 14,
+          "abstractCoverage": 0,
+          "fieldCoverage": {
+            "title": 1,
+            "author": 1,
+            "date": 0,
+            "doi": 1
+          }
+        },
+        "year": {
+          "total": 146,
+          "sampleCount": 100,
+          "abstractCoverage": 0
+        },
+        "maxRecentDate": null
+      },
+      "openalex": {
+        "id": "https://openalex.org/S95323914",
+        "displayName": "Journal of Political Economy",
+        "worksCount": 15888,
+        "status": 200,
+        "recent30": {
+          "total": 5,
+          "sampleCount": 5,
+          "abstractCoverage": 0
+        },
+        "year": {
+          "total": 101,
+          "sampleCount": 100,
+          "abstractCoverage": 0.31
+        }
+      },
+      "rss": [
+        {
+          "url": "https://www.journals.uchicago.edu/action/showFeed?type=etoc&feed=rss&jc=jpe",
+          "status": 403,
+          "looksFeed": false,
+          "contentType": "text/html"
+        }
+      ],
+      "hasRSS": false,
+      "doiIntersection": {
+        "crossrefDoiCount": 14,
+        "openalexDoiCount": 5,
+        "intersectionCount": 5
+      },
+      "provisionalStatus": "supportedWithMissingAbstracts"
+    },
+    {
+      "name": "Journal of Management Information Systems",
+      "printISSN": "0742-1222",
+      "onlineISSN": "1557-928X",
+      "publisherHint": "Taylor & Francis",
+      "crossref": {
+        "title": "Journal of Management Information Systems",
+        "publisher": "Informa UK (Taylor & Francis)",
+        "issnType": [
+          {
+            "type": "print",
+            "value": "0742-1222"
+          },
+          {
+            "type": "electronic",
+            "value": "1557-928X"
+          }
+        ],
+        "status": 200,
+        "recent30": {
+          "total": 0,
+          "sampleCount": 0,
+          "abstractCoverage": null,
+          "fieldCoverage": {
+            "title": null,
+            "author": null,
+            "date": null,
+            "doi": null
+          }
+        },
+        "year": {
+          "total": 44,
+          "sampleCount": 44,
+          "abstractCoverage": 0
+        },
+        "maxRecentDate": null
+      },
+      "openalex": {
+        "id": "https://openalex.org/S9954729",
+        "displayName": "Journal of Management Information Systems",
+        "worksCount": 1875,
+        "status": 200,
+        "recent30": {
+          "total": 0,
+          "sampleCount": 0,
+          "abstractCoverage": null
+        },
+        "year": {
+          "total": 44,
+          "sampleCount": 44,
+          "abstractCoverage": 0.75
+        }
+      },
+      "rss": [
+        {
+          "url": "https://www.tandfonline.com/feed/rss/mmis20",
+          "status": 403,
+          "looksFeed": false,
+          "contentType": "text/html"
+        }
+      ],
+      "hasRSS": false,
+      "doiIntersection": {
+        "crossrefDoiCount": 0,
+        "openalexDoiCount": 0,
+        "intersectionCount": 0
+      },
+      "provisionalStatus": "fullySupported"
+    },
+    {
+      "name": "Econometrica",
+      "printISSN": "0012-9682",
+      "onlineISSN": "1468-0262",
+      "publisherHint": "Wiley (Econometric Society)",
+      "crossref": {
+        "title": "Econometrica",
+        "publisher": "The Econometric Society",
+        "issnType": [
+          {
+            "type": "print",
+            "value": "0012-9682"
+          },
+          {
+            "type": "electronic",
+            "value": "1468-0262"
+          }
+        ],
+        "status": 200,
+        "recent30": {
+          "total": 0,
+          "sampleCount": 0,
+          "abstractCoverage": null,
+          "fieldCoverage": {
+            "title": null,
+            "author": null,
+            "date": null,
+            "doi": null
+          }
+        },
+        "year": {
+          "total": 62,
+          "sampleCount": 62,
+          "abstractCoverage": 0.6935483870967742
+        },
+        "maxRecentDate": null
+      },
+      "openalex": {
+        "id": "https://openalex.org/S95464858",
+        "displayName": "Econometrica",
+        "worksCount": 7309,
+        "status": 200,
+        "recent30": {
+          "total": 0,
+          "sampleCount": 0,
+          "abstractCoverage": null
+        },
+        "year": {
+          "total": 57,
+          "sampleCount": 57,
+          "abstractCoverage": 0.6666666666666666
+        }
+      },
+      "rss": [
+        {
+          "url": "https://onlinelibrary.wiley.com/action/showFeed?type=etoc&feed=rss&jc=ecta",
+          "status": 403,
+          "looksFeed": false,
+          "contentType": "text/html"
+        }
+      ],
+      "hasRSS": false,
+      "doiIntersection": {
+        "crossrefDoiCount": 0,
+        "openalexDoiCount": 0,
+        "intersectionCount": 0
+      },
+      "provisionalStatus": "supportedWithMissingAbstracts"
+    }
+  ]
+}
