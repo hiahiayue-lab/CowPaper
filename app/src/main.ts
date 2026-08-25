@@ -77,6 +77,17 @@ interface AiStatus {
   lastError: string | null;
   elapsedSeconds: number;
   etaSeconds: number | null;
+  lastRun: LastAiRun | null;
+}
+
+interface LastAiRun {
+  total: number;
+  success: number;
+  failed: number;
+  skipped: number;
+  startedAt: string | null;
+  finishedAt: string | null;
+  errorSummary: string | null;
 }
 
 interface Settings {
@@ -87,8 +98,9 @@ interface Settings {
   defaultAbstractLang: string;
 }
 
-const KEY_NAME = "cowpaper_api_key";
+const KEY_NAME = "cowpaper_api_key"; // 旧版 localStorage Key（仅用于一次性迁移，不再写入）
 const MODEL_NAME = "cowpaper_model";
+const DEFAULT_MODEL = "deepseek-v4-flash"; // 已验证可用的模型
 
 let journals: Journal[] = [];
 let tags: Tag[] = [];
@@ -103,7 +115,7 @@ function emptyAiStatus(): AiStatus {
     state: "idle", batchSize: 0, completed: 0, success: 0, failed: 0, skipped: 0, remaining: 0,
     currentPaperId: null, currentPaperTitle: null, batchStartedAt: null, lastProgressAt: null,
     currentPaperStartedAt: null, retryWaiting: false, retryUntil: null, lastError: null,
-    elapsedSeconds: 0, etaSeconds: null,
+    elapsedSeconds: 0, etaSeconds: null, lastRun: null,
   };
 }
 
@@ -152,11 +164,40 @@ function setStatus(text: string, cls: "idle" | "running" | "error" | "done") {
   el.className = `status ${cls}`;
 }
 
-function getApiKey(): string {
-  return localStorage.getItem(KEY_NAME) || "";
-}
 function getModel(): string {
-  return localStorage.getItem(MODEL_NAME) || "deepseek-flash";
+  return localStorage.getItem(MODEL_NAME) || DEFAULT_MODEL;
+}
+
+// ---------- API Key（存 macOS Keychain，前端不长期保存真实 Key） ----------
+
+async function hasKey(): Promise<boolean> {
+  try {
+    return await invoke<boolean>("has_api_key");
+  } catch {
+    return false;
+  }
+}
+
+/// 一次性迁移：把旧 localStorage Key 写入 Keychain，写入成功后才删除 localStorage。
+async function migrateLegacyKey() {
+  const legacy = localStorage.getItem(KEY_NAME);
+  if (!legacy) return;
+  try {
+    if (!(await hasKey())) {
+      await invoke("save_api_key", { key: legacy });
+    }
+    localStorage.removeItem(KEY_NAME); // 只有 Keychain 写入成功后才删旧 Key
+  } catch {
+    // 写入失败：保留 localStorage，下次启动再试；不在这里输出 Key
+  }
+}
+
+async function refreshKeyStatus() {
+  const el = $("key-status");
+  if (!el) return;
+  const has = await hasKey();
+  el.textContent = has ? "✓ 已保存到 macOS 钥匙串" : "未保存 Key";
+  el.className = has ? "ok small" : "muted small";
 }
 
 // ---------- 加载 ----------
@@ -403,15 +444,22 @@ function renderAiPanel() {
   const s = aiStatus;
   const pending = papers.filter((p) => p.analysisStatus === "pendingAnalysis" && p.abstractText).length;
 
+  // 上一次运行摘要（§七：批次结束后保留，直到下一次运行完成覆盖）
+  const lastRun = s.lastRun
+    ? `<div class="ai-last-run muted small">上次分析：${s.lastRun.total} 篇 · 成功 ${s.lastRun.success} · 失败 ${s.lastRun.failed}${s.lastRun.finishedAt ? " · 完成于 " + new Date(s.lastRun.finishedAt).toLocaleTimeString() : ""}</div>`
+    : "";
+
   // 任何状态都渲染有意义内容，绝不允许空白横条
   if (s.state === "idle" && s.remaining === 0 && s.failed === 0 && pending === 0) {
     panel.innerHTML = `
-      <div class="ai-panel-head"><strong>AI 分析</strong><span class="muted small">当前无待处理任务</span></div>`;
+      <div class="ai-panel-head"><strong>AI 分析</strong><span class="muted small">当前无待处理任务</span></div>
+      ${lastRun}`;
     return;
   }
   if (s.state === "idle" && s.remaining === 0 && s.failed === 0) {
     panel.innerHTML = `
       <div class="ai-panel-head"><strong>AI 分析</strong><span class="muted small">待分析 ${pending} 篇</span></div>
+      ${lastRun}
       <div class="ai-panel-actions"><button class="primary small" data-action="ai-backlog">开始分析</button></div>`;
     return;
   }
@@ -421,7 +469,7 @@ function renderAiPanel() {
       : "";
     panel.innerHTML = `
       <div class="ai-panel-head"><strong>AI 分析</strong><span class="muted small">${s.failed} 篇分析失败</span></div>
-      ${reason}
+      ${reason}${lastRun}
       <div class="ai-panel-actions"><button class="ghost small" data-action="ai-retry">重试失败论文</button></div>`;
     return;
   }
@@ -492,22 +540,33 @@ function switchView(name: string) {
   $("view-title").textContent = titles[name] || name;
 }
 
-async function startSync(ids: number[] | null) {
-  ($("btn-sync") as HTMLButtonElement).disabled = true;
-  setStatus("同步中…", "running");
-  await invoke("sync_journals", { ids });
+interface SyncStartResult {
+  started: boolean;
+  reason: string;
+  trigger: string | null;
+  startedAt: string | null;
 }
 
-function requireKey(): boolean {
-  if (getApiKey()) return true;
+async function startSync(ids: number[] | null, trigger: string = "manual") {
+  const res = await invoke<SyncStartResult>("sync_journals", { trigger, ids });
+  if (!res.started) {
+    // 已有全局同步在执行：不得再启动第二份
+    setStatus("正在检查新论文…", "running");
+    return;
+  }
+  setStatus("同步中…", "running");
+}
+
+async function requireKey(): Promise<boolean> {
+  if (await hasKey()) return true;
   setStatus("请先在「设置」保存 DeepSeek API Key", "error");
   switchView("settings");
   return false;
 }
 
 async function startAnalyze(paperIds: number[] | null) {
-  if (!requireKey()) return;
-  await invoke("start_ai", { paperIds, apiKey: getApiKey(), model: getModel() });
+  if (!(await requireKey())) return;
+  await invoke("start_ai", { paperIds, model: getModel() });
   setStatus("AI 分析已开始", "running");
 }
 
@@ -515,8 +574,8 @@ async function pauseAi() {
   await invoke("pause_ai");
 }
 async function resumeAi() {
-  if (!requireKey()) return;
-  await invoke("resume_ai", { apiKey: getApiKey(), model: getModel() });
+  if (!(await requireKey())) return;
+  await invoke("resume_ai", { model: getModel() });
 }
 async function stopAi() {
   if (confirm("停止本次分析？已完成结果会保留，未完成论文回到待分析。")) {
@@ -524,13 +583,13 @@ async function stopAi() {
   }
 }
 async function retryFailedAi() {
-  if (!requireKey()) return;
-  await invoke("retry_failed_ai", { apiKey: getApiKey(), model: getModel() });
+  if (!(await requireKey())) return;
+  await invoke("retry_failed_ai", { model: getModel() });
 }
 
 /// 顶部「AI 分析」手动入口：只处理有摘要、尚未成功、且当前无其他 batch 的论文。
 async function manualAnalyze() {
-  if (!requireKey()) return;
+  if (!(await requireKey())) return;
   if (aiStatus.state !== "idle" || aiStatus.remaining > 0) {
     setStatus("已有 AI 任务在运行，可在 AI 面板暂停或停止", "error");
     $("ai-panel").classList.remove("hidden");
@@ -599,24 +658,33 @@ async function setFlag(id: number, flag: string, value: boolean) {
 }
 
 async function saveKey() {
-  localStorage.setItem(KEY_NAME, ($("api-key") as HTMLInputElement).value.trim());
-  localStorage.setItem(MODEL_NAME, ($("model") as HTMLInputElement).value.trim() || "deepseek-flash");
-  $("settings-msg").textContent = "已保存到本机";
-  $("settings-msg").className = "ok small";
-}
-
-async function testConnection() {
   const key = ($("api-key") as HTMLInputElement).value.trim();
-  const model = ($("model") as HTMLInputElement).value.trim() || "deepseek-flash";
+  const model = ($("model") as HTMLInputElement).value.trim() || DEFAULT_MODEL;
+  localStorage.setItem(MODEL_NAME, model);
   if (!key) {
-    $("settings-msg").textContent = "请先输入 API Key";
+    $("settings-msg").textContent = "请输入 API Key";
     $("settings-msg").className = "error";
     return;
   }
+  try {
+    await invoke("save_api_key", { key });
+    ($("api-key") as HTMLInputElement).value = ""; // 不回显真实 Key
+    localStorage.removeItem(KEY_NAME); // 迁移完成，不再保留 localStorage
+    $("settings-msg").textContent = "已保存到 macOS 钥匙串";
+    $("settings-msg").className = "ok small";
+    await refreshKeyStatus();
+  } catch (err) {
+    $("settings-msg").textContent = String(err);
+    $("settings-msg").className = "error";
+  }
+}
+
+async function testConnection() {
+  const model = ($("model") as HTMLInputElement).value.trim() || DEFAULT_MODEL;
   $("settings-msg").textContent = "测试中…";
   $("settings-msg").className = "muted small";
   try {
-    const r = await invoke<{ ok: boolean; message: string }>("test_connection", { apiKey: key, model });
+    const r = await invoke<{ ok: boolean; message: string }>("test_api_connection", { model });
     $("settings-msg").textContent = r.message;
     $("settings-msg").className = r.ok ? "ok small" : "error";
   } catch (err) {
@@ -654,8 +722,8 @@ async function setupListeners() {
     await loadJournals();
     await loadPapers();
     // 同步后自动分析新论文（§十一）
-    if (settings?.autoAnalyzeNew && Array.isArray(r.newPaperIds) && r.newPaperIds.length > 0 && getApiKey()) {
-      await invoke("start_ai", { paperIds: r.newPaperIds, apiKey: getApiKey(), model: getModel() });
+    if (settings?.autoAnalyzeNew && Array.isArray(r.newPaperIds) && r.newPaperIds.length > 0 && (await hasKey())) {
+      await invoke("start_ai", { paperIds: r.newPaperIds, model: getModel() });
     }
   });
 
@@ -690,7 +758,7 @@ async function setupListeners() {
     }
     const syncOne = t.closest("[data-action='sync-one']") as HTMLElement | null;
     if (syncOne) {
-      await startSync([parseInt(syncOne.dataset.id!, 10)]);
+      await startSync([parseInt(syncOne.dataset.id!, 10)], "journalTest");
       return;
     }
     const toggle = t.closest("[data-action='toggle']") as HTMLElement | null;
@@ -802,11 +870,18 @@ window.addEventListener("DOMContentLoaded", () => {
   $("flag-filter").addEventListener("change", renderPapers);
   $("btn-save-key").addEventListener("click", saveKey);
   $("btn-test").addEventListener("click", testConnection);
-  $("btn-clear-key").addEventListener("click", () => {
-    localStorage.removeItem(KEY_NAME);
-    ($("api-key") as HTMLInputElement).value = "";
-    $("settings-msg").textContent = "已删除本机 Key";
-    $("settings-msg").className = "muted small";
+  $("btn-clear-key").addEventListener("click", async () => {
+    try {
+      await invoke("delete_api_key");
+      localStorage.removeItem(KEY_NAME);
+      ($("api-key") as HTMLInputElement).value = "";
+      $("settings-msg").textContent = "已删除钥匙串中的 Key";
+      $("settings-msg").className = "muted small";
+      await refreshKeyStatus();
+    } catch (err) {
+      $("settings-msg").textContent = String(err);
+      $("settings-msg").className = "error";
+    }
   });
   $("btn-save-settings").addEventListener("click", saveSettings);
   $("btn-analyze-backlog").addEventListener("click", async () => {
@@ -825,7 +900,8 @@ window.addEventListener("DOMContentLoaded", () => {
     setStatus("已加入失败论文重试队列", "running");
   });
 
-  ($("api-key") as HTMLInputElement).value = getApiKey();
+  // Key 存 Keychain，不再回填到输入框（输入框仅用于「替换 Key」时输入）
+  ($("api-key") as HTMLInputElement).value = "";
   ($("model") as HTMLInputElement).value = getModel();
 
   (async () => {
@@ -833,6 +909,9 @@ window.addEventListener("DOMContentLoaded", () => {
     await Promise.all([loadJournals(), loadTags(), loadSettings()]);
     await loadAiStatus();
     await loadPapers();
+    // 旧 localStorage Key 一次性迁移到 Keychain（写入成功后才删除旧 Key）
+    await migrateLegacyKey();
+    await refreshKeyStatus();
     // 启动自动同步（阈值判断在 Rust 端）
     await invoke("maybe_auto_sync").catch(() => {});
   })();

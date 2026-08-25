@@ -17,6 +17,52 @@ pub const QS_PAUSING: &str = "pausing";
 pub const QS_PAUSED: &str = "paused";
 pub const QS_STOPPING: &str = "stopping";
 
+// 同步触发来源（区分 manual/startup/daily/tray/journalTest）
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SyncTrigger {
+    Manual,
+    Startup,
+    Daily,
+    Tray,
+    JournalTest,
+}
+
+impl SyncTrigger {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SyncTrigger::Manual => "manual",
+            SyncTrigger::Startup => "startup",
+            SyncTrigger::Daily => "daily",
+            SyncTrigger::Tray => "tray",
+            SyncTrigger::JournalTest => "journalTest",
+        }
+    }
+}
+
+/// 同步启动结果：started=false 且 reason="syncAlreadyRunning" 表示已有全局同步在执行。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncStartResult {
+    pub started: bool,
+    pub reason: String,
+    pub trigger: Option<String>,
+    pub started_at: Option<String>,
+}
+
+/// 上一次 AI 运行摘要（供 UI 在队列空闲时展示，直到下一次运行覆盖）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LastAiRun {
+    pub total: i64,
+    pub success: i64,
+    pub failed: i64,
+    pub skipped: i64,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub error_summary: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Journal {
@@ -164,6 +210,8 @@ pub struct AiStatus {
     pub last_error: Option<String>,
     pub elapsed_seconds: i64,
     pub eta_seconds: Option<i64>,
+    /// 上一次完成的 AI 运行摘要（队列空闲时仍可展示）。
+    pub last_run: Option<LastAiRun>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

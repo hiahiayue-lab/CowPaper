@@ -35,6 +35,7 @@ npm run tauri build  # 打包 .app（产物在 app/src-tauri/target/release/bund
 - [x] 阶段三：DeepSeek AI（中文标题/摘要/一句话总结 + 标签评分 + 推荐视图）
 - [x] 阶段四：日常体验（启动自动同步 / 每日计划 / 菜单栏托盘 / 通知 / 收藏·已读·忽略）
 - [x] 阶段四增补：**AI Analysis Queue**（持久化、并发 2、暂停/继续/停止、retry/429、实时进度、退出恢复）
+- [x] Round 3.5 加固：唯一 SyncCoordinator（禁止同步重入）、DeepSeek 错误三级分类（Retryable/GlobalConfig/Paper + 配置错误全局暂停）、duplicate tag 规范化（canonical 集合 + 最高分）、API Key 迁移 Keychain、AI last-run 摘要、migration 版本化（PRAGMA user_version + 事务）
 - [ ] 阶段五：缺口适配（仅 JPE 待评估）
 
 ## 关键实现说明
@@ -44,7 +45,7 @@ npm run tauri build  # 打包 .app（产物在 app/src-tauri/target/release/bund
 - **自动同步**：启动时 `maybe_auto_sync`（距上次同步 >30 分钟才执行）；Rust 每日调度器（默认 09:00，每天一次，`lastDailySyncDate` 防重复，退出后下次启动 catch-up）；手动/托盘即时。
 - 去重优先级（需求书 §8.2）：DOI → 出版社文章 ID → OpenAlex Work ID → 标题+ISSN+年份。
 - 摘要来源：Crossref `abstract` → OpenAlex `abstract_inverted_index`；缺失则 `waitingForAbstract`。
-- DeepSeek Key 按用户决策存浏览器 localStorage（明文，仅本机自用；需求书 §18.15 未满足，见 `docs/decisions.md`）。
+- DeepSeek API Key 存 **macOS Keychain**（经 `SecureStore` 抽象，Rust 读取，前端不保存真实 Key；旧 localStorage Key 启动时一次性迁移）。
 - 前端为 **Vite + 原生 TypeScript**（项目初始脚手架即如此，未引入 React）。
 
 ## 测试

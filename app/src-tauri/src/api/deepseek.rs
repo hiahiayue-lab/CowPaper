@@ -5,33 +5,45 @@ use crate::models::TagMatch;
 
 const ENDPOINT: &str = "https://api.deepseek.com/chat/completions";
 
-/// 结构化 AI 错误，供队列区分「可重试」与「全局配置错误」。
+/// 结构化 AI 错误，供队列区分「可重试 / 全局配置错误 / 单篇错误」。
 #[derive(Debug)]
 pub enum AiError {
-    /// 401/400/403：全局配置错误（Key/模型/请求结构），应暂停整个队列。
-    Config(String),
-    /// 429：限流，携带服务端 Retry-After 秒数（可能为 None）。
+    /// 429 限流（可重试；携带服务端 Retry-After 秒数，可能为 None）。
     RateLimited(Option<u64>),
-    /// 5xx 及其它服务端错误。
-    Server(u16),
-    /// 网络层错误（瞬断、timeout）。
+    /// 网络层瞬断 / timeout（可重试）。
     Network(String),
-    /// 响应内容解析失败（单篇失败，不重试）。
-    Parse(String),
-    /// AI 输出缺少必要字段（单篇失败，不重试）。
-    Empty,
+    /// 5xx 服务端错误（可重试）。
+    Server(u16),
+    /// 全局配置错误：无效 Key / 无效模型 / 请求 schema 配置错误。
+    /// 一旦确认，应停止领取新任务并暂停整个 AI 队列（避免逐篇重复失败）。
+    GlobalConfig {
+        status: u16,
+        code: Option<String>,
+        message: String,
+    },
+    /// 单篇论文级错误：响应 JSON 不合法 / 内容异常，不影响其他论文，不重试。
+    Paper(String),
 }
 
 impl std::fmt::Display for AiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AiError::Config(m) => write!(f, "配置错误：{}", m),
             AiError::RateLimited(Some(s)) => write!(f, "API 限流，建议 {} 秒后重试", s),
             AiError::RateLimited(None) => write!(f, "API 限流"),
-            AiError::Server(c) => write!(f, "服务端错误 HTTP {}", c),
             AiError::Network(m) => write!(f, "网络错误：{}", m),
-            AiError::Parse(m) => write!(f, "响应解析失败：{}", m),
-            AiError::Empty => write!(f, "AI 输出缺少必要字段"),
+            AiError::Server(c) => write!(f, "服务端错误 HTTP {}", c),
+            AiError::GlobalConfig {
+                status,
+                code,
+                message,
+            } => {
+                write!(f, "HTTP {} {}", status, message)?;
+                if let Some(c) = code {
+                    write!(f, " (code: {})", c)?;
+                }
+                Ok(())
+            }
+            AiError::Paper(m) => write!(f, "单篇响应异常：{}", m),
         }
     }
 }
@@ -42,6 +54,10 @@ impl AiError {
     /// 是否可自动重试（429 / 5xx / 网络层）。
     pub fn retryable(&self) -> bool {
         matches!(self, AiError::RateLimited(_) | AiError::Server(_) | AiError::Network(_))
+    }
+    /// 是否全局配置错误（应暂停整队）。
+    pub fn is_global_config(&self) -> bool {
+        matches!(self, AiError::GlobalConfig { .. })
     }
 }
 
@@ -102,22 +118,38 @@ impl DeepSeek {
             } else {
                 None
             };
-            let text = truncate(&resp.text().unwrap_or_default(), 200);
+            let text = resp.text().unwrap_or_default();
+            // 解析 OpenAI/DeepSeek 风格错误体（不包含 Key/Authorization）
+            let err: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+            let code = err["error"]["code"].as_str().map(String::from);
+            let msg = err["error"]["message"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| truncate(&text, 200));
+            let req_id = err["id"].as_str().map(String::from);
+            let message = match req_id {
+                Some(id) => format!("{} (request id: {})", msg, id),
+                None => msg,
+            };
             return match status {
                 429 => Err(AiError::RateLimited(retry_after)),
-                400 | 401 | 403 => Err(AiError::Config(format!("HTTP {}: {}", status, text))),
-                s if s >= 500 => Err(AiError::Server(s)),
+                // 400/401/403/404/422 及其余 4xx：全局配置/不可恢复请求错误
+                s if s < 500 => Err(AiError::GlobalConfig {
+                    status: s,
+                    code,
+                    message,
+                }),
                 s => Err(AiError::Server(s)),
             };
         }
 
-        let v: Value = resp.json().map_err(|e| AiError::Parse(e.to_string()))?;
+        let v: Value = resp.json().map_err(|e| AiError::Paper(e.to_string()))?;
         let content = v["choices"][0]["message"]["content"]
             .as_str()
-            .ok_or_else(|| AiError::Parse("响应缺少 content 字段".to_string()))?;
+            .ok_or_else(|| AiError::Paper("响应缺少 content 字段".to_string()))?;
         let content = strip_code_fences(content);
         let parsed: Value = serde_json::from_str(&content)
-            .map_err(|e| AiError::Parse(format!("{}（内容: {}）", e, truncate(&content, 300))))?;
+            .map_err(|e| AiError::Paper(format!("{}（内容: {}）", e, truncate(&content, 300))))?;
 
         let chinese_title = parsed["chineseTitle"].as_str().unwrap_or("").to_string();
         let chinese_abstract = parsed["chineseAbstract"].as_str().unwrap_or("").to_string();
@@ -136,7 +168,7 @@ impl DeepSeek {
             .unwrap_or_default();
 
         if chinese_title.is_empty() && chinese_abstract.is_empty() && one_sentence_summary.is_empty() {
-            return Err(AiError::Empty);
+            return Err(AiError::Paper("AI 输出缺少必要字段".to_string()));
         }
         Ok(AnalysisOutput {
             chinese_title,
@@ -162,15 +194,22 @@ impl DeepSeek {
             .map_err(|e| AiError::Network(e.to_string()))?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
-            let text = truncate(&resp.text().unwrap_or_default(), 200);
+            let text = resp.text().unwrap_or_default();
+            let msg = serde_json::from_str::<Value>(&text)
+                .ok()
+                .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
+                .unwrap_or_else(|| truncate(&text, 200));
             return Err(match status {
                 429 => AiError::RateLimited(None),
-                400 | 401 | 403 => AiError::Config(format!("HTTP {}: {}", status, text)),
-                s if s >= 500 => AiError::Server(s),
+                s if s < 500 => AiError::GlobalConfig {
+                    status: s,
+                    code: None,
+                    message: msg,
+                },
                 s => AiError::Server(s),
             });
         }
-        let v: Value = resp.json().map_err(|e| AiError::Parse(e.to_string()))?;
+        let v: Value = resp.json().map_err(|e| AiError::Paper(e.to_string()))?;
         let reply = v["choices"][0]["message"]["content"].as_str().unwrap_or("").to_string();
         Ok(format!("连接成功，模型 {} 回复：{}", model, truncate(&reply, 50)))
     }

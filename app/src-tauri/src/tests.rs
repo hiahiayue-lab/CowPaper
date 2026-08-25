@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::db;
 use crate::models::{Author, PaperCandidate, UpsertOutcome};
@@ -296,7 +296,7 @@ fn test_retry_logic() {
     let result = run_with_retry(
         move || {
             a.fetch_add(1, Ordering::SeqCst);
-            Err(AiError::Config("bad key".into()))
+            Err(AiError::GlobalConfig { status: 401, code: None, message: "bad key".into() })
         },
         |_, _| {},
     );
@@ -348,7 +348,8 @@ fn test_ai_queue_scenarios() {
 
     let h2 = handle.clone();
     let c2 = conn.clone();
-    let _coord = std::thread::spawn(move || ai_queue::coordinator_loop(c2, cmd_rx, h2));
+    let store = Arc::new(crate::secure_store::MockStore::with_key("test-key"));
+    let _coord = std::thread::spawn(move || ai_queue::coordinator_loop(c2, cmd_rx, h2, store));
 
     let wait = |conn: &Arc<Mutex<Connection>>,
                 timeout: Duration,
@@ -379,7 +380,6 @@ fn test_ai_queue_scenarios() {
     cmd_tx
         .send(QueueCommand::Start {
             paper_ids: None,
-            api_key: "k".into(),
             model: "m".into(),
         })
         .unwrap();
@@ -396,6 +396,14 @@ fn test_ai_queue_scenarios() {
         assert_eq!(db::count_by_status(&c, "analysisSucceeded").unwrap(), 20);
         assert_eq!(db::count_active_queue(&c).unwrap(), 0);
     }
+    // 上次运行摘要应保留（§七：批次结束后不清零历史统计）
+    {
+        let lr = ai_queue::status_from_db(&conn).last_run.expect("应有 last_run 摘要");
+        assert_eq!(lr.total, 20, "last_run.total");
+        assert_eq!(lr.success, 20, "last_run.success");
+        assert_eq!(lr.failed, 0, "last_run.failed");
+        assert!(lr.finished_at.is_some(), "last_run.finished_at");
+    }
 
     // ===== 场景 B：暂停 / 继续（慢速 mock 300ms/篇） =====
     reset_pending(&conn);
@@ -409,7 +417,6 @@ fn test_ai_queue_scenarios() {
     cmd_tx
         .send(QueueCommand::Start {
             paper_ids: None,
-            api_key: "k".into(),
             model: "m".into(),
         })
         .unwrap();
@@ -425,7 +432,6 @@ fn test_ai_queue_scenarios() {
     assert_eq!(s.remaining, 18, "B: 剩余 18 篇（remaining={}）", s.remaining);
     cmd_tx
         .send(QueueCommand::Resume {
-            api_key: "k".into(),
             model: "m".into(),
         })
         .unwrap();
@@ -447,7 +453,6 @@ fn test_ai_queue_scenarios() {
     cmd_tx
         .send(QueueCommand::Start {
             paper_ids: None,
-            api_key: "k".into(),
             model: "m".into(),
         })
         .unwrap();
@@ -483,7 +488,7 @@ fn test_ai_queue_scenarios() {
     };
     ai_queue::set_mock_analyzer(Some(Arc::new(move |id| {
         if id == first_id {
-            Err(AiError::Empty)
+            Err(AiError::Paper("mock 单篇失败".into()))
         } else {
             Ok(true)
         }
@@ -491,7 +496,6 @@ fn test_ai_queue_scenarios() {
     cmd_tx
         .send(QueueCommand::Start {
             paper_ids: None,
-            api_key: "k".into(),
             model: "m".into(),
         })
         .unwrap();
@@ -529,7 +533,6 @@ fn test_ai_queue_scenarios() {
     cmd_tx
         .send(QueueCommand::Start {
             paper_ids: Some(vec![one_id]),
-            api_key: "k".into(),
             model: "m".into(),
         })
         .unwrap();
@@ -587,6 +590,11 @@ fn live_deepseek_smoke() {
     assert!(!key.is_empty(), "COWPAPER_KEY 不能为空");
     println!("[live] model={}", model);
 
+    // 真实 macOS Keychain：保存 → 队列经 Keychain 读取 → 用后删除
+    let store: Arc<dyn crate::secure_store::SecureStore> =
+        Arc::new(crate::secure_store::KeychainStore::new());
+    store.save(&key).expect("真实 Keychain 写入失败");
+
     let app = tauri::test::mock_builder()
         .build(tauri::test::mock_context(tauri::test::noop_assets()))
         .expect("mock app");
@@ -611,13 +619,13 @@ fn live_deepseek_smoke() {
     });
     let h2 = handle.clone();
     let c2 = conn.clone();
-    let _coord = std::thread::spawn(move || ai_queue::coordinator_loop(c2, cmd_rx, h2));
+    let store2 = store.clone();
+    let _coord = std::thread::spawn(move || ai_queue::coordinator_loop(c2, cmd_rx, h2, store2));
 
     // ---------- 第一步：1 篇真实分析 ----------
     cmd_tx
         .send(QueueCommand::Start {
             paper_ids: None,
-            api_key: key.clone(),
             model: model.clone(),
         })
         .unwrap();
@@ -686,7 +694,6 @@ fn live_deepseek_smoke() {
     cmd_tx
         .send(QueueCommand::Start {
             paper_ids: Some(vec![2, 3, 4, 5]),
-            api_key: key,
             model,
         })
         .unwrap();
@@ -722,4 +729,278 @@ fn live_deepseek_smoke() {
     assert!(succ >= 5, "应有 ≥5 篇成功（含第 1 篇），实际 {}", succ);
     assert_eq!(dup, 0, "不应有重复 evidence 的成功论文（未重复分析）");
     println!("[live-2] OK: batch 连续推进、成功计数正确、未重复分析");
+
+    // 清理：删除测试写入的 Keychain 条目，恢复环境原状
+    store.delete().expect("真实 Keychain 清理失败");
+    println!("[live] Keychain 清理完成");
+}
+
+// ================= Round 3.5 hardening 测试 =================
+
+#[test]
+fn test_sync_coordinator_no_reentry() {
+    use crate::models::SyncTrigger;
+    use crate::sync_coordinator::SyncCoordinator;
+
+    let sc = SyncCoordinator::new();
+    assert!(!sc.is_running());
+    assert!(sc.try_acquire(SyncTrigger::Manual).is_some());
+    assert!(sc.is_running());
+    // 任意其他 trigger 都不得重入
+    assert!(sc.try_acquire(SyncTrigger::Startup).is_none());
+    assert!(sc.try_acquire(SyncTrigger::Daily).is_none());
+    assert!(sc.try_acquire(SyncTrigger::Tray).is_none());
+    assert!(sc.try_acquire(SyncTrigger::JournalTest).is_none());
+    let st = sc.status();
+    assert!(st.started);
+    assert_eq!(st.reason, "running");
+    assert_eq!(st.trigger.as_deref(), Some("manual"));
+    // 释放后恢复
+    sc.release();
+    assert!(!sc.is_running());
+    assert!(sc.try_acquire(SyncTrigger::Manual).is_some());
+    sc.release();
+}
+
+#[test]
+fn test_duplicate_tag_normalization() {
+    use crate::analyze::normalize_tag_matches;
+    use crate::models::TagMatch;
+    let pairs: Vec<(String, String)> = vec![
+        ("平台经济".into(), "".into()),
+        ("博弈论".into(), "".into()),
+        ("定价".into(), "".into()),
+    ];
+    let t = |tag: &str, s: f64| TagMatch {
+        tag: tag.into(),
+        score: s,
+    };
+    let total = |out: &Vec<TagMatch>| out.iter().map(|m| m.score).sum::<f64>();
+
+    // 1) 重复 tag：平台经济 x2 → 只保留一个，取最高分，totalScore 不得翻倍
+    let out = normalize_tag_matches(vec![t("平台经济", 0.8), t("平台经济", 0.8)], &pairs);
+    assert_eq!(out.len(), 3);
+    assert_eq!(out.iter().find(|m| m.tag == "平台经济").unwrap().score, 0.8);
+    assert_eq!(total(&out), 0.8, "重复 tag 不得求和");
+
+    // 2) 重复且分数不同 → 取最高合法分
+    let out = normalize_tag_matches(vec![t("平台经济", 0.4), t("平台经济", 1.0)], &pairs);
+    assert_eq!(out.iter().find(|m| m.tag == "平台经济").unwrap().score, 1.0);
+
+    // 3) 未知标签 → 丢弃
+    let out = normalize_tag_matches(vec![t("不存在的标签", 1.0), t("定价", 0.6)], &pairs);
+    assert!(!out.iter().any(|m| m.tag == "不存在的标签"));
+    assert_eq!(total(&out), 0.6);
+
+    // 4) 已禁用标签（不在 canonical pairs）→ 丢弃
+    let out = normalize_tag_matches(vec![t("已禁用标签", 0.8)], &pairs);
+    assert!(!out.iter().any(|m| m.tag == "已禁用标签"));
+
+    // 5) 非法 score → 钳制到合法档位
+    let out = normalize_tag_matches(
+        vec![t("博弈论", 5.0), t("定价", -1.0), t("平台经济", 0.75)],
+        &pairs,
+    );
+    let by = |tag: &str| out.iter().find(|m| m.tag == tag).unwrap().score;
+    assert_eq!(by("博弈论"), 1.0);
+    assert_eq!(by("定价"), 0.0);
+    assert_eq!(by("平台经济"), 0.8);
+
+    // 6) 正常列表
+    let out = normalize_tag_matches(vec![t("平台经济", 0.8), t("定价", 0.6)], &pairs);
+    assert_eq!(total(&out), 1.4);
+}
+
+#[test]
+fn test_global_config_no_retry() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use crate::ai_queue::run_with_retry;
+    use crate::api::deepseek::AiError;
+
+    // 无效模型（404 model_not_found）→ GlobalConfig → 只尝试 1 次，不逐篇重试
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let a = attempts.clone();
+    let result = run_with_retry(
+        move || {
+            a.fetch_add(1, Ordering::SeqCst);
+            Err(AiError::GlobalConfig {
+                status: 404,
+                code: Some("model_not_found".into()),
+                message: "model not found".into(),
+            })
+        },
+        |_, _| {},
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 1, "GlobalConfig 不得重试");
+    assert!(result.err().unwrap().is_global_config());
+
+    // 429 仍然允许 retry
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let a = attempts.clone();
+    let result = run_with_retry(
+        move || {
+            let n = a.fetch_add(1, Ordering::SeqCst);
+            if n < 2 {
+                Err(AiError::RateLimited(Some(0)))
+            } else {
+                Ok(true)
+            }
+        },
+        |_, _| {},
+    );
+    assert!(matches!(result, Ok(true)));
+    assert_eq!(attempts.load(Ordering::SeqCst), 3, "429 应重试到成功");
+
+    // 5xx 仍有限 retry（最多 MAX_RETRIES 次后失败）
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let a = attempts.clone();
+    let result = run_with_retry(
+        move || {
+            a.fetch_add(1, Ordering::SeqCst);
+            Err(AiError::Server(503))
+        },
+        |_, _| {},
+    );
+    assert!(result.is_err());
+    assert_eq!(attempts.load(Ordering::SeqCst), 1 + crate::ai_queue::MAX_RETRIES as usize);
+}
+
+#[test]
+fn test_secure_store_mock_save_has_delete() {
+    use crate::secure_store::{MockStore, SecureStore};
+    let store = MockStore::new();
+    assert!(!store.has());
+    assert!(store.get().unwrap().is_none());
+    store.save("sk-abc").unwrap();
+    assert!(store.has());
+    assert_eq!(store.get().unwrap().unwrap(), "sk-abc");
+    store.delete().unwrap();
+    assert!(!store.has());
+    assert!(store.get().unwrap().is_none());
+}
+
+#[test]
+fn test_api_key_not_in_sqlite() {
+    use crate::secure_store::{MockStore, SecureStore};
+    let conn = mem_db();
+    let store = MockStore::with_key("sk-test-secret-12345");
+    store.save("sk-test-secret-12345").unwrap();
+    assert!(store.has());
+
+    // app_state 不得出现 key 相关键
+    let keys: Vec<String> = conn
+        .prepare("SELECT key FROM app_state")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(
+        !keys.iter().any(|k| k.contains("api_key") || k.contains("keychain") || k.contains("secret")),
+        "app_state 不得保存 API Key：{:?}",
+        keys
+    );
+
+    // 任何表的文本列不得包含该 Key
+    let needle = "sk-test-secret-12345";
+    let mut found = false;
+    let mut tables: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    tables.push("app_state".into());
+    for t in &tables {
+        let cols: Vec<String> = conn
+            .prepare(&format!("PRAGMA table_info({})", t))
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        for col in cols {
+            let q = format!(
+                "SELECT 1 FROM \"{}\" WHERE COALESCE(CAST(\"{}\" AS TEXT), '') LIKE ?1 LIMIT 1",
+                t, col
+            );
+            let hit = conn
+                .query_row(&q, params![&format!("%{}%", needle)], |_| Ok(()))
+                .optional()
+                .unwrap();
+            if hit.is_some() {
+                found = true;
+            }
+        }
+    }
+    assert!(!found, "API Key 不得出现在任何 SQLite 表中");
+}
+
+#[test]
+fn test_migration_upgrade_preserves_data() {
+    // 构造 round-2 时代旧 schema（无 chinese_*/is_favorite 等列）
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        r#"
+        CREATE TABLE journals (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, print_issn TEXT, online_issn TEXT, publisher TEXT, enabled INTEGER NOT NULL DEFAULT 1, priority INTEGER NOT NULL DEFAULT 0, rss_url TEXT, openalex_source_id TEXT, publisher_adapter TEXT, last_successful_sync_at TEXT, last_paper_date TEXT, coverage_status TEXT, abstract_coverage_rate REAL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+        CREATE TABLE papers (id INTEGER PRIMARY KEY AUTOINCREMENT, journal_id INTEGER NOT NULL, normalized_doi TEXT, original_doi TEXT, title TEXT, title_norm TEXT, authors_json TEXT, published_date TEXT, year INTEGER, abstract TEXT, abstract_source TEXT, abstract_retrieved_at TEXT, url TEXT, publisher_article_id TEXT, openalex_work_id TEXT, discovery_source TEXT, analysis_status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+        CREATE TABLE source_records (id INTEGER PRIMARY KEY AUTOINCREMENT, paper_id INTEGER NOT NULL, source TEXT NOT NULL, source_id TEXT, raw_json TEXT, retrieved_at TEXT NOT NULL);
+        CREATE TABLE tags (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, description TEXT, enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+        INSERT INTO journals (name, created_at, updated_at) VALUES ('Old J', 't', 't');
+        INSERT INTO papers (journal_id, title, abstract, analysis_status, created_at, updated_at) VALUES (1, 'Old Paper', 'old abstract', 'pending', 't', 't');
+        INSERT INTO tags (name, created_at, updated_at) VALUES ('旧标签', 't', 't');
+        "#,
+    )
+    .unwrap();
+
+    // 升级
+    db::init(&conn).unwrap();
+
+    // 数据保留
+    let title: String = conn
+        .query_row("SELECT title FROM papers WHERE id=1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(title, "Old Paper");
+    let tag: String = conn
+        .query_row("SELECT name FROM tags WHERE id=1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(tag, "旧标签");
+    let st: String = conn
+        .query_row("SELECT analysis_status FROM papers WHERE id=1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(st, "pendingAnalysis", "旧状态值应重命名");
+
+    // 新列存在
+    let cols: Vec<String> = conn
+        .prepare("PRAGMA table_info(papers)")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(1))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    for need in ["chinese_title", "is_favorite", "retry_count", "total_score"] {
+        assert!(cols.contains(&need.to_string()), "缺少列 {}", need);
+    }
+
+    // user_version 推进且重复 init 幂等
+    let v: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, db::SCHEMA_VERSION);
+    db::init(&conn).unwrap();
+    let v2: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v2, db::SCHEMA_VERSION);
+}
+
+/// 真实 macOS Keychain 冒烟（ignored）：save/get/has/delete 真实值。
+#[test]
+#[ignore]
+fn keychain_real_smoke() {
+    let msg = crate::secure_store::keychain_smoke().expect("真实 Keychain 验证失败");
+    println!("{}", msg);
 }

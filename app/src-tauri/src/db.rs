@@ -83,9 +83,14 @@ pub fn open(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// 当前 schema 版本（下一轮 Batch 表将从 v2 开始递增）。
+/// 生产构建中仅由迁移系统隐式使用；测试中直接断言。
+#[allow(dead_code)]
+pub const SCHEMA_VERSION: i64 = 1;
+
 pub fn init(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
-    migrate(conn)?;
+    run_migrations(conn)?;
     seed_default_tags(conn)?;
     Ok(())
 }
@@ -491,7 +496,28 @@ fn column_exists(conn: &Connection, table: &str, col: &str) -> bool {
     false
 }
 
-pub fn migrate(conn: &Connection) -> Result<()> {
+/// 版本化迁移：按 user_version 顺序执行，每个迁移在事务中完成，
+/// 失败即回滚且不推进版本，杜绝半迁移状态。已成功的迁移不会重复执行。
+fn run_migrations(conn: &Connection) -> Result<()> {
+    let current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    for (version, _name, up) in migrations() {
+        if version <= current {
+            continue;
+        }
+        let tx = conn.unchecked_transaction()?;
+        up(&tx)?;
+        tx.pragma_update(None, "user_version", version)?;
+        tx.commit()?;
+    }
+    Ok(())
+}
+
+fn migrations() -> Vec<(i64, &'static str, fn(&Connection) -> Result<()>)> {
+    vec![(1, "round3-baseline", migrate_to_v1)]
+}
+
+/// v1：把任意旧库升级到 round-3 基线（幂等：列已存在则跳过）。
+fn migrate_to_v1(conn: &Connection) -> Result<()> {
     let add_cols: &[(&str, &str)] = &[
         ("chinese_title", "TEXT"),
         ("chinese_abstract", "TEXT"),

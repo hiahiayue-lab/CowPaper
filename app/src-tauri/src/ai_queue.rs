@@ -11,8 +11,9 @@ use crate::analyze::{self, AnalyzeContext};
 use crate::api::deepseek::{AiError, DeepSeek};
 use crate::db;
 use crate::models::{
-    AiStatus, ST_ANALYZING, QS_IDLE, QS_PAUSED, QS_PAUSING, QS_RUNNING, QS_STOPPING,
+    AiStatus, LastAiRun, ST_ANALYZING, QS_IDLE, QS_PAUSED, QS_PAUSING, QS_RUNNING, QS_STOPPING,
 };
+use crate::secure_store::SecureStore;
 
 /// 最大并发 DeepSeek 请求数（保守，§八）。
 pub const MAX_CONCURRENCY: usize = 2;
@@ -24,17 +25,14 @@ const BASE_BACKOFF_MS: u64 = 2000;
 pub enum QueueCommand {
     Start {
         paper_ids: Option<Vec<i64>>,
-        api_key: String,
         model: String,
     },
     Pause,
     Resume {
-        api_key: String,
         model: String,
     },
     Stop,
     RetryFailed {
-        api_key: String,
         model: String,
     },
 }
@@ -110,10 +108,12 @@ impl Batch {
 }
 
 /// 全局唯一的 AI Queue 协调器主循环（应用生命周期内常驻）。
+/// API Key 由 SecureStore（macOS Keychain）读取，前端不传 Key。
 pub fn coordinator_loop<R: Runtime>(
     conn: Arc<Mutex<Connection>>,
     cmd_rx: Receiver<QueueCommand>,
     app: AppHandle<R>,
+    store: Arc<dyn SecureStore>,
 ) {
     let mut state = QS_IDLE.to_string();
     let pick_new = Arc::new(AtomicBool::new(false));
@@ -121,7 +121,7 @@ pub fn coordinator_loop<R: Runtime>(
 
     loop {
         match cmd_rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(cmd) => handle_command(&conn, &app, &mut state, &pick_new, &mut batch, cmd),
+            Ok(cmd) => handle_command(&conn, &app, &mut state, &pick_new, &mut batch, cmd, &store),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
@@ -132,6 +132,25 @@ pub fn coordinator_loop<R: Runtime>(
                 let status = build_status(&conn, &b.final_state, b);
                 let _ = app.emit("ai://progress", &status);
                 let _ = app.emit("ai://finished", &status);
+                // 记录上一次 AI 运行摘要（保留到下一次运行完成，供 idle 展示）
+                {
+                    let c = conn.lock().unwrap();
+                    let set = |k: &str, v: &str| {
+                        let _ = db::set_setting(&c, k, v);
+                    };
+                    set("ai.last_total", &b.size.to_string());
+                    set("ai.last_success", &b.success.to_string());
+                    set("ai.last_failed", &b.failed.to_string());
+                    set("ai.last_skipped", &b.skipped.to_string());
+                    set("ai.last_started_at", &b.batch_started_at_iso);
+                    set("ai.last_finished_at", &now_iso());
+                    match &b.last_error {
+                        Some(e) => set("ai.last_error_summary", e),
+                        None => {
+                            let _ = db::set_setting(&c, "ai.last_error_summary", "");
+                        }
+                    }
+                }
                 // 清空批次计数，避免残留旧批次数字误导 UI
                 {
                     let c = conn.lock().unwrap();
@@ -159,16 +178,16 @@ fn handle_command<R: Runtime>(
     pick_new: &AtomicBool,
     batch: &mut Option<Batch>,
     cmd: QueueCommand,
+    store: &Arc<dyn SecureStore>,
 ) {
     match cmd {
-        QueueCommand::Start {
-            paper_ids,
-            api_key,
-            model,
-        } => {
+        QueueCommand::Start { paper_ids, model } => {
             if state.as_str() != QS_IDLE {
                 return; // 单一队列：已有批次时不重复启动
             }
+            let Some(api_key) = read_api_key(store, app) else {
+                return;
+            };
             let ctx = match analyze::build_context(conn) {
                 Some(c) => Arc::new(c),
                 None => {
@@ -216,8 +235,11 @@ fn handle_command<R: Runtime>(
                 }
             }
         }
-        QueueCommand::Resume { api_key, model } => {
+        QueueCommand::Resume { model } => {
             if state.as_str() == QS_PAUSED || state.as_str() == QS_PAUSING {
+                let Some(api_key) = read_api_key(store, app) else {
+                    return;
+                };
                 pick_new.store(true, Ordering::SeqCst);
                 *state = QS_RUNNING.to_string();
                 if let Some(b) = batch {
@@ -227,6 +249,9 @@ fn handle_command<R: Runtime>(
                 }
             } else if state.as_str() == QS_IDLE {
                 // 重启恢复：从 queued 残留重建批次
+                let Some(api_key) = read_api_key(store, app) else {
+                    return;
+                };
                 let ctx = match analyze::build_context(conn) {
                     Some(c) => Arc::new(c),
                     None => return,
@@ -272,10 +297,13 @@ fn handle_command<R: Runtime>(
             }
             _ => {}
         },
-        QueueCommand::RetryFailed { api_key, model } => {
+        QueueCommand::RetryFailed { model } => {
             if state.as_str() != QS_IDLE {
                 return;
             }
+            let Some(api_key) = read_api_key(store, app) else {
+                return;
+            };
             let failed_ids = {
                 let c = conn.lock().unwrap();
                 db::list_failed_ids(&c).unwrap_or_default()
@@ -307,6 +335,21 @@ fn handle_command<R: Runtime>(
             pick_new.store(true, Ordering::SeqCst);
             persist_queue_state(conn, state, batch.as_ref().unwrap());
             emit_progress(app, conn, state, batch.as_ref().unwrap());
+        }
+    }
+}
+
+/// 从 SecureStore 读取 API Key；缺失/失败时发错误事件并返回 None。
+fn read_api_key<R: Runtime>(store: &Arc<dyn SecureStore>, app: &AppHandle<R>) -> Option<String> {
+    match store.get() {
+        Ok(Some(k)) if !k.is_empty() => Some(k),
+        Ok(_) => {
+            let _ = app.emit("ai://error", "未保存 API Key，请先在设置中保存");
+            None
+        }
+        Err(e) => {
+            let _ = app.emit("ai://error", format!("读取 API Key 失败：{}", e));
+            None
         }
     }
 }
@@ -366,8 +409,8 @@ fn step_batch<R: Runtime>(
                         let c = conn.lock().unwrap();
                         let _ = db::mark_analysis_failed(&c, paper_id);
                         drop(c);
-                        // 全局配置错误（无效 Key / 模型 / 请求结构）：暂停整个队列并提示。
-                        if matches!(e, AiError::Config(_)) {
+                        // 全局配置错误（无效 Key / 模型 / 请求 schema）：暂停整个队列并提示。
+                        if e.is_global_config() {
                             pick_new.store(false, Ordering::SeqCst);
                             *state = QS_PAUSING.to_string();
                             let _ = app.emit(
@@ -570,9 +613,12 @@ fn persist_queue_state(conn: &Arc<Mutex<Connection>>, state: &str, b: &Batch) {
 }
 
 fn build_status(conn: &Arc<Mutex<Connection>>, state: &str, b: &Batch) -> AiStatus {
-    let remaining = {
+    let (remaining, last_run) = {
         let c = conn.lock().unwrap();
-        db::count_active_queue(&c).unwrap_or(0)
+        (
+            db::count_active_queue(&c).unwrap_or(0),
+            last_run_from(&c),
+        )
     };
     let completed = b.size - remaining;
     let elapsed = b.started_at.elapsed().as_secs() as i64;
@@ -600,7 +646,32 @@ fn build_status(conn: &Arc<Mutex<Connection>>, state: &str, b: &Batch) -> AiStat
         last_error: b.last_error.clone(),
         elapsed_seconds: elapsed,
         eta_seconds: eta,
+        last_run,
     }
+}
+
+/// 从 app_state 读取上一次 AI 运行摘要。
+fn last_run_from(conn: &Connection) -> Option<LastAiRun> {
+    let g = |k: &str| db::get_setting(conn, k).unwrap_or_default();
+    let total: i64 = g("ai.last_total").parse().unwrap_or(0);
+    let success: i64 = g("ai.last_success").parse().unwrap_or(0);
+    let failed: i64 = g("ai.last_failed").parse().unwrap_or(0);
+    let skipped: i64 = g("ai.last_skipped").parse().unwrap_or(0);
+    let started = g("ai.last_started_at");
+    let finished = g("ai.last_finished_at");
+    let err = g("ai.last_error_summary");
+    if total == 0 && success == 0 && failed == 0 && skipped == 0 && started.is_empty() {
+        return None;
+    }
+    Some(LastAiRun {
+        total,
+        success,
+        failed,
+        skipped,
+        started_at: if started.is_empty() { None } else { Some(started) },
+        finished_at: if finished.is_empty() { None } else { Some(finished) },
+        error_summary: if err.is_empty() { None } else { Some(err) },
+    })
 }
 
 fn emit_progress<R: Runtime>(
@@ -650,6 +721,7 @@ pub fn status_from_db(conn: &Arc<Mutex<Connection>>) -> AiStatus {
     let csa = g("queue.current_paper_started_at");
     let ru = g("queue.retry_until");
     let le = g("queue.last_error");
+    let last_run = last_run_from(&c);
 
     AiStatus {
         state: state.clone(),
@@ -669,6 +741,7 @@ pub fn status_from_db(conn: &Arc<Mutex<Connection>>) -> AiStatus {
         last_error: if le.is_empty() { None } else { Some(le) },
         elapsed_seconds: elapsed,
         eta_seconds: eta,
+        last_run,
     }
 }
 

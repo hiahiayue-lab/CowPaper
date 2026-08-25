@@ -1,17 +1,17 @@
 use std::sync::{Arc, Mutex};
 
 use rusqlite::Connection;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Runtime};
 
 use crate::api::{crossref::Crossref, openalex::OpenAlex};
 use crate::db;
 use crate::models::{Journal, PaperCandidate, SyncReport, UpsertOutcome};
 
 /// 在后台线程中运行同步（由命令触发）。通过事件回报进度与结果。
-pub fn run_sync(
+pub fn run_sync<R: Runtime>(
     conn: &Arc<Mutex<Connection>>,
     ids: Option<Vec<i64>>,
-    app: &AppHandle,
+    app: &AppHandle<R>,
     mailto: &str,
 ) -> SyncReport {
     let start = std::time::Instant::now();

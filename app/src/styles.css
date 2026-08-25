@@ -180,6 +180,12 @@ body {
 .ai-panel-meta {
   margin-bottom: 6px;
 }
+.ai-last-run {
+  margin-top: 6px;
+  padding: 4px 8px;
+  background: #f4f6f8;
+  border-radius: 6px;
+}
 .ai-current {
   margin: 4px 0;
   color: #1e3a5f;

@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use rusqlite::Connection;
@@ -10,11 +9,10 @@ use crate::util::hash64;
 
 pub const PROMPT_VERSION: &str = "v1";
 
-/// 标签上下文：入队时快照一次，整批复用。
+/// 标签上下文：入队时快照一次，整批复用（仅包含当前启用标签 = canonical set）。
 #[derive(Debug, Clone)]
 pub struct AnalyzeContext {
     pub tag_pairs: Vec<(String, String)>,
-    pub known: HashSet<String>,
 }
 
 pub fn build_context(conn: &Arc<Mutex<Connection>>) -> Option<AnalyzeContext> {
@@ -28,8 +26,33 @@ pub fn build_context(conn: &Arc<Mutex<Connection>>) -> Option<AnalyzeContext> {
         .iter()
         .map(|t| (t.name.clone(), t.description.clone().unwrap_or_default()))
         .collect();
-    let known: HashSet<String> = tag_pairs.iter().map(|(n, _)| n.clone()).collect();
-    Some(AnalyzeContext { tag_pairs, known })
+    Some(AnalyzeContext { tag_pairs })
+}
+
+/// 以本地启用的标签集合（canonical set）规范化 AI 返回的 tagMatches：
+/// 1. 只保留存在于 canonical 集合的标签（未知 / 已禁用标签被丢弃，不信任 AI 返回列表）；
+/// 2. 相同标签出现多次时取最高合法分（绝不对重复项求和）；
+/// 3. score 钳制到合法档位 {0.0, 0.2, 0.4, 0.6, 0.8, 1.0}；
+/// 4. canonical 中 AI 未返回的标签补 0.0，保证集合完整。
+/// totalScore 必须由 Rust 基于该规范化结果求和。
+pub fn normalize_tag_matches(
+    ai_matches: Vec<TagMatch>,
+    tag_pairs: &[(String, String)],
+) -> Vec<TagMatch> {
+    tag_pairs
+        .iter()
+        .map(|(name, _)| {
+            let score = ai_matches
+                .iter()
+                .filter(|m| m.tag == *name)
+                .map(|m| clamp_score(m.score))
+                .fold(0.0_f64, |acc, s| acc.max(s));
+            TagMatch {
+                tag: name.clone(),
+                score,
+            }
+        })
+        .collect()
 }
 
 /// 单篇论文的一次分析尝试（不含重试）。
@@ -46,7 +69,7 @@ pub fn analyze_paper_once(
     ctx: &AnalyzeContext,
 ) -> Result<bool, AiError> {
     if title.is_empty() || abstract_text.is_empty() {
-        return Err(AiError::Empty);
+        return Err(AiError::Paper("缺少标题或摘要".to_string()));
     }
     let tag_names: String = ctx
         .tag_pairs
@@ -71,23 +94,8 @@ pub fn analyze_paper_once(
 
     let out = ds.analyze(api_key, model, title, abstract_text, &ctx.tag_pairs)?;
 
-    let mut tag_matches: Vec<TagMatch> = out
-        .tag_matches
-        .into_iter()
-        .filter(|m| ctx.known.contains(&m.tag))
-        .map(|m| TagMatch {
-            tag: m.tag,
-            score: clamp_score(m.score),
-        })
-        .collect();
-    for (name, _) in &ctx.tag_pairs {
-        if !tag_matches.iter().any(|m| &m.tag == name) {
-            tag_matches.push(TagMatch {
-                tag: name.clone(),
-                score: 0.0,
-            });
-        }
-    }
+    // 规范化：canonical 唯一标签集 + 最高合法分（重复 tag 不求和）。
+    let tag_matches = normalize_tag_matches(out.tag_matches, &ctx.tag_pairs);
     let total: f64 = tag_matches.iter().map(|m| m.score).sum();
     let tag_matches_json = serde_json::to_string(&tag_matches).unwrap_or_else(|_| "[]".to_string());
 
@@ -105,7 +113,7 @@ pub fn analyze_paper_once(
             PROMPT_VERSION,
             &evidence_hash,
         )
-        .map_err(|e| AiError::Parse(e.to_string()))?;
+        .map_err(|e| AiError::Paper(e.to_string()))?;
     }
     Ok(true)
 }
