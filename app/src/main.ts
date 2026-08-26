@@ -741,10 +741,13 @@ function tagDraftEqual(a: TagDraftItem[], b: TagDraftItem[]): boolean {
 function setTagDirty(v: boolean) {
   tagConfigDirty = v;
   $("tag-draft-dirty").classList.toggle("hidden", !v);
-  ($("[data-action='tag-save-scheduled']") as HTMLButtonElement).disabled = !v;
-  ($("[data-action='tag-save-immediate']") as HTMLButtonElement).disabled = !v;
+  const schedBtn = document.querySelector("[data-action='save-tag-config-scheduled']") as HTMLButtonElement | null;
+  const immBtn = document.querySelector("[data-action='save-tag-config-immediate']") as HTMLButtonElement | null;
+  if (schedBtn) schedBtn.disabled = !v;
+  if (immBtn) immBtn.disabled = !v;
   const n = draftChanges();
-  $("tag-action-summary").textContent = v ? `${n} 项未保存修改` : "";
+  const sum = $("tag-action-summary");
+  if (sum) sum.textContent = v ? `${n} 项未保存修改` : "";
 }
 
 function draftChanges(): number {
@@ -787,47 +790,88 @@ function renderTagEditor() {
 }
 
 /// 保存 draft。
+/// 纯逻辑（可测试）：计算保存预览（immediate 确认 Modal 用）。
+interface TagSavePreview {
+  added: number;
+  semanticChanged: number;
+  removed: number;
+  disabled: number;
+  needsAi: boolean;
+}
+function computeTagSavePreview(draft: TagDraftItem[], baseline: TagDraftItem[]): TagSavePreview {
+  const added = draft.filter((d) => d.id === 0 && !d.deleted).length;
+  const removed = baseline.filter((b) => b.id > 0 && !draft.some((d) => d.id === b.id)).length;
+  const disabled = draft.filter((d) => {
+    const b = baseline.find((x) => x.id === d.id);
+    return b ? b.enabled && !d.enabled : false;
+  }).length;
+  const norm = (x: string) => x.replace(/\s/g, "").toLowerCase();
+  const semanticChanged = draft.filter((d) => {
+    if (d.id === 0 || d.deleted) return false;
+    const b = baseline.find((x) => x.id === d.id);
+    if (!b) return false;
+    return norm(b.name) !== norm(d.name) || norm(b.description || "") !== norm(d.description || "");
+  }).length;
+  return { added, semanticChanged, removed, disabled, needsAi: added + semanticChanged > 0 };
+}
+
+function setTagSaveStatus(text: string, cls: "idle" | "running" | "error" | "done") {
+  const el = $("tag-action-summary");
+  if (!el) return;
+  el.textContent = text;
+  el.className = `muted small ${cls === "error" ? "error" : cls === "running" ? "running" : ""}`;
+}
+
+function safeError(err: unknown): string {
+  const m = err instanceof Error ? err.message : String(err);
+  return m.length > 160 ? m.slice(0, 160) + "…" : m;
+}
+
 async function saveTagConfig(mode: "scheduled" | "immediate") {
-  const items = tagDraft.filter((d) => !(d.deleted && d.id === 0)); // 未保存过的新增且被删 → 丢弃
+  if (!tagConfigDirty) return;
+  const items = tagDraft.filter((d) => !(d.deleted && d.id === 0));
   if (mode === "scheduled") {
+    // 立即反馈 + try/catch（失败可见，dirty 保持）
+    setTagSaveStatus("正在保存…", "running");
     try {
       const res = await invoke<SaveTagConfigResult>("save_tag_config", { items, mode });
-      setStatus(`已保存，将于 ${fmtCycle(res.effectiveCycleKey || "")} 生效。`, "done");
+      setTagSaveStatus(`已保存 · 将于 ${fmtCycle(res.effectiveCycleKey || "")} 生效`, "done");
       await loadTagEditor();
     } catch (err) {
-      setStatus(String(err), "error");
+      setTagSaveStatus(`保存失败：${safeError(err)}`, "error");
+      return;
     }
     return;
   }
-  // immediate：确认（若含 AI-needed）
-  const added = tagDraft.filter((d) => d.id === 0 && !d.deleted);
-  const semanticChanged = tagDraft.filter((d) => {
-    if (d.id === 0 || d.deleted) return false;
-    const b = tagBaseline.find((x) => x.id === d.id);
-    if (!b) return false;
-    const norm = (s: string) => s.replace(/\s/g, "").toLowerCase();
-    return norm(b.name) !== norm(d.name) || norm(b.description || "") !== norm(d.description || "");
-  });
-  if (added.length + semanticChanged.length > 0) {
+  // immediate：先算 diff → 确认 → 才 persist + execute（禁止先保存再问）
+  const preview = computeTagSavePreview(tagDraft, tagBaseline);
+  if (preview.needsAi) {
     const ok = await showConfirmModal({
       title: "立即更新标签评分？",
-      message: `本次修改：\n新增标签 ${added.length} · 说明/名称修改 ${semanticChanged.length}\n\n需要为已有论文补充标签评分。\n只更新相关标签，不会重新生成标题、摘要或总结。`,
+      message: `本次修改：\n新增标签 ${preview.added} · 说明/名称修改 ${preview.semanticChanged}\n\n需要为已有论文补充标签评分。\n只更新相关标签，不会重新生成标题、摘要或总结。`,
       confirmText: "保存并更新",
       cancelText: "取消",
     });
-    if (!ok) return;
+    if (!ok) {
+      setTagSaveStatus("已取消（修改仍保留）", "idle");
+      return; // 不保存、不启动 AI、dirty 保持
+    }
+  } else {
+    setTagSaveStatus("正在更新排序…", "running");
   }
   try {
     const res = await invoke<SaveTagConfigResult>("save_tag_config", { items, mode });
-    setStatus(`已保存并立即更新排序${res.aiNeededPapers > 0 ? `（需为 ${res.aiNeededPapers} 篇论文补充标签评分）` : ""}`, "done");
+    setTagSaveStatus(
+      res.aiNeededPapers > 0 ? "正在更新标签评分…" : "已保存并更新排序",
+      res.aiNeededPapers > 0 ? "running" : "done",
+    );
     await loadTagEditor();
     await loadPapers();
     await refreshRecommendations();
   } catch (err) {
-    setStatus(String(err), "error");
+    setTagSaveStatus(`保存失败：${safeError(err)}`, "error");
   }
 }
-
 function tagChips(matches: TagMatch[]): string {
   const shown = matches.filter((m) => m.score > 0);
   if (!shown.length) return "";
@@ -1896,11 +1940,11 @@ async function setupListeners() {
       }
       return;
     }
-    if (t.closest("[data-action='tag-save-scheduled']")) {
+    if (t.closest("[data-action='save-tag-config-scheduled']")) {
       await saveTagConfig("scheduled");
       return;
     }
-    if (t.closest("[data-action='tag-save-immediate']")) {
+    if (t.closest("[data-action='save-tag-config-immediate']")) {
       await saveTagConfig("immediate");
       return;
     }
