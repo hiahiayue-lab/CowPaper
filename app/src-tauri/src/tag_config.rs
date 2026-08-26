@@ -74,6 +74,7 @@ pub fn compute_diff(old_items: &[TagConfigItem], new_items: &[TagDraftItem]) -> 
             }
             continue;
         };
+
         if n.deleted {
             diff.removed.push(n.name.clone());
             continue;
@@ -100,6 +101,16 @@ pub fn compute_diff(old_items: &[TagConfigItem], new_items: &[TagDraftItem]) -> 
             }
         } else {
             diff.unchanged.push(n.name.clone());
+        }
+    }
+    // removed：old 中存在（非 deleted）但 draft 中已移除（splice 删除）→ removed
+    for o in old_items {
+        if o.deleted {
+            continue;
+        }
+        let in_new = new_items.iter().any(|n| n.id > 0 && n.id == o.tag_id);
+        if !in_new {
+            diff.removed.push(o.name.clone());
         }
     }
     diff
@@ -192,6 +203,13 @@ pub fn save_immediate_config(conn: &Connection, draft: &[TagDraftItem]) -> Resul
             }
         }
     }
+    // 1.5) 删除 old 中存在但 draft 中已移除的 tag（前端 splice 删除语义）
+    for o in &old_items {
+        let in_draft = draft.iter().any(|d| d.id > 0 && d.id == o.tag_id);
+        if !in_draft {
+            db::delete_tag(conn, o.tag_id).map_err(|e| e.to_string())?;
+        }
+    }
     // 2) 新 active version（当前 tags 表快照）
     db::create_active_tag_version(conn).map_err(|e| e.to_string())?;
     // 3) diff：old active items vs draft（draft 即 new）
@@ -206,6 +224,8 @@ pub fn save_immediate_config(conn: &Connection, draft: &[TagDraftItem]) -> Resul
     for pid in &local_paper_ids {
         recompute_paper_total_score(conn, *pid, &active).map_err(|e| e.to_string())?;
     }
+    // immediate 激活即消费 scheduled：不得在下一 cutoff 重复激活/重复 tag-only
+    db::delete_scheduled_tag_config(conn).map_err(|e| e.to_string())?;
     Ok(SaveTagConfigResult {
         mode: "immediate".to_string(),
         effective_cycle_key: None,

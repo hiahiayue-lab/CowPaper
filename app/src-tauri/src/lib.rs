@@ -441,6 +441,23 @@ fn get_collection_journals(code: String, state: State<Db>) -> Result<Vec<models:
 
 // ---------- Round 6.5：Versioned Tag Configuration ----------
 
+/// 当前 active tag 配置（对比 candidate 计算 diff 用）。
+#[tauri::command]
+fn get_active_tag_config(state: State<Db>) -> Result<Vec<models::TagDraftItem>, String> {
+    let conn = state.inner().lock().unwrap();
+    let tags = db::list_tags(&conn).map_err(|e| e.to_string())?;
+    Ok(tags
+        .into_iter()
+        .map(|t| models::TagDraftItem {
+            id: t.id,
+            name: t.name,
+            description: t.description,
+            enabled: t.enabled,
+            deleted: false,
+        })
+        .collect())
+}
+
 /// Tags 页 baseline：scheduled 优先（继续编辑将生效的版本），否则 active。
 #[tauri::command]
 fn get_tag_config_baseline(state: State<Db>) -> Result<models::TagBaseline, String> {
@@ -580,6 +597,13 @@ fn activate_scheduled_tag_config_if_due(conn: &rusqlite::Connection, queue: &AiQ
                     db::add_tag(conn, &it.name, it.description.as_deref()).map_err(|e| e.to_string())?;
                 }
             }
+        }
+    }
+    // 删除激活前存在但 scheduled items 中已移除的 tag
+    for o in &old_items {
+        let in_items = items.iter().any(|it| it.tag_id > 0 && it.tag_id == o.tag_id);
+        if !in_items {
+            db::delete_tag(conn, o.tag_id).map_err(|e| e.to_string())?;
         }
     }
     db::create_active_tag_version(conn).map_err(|e| e.to_string())?;
@@ -1356,7 +1380,8 @@ pub fn run() {
             remove_collection_member,
             get_collection_journals,
             save_tag_config,
-            get_tag_config_baseline
+            get_tag_config_baseline,
+            get_active_tag_config
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

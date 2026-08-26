@@ -729,6 +729,8 @@ interface SaveTagConfigResult {
 let tagBaseline: TagDraftItem[] = [];
 let tagDraft: TagDraftItem[] = [];
 let tagConfigDirty = false;
+let tagBaselineSource = "active";
+let tagScheduledCycleKey: string | null = null;
 
 function tagDraftEqual(a: TagDraftItem[], b: TagDraftItem[]): boolean {
   if (a.length !== b.length) return false;
@@ -741,13 +743,28 @@ function tagDraftEqual(a: TagDraftItem[], b: TagDraftItem[]): boolean {
 function setTagDirty(v: boolean) {
   tagConfigDirty = v;
   $("tag-draft-dirty").classList.toggle("hidden", !v);
-  const schedBtn = document.querySelector("[data-action='save-tag-config-scheduled']") as HTMLButtonElement | null;
-  const immBtn = document.querySelector("[data-action='save-tag-config-immediate']") as HTMLButtonElement | null;
-  if (schedBtn) schedBtn.disabled = !v;
-  if (immBtn) immBtn.disabled = !v;
+  updateTagActionState();
   const n = draftChanges();
   const sum = $("tag-action-summary");
   if (sum) sum.textContent = v ? `${n} 项未保存修改` : "";
+}
+
+/// 统一按钮 enable 状态（Round 6.5.2）：
+/// saveScheduled = dirty；immediate = dirty || (存在 scheduled 且 scheduled != active)。
+function updateTagActionState() {
+  const schedBtn = document.querySelector("[data-action='save-tag-config-scheduled']") as HTMLButtonElement | null;
+  const immBtn = document.querySelector("[data-action='save-tag-config-immediate']") as HTMLButtonElement | null;
+  const hasScheduled = tagBaselineSource === "scheduled";
+  if (schedBtn) schedBtn.disabled = !tagConfigDirty;
+  if (immBtn) immBtn.disabled = !(tagConfigDirty || hasScheduled);
+  const status = $("tag-config-status");
+  if (status && hasScheduled && !tagConfigDirty) {
+    status.textContent = `✓ 已保存 · 等待下个周期生效（将于 ${fmtCycle(tagScheduledCycleKey || "")}）`;
+  } else if (status && hasScheduled && tagConfigDirty) {
+    status.textContent = `有一组标签设置将在 ${fmtCycle(tagScheduledCycleKey || "")} 生效（当前编辑为新修改）`;
+  } else if (status) {
+    status.textContent = "";
+  }
 }
 
 function draftChanges(): number {
@@ -763,9 +780,9 @@ async function loadTagEditor() {
     tagBaseline = base.items;
     tagDraft = base.items.map((x) => ({ ...x }));
     tagConfigDirty = false;
-    $("tag-config-status").textContent = base.source === "scheduled"
-      ? `有一组标签设置将在 ${fmtCycle(base.scheduledEffectiveCycleKey || "")} 生效（当前编辑的是该版本）`
-      : "";
+    tagBaselineSource = base.source;
+    tagScheduledCycleKey = base.scheduledEffectiveCycleKey;
+    updateTagActionState();
   } catch (err) {
     $("tag-config-status").textContent = "标签配置加载失败";
     console.error(err);
@@ -843,26 +860,44 @@ async function saveTagConfig(mode: "scheduled" | "immediate") {
     }
     return;
   }
-  // immediate：先算 diff → 确认 → 才 persist + execute（禁止先保存再问）
-  const preview = computeTagSavePreview(tagDraft, tagBaseline);
+  // immediate：candidate = 用户最新意图（dirty → draft；否则 scheduled）
+  // 先算 candidate vs active 的 diff → 确认 → 才 persist + execute（禁止先保存再问）
+  const candidate =
+    tagConfigDirty
+      ? tagDraft.filter((d) => !(d.deleted && d.id === 0))
+      : tagBaselineSource === "scheduled"
+        ? tagBaseline.filter((d) => !d.deleted)
+        : [];
+  if (candidate.length === 0) {
+    setTagSaveStatus("没有可立即生效的配置变化", "idle");
+    return;
+  }
+  let activeItems: TagDraftItem[];
+  try {
+    activeItems = await invoke<TagDraftItem[]>("get_active_tag_config");
+  } catch (err) {
+    setTagSaveStatus(`保存失败：${safeError(err)}`, "error");
+    return;
+  }
+  const preview = computeTagSavePreview(candidate, activeItems);
   if (preview.needsAi) {
     const ok = await showConfirmModal({
       title: "立即更新标签评分？",
-      message: `本次修改：\n新增标签 ${preview.added} · 说明/名称修改 ${preview.semanticChanged}\n\n需要为已有论文补充标签评分。\n只更新相关标签，不会重新生成标题、摘要或总结。`,
-      confirmText: "保存并更新",
+      message: `本次配置需要为已有论文补充标签评分。\n新增标签 ${preview.added} · 说明/名称修改 ${preview.semanticChanged}\n\n只更新相关标签，不会重新生成标题、摘要或总结。`,
+      confirmText: "立即更新",
       cancelText: "取消",
     });
     if (!ok) {
       setTagSaveStatus("已取消（修改仍保留）", "idle");
-      return; // 不保存、不启动 AI、dirty 保持
+      return; // 不保存、不启动 AI；dirty/scheduled 均保持
     }
   } else {
     setTagSaveStatus("正在更新排序…", "running");
   }
   try {
-    const res = await invoke<SaveTagConfigResult>("save_tag_config", { items, mode });
+    const res = await invoke<SaveTagConfigResult>("save_tag_config", { items: candidate, mode });
     setTagSaveStatus(
-      res.aiNeededPapers > 0 ? "正在更新标签评分…" : "已保存并更新排序",
+      res.aiNeededPapers > 0 ? "正在更新标签评分…" : "标签设置已生效 · 当前推荐已更新",
       res.aiNeededPapers > 0 ? "running" : "done",
     );
     await loadTagEditor();

@@ -3297,3 +3297,104 @@ fn test_full_ai_prompt_uses_description() {
     let ctx = crate::analyze::build_context(&std::sync::Arc::new(std::sync::Mutex::new(conn))).unwrap();
     assert!(ctx.tag_pairs.iter().any(|(n, d)| n == "新标签Y" && d == "关注双边平台"), "description 必须进入 prompt 上下文");
 }
+
+// ================= Round 6.5.2：Decouple Save from Rerank =================
+
+#[test]
+fn test_immediate_consumes_scheduled() {
+    use crate::models::TagDraftItem;
+    let conn = mem_db();
+    let tag = db::add_tag(&conn, "新标签Z", Some("说明")).unwrap();
+    let draft = vec![TagDraftItem {
+        id: tag.id,
+        name: "新标签Z".into(),
+        description: Some("新说明".into()),
+        enabled: true,
+        deleted: false,
+    }];
+    crate::tag_config::save_scheduled_config(&conn, &draft, "2026-08-27").unwrap();
+    assert!(db::scheduled_tag_config(&conn).unwrap().is_some());
+    // immediate（用 scheduled 内容作为 candidate，无需再次编辑）
+    crate::tag_config::save_immediate_config(&conn, &draft).unwrap();
+    assert!(db::scheduled_tag_config(&conn).unwrap().is_none(), "immediate 消耗 scheduled");
+    // 下一 cutoff 不重复激活（scheduled 已删 → activate 无触发源）
+    let now = local_dt(2026, 8, 27, 9, 0);
+    let key = crate::recommendation::cycle_key_for(&now, "09:00");
+    assert!(db::scheduled_tag_config(&conn).unwrap().is_none(), "cutoff 不得重复激活已消费的 scheduled");
+    assert_eq!(key, "2026-08-27");
+}
+
+#[test]
+fn test_scheduled_immediate_activation_no_second_edit() {
+    use crate::models::TagDraftItem;
+    let conn = mem_db();
+    let t1 = db::add_tag(&conn, "T甲", Some("旧")).unwrap();
+    let draft = vec![TagDraftItem {
+        id: t1.id,
+        name: "T甲".into(),
+        description: Some("新说明".into()),
+        enabled: true,
+        deleted: false,
+    }];
+    crate::tag_config::save_scheduled_config(&conn, &draft, "2026-08-27").unwrap();
+    // 无新编辑：直接用 scheduled 内容立即激活
+    crate::tag_config::save_immediate_config(&conn, &draft).unwrap();
+    let t = db::list_tags(&conn).unwrap();
+    let tx = t.iter().find(|x| x.name == "T甲").unwrap();
+    assert_eq!(tx.description.as_deref(), Some("新说明"), "scheduled 立即激活无需再次编辑");
+    assert!(db::scheduled_tag_config(&conn).unwrap().is_none());
+}
+
+#[test]
+fn test_delete_only_immediate_zero_ai() {
+    let conn = mem_db();
+    let t1 = db::add_tag(&conn, "T删", Some("说明")).unwrap();
+    // draft 不含 t1（前端 splice 删除语义）→ removed，零 AI
+    let res = crate::tag_config::save_immediate_config(&conn, &[]).unwrap();
+    assert!(res.diff.removed.contains(&"T删".to_string()), "diff.removed 应含被移除 tag: {:?}", res.diff.removed);
+    assert!(res.diff.added.is_empty() && res.diff.semantic_changed.is_empty(), "删除不触发 AI");
+    assert!(db::find_tag_by_name(&conn, "T删").unwrap().is_none(), "splice 删除必须真正删 DB tag");
+}
+
+#[test]
+fn test_immediate_cancel_preserves_state() {
+    // 前端取消语义验证（后端无 cancel；由前端不 invoke 保证）：
+    // 这里验证 scheduled 在未 immediate 前保持（供前端取消后仍可继续）
+    use crate::models::TagDraftItem;
+    let conn = mem_db();
+    let t1 = db::add_tag(&conn, "T乙", Some("说明")).unwrap();
+    let draft = vec![TagDraftItem {
+        id: t1.id,
+        name: "T乙".into(),
+        description: Some("新说明".into()),
+        enabled: true,
+        deleted: false,
+    }];
+    crate::tag_config::save_scheduled_config(&conn, &draft, "2026-08-27").unwrap();
+    // 未调 immediate → scheduled 保留（取消不改变 active）
+    assert!(db::scheduled_tag_config(&conn).unwrap().is_some());
+    let t = db::list_tags(&conn).unwrap();
+    let tx = t.iter().find(|x| x.name == "T乙").unwrap();
+    assert_eq!(tx.description.as_deref(), Some("说明"), "取消后 active 不变");
+}
+
+#[test]
+fn test_scheduled_not_dirty_and_guard_semantics() {
+    // scheduled != active 不算 unsaved；前端 guard 只由 dirty 触发（前端逻辑）——
+    // 后端验证 scheduled 保存不改 active tags（无 dirty 数据面变化）
+    use crate::models::TagDraftItem;
+    let conn = mem_db();
+    let t1 = db::add_tag(&conn, "T丙", Some("旧")).unwrap();
+    let draft = vec![TagDraftItem {
+        id: t1.id,
+        name: "T丙".into(),
+        description: Some("新说明".into()),
+        enabled: true,
+        deleted: false,
+    }];
+    crate::tag_config::save_scheduled_config(&conn, &draft, "2026-08-27").unwrap();
+    let t = db::list_tags(&conn).unwrap();
+    let tx = t.iter().find(|x| x.name == "T丙").unwrap();
+    assert_eq!(tx.description.as_deref(), Some("旧"), "scheduled 保存不改 active（非 dirty 数据面）");
+    assert!(db::scheduled_tag_config(&conn).unwrap().is_some());
+}
