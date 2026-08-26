@@ -20,24 +20,25 @@
           <button class="nav-item" data-view="settings">设置</button>
           <button class="nav-item" data-view="activity">活动</button>
         </nav>
-        <div class="sidebar-foot">
-          <button id="btn-sync" class="ghost full">检查新论文</button>
-        </div>
       </aside>
 
       <main class="main">
         <header class="topbar">
           <div class="topbar-title" id="view-title">今日推荐</div>
           <div class="topbar-actions">
-            <button id="btn-ai-manual" class="ghost small">AI 分析</button>
             <button id="ai-badge" class="ai-badge idle" title="AI 分析状态详情">AI</button>
             <span id="status" class="status idle">就绪</span>
           </div>
         </header>
 
-        <button id="activity-bar" class="activity-bar" title="查看活动中心">
-          <span id="activity-text" class="activity-text">✓ 已更新</span>
-        </button>
+        <!-- 工作中心：统一状态 + 主操作（所有主页面共享） -->
+        <div id="work-center" class="work-center">
+          <div id="work-status" class="work-status idle" title="查看活动中心"></div>
+          <div class="work-actions">
+            <button id="btn-sync-main" class="primary">检查新论文</button>
+            <button id="btn-ai-main" class="ghost">AI 分析</button>
+          </div>
+        </div>
 
         <div id="ai-panel" class="ai-panel hidden"></div>
 
@@ -168,6 +169,12 @@
     <!-- 应用内确认 Modal：替代 WebView 原生 confirm/alert/prompt（WKWebView 下原生 dialog 不可靠） -->
     <div id="confirm-modal" class="modal-overlay hidden">
       <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="confirm-modal-title">
+        <div class="modal-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1" />
+            <circle cx="12" cy="12" r="3.4" />
+          </svg>
+        </div>
         <h3 id="confirm-modal-title" class="modal-title"></h3>
         <p id="confirm-modal-message" class="modal-message"></p>
         <div class="modal-actions">

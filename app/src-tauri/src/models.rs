@@ -357,6 +357,8 @@ pub struct SyncProgress {
 }
 
 /// 全局 Activity 状态聚合（get_activity_state 返回）。
+/// 所有界面必须消费同一份该状态：顶部 badge / AI 面板 / 积压横幅 / 待处理区 / 设置页计数
+/// 均从这里读取，不得各自从 papers 数组重新计算。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActivityState {
@@ -365,4 +367,10 @@ pub struct ActivityState {
     pub last_sync: Option<SyncBatch>,
     pub last_analysis: Option<AnalysisBatch>,
     pub retry_waiting: bool,
+    /// 当前仍待分析数量（实时 DB 计数，与 last_analysis.total 严格区分）
+    pub pending_analysis: i64,
+    /// 分析失败数量（analysisFailed）
+    pub analysis_failed: i64,
+    /// 等待摘要数量（waitingForAbstract，不计入 pending_analysis）
+    pub waiting_for_abstract: i64,
 }

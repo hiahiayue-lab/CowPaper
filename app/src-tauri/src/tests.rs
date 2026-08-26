@@ -1559,3 +1559,94 @@ fn test_sync_batch_journal_counters() {
     );
     assert_eq!(sb.journal_completed + sb.journal_failed, sb.journal_total, "正常结束应相等");
 }
+
+#[test]
+fn test_work_state_consistency() {
+    // ===== Scenario A：7 篇 pendingAnalysis（有摘要）→ Work State pending_analysis=7 =====
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let mut ids = Vec::new();
+    for i in 0..7 {
+        let c = candidate(
+            Some(&format!("10.1000/ws-a{}", i)),
+            &format!("WorkState A{}", i),
+            Some("abstract"),
+            Some("crossref"),
+        );
+        match db::upsert_paper(&conn, jid, &c).unwrap() {
+            UpsertOutcome::New(id) => ids.push(id),
+            _ => panic!("expected new"),
+        }
+    }
+    let st = crate::build_activity_state(&conn).unwrap();
+    assert_eq!(st.pending_analysis, 7, "A: 7 篇待分析 → pendingAnalysis=7");
+    assert_eq!(st.analysis_failed, 0, "A: analysisFailed=0");
+    assert_eq!(st.waiting_for_abstract, 0, "A: waitingForAbstract=0");
+    assert!(st.last_analysis.is_none(), "A: 尚无已完成批次");
+
+    // ===== Scenario B：AnalysisBatch completed 7/7 + papers 全部 succeeded → pending_analysis=0 =====
+    for id in &ids {
+        db::set_paper_status(&conn, *id, "analysisSucceeded").unwrap();
+    }
+    let b = db::create_analysis_batch(&conn, "manual", Some("deepseek-v4-flash"), None, None, None, &ids).unwrap();
+    for id in &ids {
+        db::set_item_status(&conn, b, *id, "succeeded", Some(1), None, None, Some(&db::now_utc())).unwrap();
+    }
+    db::recompute_analysis_aggregate(&conn, b).unwrap();
+    db::set_analysis_batch_status(&conn, b, "completed", Some(&db::now_utc()), None).unwrap();
+    let ab = db::get_analysis_batch(&conn, b).unwrap().unwrap();
+    assert_eq!((ab.total, ab.succeeded, ab.failed), (7, 7, 0), "B: 批次 7/7 成功");
+    let st = crate::build_activity_state(&conn).unwrap();
+    assert_eq!(st.pending_analysis, 0, "B: 7/7 全部成功 → pendingAnalysis=0");
+    assert_eq!(st.analysis_failed, 0, "B: analysisFailed=0");
+
+    // ===== Scenario C：lastAnalysis.total=7 但 pending=0 → 不得把 total 当 pending =====
+    let st = crate::build_activity_state(&conn).unwrap();
+    let la = st.last_analysis.expect("C: 应有 lastAnalysis");
+    assert_eq!(la.total, 7, "C: lastAnalysis.total=7");
+    assert_eq!(la.succeeded, 7, "C: lastAnalysis.succeeded=7");
+    assert_eq!(st.pending_analysis, 0, "C: lastAnalysis.total 不得影响 pendingAnalysis");
+
+    // ===== Scenario D：retry failed 后 counts 正确重新计算 =====
+    db::set_paper_status(&conn, ids[0], "analysisFailed").unwrap();
+    db::set_paper_status(&conn, ids[1], "analysisFailed").unwrap();
+    let st = crate::build_activity_state(&conn).unwrap();
+    assert_eq!(st.analysis_failed, 2, "D: 2 篇失败 → analysisFailed=2");
+    assert_eq!(st.pending_analysis, 0, "D: 失败篇不计入 pendingAnalysis");
+    // retry：失败论文回到 pendingAnalysis（retry_failed_ai 的入队语义）
+    db::set_paper_status(&conn, ids[0], "pendingAnalysis").unwrap();
+    db::set_paper_status(&conn, ids[1], "pendingAnalysis").unwrap();
+    let st = crate::build_activity_state(&conn).unwrap();
+    assert_eq!(st.analysis_failed, 0, "D: 重试后失败清零");
+    assert_eq!(st.pending_analysis, 2, "D: 重试后 pending=2");
+    // 重试完成
+    for id in [ids[0], ids[1]] {
+        db::set_paper_status(&conn, id, "analysisSucceeded").unwrap();
+    }
+    let st = crate::build_activity_state(&conn).unwrap();
+    assert_eq!(st.pending_analysis, 0, "D: 重试完成 → pending=0");
+    assert_eq!(st.analysis_failed, 0, "D: 重试完成 → failed=0");
+
+    // ===== Scenario E：sync 新增 3 篇（2 有摘要 + 1 无摘要 waitingForAbstract）→ pending=2, waiting=1 =====
+    for i in 0..2 {
+        let c = candidate(
+            Some(&format!("10.1000/ws-e{}", i)),
+            &format!("WorkState E{}", i),
+            Some("abstract"),
+            Some("crossref"),
+        );
+        match db::upsert_paper(&conn, jid, &c).unwrap() {
+            UpsertOutcome::New(_) => {}
+            _ => panic!("expected new"),
+        }
+    }
+    let c = candidate(Some("10.1000/ws-e-noabs"), "WorkState ENoAbs", None, None);
+    match db::upsert_paper(&conn, jid, &c).unwrap() {
+        UpsertOutcome::New(_) => {}
+        _ => panic!("expected new"),
+    }
+    let st = crate::build_activity_state(&conn).unwrap();
+    assert_eq!(st.pending_analysis, 2, "E: 2 篇有摘要待分析（不得把无摘要篇计入）");
+    assert_eq!(st.waiting_for_abstract, 1, "E: 1 篇等待摘要");
+    assert_eq!(st.pending_analysis + st.waiting_for_abstract, 3, "E: 合计 3 篇");
+}

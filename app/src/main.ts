@@ -178,6 +178,12 @@ interface ActivityState {
   lastSync: SyncBatch | null;
   lastAnalysis: AnalysisBatch | null;
   retryWaiting: boolean;
+  /** 当前仍待分析数量（实时 DB 计数；与 lastAnalysis.total 严格区分） */
+  pendingAnalysis: number;
+  /** 分析失败数量 */
+  analysisFailed: number;
+  /** 等待摘要数量（不计入 pendingAnalysis） */
+  waitingForAbstract: number;
 }
 
 const KEY_NAME = "cowpaper_api_key"; // 旧版 localStorage Key（仅用于一次性迁移，不再写入）
@@ -188,10 +194,17 @@ let journals: Journal[] = [];
 let tags: Tag[] = [];
 let papers: Paper[] = [];
 let aiStatus: AiStatus = emptyAiStatus();
-let activity: ActivityState = { syncBatch: null, analysisBatch: null, lastSync: null, lastAnalysis: null, retryWaiting: false };
+let activity: ActivityState = emptyActivity();
 let settings: Settings | null = null;
 let abstractLang: "zh" | "en" = "zh";
 const expandedAbstracts = new Set<number>();
+
+function emptyActivity(): ActivityState {
+  return {
+    syncBatch: null, analysisBatch: null, lastSync: null, lastAnalysis: null, retryWaiting: false,
+    pendingAnalysis: 0, analysisFailed: 0, waitingForAbstract: 0,
+  };
+}
 
 function emptyAiStatus(): AiStatus {
   return {
@@ -309,9 +322,6 @@ async function loadAiStatus() {
   } catch {
     aiStatus = emptyAiStatus();
   }
-  renderAiBadge();
-  renderAiPanel();
-  renderBacklog();
 }
 
 async function loadSettings() {
@@ -328,8 +338,6 @@ async function loadSettings() {
     ($("set-daily-time") as HTMLInputElement).value = settings.dailySyncTime;
     ($("set-abstract-lang") as HTMLSelectElement).value = abstractLang;
   }
-  const pending = await invoke<number>("get_pending_ai_count").catch(() => 0);
-  $("pending-count").textContent = `当前待分析：${pending} 篇`;
 }
 
 // ---------- 渲染 ----------
@@ -501,31 +509,41 @@ function renderFavorites() {
 
 // ---------- AI 状态徽标 / 面板 / 积压 ----------
 
-function aiBadgeText(): string {
-  const s = aiStatus;
-  if (s.state === "running" || s.state === "pausing") return `AI ${s.completed}/${s.batchSize}`;
-  if (s.state === "paused") return `AI 已暂停 · ${s.completed}/${s.batchSize}`;
-  if (s.state === "stopping") return "AI 停止中";
-  if (s.remaining > 0) return `AI 未完成 ${s.remaining}`;
-  if (s.failed > 0) return "AI 需要处理";
-  return "✓ 已更新";
-}
-
+/// AI 徽标：唯一 pending 来源是 activity.pendingAnalysis（实时 DB 计数），
+/// 绝不从 papers 数组重算，杜绝"上次批次 total"被误读为"待处理 N"。
 function renderAiBadge() {
   const badge = $("ai-badge");
-  badge.textContent = aiBadgeText();
-  badge.className = `ai-badge ${aiStatus.state}`;
-  const pending = papers.filter((p) => p.analysisStatus === "pendingAnalysis" && p.abstractText).length;
-  if (aiStatus.state === "idle" && aiStatus.remaining === 0 && aiStatus.failed === 0 && pending > 0) {
-    badge.textContent = `AI 待处理 ${pending}`;
-    badge.className = "ai-badge idle-has";
+  const s = aiStatus;
+  const pending = activity.pendingAnalysis;
+  const failed = activity.analysisFailed;
+  let text: string;
+  let cls = s.state;
+  if (s.state === "running" || s.state === "pausing") {
+    text = `AI ${s.completed}/${s.batchSize}`;
+  } else if (s.state === "paused") {
+    text = `AI 已暂停 · ${s.completed}/${s.batchSize}`;
+  } else if (s.state === "stopping") {
+    text = "AI 停止中";
+  } else if (s.remaining > 0) {
+    text = `AI 未完成 ${s.remaining}`;
+  } else if (failed > 0) {
+    text = `AI 失败 ${failed}`;
+    cls = "has-error";
+  } else if (pending > 0) {
+    text = `待分析 ${pending}`;
+    cls = "idle-has";
+  } else {
+    text = "✓ 已更新";
   }
+  badge.textContent = text;
+  badge.className = `ai-badge ${cls}`;
 }
 
 function renderAiPanel() {
   const panel = $("ai-panel");
   const s = aiStatus;
-  const pending = papers.filter((p) => p.analysisStatus === "pendingAnalysis" && p.abstractText).length;
+  const pending = activity.pendingAnalysis;
+  const failed = activity.analysisFailed;
 
   // 上一次运行摘要（§七：批次结束后保留；stopped 时表达"已停止·已处理·剩余"）
   const lastRun = s.lastRun
@@ -540,25 +558,25 @@ function renderAiPanel() {
     : "";
 
   // 任何状态都渲染有意义内容，绝不允许空白横条
-  if (s.state === "idle" && s.remaining === 0 && s.failed === 0 && pending === 0) {
+  if (s.state === "idle" && s.remaining === 0 && failed === 0 && pending === 0) {
     panel.innerHTML = `
       <div class="ai-panel-head"><strong>AI 分析</strong><span class="muted small">当前无待处理任务</span></div>
       ${lastRun}`;
     return;
   }
-  if (s.state === "idle" && s.remaining === 0 && s.failed === 0) {
+  if (s.state === "idle" && s.remaining === 0 && failed === 0) {
     panel.innerHTML = `
       <div class="ai-panel-head"><strong>AI 分析</strong><span class="muted small">待分析 ${pending} 篇</span></div>
       ${lastRun}
-      <div class="ai-panel-actions"><button class="primary small" data-action="ai-backlog">开始分析</button></div>`;
+      <div class="ai-panel-actions"><button class="ghost small" data-action="ai-backlog">开始分析</button></div>`;
     return;
   }
-  if (s.state === "idle" && s.remaining === 0 && s.failed > 0) {
+  if (s.state === "idle" && s.remaining === 0 && failed > 0) {
     const reason = s.lastError
       ? `<div class="ai-error">最近失败原因：${escapeHtml(s.lastError)}</div>`
       : "";
     panel.innerHTML = `
-      <div class="ai-panel-head"><strong>AI 分析</strong><span class="muted small">${s.failed} 篇分析失败</span></div>
+      <div class="ai-panel-head"><strong>AI 分析</strong><span class="muted small">${failed} 篇分析失败</span></div>
       ${reason}${lastRun}
       <div class="ai-panel-actions"><button class="ghost small" data-action="ai-retry">重试失败论文</button></div>`;
     return;
@@ -591,7 +609,6 @@ function renderAiPanel() {
       ${s.state === "running" || s.state === "pausing" ? `<button class="ghost small" data-action="ai-pause">暂停</button>` : ""}
       ${s.state === "paused" ? `<button class="primary small" data-action="ai-resume">继续分析</button>` : ""}
       ${s.state !== "idle" || s.remaining > 0 ? `<button class="ghost small" data-action="ai-stop">停止本次任务</button>` : ""}
-      ${s.failed > 0 && s.state === "idle" ? `<button class="ghost small" data-action="ai-retry">重试失败论文</button>` : ""}
     </div>
   `;
 }
@@ -609,7 +626,7 @@ function renderBacklog() {
     banner.innerHTML = `上次分析未完成，剩余 <strong>${s.remaining}</strong> 篇 · <button class="ghost small" data-action="ai-resume">继续</button>`;
     return;
   }
-  const pending = papers.filter((p) => p.analysisStatus === "pendingAnalysis" && p.abstractText).length;
+  const pending = activity.pendingAnalysis;
   if (s.state === "idle" && s.remaining === 0 && pending > 0) {
     banner.classList.remove("hidden");
     banner.innerHTML = `待分析论文 <strong>${pending}</strong> 篇 · <button class="ghost small" data-action="ai-backlog">开始分析</button>`;
@@ -633,48 +650,116 @@ const STATUS_ZH: Record<string, string> = {
   cancelled: "已取消", skipped: "跳过",
 };
 
+/// 统一工作状态刷新入口：所有界面（Work Center / AI 徽标 / AI 面板 / 积压横幅 /
+/// Activity 待处理区 / 设置页计数）消费同一份 (aiStatus, activity) 全局状态。
+/// 调用时机：启动 / 同步开始·进度·完成 / 手动 AI 接受 / AI 进度·完成 /
+/// pause·resume·stop / retry 完成。任何事件都不允许绕过本函数单独刷新部分 UI。
+async function refreshWorkState() {
+  await Promise.all([loadAiStatus(), loadActivity()]);
+  renderWorkCenter();
+  renderAiBadge();
+  renderAiPanel();
+  renderBacklog();
+  renderPendingCount();
+}
+
 async function loadActivity() {
   try {
     activity = await invoke<ActivityState>("get_activity_state");
   } catch {
-    activity = { syncBatch: null, analysisBatch: null, lastSync: null, lastAnalysis: null, retryWaiting: false };
+    activity = emptyActivity();
   }
-  renderActivityBar();
-  renderActivityCenter();
 }
 
-function renderActivityBar() {
-  const el = $("activity-text");
+/// 设置页"当前待分析"计数（唯一来源 activity.pendingAnalysis）。
+function renderPendingCount() {
+  $("pending-count").textContent = `当前待分析：${activity.pendingAnalysis} 篇`;
+}
+
+function fmtTimeNow(): string {
+  return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+/// 工作中心：状态行（可点击进入活动页）+ 检查新论文 / AI 分析主操作。
+/// 状态语义严格区分：running（蓝）→ 进行中；paused/pending（橙）→ 待处理；
+/// error（红）→ 真失败；ok（绿少量）→ 无待处理。
+function renderWorkCenter() {
+  const statusEl = $("work-status");
+  const syncBtn = $("btn-sync-main") as HTMLButtonElement;
+  const aiBtn = $("btn-ai-main") as HTMLButtonElement;
   const a = activity;
-  if (a.syncBatch && a.syncBatch.status === "running") {
-    const sb = a.syncBatch;
-    el.textContent = `正在检查期刊 · ${sb.journalCompleted}/${sb.journalTotal}`;
-    return;
+  const s = aiStatus;
+  const syncRunning = !!(a.syncBatch && a.syncBatch.status === "running");
+  let html: string;
+  let cls: string;
+
+  if (syncRunning) {
+    // 同步优先：进行中显示进度，禁止同时高强调"待分析 N"
+    cls = "running";
+    html = `正在检查新论文 · ${a.syncBatch!.journalCompleted}/${a.syncBatch!.journalTotal} 本期刊`;
+    syncBtn.disabled = true;
+    syncBtn.textContent = "同步中…";
+    aiBtn.disabled = false;
+    aiBtn.textContent = s.state === "paused" ? "继续" : "AI 分析";
+  } else {
+    syncBtn.disabled = false;
+    syncBtn.textContent = "检查新论文";
+    if (s.state === "running" || s.state === "pausing") {
+      cls = "running";
+      const cur = s.currentPaperTitle
+        ? ` · 当前：${escapeHtml(s.currentPaperTitle.length > 42 ? s.currentPaperTitle.slice(0, 42) + "…" : s.currentPaperTitle)}`
+        : "";
+      html = `AI 分析中 · ${s.completed}/${s.batchSize}${cur}`;
+      aiBtn.textContent = "暂停";
+    } else if (s.state === "paused") {
+      cls = "paused";
+      html = `AI 已暂停 · ${s.completed}/${s.batchSize}（剩余 ${s.remaining} 篇）`;
+      aiBtn.textContent = "继续";
+    } else if (s.remaining > 0) {
+      cls = "paused";
+      html = `AI 任务未完成 · 剩余 ${s.remaining} 篇`;
+      aiBtn.textContent = "继续";
+    } else if (a.analysisFailed > 0) {
+      // 真失败：红色，需要用户处理
+      cls = "error";
+      html = `AI 分析失败 ${a.analysisFailed} 篇 · <button class="link-btn" data-action="ai-retry">重试</button>`;
+      aiBtn.textContent = "重试失败";
+    } else if (a.pendingAnalysis > 0) {
+      // 待处理：中性橙，低强调
+      cls = "pending";
+      html = `AI：待分析 ${a.pendingAnalysis} 篇`;
+      aiBtn.textContent = "AI 分析";
+    } else {
+      // 已完成 / healthy：绿色仅少量使用
+      cls = "ok";
+      const last = a.lastAnalysis;
+      const time = fmtTimeNow();
+      const lastText =
+        last && last.succeeded > 0
+          ? ` · 上次成功分析 ${last.succeeded} 篇${last.finishedAt ? " · " + new Date(last.finishedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : ""}`
+          : "";
+      html = `✓ 已更新 · ${time}　AI：待分析 0${lastText}`;
+      aiBtn.textContent = "AI 分析";
+    }
   }
-  if (a.analysisBatch && (a.analysisBatch.status === "running" || a.analysisBatch.status === "paused")) {
-    const ab = a.analysisBatch;
-    const prefix = ab.status === "paused" ? "Ⅱ AI 已暂停" : "AI 分析";
-    el.textContent = `${prefix} · ${ab.completed}/${ab.total}`;
-    return;
+
+  statusEl.className = `work-status ${cls}`;
+  statusEl.innerHTML = html;
+}
+
+/// Work Center 的 AI 按钮：按当前上下文分发（暂停 / 继续 / 重试失败 / 开始分析）。
+/// 各 action 内部已做统一状态刷新。
+async function workAiAction() {
+  const s = aiStatus;
+  if (s.state === "running" || s.state === "pausing") {
+    await pauseAi();
+  } else if (s.state === "paused" || s.remaining > 0) {
+    await resumeAi();
+  } else if (activity.analysisFailed > 0) {
+    await retryFailed(null);
+  } else {
+    await manualAnalyze();
   }
-  if (a.analysisBatch && a.analysisBatch.status === "running" && a.retryWaiting) {
-    el.textContent = "AI 等待重试";
-    return;
-  }
-  if (a.lastAnalysis && a.lastAnalysis.failed > 0 && a.lastAnalysis.status !== "running") {
-    el.textContent = `⚠ AI 有 ${a.lastAnalysis.failed} 篇失败`;
-    return;
-  }
-  if (a.lastSync && a.lastSync.status === "completed") {
-    el.textContent = `✓ 同步完成 · 新增 ${a.lastSync.papersInserted} 篇`;
-    return;
-  }
-  if (a.lastAnalysis && a.lastAnalysis.status === "completed") {
-    el.textContent = `✓ AI 完成 · ${a.lastAnalysis.succeeded}/${a.lastAnalysis.total}`;
-    return;
-  }
-  const now = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  el.textContent = `✓ 已更新 · ${now}`;
 }
 
 function activityItemTitle(p: { title: string | null; paperId: number }): string {
@@ -683,14 +768,10 @@ function activityItemTitle(p: { title: string | null; paperId: number }): string
 
 let selectedActivity: { type: string; id: number } | null = null;
 
-/// 待处理区（待分析 / 失败重试 / 等待摘要）。
-async function renderActivityPending() {
+/// 待处理区（待分析 / 失败重试 / 等待摘要）：计数来自 activity（统一状态），不再单独查询。
+function renderActivityPending() {
   const box = $("activity-pending");
-  const [pending, failed, waiting] = await Promise.all([
-    invoke<number>("get_pending_ai_count").catch(() => 0),
-    invoke<number>("get_failed_ai_count").catch(() => 0),
-    invoke<number>("get_waiting_abstract_count").catch(() => 0),
-  ]);
+  const { pendingAnalysis: pending, analysisFailed: failed, waitingForAbstract: waiting } = activity;
   box.innerHTML = `
     <div class="title">待处理</div>
     <div class="pending-rows">
@@ -704,7 +785,7 @@ async function renderActivityPending() {
 
 /// master-detail：左侧最近活动列表 + 右侧选中批次详情。默认选中最近一条。
 async function renderActivityCenter() {
-  await renderActivityPending();
+  renderActivityPending();
   await renderActivityHistory();
   if (!selectedActivity) {
     // 默认选中最近一条 activity
@@ -831,6 +912,8 @@ function switchView(name: string) {
     recommend: "今日推荐", papers: "所有论文", favorites: "收藏", journals: "期刊订阅", tags: "标签", settings: "设置", activity: "活动",
   };
   $("view-title").textContent = titles[name] || name;
+  // 进入活动页时渲染 master-detail（数据来自统一 activity + 批次查询）
+  if (name === "activity") renderActivityCenter().catch(() => {});
 }
 
 interface SyncStartResult {
@@ -862,8 +945,7 @@ async function startAnalyze(paperIds: number[] | null, trigger: string, sourceSy
   if (!(await requireKey())) return false;
   try {
     await invoke("start_ai", { paperIds, model: getModel(), trigger, sourceSyncBatchId });
-    await loadAiStatus();
-    await loadActivity();
+    await refreshWorkState();
     return true;
   } catch (err) {
     setStatus("无法开始 AI 分析", "error");
@@ -873,11 +955,23 @@ async function startAnalyze(paperIds: number[] | null, trigger: string, sourceSy
 }
 
 async function pauseAi() {
-  await invoke("pause_ai");
+  try {
+    await invoke("pause_ai");
+  } catch (err) {
+    setStatus("无法暂停分析", "error");
+    console.error("pause_ai 调用失败:", err);
+  }
+  await refreshWorkState();
 }
 async function resumeAi() {
   if (!(await requireKey())) return;
-  await invoke("resume_ai", { model: getModel() });
+  try {
+    await invoke("resume_ai", { model: getModel() });
+  } catch (err) {
+    setStatus("无法继续分析", "error");
+    console.error("resume_ai 调用失败:", err);
+  }
+  await refreshWorkState();
 }
 async function stopAi() {
   const ok = await showConfirmModal({
@@ -893,6 +987,7 @@ async function stopAi() {
     setStatus("无法停止分析", "error");
     console.error("stop_ai 调用失败:", err);
   }
+  await refreshWorkState();
 }
 
 // ---------- 应用内确认 Modal（替代 WebView 原生 confirm/alert/prompt） ----------
@@ -966,8 +1061,7 @@ async function retryFailed(parentBatchId: number | null = null): Promise<boolean
   try {
     await invoke("retry_failed_ai", { model: getModel(), parentBatchId });
     setStatus("已加入失败论文重试队列", "running");
-    await loadAiStatus();
-    await loadActivity();
+    await refreshWorkState();
     return true;
   } catch (err) {
     setStatus("无法开始重试", "error");
@@ -988,8 +1082,8 @@ async function manualAnalyze(): Promise<boolean> {
     }
     if (aiStatus.state !== "idle" || aiStatus.remaining > 0) {
       setStatus("已有 AI 分析任务正在运行", "error");
+      await refreshWorkState();
       switchView("activity");
-      await renderActivityCenter();
       return false;
     }
     let pending: number;
@@ -1124,20 +1218,26 @@ async function saveSettings() {
 // ---------- 事件监听 ----------
 
 async function setupListeners() {
-  await listen("sync://start", () => setStatus("同步中…", "running"));
+  await listen("sync://start", async () => {
+    setStatus("同步中…", "running");
+    await refreshWorkState();
+  });
   await listen("sync://journal-start", (e) => setStatus(`正在同步 ${e.payload}`, "running"));
   await listen("sync://journal-error", (e) => setStatus(`同步错误：${e.payload}`, "error"));
-  await listen("sync://progress", async (e) => {
+  // 同步进度为高频事件：只轻量更新 Work Center 状态行，不触发全量刷新
+  await listen("sync://progress", (e) => {
     const p = e.payload as SyncProgress;
-    $("activity-text").textContent = `正在检查期刊 · ${p.journalCompleted}/${p.journalTotal}`;
+    const el = $("work-status");
+    el.className = "work-status running";
+    el.innerHTML = `正在检查新论文 · ${p.journalCompleted}/${p.journalTotal} 本期刊`;
   });
   await listen("sync://done", async (e) => {
     const r = e.payload as any;
     setStatus(`同步完成：新增 ${r.newPapers} · 已有 ${r.existingPapers} · 补摘要 ${r.abstractsFilled}`, "done");
-    ($("btn-sync") as HTMLButtonElement).disabled = false;
+    // 统一刷新：papers + 工作状态（Work Center / 徽标 / 面板 / 待处理区 / 计数）
     await loadJournals();
     await loadPapers();
-    await loadActivity();
+    await refreshWorkState();
     // 同步后自动分析新论文（§十一）：新 AnalysisBatch trigger=autoAfterSync，关联 source_sync_batch_id
     if (settings?.autoAnalyzeNew && Array.isArray(r.newPaperIds) && r.newPaperIds.length > 0 && (await hasKey())) {
       await invoke("start_ai", {
@@ -1146,31 +1246,27 @@ async function setupListeners() {
         trigger: "autoAfterSync",
         sourceSyncBatchId: r.batchId || null,
       });
-      await loadActivity();
+      await refreshWorkState();
     }
   });
 
-  await listen("ai://progress", async (e) => {
+  await listen("ai://progress", (e) => {
     aiStatus = e.payload as AiStatus;
+    renderWorkCenter();
     renderAiBadge();
     renderAiPanel();
     renderBacklog();
-    if (aiStatus.state === "running" || aiStatus.state === "pausing") {
-      $("activity-text").textContent = `AI 分析 · ${aiStatus.completed}/${aiStatus.batchSize}`;
-    } else if (aiStatus.state === "paused") {
-      $("activity-text").textContent = `Ⅱ AI 已暂停 · ${aiStatus.completed}/${aiStatus.batchSize}`;
-    }
   });
   await listen("ai://retry", async () => {
-    $("activity-text").textContent = "AI 等待重试";
-    await loadAiStatus();
+    await refreshWorkState();
   });
   await listen("ai://error", (e) => setStatus(`AI：${e.payload}`, "error"));
   await listen("ai://finished", async () => {
     setStatus("AI 分析批次结束", "done");
-    await loadAiStatus();
+    // 必须统一刷新：papers（论文列表/推荐）+ 工作状态（pending 计数立即归零，
+    // 杜绝"AI 待处理 7"与"无待处理"并存）
     await loadPapers();
-    await loadActivity();
+    await refreshWorkState();
   });
 
   document.addEventListener("click", async (ev) => {
@@ -1207,6 +1303,7 @@ async function setupListeners() {
         await invoke("delete_journal", { id: parseInt(del.dataset.id!, 10) });
         await loadJournals();
         await loadPapers();
+        await refreshWorkState();
       }
       return;
     }
@@ -1289,8 +1386,16 @@ async function setupListeners() {
       $("ai-badge").classList.toggle("open", nowOpen);
       return;
     }
-    if (t.closest("#activity-bar")) {
+    if (t.closest("#work-status")) {
       switchView("activity");
+      return;
+    }
+    if (t.closest("#btn-sync-main")) {
+      await startSync(null);
+      return;
+    }
+    if (t.closest("#btn-ai-main")) {
+      await workAiAction();
       return;
     }
     const actItem = t.closest("[data-activity-type]") as HTMLElement | null;
@@ -1302,12 +1407,12 @@ async function setupListeners() {
     }
     if (t.closest("[data-action='manual-analyze']")) {
       await manualAnalyze();
-      await loadActivity();
+      await refreshWorkState();
       return;
     }
     if (t.closest("[data-action='retry-failed']")) {
       await retryFailed(null);
-      await loadActivity();
+      await refreshWorkState();
       return;
     }
   });
@@ -1316,7 +1421,6 @@ async function setupListeners() {
 window.addEventListener("DOMContentLoaded", () => {
   $("add-form").addEventListener("submit", addJournalHandler);
   $("tag-form").addEventListener("submit", addTagHandler);
-  $("btn-sync").addEventListener("click", () => startSync(null));
   $("btn-refresh").addEventListener("click", loadPapers);
   $("journal-filter").addEventListener("change", renderPapers);
   $("ai-filter").addEventListener("change", renderPapers);
@@ -1337,8 +1441,6 @@ window.addEventListener("DOMContentLoaded", () => {
     }
   });
   $("btn-save-settings").addEventListener("click", saveSettings);
-  // 唯一手动 AI 入口（顶部按钮；Activity 待处理区按钮走 data-action）
-  $("btn-ai-manual").addEventListener("click", manualAnalyze);
 
   // Key 存 Keychain，不再回填到输入框（输入框仅用于「替换 Key」时输入）
   ($("api-key") as HTMLInputElement).value = "";
@@ -1347,9 +1449,9 @@ window.addEventListener("DOMContentLoaded", () => {
   (async () => {
     await setupListeners();
     await Promise.all([loadJournals(), loadTags(), loadSettings()]);
-    await loadAiStatus();
     await loadPapers();
-    await loadActivity();
+    // 统一工作状态刷新（Work Center / 徽标 / 面板 / 积压 / 待处理区 / 计数）
+    await refreshWorkState();
     renderNextCheck();
     // 旧 localStorage Key 一次性迁移到 Keychain（写入成功后才删除旧 Key）
     await migrateLegacyKey();

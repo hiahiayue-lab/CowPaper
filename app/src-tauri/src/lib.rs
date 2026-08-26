@@ -540,17 +540,27 @@ fn set_settings(s: models::Settings, state: State<Db>) -> Result<(), String> {
 
 // ---------- Round 4：Activity 查询 ----------
 
+/// 聚合全局 Activity 状态（get_activity_state 命令与一致性测试共用）。
+/// pending_analysis / analysis_failed / waiting_for_abstract 为实时 DB 计数，
+/// 与 last_analysis（上一次批次的 total）严格区分，杜绝"上次 7 篇"被误读成"待处理 7 篇"。
+pub(crate) fn build_activity_state(conn: &Connection) -> Result<models::ActivityState, String> {
+    let retry_waiting = db::get_setting(conn, "queue.retry_waiting").unwrap_or_default() == "1";
+    Ok(models::ActivityState {
+        sync_batch: db::get_running_sync_batch(conn).map_err(|e| e.to_string())?,
+        analysis_batch: db::get_current_analysis_batch(conn).map_err(|e| e.to_string())?,
+        last_sync: db::last_finished_sync_batch(conn).map_err(|e| e.to_string())?,
+        last_analysis: db::last_finished_analysis_batch(conn).map_err(|e| e.to_string())?,
+        retry_waiting,
+        pending_analysis: db::count_pending_papers(conn).unwrap_or(0),
+        analysis_failed: db::count_by_status(conn, "analysisFailed").unwrap_or(0),
+        waiting_for_abstract: db::count_waiting_for_abstract(conn).unwrap_or(0),
+    })
+}
+
 #[tauri::command]
 fn get_activity_state(state: State<Db>) -> Result<models::ActivityState, String> {
     let conn = state.inner().lock().unwrap();
-    let retry_waiting = db::get_setting(&conn, "queue.retry_waiting").unwrap_or_default() == "1";
-    Ok(models::ActivityState {
-        sync_batch: db::get_running_sync_batch(&conn).map_err(|e| e.to_string())?,
-        analysis_batch: db::get_current_analysis_batch(&conn).map_err(|e| e.to_string())?,
-        last_sync: db::last_finished_sync_batch(&conn).map_err(|e| e.to_string())?,
-        last_analysis: db::last_finished_analysis_batch(&conn).map_err(|e| e.to_string())?,
-        retry_waiting,
-    })
+    build_activity_state(&conn)
 }
 
 #[tauri::command]

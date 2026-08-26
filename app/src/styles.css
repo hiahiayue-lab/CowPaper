@@ -80,11 +80,6 @@ body {
   font-weight: 600;
 }
 
-.sidebar-foot {
-  margin-top: auto;
-  padding: 12px;
-}
-
 /* ---------- 主区 ---------- */
 
 .main {
@@ -147,11 +142,18 @@ body {
   border-color: #bfdbfe;
 }
 .ai-badge.paused {
-  background: #fef3c7;
-  color: #92400e;
+  background: #fffbeb;
+  color: #b45309;
   border-color: #fde68a;
 }
+/* 待处理：中性橙（低强调），不用红色表示普通待处理 */
 .ai-badge.idle-has {
+  background: #fffbeb;
+  color: #b45309;
+  border-color: #fde68a;
+}
+/* 真失败：红色，需要用户处理 */
+.ai-badge.has-error {
   background: #fef2f2;
   color: var(--danger);
   border-color: #fecaca;
@@ -519,28 +521,65 @@ button.full {
   color: var(--danger);
 }
 
-/* ---------- Round 4B：Activity ---------- */
+/* ---------- Round 4.2：Work Center（统一状态 + 主操作） ---------- */
 
-.activity-bar {
-  display: block;
-  width: 100%;
-  text-align: left;
-  padding: 6px 20px;
-  border: none;
-  border-bottom: 1px solid var(--border);
-  background: #fbfcfe;
-  color: var(--muted);
-  font-size: 12px;
+.work-center {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 12px 20px 0;
+  padding: 12px 16px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  flex-shrink: 0;
+}
+.work-status {
+  font-size: 13px;
+  color: var(--text);
   cursor: pointer;
-}
-.activity-bar:hover {
-  background: #f2f5f9;
-}
-.activity-text {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
+  min-height: 20px;
 }
+.work-status:hover {
+  color: var(--accent);
+}
+.work-status.running {
+  color: var(--accent);
+}
+.work-status.paused,
+.work-status.pending {
+  color: #b45309;
+}
+.work-status.error {
+  color: var(--danger);
+}
+.work-status.ok {
+  color: var(--ok);
+}
+.work-actions {
+  display: flex;
+  gap: 10px;
+  flex-shrink: 0;
+}
+.link-btn {
+  border: none;
+  background: none;
+  padding: 0;
+  margin: 0;
+  font-size: 13px;
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: underline;
+}
+.link-btn:hover {
+  color: var(--accent-hover);
+}
+
+/* ---------- Round 4B：Activity ---------- */
 
 .section-title {
   font-size: 14px;
@@ -613,38 +652,64 @@ button.full {
 .modal-overlay {
   position: fixed;
   inset: 0;
-  background: rgba(15, 23, 42, 0.45);
+  background: rgba(15, 23, 42, 0.28);
   display: flex;
   align-items: center;
   justify-content: center;
   z-index: 1000;
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
 }
 .modal-overlay.hidden {
   display: none;
 }
 .modal-card {
   background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18);
-  width: 360px;
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-radius: 16px;
+  box-shadow:
+    0 2px 8px rgba(0, 0, 0, 0.06),
+    0 12px 40px rgba(0, 0, 0, 0.10);
+  width: 440px;
   max-width: calc(100vw - 48px);
-  padding: 20px;
+  padding: 24px;
+  text-align: center;
+}
+.modal-icon {
+  width: 44px;
+  height: 44px;
+  margin: 0 auto 14px;
+  border-radius: 50%;
+  background: #eff6ff;
+  color: var(--accent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 .modal-title {
   margin: 0 0 10px;
-  font-size: 15px;
+  font-size: 16px;
+  font-weight: 650;
   color: var(--text);
 }
 .modal-message {
-  margin: 0;
+  margin: 0 auto;
+  max-width: 360px;
   color: var(--muted);
-  line-height: 1.6;
+  line-height: 1.7;
   white-space: pre-line;
+  text-align: center;
 }
 .modal-actions {
   display: flex;
   justify-content: flex-end;
   gap: 10px;
-  margin-top: 18px;
+  margin-top: 22px;
+  text-align: left;
+}
+.modal-actions button {
+  min-width: 84px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
