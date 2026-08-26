@@ -2258,3 +2258,147 @@ fn test_migration_v4_abstract_quality_init() {
         .unwrap();
     assert_eq!(cnt, 2, "两篇有摘要论文的 migration 来源候选已记录");
 }
+
+// ================= Round 5B.1：Abstract Upgrade Reanalysis Orchestration =================
+
+/// P1-1 修复：succeeded partial → complete 升级后必须真正获得重新入队资格
+/// （analysis_status → pendingAnalysis，enqueue 不再 UPDATE 0 rows），
+/// 走真实 enqueue + AnalysisBatch（batch item 落库），新 analysis 写入新 hash。
+#[test]
+fn test_upgrade_reanalysis_orchestration() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let cand = candidate(
+        Some("10.1000/orch1"),
+        "Orch Paper",
+        Some("We study platform pricing and network effects..."),
+        Some("crossref"),
+    );
+    let id = match db::upsert_paper(&conn, jid, &cand).unwrap() {
+        UpsertOutcome::New(i) => i,
+        _ => panic!("expected new"),
+    };
+    // 模拟基于 partial 摘要的已完成旧分析（succeeded + hash H1 + score）
+    db::save_analysis(&conn, id, "中文标题", "中文摘要", "一句话", "[{\"tag\":\"t1\",\"score\":0.6}]", 0.6, "m", "v1", "H1").unwrap();
+    {
+        let p = db::list_papers(&conn, None, 100).unwrap().remove(0);
+        assert_eq!(p.analysis_status, "analysisSucceeded");
+        assert_eq!(p.abstract_quality, "partial");
+        assert_eq!(p.evidence_hash.as_deref(), Some("H1"));
+        assert_eq!(p.total_score, Some(0.6));
+    }
+    // 完整摘要到达 → 真实 merge_abstract 升级路径（upsert Existing）
+    let full = "We study platform pricing and network effects in two-sided markets. ".repeat(10) + "We derive equilibrium and welfare results.";
+    let cand2 = candidate(Some("10.1000/orch1"), "Orch Paper", Some(&full), Some("openalex"));
+    match db::upsert_paper(&conn, jid, &cand2).unwrap() {
+        UpsertOutcome::Existing { abstract_upgraded, .. } => assert!(abstract_upgraded, "必须标记升级"),
+        _ => panic!("expected existing"),
+    }
+    {
+        let p = db::list_papers(&conn, None, 100).unwrap().remove(0);
+        assert_eq!(p.abstract_quality, "complete");
+        assert_eq!(p.analysis_status, "pendingAnalysis", "succeeded 必须回到 pendingAnalysis 获得入队资格");
+        assert_eq!(p.evidence_hash, None, "evidenceHash 清空 → 旧分析 stale");
+        assert_eq!(p.total_score, Some(0.6), "旧 AI 结果保留，直到新分析覆盖");
+    }
+    // 真实 enqueue：UPDATE 必须生效（不再是 0 rows），论文进入 queued
+    db::enqueue_paper(&conn, id).unwrap();
+    {
+        let st = db::get_analysis_status(&conn, id).unwrap();
+        assert_eq!(st.as_deref(), Some("queued"), "enqueue 成功：pendingAnalysis → queued");
+    }
+    // 真实 AnalysisBatch（trigger=abstractUpgraded）+ item 落库
+    let batch = db::create_analysis_batch(&conn, "abstractUpgraded", Some("m"), None, None, None, &[id]).unwrap();
+    let b = db::get_analysis_batch(&conn, batch).unwrap().unwrap();
+    assert_eq!(b.trigger, "abstractUpgraded");
+    assert_eq!(b.total, 1);
+    assert_eq!(db::list_analysis_batch_items(&conn, batch).unwrap().len(), 1, "Paper 成功进入 batch item");
+    // 模拟重新分析完成：succeeded + 新 hash H2（对应新 canonical abstract）
+    db::set_paper_status(&conn, id, "analysisSucceeded").unwrap();
+    db::save_analysis(&conn, id, "新中文标题", "新中文摘要", "新一句话", "[{\"tag\":\"t1\",\"score\":1.0}]", 3.0, "m", "v1", "H2").unwrap();
+    {
+        let p = db::list_papers(&conn, None, 100).unwrap().remove(0);
+        assert_eq!(p.analysis_status, "analysisSucceeded");
+        assert_eq!(p.evidence_hash.as_deref(), Some("H2"), "新 evidenceHash 写入");
+        assert_ne!(p.evidence_hash.as_deref(), Some("H1"));
+        assert_eq!(p.total_score, Some(3.0), "新分析覆盖旧结果");
+        // 旧批次历史不修改：本测试只有新批次；batch 状态保持
+        assert_eq!(db::list_analysis_batches(&conn, 10).unwrap().len(), 1);
+    }
+}
+
+/// 同一 complete 摘要再次同步不得重复触发：
+/// status 保持 succeeded、hash 保持 H2、不产生 upgraded id。
+#[test]
+fn test_same_complete_no_retrigger() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let full = "We study platform pricing and network effects in two-sided markets. ".repeat(10) + "We derive equilibrium and welfare results.";
+    let cand = candidate(Some("10.1000/nore"), "No Re-trigger", Some(&full), Some("openalex"));
+    let id = match db::upsert_paper(&conn, jid, &cand).unwrap() {
+        UpsertOutcome::New(i) => i,
+        _ => panic!("expected new"),
+    };
+    db::save_analysis(&conn, id, "中文", "摘要", "一句话", "[]", 2.0, "m", "v1", "H2").unwrap();
+    // 再次收到相同 complete B（同来源同文本）
+    let cand2 = candidate(Some("10.1000/nore"), "No Re-trigger", Some(&full), Some("openalex"));
+    match db::upsert_paper(&conn, jid, &cand2).unwrap() {
+        UpsertOutcome::Existing { abstract_upgraded, abstract_filled, .. } => {
+            assert!(!abstract_upgraded, "相同 complete 不得触发升级");
+            assert!(!abstract_filled, "相同摘要不得视为新增");
+        }
+        _ => panic!("expected existing"),
+    }
+    let p = db::list_papers(&conn, Some(jid), 100).unwrap().remove(0);
+    assert_eq!(p.analysis_status, "analysisSucceeded", "不得改回 pendingAnalysis");
+    assert_eq!(p.evidence_hash.as_deref(), Some("H2"), "hash 保持");
+    assert_eq!(p.abstract_quality, "complete");
+}
+
+/// Post-Sync 自动分析目标合并（Case A–E）：一次 sync 最多一个自动 AnalysisBatch。
+#[test]
+fn test_post_sync_analysis_union() {
+    let f = crate::post_sync_analysis_ids;
+    // Case A：new + autoNew=true → [1,2]
+    assert_eq!(f(&[1, 2], &[], true), vec![1, 2]);
+    // Case B：仅 upgraded → [3,4]
+    assert_eq!(f(&[], &[3, 4], true), vec![3, 4]);
+    // Case C：两类都有 + autoNew=true → 一个合并集合 [1,2,3,4]
+    assert_eq!(f(&[1, 2], &[3, 4], true), vec![1, 2, 3, 4]);
+    // Case D：autoNew=false → 只分析升级论文 [3]
+    assert_eq!(f(&[1, 2], &[3], false), vec![3]);
+    // Case E：overlap dedup → [1,2,3]（Paper 2 只出现一次）
+    assert_eq!(f(&[1, 2], &[2, 3], true), vec![1, 2, 3]);
+    // 空 → 不启动
+    assert!(f(&[], &[], true).is_empty());
+}
+
+/// 升级论文重分析后推荐排序回归：A 升级重分析 score 3 > B score 2 → A 排前。
+#[test]
+fn test_upgrade_recommendation_reorder() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let ca = candidate(Some("10.1000/ra"), "Paper A", Some("abstract a with full detail here."), Some("crossref"));
+    let ida = match db::upsert_paper(&conn, jid, &ca).unwrap() {
+        UpsertOutcome::New(i) => i,
+        _ => panic!(),
+    };
+    let cb = candidate(Some("10.1000/rb"), "Paper B", Some("abstract b with full detail here."), Some("crossref"));
+    let idb = match db::upsert_paper(&conn, jid, &cb).unwrap() {
+        UpsertOutcome::New(i) => i,
+        _ => panic!(),
+    };
+    // 旧分析：A=1, B=2 → B 排前
+    db::save_analysis(&conn, ida, "A", "a", "sa", "[]", 1.0, "m", "v1", "HA").unwrap();
+    db::save_analysis(&conn, idb, "B", "b", "sb", "[]", 2.0, "m", "v1", "HB").unwrap();
+    let rank = |conn: &Connection| -> Vec<i64> {
+        let papers = db::list_papers(conn, None, 100).unwrap();
+        let mut scored: Vec<&crate::models::Paper> = papers.iter().filter(|p| p.total_score.is_some()).collect();
+        scored.sort_by(|x, y| y.total_score.unwrap().total_cmp(&x.total_score.unwrap()));
+        scored.iter().map(|p| p.id).collect()
+    };
+    assert_eq!(rank(&conn), vec![idb, ida], "旧：B(2) > A(1)");
+    // A 摘要升级 + 重新分析（新 score 3）→ A 排前（不修改推荐算法，仅验证数据层排序）
+    db::save_analysis(&conn, ida, "A2", "a2", "s2", "[]", 3.0, "m", "v1", "HA2").unwrap();
+    assert_eq!(rank(&conn), vec![ida, idb], "新：A(3) > B(2)");
+}

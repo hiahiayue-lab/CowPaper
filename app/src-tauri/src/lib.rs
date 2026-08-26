@@ -36,6 +36,21 @@ type Secure = Arc<dyn SecureStore>;
 
 // ---------- 期刊 ----------
 
+/// Post-Sync 自动分析目标合并（Round 5B.1）：一次 sync 最多一个自动 AnalysisBatch。
+/// 新论文受 auto_new（「同步后自动分析新论文」checkbox）控制；摘要升级论文默认自动。
+/// 结果按 paper id 去重且只出现一次（前端另有 Set dedup 作为防御）。
+#[allow(dead_code)] // 语义由测试锁定；前端以等价 JS 逻辑消费
+pub(crate) fn post_sync_analysis_ids(new_ids: &[i64], upgraded_ids: &[i64], auto_new: bool) -> Vec<i64> {
+    let mut out: Vec<i64> = Vec::with_capacity(new_ids.len() + upgraded_ids.len());
+    if auto_new {
+        out.extend_from_slice(new_ids);
+    }
+    out.extend_from_slice(upgraded_ids);
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 #[tauri::command]
 fn list_journals(state: State<Db>) -> Result<Vec<models::Journal>, String> {
     let conn = state.inner().lock().unwrap();

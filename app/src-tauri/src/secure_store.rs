@@ -132,9 +132,6 @@ impl TempDirSecretStore {
         }
     }
 
-    pub fn path(&self) -> &Path {
-        &self.dir
-    }
 }
 
 #[cfg(test)]

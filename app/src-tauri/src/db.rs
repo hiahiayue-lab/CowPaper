@@ -658,9 +658,11 @@ fn merge_abstract(conn: &Connection, paper_id: i64, c: &PaperCandidate) -> Resul
             } else {
                 upgraded = true;
             }
-            // 摘要补全/升级后回到可分析状态
+            // 摘要补全/升级后获得重新入队资格：final/stale 状态 → pendingAnalysis。
+            // 正在执行中的分析（queued/analyzing）不覆盖，避免重复请求；pendingAnalysis 保持不变。
             conn.execute(
-                "UPDATE papers SET analysis_status = 'pendingAnalysis' WHERE id = ?1 AND analysis_status = 'waitingForAbstract'",
+                "UPDATE papers SET analysis_status = 'pendingAnalysis'
+                 WHERE id = ?1 AND analysis_status IN ('waitingForAbstract','analysisSucceeded','analysisFailed')",
                 params![paper_id],
             )?;
         } else {

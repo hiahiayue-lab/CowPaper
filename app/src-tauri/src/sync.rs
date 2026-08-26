@@ -140,6 +140,11 @@ pub fn run_sync<R: Runtime>(
             report.waiting_for_abstract,
         );
     }
+    // 后端保证 disjoint：本次 discovery 中新建的 Paper 归为 new（不重复视为历史升级）。
+    // 同一次 sync 里从较差 candidate 换成更好 candidate 的论文，升级归类让位给 new。
+    report
+        .abstract_upgraded_ids
+        .retain(|id| !report.new_paper_ids.contains(id));
     report.duration_ms = start.elapsed().as_millis() as i64;
     report
 }

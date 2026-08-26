@@ -562,7 +562,8 @@ function renderBacklog() {
 
 const TRIGGER_ZH: Record<string, string> = {
   manual: "手动检查", startup: "启动检查", daily: "每日检查", tray: "托盘检查",
-  journalTest: "期刊测试", autoAfterSync: "同步后自动分析", retryFailed: "重试失败",
+  journalTest: "期刊测试", autoAfterSync: "同步后自动分析", syncAutoAnalysis: "同步后自动分析",
+  retryFailed: "重试失败",
   resumeRecovered: "恢复继续",
   abstractUpgraded: "摘要补全后重新分析",
 };
@@ -1158,22 +1159,19 @@ async function setupListeners() {
     await loadJournals();
     await loadPapers();
     await refreshWorkState();
-    // 同步后自动分析新论文（§十一）：新 AnalysisBatch trigger=autoAfterSync，关联 source_sync_batch_id
-    if (settings?.autoAnalyzeNew && Array.isArray(r.newPaperIds) && r.newPaperIds.length > 0 && (await hasKey())) {
+    // Post-Sync 自动分析（Round 5B.1）：一次 sync 最多启动一个 AnalysisBatch。
+    // 新论文受「同步后自动分析新论文」checkbox 控制；摘要升级论文默认自动重新分析。
+    // 两类目标合并为单一 batch（trigger=syncAutoAnalysis），按 paper id 去重，只调用一次 start_ai。
+    const newEligible =
+      settings?.autoAnalyzeNew && Array.isArray(r.newPaperIds) ? (r.newPaperIds as number[]) : [];
+    const upgradedEligible =
+      Array.isArray(r.abstractUpgradedIds) ? (r.abstractUpgradedIds as number[]) : [];
+    const postSyncIds = [...new Set([...newEligible, ...upgradedEligible])];
+    if (postSyncIds.length > 0 && (await hasKey())) {
       await invoke("start_ai", {
-        paperIds: r.newPaperIds,
+        paperIds: postSyncIds,
         model: getModel(),
-        trigger: "autoAfterSync",
-        sourceSyncBatchId: r.batchId || null,
-      });
-      await refreshWorkState();
-    }
-    // 摘要升级（partial→complete / missing→更完整）：自动重新分析并更新推荐（默认行为）
-    if (Array.isArray(r.abstractUpgradedIds) && r.abstractUpgradedIds.length > 0 && (await hasKey())) {
-      await invoke("start_ai", {
-        paperIds: r.abstractUpgradedIds,
-        model: getModel(),
-        trigger: "abstractUpgraded",
+        trigger: "syncAutoAnalysis",
         sourceSyncBatchId: r.batchId || null,
       });
       await refreshWorkState();
