@@ -161,6 +161,8 @@ pub struct AddJournalResult {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncReport {
+    pub batch_id: i64,
+    pub trigger: String,
     pub checked_journals: i64,
     pub found_records: i64,
     pub new_papers: i64,
@@ -198,6 +200,7 @@ pub struct PaperCandidate {
 #[serde(rename_all = "camelCase")]
 pub struct AiStatus {
     pub state: String,
+    pub analysis_batch_id: Option<i64>,
     pub batch_size: i64,
     pub completed: i64,
     pub success: i64,
@@ -239,4 +242,127 @@ pub struct ConnectionTestResult {
 pub enum UpsertOutcome {
     New(i64),
     Existing { id: i64, abstract_filled: bool },
+}
+
+// ================= Round 4：Batch & Activity =================
+
+// SyncBatch 状态
+#[allow(dead_code)]
+pub const SBC_RUNNING: &str = "running";
+pub const SBC_COMPLETED: &str = "completed";
+pub const SBC_COMPLETED_WITH_ERRORS: &str = "completedWithErrors";
+#[allow(dead_code)]
+pub const SBC_FAILED: &str = "failed";
+
+// AnalysisBatch 状态
+pub const ABC_RUNNING: &str = "running";
+pub const ABC_PAUSED: &str = "paused";
+pub const ABC_COMPLETED: &str = "completed";
+pub const ABC_COMPLETED_WITH_ERRORS: &str = "completedWithErrors";
+pub const ABC_STOPPED: &str = "stopped";
+#[allow(dead_code)]
+pub const ABC_FAILED: &str = "failed";
+
+// AnalysisBatch item 状态
+#[allow(dead_code)]
+pub const ABI_QUEUED: &str = "queued";
+pub const ABI_RUNNING: &str = "running";
+pub const ABI_SUCCEEDED: &str = "succeeded";
+pub const ABI_FAILED: &str = "failed";
+pub const ABI_SKIPPED: &str = "skipped";
+#[allow(dead_code)]
+pub const ABI_CANCELLED: &str = "cancelled";
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncBatch {
+    pub id: i64,
+    pub trigger: String,
+    pub status: String,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub journal_total: i64,
+    pub journal_completed: i64,
+    pub journal_failed: i64,
+    pub records_found: i64,
+    pub papers_inserted: i64,
+    pub papers_existing: i64,
+    pub abstracts_added: i64,
+    pub waiting_abstract: i64,
+    pub error_summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncBatchPaper {
+    pub sync_batch_id: i64,
+    pub paper_id: i64,
+    pub result: String,
+    pub title: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisBatch {
+    pub id: i64,
+    pub source_sync_batch_id: Option<i64>,
+    pub parent_batch_id: Option<i64>,
+    pub trigger: String,
+    pub status: String,
+    pub model_name: Option<String>,
+    pub prompt_version: Option<String>,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub total: i64,
+    pub completed: i64,
+    pub succeeded: i64,
+    pub failed: i64,
+    pub skipped: i64,
+    pub remaining: i64,
+    pub error_summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisBatchItem {
+    pub id: i64,
+    pub analysis_batch_id: i64,
+    pub paper_id: i64,
+    pub status: String,
+    pub attempt_count: i64,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub error_type: Option<String>,
+    pub error_summary: Option<String>,
+    pub title: Option<String>,
+}
+
+/// 同步进度事件负载（Activity Bar 渲染来源之一）。
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncProgress {
+    pub batch_id: i64,
+    pub trigger: String,
+    pub journal_total: i64,
+    pub journal_completed: i64,
+    pub journal_failed: i64,
+    pub current_journal: Option<String>,
+    pub records_found: i64,
+    pub papers_inserted: i64,
+    pub papers_existing: i64,
+    pub abstracts_added: i64,
+    pub started_at: String,
+}
+
+/// 全局 Activity 状态聚合（get_activity_state 返回）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityState {
+    pub sync_batch: Option<SyncBatch>,
+    pub analysis_batch: Option<AnalysisBatch>,
+    pub last_sync: Option<SyncBatch>,
+    pub last_analysis: Option<AnalysisBatch>,
+    pub retry_waiting: bool,
 }

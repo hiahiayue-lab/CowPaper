@@ -2,8 +2,8 @@ use rusqlite::{params, Connection, OptionalExtension, Result};
 use std::path::Path;
 
 use crate::models::{
-    Author, Journal, Paper, PaperCandidate, Tag, TagMatch, UpsertOutcome, ST_PENDING,
-    ST_SUCCEEDED, ST_WAITING_ABSTRACT,
+    AnalysisBatch, AnalysisBatchItem, Author, Journal, Paper, PaperCandidate, SyncBatch,
+    SyncBatchPaper, Tag, TagMatch, UpsertOutcome, ST_PENDING, ST_SUCCEEDED, ST_WAITING_ABSTRACT,
 };
 
 const SCHEMA: &str = r#"
@@ -86,7 +86,7 @@ pub fn open(path: &Path) -> Result<Connection> {
 /// 当前 schema 版本（下一轮 Batch 表将从 v2 开始递增）。
 /// 生产构建中仅由迁移系统隐式使用；测试中直接断言。
 #[allow(dead_code)]
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 pub fn init(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
@@ -513,7 +513,85 @@ fn run_migrations(conn: &Connection) -> Result<()> {
 }
 
 fn migrations() -> Vec<(i64, &'static str, fn(&Connection) -> Result<()>)> {
-    vec![(1, "round3-baseline", migrate_to_v1)]
+    vec![
+        (1, "round3-baseline", migrate_to_v1),
+        (2, "round4-batches", migrate_to_v2),
+    ]
+}
+
+/// v2：新增 Batch & Activity 表（事务内执行，由 run_migrations 统一驱动）。
+fn migrate_to_v2(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS sync_batches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trigger TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            started_at TEXT,
+            finished_at TEXT,
+            journal_total INTEGER NOT NULL DEFAULT 0,
+            journal_completed INTEGER NOT NULL DEFAULT 0,
+            journal_failed INTEGER NOT NULL DEFAULT 0,
+            records_found INTEGER NOT NULL DEFAULT 0,
+            papers_inserted INTEGER NOT NULL DEFAULT 0,
+            papers_existing INTEGER NOT NULL DEFAULT 0,
+            abstracts_added INTEGER NOT NULL DEFAULT 0,
+            waiting_abstract INTEGER NOT NULL DEFAULT 0,
+            error_summary TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_sb_started ON sync_batches(started_at);
+
+        CREATE TABLE IF NOT EXISTS sync_batch_papers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sync_batch_id INTEGER NOT NULL REFERENCES sync_batches(id) ON DELETE CASCADE,
+            paper_id INTEGER NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+            result TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_sbp_batch ON sync_batch_papers(sync_batch_id);
+        CREATE INDEX IF NOT EXISTS idx_sbp_paper ON sync_batch_papers(paper_id);
+
+        CREATE TABLE IF NOT EXISTS analysis_batches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_sync_batch_id INTEGER,
+            parent_batch_id INTEGER,
+            trigger TEXT NOT NULL,
+            status TEXT NOT NULL,
+            model_name TEXT,
+            prompt_version TEXT,
+            created_at TEXT NOT NULL,
+            started_at TEXT,
+            finished_at TEXT,
+            total INTEGER NOT NULL DEFAULT 0,
+            completed INTEGER NOT NULL DEFAULT 0,
+            succeeded INTEGER NOT NULL DEFAULT 0,
+            failed INTEGER NOT NULL DEFAULT 0,
+            skipped INTEGER NOT NULL DEFAULT 0,
+            remaining INTEGER NOT NULL DEFAULT 0,
+            error_summary TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_ab_started ON analysis_batches(started_at);
+        CREATE INDEX IF NOT EXISTS idx_ab_status ON analysis_batches(status);
+
+        CREATE TABLE IF NOT EXISTS analysis_batch_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            analysis_batch_id INTEGER NOT NULL REFERENCES analysis_batches(id) ON DELETE CASCADE,
+            paper_id INTEGER NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+            status TEXT NOT NULL,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            started_at TEXT,
+            finished_at TEXT,
+            error_type TEXT,
+            error_summary TEXT,
+            previous_analysis_hash TEXT,
+            result_analysis_hash TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_abi_batch ON analysis_batch_items(analysis_batch_id);
+        CREATE INDEX IF NOT EXISTS idx_abi_paper ON analysis_batch_items(paper_id);
+        CREATE INDEX IF NOT EXISTS idx_abi_status ON analysis_batch_items(status);
+        "#,
+    )?;
+    Ok(())
 }
 
 /// v1：把任意旧库升级到 round-3 基线（幂等：列已存在则跳过）。
@@ -827,5 +905,331 @@ pub fn reset_failed_to_pending(conn: &Connection) -> Result<()> {
 pub fn list_failed_ids(conn: &Connection) -> Result<Vec<i64>> {
     let mut stmt = conn.prepare("SELECT id FROM papers WHERE analysis_status = 'analysisFailed'")?;
     let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+    rows.collect()
+}
+
+// ================= Round 4：Batch CRUD =================
+
+// ---------- SyncBatch ----------
+
+pub fn create_sync_batch(conn: &Connection, trigger: &str) -> Result<i64> {
+    let now = now_utc();
+    conn.execute(
+        "INSERT INTO sync_batches (trigger, status, created_at, started_at) VALUES (?1, 'running', ?2, ?2)",
+        params![trigger, now],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn update_sync_batch_journal_progress(
+    conn: &Connection,
+    id: i64,
+    journal_completed: i64,
+    journal_failed: i64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE sync_batches SET journal_completed=?1, journal_failed=?2 WHERE id=?3",
+        params![journal_completed, journal_failed, id],
+    )?;
+    Ok(())
+}
+
+pub fn update_sync_batch_counts(
+    conn: &Connection,
+    id: i64,
+    records_found: i64,
+    papers_inserted: i64,
+    papers_existing: i64,
+    abstracts_added: i64,
+    waiting_abstract: i64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE sync_batches SET records_found=?1, papers_inserted=?2, papers_existing=?3, abstracts_added=?4, waiting_abstract=?5 WHERE id=?6",
+        params![records_found, papers_inserted, papers_existing, abstracts_added, waiting_abstract, id],
+    )?;
+    Ok(())
+}
+
+pub fn add_sync_batch_papers(
+    conn: &Connection,
+    batch_id: i64,
+    inserted: &[i64],
+    existing: &[i64],
+    abstract_updated: &[i64],
+) -> Result<()> {
+    for id in inserted {
+        conn.execute(
+            "INSERT INTO sync_batch_papers (sync_batch_id, paper_id, result) VALUES (?1,?2,'inserted')",
+            params![batch_id, id],
+        )?;
+    }
+    for id in existing {
+        conn.execute(
+            "INSERT INTO sync_batch_papers (sync_batch_id, paper_id, result) VALUES (?1,?2,'existing')",
+            params![batch_id, id],
+        )?;
+    }
+    for id in abstract_updated {
+        conn.execute(
+            "INSERT INTO sync_batch_papers (sync_batch_id, paper_id, result) VALUES (?1,?2,'abstractUpdated')",
+            params![batch_id, id],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn finalize_sync_batch(
+    conn: &Connection,
+    id: i64,
+    status: &str,
+    error_summary: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE sync_batches SET status=?1, finished_at=?2, error_summary=?3 WHERE id=?4",
+        params![status, now_utc(), error_summary, id],
+    )?;
+    Ok(())
+}
+
+fn row_to_sync_batch(row: &rusqlite::Row) -> Result<SyncBatch> {
+    Ok(SyncBatch {
+        id: row.get("id")?,
+        trigger: row.get("trigger")?,
+        status: row.get("status")?,
+        created_at: row.get("created_at")?,
+        started_at: row.get("started_at")?,
+        finished_at: row.get("finished_at")?,
+        journal_total: row.get("journal_total")?,
+        journal_completed: row.get("journal_completed")?,
+        journal_failed: row.get("journal_failed")?,
+        records_found: row.get("records_found")?,
+        papers_inserted: row.get("papers_inserted")?,
+        papers_existing: row.get("papers_existing")?,
+        abstracts_added: row.get("abstracts_added")?,
+        waiting_abstract: row.get("waiting_abstract")?,
+        error_summary: row.get("error_summary")?,
+    })
+}
+
+pub fn get_sync_batch(conn: &Connection, id: i64) -> Result<Option<SyncBatch>> {
+    conn.query_row("SELECT * FROM sync_batches WHERE id=?1", params![id], row_to_sync_batch)
+        .optional()
+}
+
+pub fn list_sync_batches(conn: &Connection, limit: i64) -> Result<Vec<SyncBatch>> {
+    let mut stmt = conn.prepare("SELECT * FROM sync_batches ORDER BY id DESC LIMIT ?1")?;
+    let rows = stmt.query_map(params![limit], row_to_sync_batch)?;
+    rows.collect()
+}
+
+pub fn get_running_sync_batch(conn: &Connection) -> Result<Option<SyncBatch>> {
+    conn.query_row(
+        "SELECT * FROM sync_batches WHERE status='running' ORDER BY id DESC LIMIT 1",
+        [],
+        row_to_sync_batch,
+    )
+    .optional()
+}
+
+pub fn last_finished_sync_batch(conn: &Connection) -> Result<Option<SyncBatch>> {
+    conn.query_row(
+        "SELECT * FROM sync_batches WHERE status != 'running' ORDER BY id DESC LIMIT 1",
+        [],
+        row_to_sync_batch,
+    )
+    .optional()
+}
+
+pub fn list_sync_batch_papers(conn: &Connection, batch_id: i64) -> Result<Vec<SyncBatchPaper>> {
+    let mut stmt = conn.prepare(
+        "SELECT sbp.sync_batch_id, sbp.paper_id, sbp.result, p.title AS title
+         FROM sync_batch_papers sbp LEFT JOIN papers p ON p.id = sbp.paper_id
+         WHERE sbp.sync_batch_id=?1 ORDER BY sbp.id ASC",
+    )?;
+    let rows = stmt.query_map(params![batch_id], |r| {
+        Ok(SyncBatchPaper {
+            sync_batch_id: r.get("sync_batch_id")?,
+            paper_id: r.get("paper_id")?,
+            result: r.get("result")?,
+            title: r.get("title")?,
+        })
+    })?;
+    rows.collect()
+}
+
+// ---------- AnalysisBatch ----------
+
+#[allow(clippy::too_many_arguments)]
+pub fn create_analysis_batch(
+    conn: &Connection,
+    trigger: &str,
+    model: Option<&str>,
+    prompt_version: Option<&str>,
+    source_sync_batch_id: Option<i64>,
+    parent_batch_id: Option<i64>,
+    paper_ids: &[i64],
+) -> Result<i64> {
+    let now = now_utc();
+    let total = paper_ids.len() as i64;
+    conn.execute(
+        "INSERT INTO analysis_batches (source_sync_batch_id, parent_batch_id, trigger, status, model_name, prompt_version, created_at, started_at, total, remaining)
+         VALUES (?1,?2,?3,'running',?4,?5,?6,?6,?7,?7)",
+        params![source_sync_batch_id, parent_batch_id, trigger, model, prompt_version, now, total],
+    )?;
+    let batch_id = conn.last_insert_rowid();
+    for pid in paper_ids {
+        conn.execute(
+            "INSERT INTO analysis_batch_items (analysis_batch_id, paper_id, status, attempt_count) VALUES (?1,?2,'queued',0)",
+            params![batch_id, pid],
+        )?;
+    }
+    Ok(batch_id)
+}
+
+pub fn set_analysis_batch_status(
+    conn: &Connection,
+    id: i64,
+    status: &str,
+    finished_at: Option<&str>,
+    error_summary: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE analysis_batches SET status=?1, finished_at=?2, error_summary=?3 WHERE id=?4",
+        params![status, finished_at, error_summary, id],
+    )?;
+    Ok(())
+}
+
+/// 由 items 表重算聚合计数（completed/succeeded/failed/skipped/remaining）。
+pub fn recompute_analysis_aggregate(conn: &Connection, batch_id: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE analysis_batches SET
+            completed = (SELECT COUNT(*) FROM analysis_batch_items WHERE analysis_batch_id=?1 AND status IN ('succeeded','failed','skipped','cancelled')),
+            succeeded  = (SELECT COUNT(*) FROM analysis_batch_items WHERE analysis_batch_id=?1 AND status='succeeded'),
+            failed     = (SELECT COUNT(*) FROM analysis_batch_items WHERE analysis_batch_id=?1 AND status='failed'),
+            skipped    = (SELECT COUNT(*) FROM analysis_batch_items WHERE analysis_batch_id=?1 AND status='skipped'),
+            remaining  = (SELECT COUNT(*) FROM analysis_batch_items WHERE analysis_batch_id=?1 AND status IN ('queued','running'))
+         WHERE id=?1",
+        params![batch_id],
+    )?;
+    Ok(())
+}
+
+pub fn set_item_status(
+    conn: &Connection,
+    batch_id: i64,
+    paper_id: i64,
+    status: &str,
+    attempt_count: Option<i64>,
+    error_type: Option<&str>,
+    error_summary: Option<&str>,
+    finished_at: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE analysis_batch_items SET status=?1, attempt_count=COALESCE(?2, attempt_count), error_type=?3, error_summary=?4, finished_at=COALESCE(?5, finished_at) WHERE analysis_batch_id=?6 AND paper_id=?7",
+        params![status, attempt_count, error_type, error_summary, finished_at, batch_id, paper_id],
+    )?;
+    Ok(())
+}
+
+pub fn set_item_started(conn: &Connection, batch_id: i64, paper_id: i64, attempt_count: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE analysis_batch_items SET status='running', attempt_count=?1, started_at=?2, finished_at=NULL WHERE analysis_batch_id=?3 AND paper_id=?4",
+        params![attempt_count, now_utc(), batch_id, paper_id],
+    )?;
+    Ok(())
+}
+
+pub fn cancel_queued_items(conn: &Connection, batch_id: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE analysis_batch_items SET status='cancelled', finished_at=?1 WHERE analysis_batch_id=?2 AND status IN ('queued','running')",
+        params![now_utc(), batch_id],
+    )?;
+    Ok(())
+}
+
+/// 最近一个有失败的 AnalysisBatch（作为 retry 的 parent）。
+pub fn last_analysis_batch_with_failures(conn: &Connection) -> Result<Option<i64>> {
+    let v: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM analysis_batches WHERE failed > 0 ORDER BY id DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(v)
+}
+
+pub fn get_analysis_batch(conn: &Connection, id: i64) -> Result<Option<AnalysisBatch>> {
+    conn.query_row("SELECT * FROM analysis_batches WHERE id=?1", params![id], row_to_analysis_batch)
+        .optional()
+}
+
+pub fn list_analysis_batches(conn: &Connection, limit: i64) -> Result<Vec<AnalysisBatch>> {
+    let mut stmt = conn.prepare("SELECT * FROM analysis_batches ORDER BY id DESC LIMIT ?1")?;
+    let rows = stmt.query_map(params![limit], row_to_analysis_batch)?;
+    rows.collect()
+}
+
+pub fn get_current_analysis_batch(conn: &Connection) -> Result<Option<AnalysisBatch>> {
+    conn.query_row(
+        "SELECT * FROM analysis_batches WHERE status IN ('running','paused') ORDER BY id DESC LIMIT 1",
+        [],
+        row_to_analysis_batch,
+    )
+    .optional()
+}
+
+pub fn last_finished_analysis_batch(conn: &Connection) -> Result<Option<AnalysisBatch>> {
+    conn.query_row(
+        "SELECT * FROM analysis_batches WHERE status NOT IN ('running','paused') ORDER BY id DESC LIMIT 1",
+        [],
+        row_to_analysis_batch,
+    )
+    .optional()
+}
+
+fn row_to_analysis_batch(row: &rusqlite::Row) -> Result<AnalysisBatch> {
+    Ok(AnalysisBatch {
+        id: row.get("id")?,
+        source_sync_batch_id: row.get("source_sync_batch_id")?,
+        parent_batch_id: row.get("parent_batch_id")?,
+        trigger: row.get("trigger")?,
+        status: row.get("status")?,
+        model_name: row.get("model_name")?,
+        prompt_version: row.get("prompt_version")?,
+        created_at: row.get("created_at")?,
+        started_at: row.get("started_at")?,
+        finished_at: row.get("finished_at")?,
+        total: row.get("total")?,
+        completed: row.get("completed")?,
+        succeeded: row.get("succeeded")?,
+        failed: row.get("failed")?,
+        skipped: row.get("skipped")?,
+        remaining: row.get("remaining")?,
+        error_summary: row.get("error_summary")?,
+    })
+}
+
+pub fn list_analysis_batch_items(conn: &Connection, batch_id: i64) -> Result<Vec<AnalysisBatchItem>> {
+    let mut stmt = conn.prepare(
+        "SELECT abi.id, abi.analysis_batch_id, abi.paper_id, abi.status, abi.attempt_count, abi.started_at, abi.finished_at, abi.error_type, abi.error_summary, p.title AS title
+         FROM analysis_batch_items abi LEFT JOIN papers p ON p.id = abi.paper_id
+         WHERE abi.analysis_batch_id=?1 ORDER BY abi.id ASC",
+    )?;
+    let rows = stmt.query_map(params![batch_id], |r| {
+        Ok(AnalysisBatchItem {
+            id: r.get("id")?,
+            analysis_batch_id: r.get("analysis_batch_id")?,
+            paper_id: r.get("paper_id")?,
+            status: r.get("status")?,
+            attempt_count: r.get("attempt_count")?,
+            started_at: r.get("started_at")?,
+            finished_at: r.get("finished_at")?,
+            error_type: r.get("error_type")?,
+            error_summary: r.get("error_summary")?,
+            title: r.get("title")?,
+        })
+    })?;
     rows.collect()
 }

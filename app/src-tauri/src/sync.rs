@@ -5,17 +5,30 @@ use tauri::{AppHandle, Emitter, Runtime};
 
 use crate::api::{crossref::Crossref, openalex::OpenAlex};
 use crate::db;
-use crate::models::{Journal, PaperCandidate, SyncReport, UpsertOutcome};
+use crate::models::{
+    Journal, PaperCandidate, SyncProgress, SyncReport, UpsertOutcome,
+};
 
-/// 在后台线程中运行同步（由命令触发）。通过事件回报进度与结果。
+/// 单期刊同步结果：本次涉及论文及其结果（用于 SyncBatch 关联）。
+pub struct JournalSyncResult {
+    pub inserted: Vec<i64>,
+    pub existing: Vec<i64>,
+    pub abstract_updated: Vec<i64>,
+}
+
+/// 在后台线程中运行同步（由命令触发）。同步一个持久化 SyncBatch，
+/// 通过事件回报进度（sync://progress 携带 SyncProgress）。
 pub fn run_sync<R: Runtime>(
     conn: &Arc<Mutex<Connection>>,
     ids: Option<Vec<i64>>,
     app: &AppHandle<R>,
     mailto: &str,
+    batch_id: i64,
+    trigger: &str,
 ) -> SyncReport {
     let start = std::time::Instant::now();
     let mut report = SyncReport::default();
+    let started_at = db::now_utc();
 
     let journals = {
         let c = conn.lock().unwrap();
@@ -26,30 +39,103 @@ pub fn run_sync<R: Runtime>(
         .filter(|j| j.enabled && ids.as_ref().map_or(true, |ids| ids.contains(&j.id)))
         .collect();
     report.checked_journals = journals.len() as i64;
+    {
+        let c = conn.lock().unwrap();
+        let _ = db::update_sync_batch_journal_progress(&c, batch_id, 0, 0);
+    }
 
     let crossref = Crossref::new(mailto);
     let openalex = OpenAlex::new(mailto);
     let to = chrono::Utc::now().format("%Y-%m-%d").to_string();
 
-    let mut new_ids: Vec<i64> = Vec::new();
+    let mut journal_completed: i64 = 0;
+    let mut journal_failed: i64 = 0;
+
+    let emit_progress = |current: Option<&str>,
+                         jc: i64,
+                         jf: i64,
+                         records: i64,
+                         inserted: i64,
+                         existing: i64,
+                         added: i64| {
+        let prog = SyncProgress {
+            batch_id,
+            trigger: trigger.to_string(),
+            journal_total: journals.len() as i64,
+            journal_completed: jc,
+            journal_failed: jf,
+            current_journal: current.map(str::to_string),
+            records_found: records,
+            papers_inserted: inserted,
+            papers_existing: existing,
+            abstracts_added: added,
+            started_at: started_at.clone(),
+        };
+        let _ = app.emit("sync://progress", &prog);
+    };
+
     for j in &journals {
         let _ = app.emit("sync://journal-start", j.name.clone());
+        emit_progress(
+            Some(&j.name),
+            journal_completed,
+            journal_failed,
+            report.found_records,
+            report.new_papers,
+            report.existing_papers,
+            report.abstracts_filled,
+        );
         match sync_journal(conn, &crossref, &openalex, j, &to, &mut report) {
-            Ok(ids) => {
-                new_ids.extend(ids);
+            Ok(res) => {
+                journal_completed += 1;
+                report.new_paper_ids.extend(res.inserted.iter().copied());
+                {
+                    let c = conn.lock().unwrap();
+                    let _ = db::add_sync_batch_papers(
+                        &c,
+                        batch_id,
+                        &res.inserted,
+                        &res.existing,
+                        &res.abstract_updated,
+                    );
+                    let _ = db::update_sync_batch_journal_progress(
+                        &c,
+                        batch_id,
+                        journal_completed,
+                        journal_failed,
+                    );
+                }
                 let _ = app.emit("sync://journal-done", j.name.clone());
             }
             Err(e) => {
+                journal_failed += 1;
                 report.failed_journals += 1;
                 let _ = app.emit("sync://journal-error", format!("{}: {}", j.name, e));
             }
         }
+        emit_progress(
+            None,
+            journal_completed,
+            journal_failed,
+            report.found_records,
+            report.new_papers,
+            report.existing_papers,
+            report.abstracts_filled,
+        );
     }
-    report.new_paper_ids = new_ids;
 
     {
         let c = conn.lock().unwrap();
         report.waiting_for_abstract = db::count_waiting_for_abstract(&c).unwrap_or(0);
+        let _ = db::update_sync_batch_counts(
+            &c,
+            batch_id,
+            report.found_records,
+            report.new_papers,
+            report.existing_papers,
+            report.abstracts_filled,
+            report.waiting_for_abstract,
+        );
     }
     report.duration_ms = start.elapsed().as_millis() as i64;
     report
@@ -62,7 +148,7 @@ fn sync_journal(
     j: &Journal,
     to: &str,
     report: &mut SyncReport,
-) -> Result<Vec<i64>, String> {
+) -> Result<JournalSyncResult, String> {
     let issn = j
         .print_issn
         .as_deref()
@@ -97,12 +183,16 @@ fn sync_journal(
     // 合并入库（DOI 去重 + 缺失字段补全）。
     let mut c = conn.lock().unwrap();
     let tx = c.transaction().map_err(|e| e.to_string())?;
-    let mut new_ids: Vec<i64> = Vec::new();
+    let mut res = JournalSyncResult {
+        inserted: Vec::new(),
+        existing: Vec::new(),
+        abstract_updated: Vec::new(),
+    };
     for cand in &candidates {
         match db::upsert_paper(&tx, j.id, cand) {
             Ok(UpsertOutcome::New(id)) => {
                 report.new_papers += 1;
-                new_ids.push(id);
+                res.inserted.push(id);
                 let _ = db::insert_source_record(
                     &tx,
                     id,
@@ -113,8 +203,10 @@ fn sync_journal(
             }
             Ok(UpsertOutcome::Existing { id, abstract_filled }) => {
                 report.existing_papers += 1;
+                res.existing.push(id);
                 if abstract_filled {
                     report.abstracts_filled += 1;
+                    res.abstract_updated.push(id);
                 }
                 let _ = db::insert_source_record(
                     &tx,
@@ -152,7 +244,7 @@ fn sync_journal(
     .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
 
-    Ok(new_ids)
+    Ok(res)
 }
 
 fn thirty_days_ago() -> String {

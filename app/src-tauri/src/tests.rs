@@ -381,7 +381,9 @@ fn test_ai_queue_scenarios() {
         .send(QueueCommand::Start {
             paper_ids: None,
             model: "m".into(),
-        })
+            trigger: "manual".to_string(),
+            source_sync_batch_id: None,
+            })
         .unwrap();
     let s = wait(&conn, Duration::from_secs(10), &|s, conn| {
         if s.state != "idle" {
@@ -396,6 +398,24 @@ fn test_ai_queue_scenarios() {
         assert_eq!(db::count_by_status(&c, "analysisSucceeded").unwrap(), 20);
         assert_eq!(db::count_active_queue(&c).unwrap(), 0);
     }
+    // AnalysisBatch 持久化：completed + trigger manual + 聚合正确
+    {
+        let c = conn.lock().unwrap();
+        let ab = db::list_analysis_batches(&c, 1).unwrap().pop().expect("应有 AnalysisBatch");
+        assert_eq!(ab.status, "completed", "A: 自然完成应为 completed");
+        assert_eq!(ab.trigger, "manual");
+        assert_eq!(ab.total, 20);
+        assert_eq!(ab.succeeded, 20);
+        assert_eq!(ab.failed, 0);
+        assert_eq!(ab.remaining, 0);
+        let items = db::list_analysis_batch_items(&c, ab.id).unwrap();
+        assert_eq!(items.len(), 20);
+        assert!(items.iter().all(|i| i.status == "succeeded"), "A: 全部 item 应 succeeded");
+        // 队列状态携带 batch id
+        drop(c);
+    }
+    assert!(ai_queue::status_from_db(&conn).analysis_batch_id.is_none(), "A: 完成后 analysis_batch_id 应清空");
+
     // 上次运行摘要应保留（§七：批次结束后不清零历史统计）；自然完成 → completed
     {
         let lr = ai_queue::status_from_db(&conn).last_run.expect("应有 last_run 摘要");
@@ -420,7 +440,9 @@ fn test_ai_queue_scenarios() {
         .send(QueueCommand::Start {
             paper_ids: None,
             model: "m".into(),
-        })
+            trigger: "manual".to_string(),
+            source_sync_batch_id: None,
+            })
         .unwrap();
     let dl = Instant::now() + Duration::from_secs(10);
     while analyzing_count(&conn) < 2 && Instant::now() < dl {
@@ -438,6 +460,14 @@ fn test_ai_queue_scenarios() {
         assert_eq!(lr.final_status, "completed", "B: pause 不得写 completed/部分摘要");
         assert_eq!(lr.total, 20, "B: last_run 仍为上一轮（A）摘要");
     }
+    // B: batch 状态 paused，且 analysis_batch_id 被队列携带
+    let bid_pause = {
+        let c = conn.lock().unwrap();
+        let ab = db::list_analysis_batches(&c, 1).unwrap().pop().unwrap();
+        assert_eq!(ab.status, "paused", "B: pause 后 batch 应为 paused（非终态）");
+        ab.id
+    };
+    assert_eq!(ai_queue::status_from_db(&conn).analysis_batch_id, Some(bid_pause), "B: 队列应携带 paused batch id");
     cmd_tx
         .send(QueueCommand::Resume {
             model: "m".into(),
@@ -456,6 +486,14 @@ fn test_ai_queue_scenarios() {
         assert_eq!(lr.final_status, "completed", "B: resume 后自然结束应为 completed");
         assert_eq!(lr.total, 20);
     }
+    // B: resume 保持同一 batch id（不新建）
+    {
+        let c = conn.lock().unwrap();
+        let ab = db::list_analysis_batches(&c, 1).unwrap().pop().unwrap();
+        assert_eq!(ab.id, bid_pause, "B: resume 必须保持同一 batch id");
+        assert_eq!(ab.status, "completed");
+        assert_eq!(ab.succeeded, 20);
+    }
 
     // ===== 场景 D：停止 =====
     reset_pending(&conn);
@@ -467,7 +505,9 @@ fn test_ai_queue_scenarios() {
         .send(QueueCommand::Start {
             paper_ids: None,
             model: "m".into(),
-        })
+            trigger: "manual".to_string(),
+            source_sync_batch_id: None,
+            })
         .unwrap();
     let dl = Instant::now() + Duration::from_secs(10);
     while analyzing_count(&conn) < 2 && Instant::now() < dl {
@@ -499,6 +539,19 @@ fn test_ai_queue_scenarios() {
         assert_eq!(lr.success, 2, "D: 已完成结果保留");
         assert_eq!(lr.remaining, 18, "D: 未执行论文数应计为 remaining=18（实际 {}）", lr.remaining);
     }
+    // D: batch stopped + 未执行 item = cancelled（不标 failed）
+    {
+        let c = conn.lock().unwrap();
+        let ab = db::list_analysis_batches(&c, 1).unwrap().pop().unwrap();
+        assert_eq!(ab.status, "stopped", "D: batch 应为 stopped");
+        let items = db::list_analysis_batch_items(&c, ab.id).unwrap();
+        let cancelled = items.iter().filter(|i| i.status == "cancelled").count();
+        let succeeded = items.iter().filter(|i| i.status == "succeeded").count();
+        let failed = items.iter().filter(|i| i.status == "failed").count();
+        assert_eq!(cancelled, 18, "D: 未执行 item 应为 cancelled（实际 {}）", cancelled);
+        assert_eq!(succeeded, 2, "D: 已完成 item 保留");
+        assert_eq!(failed, 0, "D: 未执行 item 不得标 failed");
+    }
 
     // ===== 场景 E：单篇失败不影响后续 =====
     reset_pending(&conn);
@@ -518,7 +571,9 @@ fn test_ai_queue_scenarios() {
         .send(QueueCommand::Start {
             paper_ids: None,
             model: "m".into(),
-        })
+            trigger: "manual".to_string(),
+            source_sync_batch_id: None,
+            })
         .unwrap();
     let _ = wait(&conn, Duration::from_secs(10), &|s, conn| {
         if s.state != "idle" {
@@ -533,6 +588,15 @@ fn test_ai_queue_scenarios() {
         assert_eq!(db::count_by_status(&c, "analysisFailed").unwrap(), 1, "E: 1 篇失败");
         assert_eq!(db::count_by_status(&c, "analysisSucceeded").unwrap(), 19, "E: 其余 19 篇成功");
     }
+    // E: 批次终态 completedWithErrors（1 失败），历史保留
+    let e_batch = {
+        let c = conn.lock().unwrap();
+        let ab = db::list_analysis_batches(&c, 1).unwrap().pop().unwrap();
+        assert_eq!(ab.status, "completedWithErrors", "E: 有失败 → completedWithErrors");
+        assert_eq!(ab.failed, 1);
+        assert_eq!(ab.succeeded, 19);
+        ab
+    };
 
     // ===== 场景 F：429 限流 → 等待重试 → 成功 =====
     reset_pending(&conn);
@@ -555,7 +619,9 @@ fn test_ai_queue_scenarios() {
         .send(QueueCommand::Start {
             paper_ids: Some(vec![one_id]),
             model: "m".into(),
-        })
+            trigger: "manual".to_string(),
+            source_sync_batch_id: None,
+            })
         .unwrap();
     let s = wait(&conn, Duration::from_secs(10), &|s, conn| {
         if s.state != "idle" {
@@ -598,7 +664,9 @@ fn test_ai_queue_scenarios() {
         .send(QueueCommand::Start {
             paper_ids: None,
             model: "m".into(),
-        })
+            trigger: "manual".to_string(),
+            source_sync_batch_id: None,
+            })
         .unwrap();
     let s = wait(&conn, Duration::from_secs(10), &|s, _| s.state == "paused");
     assert_eq!(s.state, "paused", "G: 全局配置错误应暂停整队（state={}）", s.state);
@@ -609,6 +677,53 @@ fn test_ai_queue_scenarios() {
         assert!(failed <= 2, "G: 只有 in-flight 的少数篇标 failed（实际 {}）", failed);
         let active = db::count_active_queue(&c).unwrap();
         assert!(active >= 1, "G: 未执行论文应保留在队列（queued/analyzing），实际 {}", active);
+    }
+
+    // ===== 场景 H：重试失败 → 新 AnalysisBatch（parent_batch_id 正确，历史保留） =====
+    // 先停止 G 的（暂停）batch，使队列回 idle
+    cmd_tx.send(QueueCommand::Stop).unwrap();
+    let _ = wait(&conn, Duration::from_secs(10), &|s, _| s.state == "idle");
+    // 构造确定性状态：全部 pendingAnalysis，仅 first_id 一篇为 analysisFailed
+    {
+        let c = conn.lock().unwrap();
+        let _ = c.execute("UPDATE papers SET analysis_status='pendingAnalysis'", []);
+        let _ = c.execute(
+            "UPDATE papers SET analysis_status='analysisFailed' WHERE id=?1",
+            params![first_id],
+        );
+    }
+    ai_queue::set_mock_analyzer(Some(Arc::new(|_id| Ok(true))));
+    cmd_tx
+        .send(QueueCommand::RetryFailed {
+            model: "m".into(),
+            parent_batch_id: Some(e_batch.id),
+        })
+        .unwrap();
+    let _ = wait(&conn, Duration::from_secs(10), &|s, conn| {
+        if s.state != "idle" {
+            return false;
+        }
+        let c = conn.lock().unwrap();
+        db::list_analysis_batches(&c, 1)
+            .unwrap()
+            .first()
+            .map(|b| b.status == "completed")
+            .unwrap_or(false)
+    });
+    {
+        let c = conn.lock().unwrap();
+        let h = db::list_analysis_batches(&c, 1).unwrap().pop().unwrap();
+        assert_eq!(h.trigger, "retryFailed", "H: trigger=retryFailed");
+        assert_eq!(h.parent_batch_id, Some(e_batch.id), "H: parent_batch_id 应指向失败批次");
+        assert!(h.id != e_batch.id, "H: 必须创建新 batch");
+        assert_eq!(h.total, 1, "H: 只重试失败的论文");
+        assert_eq!(h.succeeded, 1, "H: 重试成功");
+        assert_eq!(h.failed, 0);
+        // 历史保留：原 batch 不变
+        let e2 = db::get_analysis_batch(&c, e_batch.id).unwrap().unwrap();
+        assert_eq!(e2.status, "completedWithErrors");
+        assert_eq!(e2.failed, 1);
+        assert_eq!(e2.succeeded, 19);
     }
 
     ai_queue::set_mock_analyzer(None);
@@ -680,7 +795,9 @@ fn live_deepseek_smoke() {
         .send(QueueCommand::Start {
             paper_ids: None,
             model: model.clone(),
-        })
+            trigger: "manual".to_string(),
+            source_sync_batch_id: None,
+            })
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
@@ -748,6 +865,8 @@ fn live_deepseek_smoke() {
         .send(QueueCommand::Start {
             paper_ids: Some(vec![2, 3, 4, 5]),
             model,
+            trigger: "manual".to_string(),
+            source_sync_batch_id: None,
         })
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(300);
@@ -1038,6 +1157,18 @@ fn test_migration_upgrade_preserves_data() {
         assert!(cols.contains(&need.to_string()), "缺少列 {}", need);
     }
 
+    // v2：批次表存在
+    let tables: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    for t in ["sync_batches", "sync_batch_papers", "analysis_batches", "analysis_batch_items"] {
+        assert!(tables.contains(&t.to_string()), "缺少 v2 表 {}", t);
+    }
+
     // user_version 推进且重复 init 幂等
     let v: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -1195,4 +1326,175 @@ fn test_sync_worker_spawn_failure_releases() {
     // 下一次 acquire 仍成功（不影响后续同步）
     assert!(sync.try_acquire(SyncTrigger::Manual).is_some());
     sync.release();
+}
+
+// ================= Round 4A：Batch Backend 测试 =================
+
+/// busy 被拒的同步不得创建 SyncBatch。
+#[test]
+fn test_busy_rejected_sync_creates_no_batch() {
+    use std::sync::{Arc, Mutex};
+
+    use crate::models::SyncTrigger;
+    use crate::sync_coordinator::SyncCoordinator;
+
+    let app = tauri::test::mock_builder()
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .expect("mock app");
+    let handle = app.handle().clone();
+    let conn = Arc::new(Mutex::new(mem_db()));
+    let sync = Arc::new(SyncCoordinator::new());
+    // coordinator busy（manual 占用）
+    assert!(sync.try_acquire(SyncTrigger::Manual).is_some());
+    let result = crate::start_sync_task(
+        &handle, &conn, &sync, SyncTrigger::Manual, None,
+    );
+    assert!(!result.started);
+    assert_eq!(result.reason, "syncAlreadyRunning");
+    // 不创建假的 SyncBatch
+    let c = conn.lock().unwrap();
+    assert_eq!(db::list_sync_batches(&c, 10).unwrap().len(), 0, "busy 被拒不得创建 SyncBatch");
+    drop(c);
+    sync.release();
+}
+
+/// SyncBatch DB 生命周期：创建 → 关联论文 → finalize；同一 Paper 可出现在多个 batch。
+#[test]
+fn test_sync_batch_db_lifecycle() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let mut paper_ids = Vec::new();
+    for i in 0..3 {
+        let c = candidate(Some(&format!("10.1000/sb{}", i)), &format!("T{}", i), Some("abs"), Some("crossref"));
+        match db::upsert_paper(&conn, jid, &c).unwrap() {
+            UpsertOutcome::New(id) => paper_ids.push(id),
+            _ => panic!(),
+        }
+    }
+    // batch #1：1 inserted + 2 existing
+    let b1 = db::create_sync_batch(&conn, "manual").unwrap();
+    db::add_sync_batch_papers(&conn, b1, &paper_ids[0..1], &paper_ids[1..3], &[]).unwrap();
+    db::finalize_sync_batch(&conn, b1, "completed", None).unwrap();
+    // batch #2：同一 Paper 再次出现（abstractUpdated）
+    let b2 = db::create_sync_batch(&conn, "daily").unwrap();
+    db::add_sync_batch_papers(&conn, b2, &[], &[], &paper_ids[1..2]).unwrap();
+    db::finalize_sync_batch(&conn, b2, "completed", None).unwrap();
+
+    let b = db::get_sync_batch(&conn, b1).unwrap().unwrap();
+    assert_eq!(b.status, "completed");
+    assert_eq!(b.trigger, "manual");
+    let p1 = db::list_sync_batch_papers(&conn, b1).unwrap();
+    assert_eq!(p1.len(), 3);
+    let p2 = db::list_sync_batch_papers(&conn, b2).unwrap();
+    assert_eq!(p2.len(), 1);
+    assert_eq!(p2[0].result, "abstractUpdated");
+    // 同一 Paper 出现在多个 batch（many-to-many 保留）
+    assert_eq!(p1.iter().filter(|x| x.paper_id == paper_ids[1]).count(), 1);
+    assert_eq!(p2[0].paper_id, paper_ids[1]);
+}
+
+/// AnalysisBatch DB 生命周期：创建+items → 状态流转 → aggregate 重算。
+#[test]
+fn test_analysis_batch_db_lifecycle() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let mut ids = Vec::new();
+    for i in 0..4 {
+        let c = candidate(Some(&format!("10.1000/ab{}", i)), &format!("T{}", i), Some("abs"), Some("crossref"));
+        match db::upsert_paper(&conn, jid, &c).unwrap() {
+            UpsertOutcome::New(id) => ids.push(id),
+            _ => panic!(),
+        }
+    }
+    let bid = db::create_analysis_batch(&conn, "manual", Some("m1"), Some("v1"), None, None, &ids).unwrap();
+    let ab = db::get_analysis_batch(&conn, bid).unwrap().unwrap();
+    assert_eq!(ab.total, 4);
+    assert_eq!(ab.status, "running");
+    let items = db::list_analysis_batch_items(&conn, bid).unwrap();
+    assert_eq!(items.len(), 4);
+    assert!(items.iter().all(|i| i.status == "queued"));
+
+    // 2 成功、1 失败、1 跳过 → aggregate
+    db::set_item_started(&conn, bid, ids[0], 1).unwrap();
+    db::set_item_status(&conn, bid, ids[0], "succeeded", None, None, None, Some(&db::now_utc())).unwrap();
+    db::set_item_started(&conn, bid, ids[1], 1).unwrap();
+    db::set_item_status(&conn, bid, ids[1], "failed", None, Some("paperError"), Some("bad json"), Some(&db::now_utc())).unwrap();
+    db::set_item_status(&conn, bid, ids[2], "skipped", None, None, None, Some(&db::now_utc())).unwrap();
+    db::recompute_analysis_aggregate(&conn, bid).unwrap();
+    let ab = db::get_analysis_batch(&conn, bid).unwrap().unwrap();
+    assert_eq!(ab.completed, 3);
+    assert_eq!(ab.succeeded, 1);
+    assert_eq!(ab.failed, 1);
+    assert_eq!(ab.skipped, 1);
+    assert_eq!(ab.remaining, 1);
+
+    // stop：未执行 → cancelled
+    db::cancel_queued_items(&conn, bid).unwrap();
+    db::recompute_analysis_aggregate(&conn, bid).unwrap();
+    db::set_analysis_batch_status(&conn, bid, "stopped", Some(&db::now_utc()), None).unwrap();
+    let items = db::list_analysis_batch_items(&conn, bid).unwrap();
+    assert_eq!(items.iter().filter(|i| i.status == "cancelled").count(), 1);
+    assert_eq!(items.iter().filter(|i| i.status == "failed").count(), 1);
+    let ab = db::get_analysis_batch(&conn, bid).unwrap().unwrap();
+    assert_eq!(ab.status, "stopped");
+}
+
+/// 重启持久化：批次历史写入文件 DB 后重开仍在。
+#[test]
+fn test_batch_persistence_restart() {
+    let path = std::env::temp_dir().join(format!("cowpaper-test-batch-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let conn = Connection::open(&path).unwrap();
+        db::init(&conn).unwrap();
+        let b = db::create_sync_batch(&conn, "daily").unwrap();
+        db::finalize_sync_batch(&conn, b, "completed", None).unwrap();
+        let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+        let c = candidate(Some("10.1000/r1"), "R1", Some("abs"), Some("crossref"));
+        let pid = match db::upsert_paper(&conn, jid, &c).unwrap() { UpsertOutcome::New(id) => id, _ => panic!() };
+        let ab = db::create_analysis_batch(&conn, "manual", Some("m"), Some("v"), None, None, &[pid]).unwrap();
+        db::set_analysis_batch_status(&conn, ab, "completed", Some(&db::now_utc()), None).unwrap();
+    }
+    // 模拟重启：重新打开
+    {
+        let conn = Connection::open(&path).unwrap();
+        db::init(&conn).unwrap();
+        let sbs = db::list_sync_batches(&conn, 10).unwrap();
+        assert_eq!(sbs.len(), 1);
+        assert_eq!(sbs[0].trigger, "daily");
+        let abs = db::list_analysis_batches(&conn, 10).unwrap();
+        assert_eq!(abs.len(), 1);
+        assert_eq!(abs[0].status, "completed");
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+/// 重新分析后 totalScore 更新（推荐排序的数据侧保证）。
+#[test]
+fn test_reanalysis_updates_totalscore() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let mk = |doi: &str, title: &str| match db::upsert_paper(
+        &conn, jid,
+        &candidate(Some(doi), title, Some("abs"), Some("crossref")),
+    ).unwrap() {
+        UpsertOutcome::New(id) => id,
+        _ => panic!(),
+    };
+    let a = mk("10.1000/ra", "Paper A");
+    let b = mk("10.1000/rb", "Paper B");
+    // 初始：A=1.0, B=2.0
+    db::save_analysis(&conn, a, "A中", "abs", "sum", "[{\"tag\":\"t\",\"score\":1.0}]", 1.0, "m", "v", "h1").unwrap();
+    db::save_analysis(&conn, b, "B中", "abs", "sum", "[{\"tag\":\"t\",\"score\":2.0}]", 2.0, "m", "v", "h2").unwrap();
+    // 重新分析 A：3.0
+    db::save_analysis(&conn, a, "A中", "abs", "sum", "[{\"tag\":\"t\",\"score\":3.0}]", 3.0, "m", "v", "h3").unwrap();
+    let papers = db::list_papers(&conn, None, 100).unwrap();
+    let score = |id: i64| papers.iter().find(|p| p.id == id).unwrap().total_score.unwrap();
+    assert_eq!(score(a), 3.0, "重新分析后 A 的 totalScore 必须更新");
+    assert_eq!(score(b), 2.0);
+    // 前端推荐按 totalScore 降序 → A(3.0) 应在 B(2.0) 之前
+    let mut sorted = papers.iter().filter(|p| p.total_score.is_some()).collect::<Vec<_>>();
+    sorted.sort_by(|x, y| y.total_score.unwrap().partial_cmp(&x.total_score.unwrap()).unwrap());
+    assert_eq!(sorted[0].id, a);
+    assert_eq!(sorted[1].id, b);
 }

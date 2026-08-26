@@ -111,11 +111,30 @@ fn set_paper_flag(id: i64, flag: String, value: bool, state: State<Db>) -> Resul
 // ---------- 同步（统一 SyncCoordinator，禁止重入） ----------
 
 /// 实际同步工作（与 AI 队列完全解耦，§三十四）。
-fn sync_task<R: Runtime>(app: &AppHandle<R>, db: &Db, ids: Option<Vec<i64>>) {
+/// 每次被 coordinator 接受的同步都创建一个持久化 SyncBatch。
+fn sync_task<R: Runtime>(app: &AppHandle<R>, db: &Db, ids: Option<Vec<i64>>, trigger: &str) {
+    let batch_id = {
+        let c = db.lock().unwrap();
+        db::create_sync_batch(&c, trigger).unwrap_or(0)
+    };
     let _ = app.emit("sync://start", ());
-    let report = sync::run_sync(db, ids, app, MAILTO);
+    let mut report = sync::run_sync(db, ids, app, MAILTO, batch_id, trigger);
+    report.batch_id = batch_id;
+    report.trigger = trigger.to_string();
+    // finalize：部分期刊失败 → completedWithErrors；否则 completed
     {
         let c = db.lock().unwrap();
+        let status = if report.failed_journals > 0 {
+            crate::models::SBC_COMPLETED_WITH_ERRORS
+        } else {
+            crate::models::SBC_COMPLETED
+        };
+        let err = if report.failed_journals > 0 {
+            Some(format!("{} 本期刊同步失败", report.failed_journals))
+        } else {
+            None
+        };
+        let _ = db::finalize_sync_batch(&c, batch_id, status, err.as_deref());
         let _ = db::set_setting(&c, "sync.last_auto_sync_at", &db::now_utc());
     }
     if report.new_papers > 0 {
@@ -181,7 +200,7 @@ fn start_sync_task_with<R: Runtime>(
             let worker: Box<dyn FnOnce() + Send + 'static> = Box::new(move || {
                 let _guard = guard; // move 进 worker：闭包结束 / panic 时 Drop → release
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    sync_task(&app2, &db2, ids);
+                    sync_task(&app2, &db2, ids, trigger.as_str());
                 }));
                 if let Err(payload) = result {
                     // 记录安全错误并发出同步失败事件；不静默吞掉 panic
@@ -370,6 +389,8 @@ fn delete_api_key(store: State<Secure>) -> Result<(), String> {
 fn start_ai(
     paper_ids: Option<Vec<i64>>,
     model: String,
+    trigger: String,
+    source_sync_batch_id: Option<i64>,
     queue: State<AiQueue>,
     store: State<Secure>,
 ) -> Result<(), String> {
@@ -378,7 +399,12 @@ fn start_ai(
     }
     queue
         .cmd_tx
-        .send(QueueCommand::Start { paper_ids, model })
+        .send(QueueCommand::Start {
+            paper_ids,
+            model,
+            trigger,
+            source_sync_batch_id,
+        })
         .map_err(|e| e.to_string())
 }
 
@@ -404,13 +430,18 @@ fn stop_ai(queue: State<AiQueue>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn retry_failed_ai(model: String, queue: State<AiQueue>, store: State<Secure>) -> Result<(), String> {
+fn retry_failed_ai(
+    model: String,
+    parent_batch_id: Option<i64>,
+    queue: State<AiQueue>,
+    store: State<Secure>,
+) -> Result<(), String> {
     if !store.has() {
         return Err("未保存 API Key，请先在设置中保存".to_string());
     }
     queue
         .cmd_tx
-        .send(QueueCommand::RetryFailed { model })
+        .send(QueueCommand::RetryFailed { model, parent_batch_id })
         .map_err(|e| e.to_string())
 }
 
@@ -494,6 +525,54 @@ fn set_settings(s: models::Settings, state: State<Db>) -> Result<(), String> {
     let _ = db::set_setting(&conn, "settings.default_abstract_lang", &s.default_abstract_lang);
     Ok(())
 }
+
+// ---------- Round 4：Activity 查询 ----------
+
+#[tauri::command]
+fn get_activity_state(state: State<Db>) -> Result<models::ActivityState, String> {
+    let conn = state.inner().lock().unwrap();
+    let retry_waiting = db::get_setting(&conn, "queue.retry_waiting").unwrap_or_default() == "1";
+    Ok(models::ActivityState {
+        sync_batch: db::get_running_sync_batch(&conn).map_err(|e| e.to_string())?,
+        analysis_batch: db::get_current_analysis_batch(&conn).map_err(|e| e.to_string())?,
+        last_sync: db::last_finished_sync_batch(&conn).map_err(|e| e.to_string())?,
+        last_analysis: db::last_finished_analysis_batch(&conn).map_err(|e| e.to_string())?,
+        retry_waiting,
+    })
+}
+
+#[tauri::command]
+fn list_sync_batches(limit: Option<i64>, state: State<Db>) -> Result<Vec<models::SyncBatch>, String> {
+    let conn = state.inner().lock().unwrap();
+    db::list_sync_batches(&conn, limit.unwrap_or(50)).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_sync_batch(id: i64, state: State<Db>) -> Result<(models::SyncBatch, Vec<models::SyncBatchPaper>), String> {
+    let conn = state.inner().lock().unwrap();
+    let batch = db::get_sync_batch(&conn, id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "SyncBatch 不存在".to_string())?;
+    let papers = db::list_sync_batch_papers(&conn, id).map_err(|e| e.to_string())?;
+    Ok((batch, papers))
+}
+
+#[tauri::command]
+fn list_analysis_batches(limit: Option<i64>, state: State<Db>) -> Result<Vec<models::AnalysisBatch>, String> {
+    let conn = state.inner().lock().unwrap();
+    db::list_analysis_batches(&conn, limit.unwrap_or(50)).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_analysis_batch(id: i64, state: State<Db>) -> Result<(models::AnalysisBatch, Vec<models::AnalysisBatchItem>), String> {
+    let conn = state.inner().lock().unwrap();
+    let batch = db::get_analysis_batch(&conn, id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "AnalysisBatch 不存在".to_string())?;
+    let items = db::list_analysis_batch_items(&conn, id).map_err(|e| e.to_string())?;
+    Ok((batch, items))
+}
+
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -613,7 +692,12 @@ pub fn run() {
             get_pending_ai_count,
             test_api_connection,
             get_settings,
-            set_settings
+            set_settings,
+            get_activity_state,
+            list_sync_batches,
+            get_sync_batch,
+            list_analysis_batches,
+            get_analysis_batch
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -12,6 +12,8 @@ use crate::api::deepseek::{AiError, DeepSeek};
 use crate::db;
 use crate::models::{
     AiStatus, LastAiRun, ST_ANALYZING, QS_IDLE, QS_PAUSED, QS_PAUSING, QS_RUNNING, QS_STOPPING,
+    ABC_COMPLETED, ABC_COMPLETED_WITH_ERRORS, ABC_PAUSED, ABC_RUNNING, ABC_STOPPED, ABI_FAILED,
+    ABI_RUNNING, ABI_SKIPPED, ABI_SUCCEEDED,
 };
 use crate::secure_store::SecureStore;
 
@@ -26,6 +28,8 @@ pub enum QueueCommand {
     Start {
         paper_ids: Option<Vec<i64>>,
         model: String,
+        trigger: String,
+        source_sync_batch_id: Option<i64>,
     },
     Pause,
     Resume {
@@ -34,6 +38,7 @@ pub enum QueueCommand {
     Stop,
     RetryFailed {
         model: String,
+        parent_batch_id: Option<i64>,
     },
 }
 
@@ -72,6 +77,8 @@ struct Batch {
     final_state: String,
     /// 终态：completed（自然完成）| stopped（用户停止）
     final_status: String,
+    /// 持久化 AnalysisBatch id（本次运行）
+    analysis_batch_id: i64,
     last_error: Option<String>,
     retry_paper: Option<i64>,
     retry_until_iso: Option<String>,
@@ -103,6 +110,7 @@ impl Batch {
             done: false,
             final_state: QS_IDLE.to_string(),
             final_status: "completed".to_string(),
+            analysis_batch_id: 0,
             last_error: None,
             retry_paper: None,
             retry_until_iso: None,
@@ -135,6 +143,28 @@ pub fn coordinator_loop<R: Runtime>(
                 let status = build_status(&conn, &b.final_state, b);
                 let _ = app.emit("ai://progress", &status);
                 let _ = app.emit("ai://finished", &status);
+                // 持久化 AnalysisBatch 终态
+                {
+                    let c = conn.lock().unwrap();
+                    let final_status = if b.final_status == "stopped" {
+                        ABC_STOPPED
+                    } else if b.failed > 0 {
+                        ABC_COMPLETED_WITH_ERRORS
+                    } else {
+                        ABC_COMPLETED
+                    };
+                    if b.final_status == "stopped" {
+                        let _ = db::cancel_queued_items(&c, b.analysis_batch_id);
+                        let _ = db::recompute_analysis_aggregate(&c, b.analysis_batch_id);
+                    }
+                    let _ = db::set_analysis_batch_status(
+                        &c,
+                        b.analysis_batch_id,
+                        final_status,
+                        Some(&db::now_utc()),
+                        b.last_error.as_deref(),
+                    );
+                }
                 // 记录上一次 AI 运行摘要（保留到下一次运行完成，供 idle 展示）
                 {
                     let c = conn.lock().unwrap();
@@ -161,6 +191,7 @@ pub fn coordinator_loop<R: Runtime>(
                 {
                     let c = conn.lock().unwrap();
                     let _ = db::set_setting(&c, "queue.state", &b.final_state);
+                    let _ = db::set_setting(&c, "queue.analysis_batch_id", "0");
                     let _ = db::set_setting(&c, "queue.batch_size", "0");
                     let _ = db::set_setting(&c, "queue.success", "0");
                     let _ = db::set_setting(&c, "queue.failed", "0");
@@ -187,7 +218,12 @@ fn handle_command<R: Runtime>(
     store: &Arc<dyn SecureStore>,
 ) {
     match cmd {
-        QueueCommand::Start { paper_ids, model } => {
+        QueueCommand::Start {
+            paper_ids,
+            model,
+            trigger,
+            source_sync_batch_id,
+        } => {
             if state.as_str() != QS_IDLE {
                 return; // 单一队列：已有批次时不重复启动
             }
@@ -217,15 +253,30 @@ fn handle_command<R: Runtime>(
                     }
                 }
             }
-            let size = {
+            // 收集实际入队的论文 → 创建持久化 AnalysisBatch（items=queued）
+            let (size, batch_id) = {
                 let c = conn.lock().unwrap();
-                db::count_active_queue(&c).unwrap_or(0)
+                let size = db::count_active_queue(&c).unwrap_or(0);
+                if size == 0 {
+                    return;
+                }
+                let queued = db::list_queued_ids(&c, size).unwrap_or_default();
+                let bid = db::create_analysis_batch(
+                    &c,
+                    &trigger,
+                    Some(&model),
+                    Some(analyze::PROMPT_VERSION),
+                    source_sync_batch_id,
+                    None,
+                    &queued,
+                )
+                .unwrap_or(0);
+                (size, bid)
             };
-            if size == 0 {
-                return;
-            }
             let (worker_tx, worker_rx) = mpsc::channel();
-            *batch = Some(Batch::new(size, worker_tx, worker_rx, ctx, (api_key, model)));
+            let mut b = Batch::new(size, worker_tx, worker_rx, ctx, (api_key, model));
+            b.analysis_batch_id = batch_id;
+            *batch = Some(b);
             *state = QS_RUNNING.to_string();
             pick_new.store(true, Ordering::SeqCst);
             persist_queue_state(conn, state, batch.as_ref().unwrap());
@@ -236,6 +287,9 @@ fn handle_command<R: Runtime>(
                 pick_new.store(false, Ordering::SeqCst);
                 *state = QS_PAUSING.to_string();
                 if let Some(b) = batch {
+                    let c = conn.lock().unwrap();
+                    let _ = db::set_analysis_batch_status(&c, b.analysis_batch_id, ABC_PAUSED, None, None);
+                    drop(c);
                     persist_queue_state(conn, state, b);
                     emit_progress(app, conn, state, b);
                 }
@@ -250,6 +304,10 @@ fn handle_command<R: Runtime>(
                 *state = QS_RUNNING.to_string();
                 if let Some(b) = batch {
                     b.creds = (api_key, model);
+                    // 同一 batch id 继续（不创建新 batch）
+                    let c = conn.lock().unwrap();
+                    let _ = db::set_analysis_batch_status(&c, b.analysis_batch_id, ABC_RUNNING, None, None);
+                    drop(c);
                     persist_queue_state(conn, state, b);
                     emit_progress(app, conn, state, b);
                 }
@@ -262,19 +320,31 @@ fn handle_command<R: Runtime>(
                     Some(c) => Arc::new(c),
                     None => return,
                 };
-                let size = {
+                let (size, batch_id) = {
                     let c = conn.lock().unwrap();
-                    db::count_active_queue(&c).unwrap_or(0)
+                    let size = db::count_active_queue(&c).unwrap_or(0);
+                    if size == 0 {
+                        (0, 0)
+                    } else {
+                        let queued = db::list_queued_ids(&c, size).unwrap_or_default();
+                        let bid = db::create_analysis_batch(
+                            &c,
+                            "resumeRecovered",
+                            Some(&model),
+                            Some(analyze::PROMPT_VERSION),
+                            None,
+                            None,
+                            &queued,
+                        )
+                        .unwrap_or(0);
+                        (size, bid)
+                    }
                 };
                 if size > 0 {
                     let (worker_tx, worker_rx) = mpsc::channel();
-                    *batch = Some(Batch::new(
-                        size,
-                        worker_tx,
-                        worker_rx,
-                        ctx,
-                        (api_key, model),
-                    ));
+                    let mut b = Batch::new(size, worker_tx, worker_rx, ctx, (api_key, model));
+                    b.analysis_batch_id = batch_id;
+                    *batch = Some(b);
                     *state = QS_RUNNING.to_string();
                     pick_new.store(true, Ordering::SeqCst);
                     persist_queue_state(conn, state, batch.as_ref().unwrap());
@@ -294,6 +364,10 @@ fn handle_command<R: Runtime>(
             QS_PAUSED => {
                 let c = conn.lock().unwrap();
                 let _ = db::revert_active_to_pending(&c);
+                if let Some(b) = batch {
+                    let _ = db::cancel_queued_items(&c, b.analysis_batch_id);
+                    let _ = db::set_analysis_batch_status(&c, b.analysis_batch_id, ABC_STOPPED, Some(&db::now_utc()), None);
+                }
                 drop(c);
                 if let Some(b) = batch {
                     b.done = true;
@@ -304,7 +378,7 @@ fn handle_command<R: Runtime>(
             }
             _ => {}
         },
-        QueueCommand::RetryFailed { model } => {
+        QueueCommand::RetryFailed { model, parent_batch_id } => {
             if state.as_str() != QS_IDLE {
                 return;
             }
@@ -322,22 +396,33 @@ fn handle_command<R: Runtime>(
                 Some(c) => Arc::new(c),
                 None => return,
             };
-            {
+            // parent：显式传入，否则取最近一个有失败的 batch
+            let parent = parent_batch_id.or_else(|| {
+                let c = conn.lock().unwrap();
+                db::last_analysis_batch_with_failures(&c).unwrap_or(None)
+            });
+            let (size, batch_id) = {
                 let c = conn.lock().unwrap();
                 let _ = db::reset_failed_to_pending(&c);
                 for id in &failed_ids {
                     let _ = db::enqueue_paper(&c, *id);
                 }
-            }
-            let size = failed_ids.len() as i64;
+                let bid = db::create_analysis_batch(
+                    &c,
+                    "retryFailed",
+                    Some(&model),
+                    Some(analyze::PROMPT_VERSION),
+                    None,
+                    parent,
+                    &failed_ids,
+                )
+                .unwrap_or(0);
+                (failed_ids.len() as i64, bid)
+            };
             let (worker_tx, worker_rx) = mpsc::channel();
-            *batch = Some(Batch::new(
-                size,
-                worker_tx,
-                worker_rx,
-                ctx,
-                (api_key, model),
-            ));
+            let mut b = Batch::new(size, worker_tx, worker_rx, ctx, (api_key, model));
+            b.analysis_batch_id = batch_id;
+            *batch = Some(b);
             *state = QS_RUNNING.to_string();
             pick_new.store(true, Ordering::SeqCst);
             persist_queue_state(conn, state, batch.as_ref().unwrap());
@@ -378,6 +463,16 @@ fn step_batch<R: Runtime>(
             } => {
                 let c = conn.lock().unwrap();
                 let _ = db::set_retry_count(&c, paper_id, attempt as i64);
+                let _ = db::set_item_status(
+                    &c,
+                    b.analysis_batch_id,
+                    paper_id,
+                    ABI_RUNNING,
+                    Some(attempt as i64),
+                    None,
+                    None,
+                    None,
+                );
                 drop(c);
                 b.last_progress_at_iso = now_iso();
                 b.retry_paper = Some(paper_id);
@@ -402,12 +497,22 @@ fn step_batch<R: Runtime>(
                         // 状态写回 DB（生产路径 save_analysis 已写；此处幂等，保证 mock/异常路径一致）
                         let c = conn.lock().unwrap();
                         let _ = db::set_paper_status(&c, paper_id, "analysisSucceeded");
+                        let _ = db::set_item_status(
+                            &c, b.analysis_batch_id, paper_id, ABI_SUCCEEDED, None, None, None,
+                            Some(&db::now_utc()),
+                        );
+                        let _ = db::recompute_analysis_aggregate(&c, b.analysis_batch_id);
                         drop(c);
                     }
                     Ok(false) => {
                         b.skipped += 1;
                         let c = conn.lock().unwrap();
                         let _ = db::set_paper_status(&c, paper_id, "analysisSucceeded");
+                        let _ = db::set_item_status(
+                            &c, b.analysis_batch_id, paper_id, ABI_SKIPPED, None, None, None,
+                            Some(&db::now_utc()),
+                        );
+                        let _ = db::recompute_analysis_aggregate(&c, b.analysis_batch_id);
                         drop(c);
                     }
                     Err(e) => {
@@ -415,6 +520,18 @@ fn step_batch<R: Runtime>(
                         b.last_error = Some(e.to_string());
                         let c = conn.lock().unwrap();
                         let _ = db::mark_analysis_failed(&c, paper_id);
+                        let err_type = if e.is_global_config() {
+                            "globalConfig"
+                        } else if e.retryable() {
+                            "retryExhausted"
+                        } else {
+                            "paperError"
+                        };
+                        let _ = db::set_item_status(
+                            &c, b.analysis_batch_id, paper_id, ABI_FAILED, None, Some(err_type),
+                            Some(&e.to_string()), Some(&db::now_utc()),
+                        );
+                        let _ = db::recompute_analysis_aggregate(&c, b.analysis_batch_id);
                         drop(c);
                         // 全局配置错误（无效 Key / 模型 / 请求 schema）：暂停整个队列并提示。
                         if e.is_global_config() {
@@ -450,6 +567,7 @@ fn step_batch<R: Runtime>(
             {
                 let c = conn.lock().unwrap();
                 let _ = db::set_paper_status(&c, pid, ST_ANALYZING);
+                let _ = db::set_item_started(&c, b.analysis_batch_id, pid, 1);
             }
             b.in_flight += 1;
             b.current = Some((pid, now_iso(), title));
@@ -587,6 +705,7 @@ fn persist_queue_state(conn: &Arc<Mutex<Connection>>, state: &str, b: &Batch) {
         let _ = db::set_setting(&c, k, v);
     };
     set("queue.state", state);
+    set("queue.analysis_batch_id", &b.analysis_batch_id.to_string());
     set("queue.batch_size", &b.size.to_string());
     set("queue.success", &b.success.to_string());
     set("queue.failed", &b.failed.to_string());
@@ -639,6 +758,7 @@ fn build_status(conn: &Arc<Mutex<Connection>>, state: &str, b: &Batch) -> AiStat
     };
     AiStatus {
         state: state.to_string(),
+        analysis_batch_id: if b.analysis_batch_id > 0 { Some(b.analysis_batch_id) } else { None },
         batch_size: b.size,
         completed: completed.max(0),
         success: b.success,
@@ -741,8 +861,10 @@ pub fn status_from_db(conn: &Arc<Mutex<Connection>>) -> AiStatus {
     let le = g("queue.last_error");
     let last_run = last_run_from(&c);
 
+    let abi: Option<i64> = g("queue.analysis_batch_id").parse().ok().filter(|i| *i > 0);
     AiStatus {
         state: state.clone(),
+        analysis_batch_id: abi,
         batch_size,
         completed: completed.max(0),
         success,
