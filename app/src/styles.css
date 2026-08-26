@@ -743,10 +743,6 @@ button.full {
   gap: 12px;
   margin-bottom: 10px;
 }
-.rec-tabs {
-  display: flex;
-  gap: 6px;
-}
 .rec-rank {
   margin: 2px 0 4px;
   font-size: 12px;
@@ -802,4 +798,32 @@ button.full {
   flex: 0 1 200px;
   background: var(--panel);
   color: var(--text);
+}
+
+/* ---------- Round 6.3：紧凑集合选择器 / 历史推荐页 ---------- */
+
+.catalog-seg-row {
+  display: inline-flex;
+  gap: 6px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 4px;
+  background: var(--panel);
+}
+.catalog-seg {
+  padding: 6px 16px;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  font-size: 13px;
+  color: var(--muted);
+  cursor: pointer;
+}
+.catalog-seg.selected {
+  background: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+.catalog-seg-meta {
+  margin-top: 6px;
 }

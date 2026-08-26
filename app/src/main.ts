@@ -257,7 +257,6 @@ interface RecommendationRunView {
   items: RecommendationItemView[];
 }
 
-let recTab: "current" | "history" = "current";
 let recHistoryRuns: RecommendationRun[] = [];
 let recSelectedRunId: number | null = null;
 /// 推荐区渲染的 Paper 副本（run 命令返回；供卡片交互查用）
@@ -421,19 +420,23 @@ async function renderCatalogCollections() {
       return;
     }
   }
-  box.innerHTML = `
-    <div class="catalog-grid">
-      ${catalogCollections
-        .map(
-          (c) => `
-        <button class="card catalog-col ${c.code === selectedCatalogCode ? "selected" : ""}" data-catalog-code="${escapeHtml(c.code)}">
-          <div class="title">${escapeHtml(c.name)}<span class="muted small"> · ${c.count} 本期刊</span></div>
-          <div class="muted small">${escapeHtml(c.version === "current" ? "当前版" : "版本 " + c.version)}${c.effectiveFrom ? " · 更新 " + escapeHtml(c.effectiveFrom) : ""}</div>
-          <div class="muted small">${escapeHtml(c.sourceName)}</div>
+  // 紧凑集合选择器（segmented buttons）+ 来源说明一行（无 detail/back 层级）
+  const seg = catalogCollections
+    .map(
+      (c) => `
+        <button class="catalog-seg ${c.code === selectedCatalogCode ? "selected" : ""}" data-catalog-code="${escapeHtml(c.code)}">
+          ${escapeHtml(c.name)} · ${c.count}
         </button>`,
-        )
-        .join("")}
-    </div>`;
+    )
+    .join("");
+  const sel = catalogCollections.find((c) => c.code === selectedCatalogCode);
+  box.innerHTML = `
+    <div class="catalog-seg-row">${seg}</div>
+    <div class="catalog-seg-meta muted small">${
+      sel
+        ? `${escapeHtml(sel.name)}${sel.version !== "current" ? " · " + escapeHtml(sel.version) : ""}${sel.effectiveFrom ? " · 更新 " + escapeHtml(sel.effectiveFrom) : ""} · ${escapeHtml(sel.sourceName)}`
+        : "选择一个期刊集合查看期刊"
+    }</div>`;
 }
 
 /// 渲染选中集合的期刊列表（受搜索框 / 仅显示未订阅过滤；不重新 invoke）。
@@ -442,11 +445,6 @@ function renderCatalogRows() {
   if (!selectedCatalogCode) return;
   const q = ($("catalog-search") as HTMLInputElement).value.trim().toLowerCase();
   const unsubOnly = ($("catalog-unsub-only") as HTMLInputElement).checked;
-  const coll = catalogCollections.find((c) => c.code === selectedCatalogCode);
-  const head = coll
-    ? `<div class="title">${escapeHtml(coll.name)}<span class="muted small"> · ${catalogDetail.length} 本期刊</span></div>
-       <div class="muted small">${escapeHtml(coll.sourceName)}${coll.effectiveFrom ? " · 更新日期 " + escapeHtml(coll.effectiveFrom) : ""}</div>`
-    : "";
   const filtered = catalogDetail.filter((j) => {
     if (unsubOnly && j.subscribed) return false;
     if (q) {
@@ -476,17 +474,12 @@ function renderCatalogRows() {
     })
     .join("");
   box.innerHTML = `
-    <div class="catalog-detail-head">
-      <button class="ghost small" data-action="catalog-back">← 返回</button>
-      ${head}
-    </div>
     <div class="catalog-tools">
-      <button class="ghost small" data-action="catalog-select-all">全选</button>
-      <button class="ghost small" data-action="catalog-select-unsub">仅选择未订阅</button>
-      <button class="ghost small" data-action="catalog-clear">取消全选</button>
+      <button class="ghost small" data-action="catalog-select-unsub">全选未订阅</button>
     </div>
     <ul class="list">${rows || (filtered.length === 0 && (q || unsubOnly) ? '<li class="empty">没有符合条件的期刊</li>' : '<li class="empty">无期刊</li>')}</ul>
     <div class="catalog-actions"><span id="catalog-selected" class="muted small">已选择 0 本</span>
+      <button class="ghost small" data-action="catalog-clear">清除</button>
       <button class="primary" data-action="catalog-subscribe">订阅 0 本</button>
     </div>`;
   updateCatalogSelected();
@@ -626,7 +619,7 @@ function renderTags() {
           <div class="muted small">${escapeHtml(t.description || "（无说明）")}</div>
         </div>
         <button class="ghost small" data-action="tag-toggle" data-id="${t.id}">${t.enabled ? "停用" : "启用"}</button>
-        <button class="ghost small danger" data-action="tag-delete" data-id="${t.id}">删除</button>
+        <button class="ghost small danger" data-action="delete-tag" data-tag-id="${t.id}">删除</button>
       </div>
     `;
     ul.appendChild(li);
@@ -753,53 +746,18 @@ function recCard(v: RecommendationItemView, withRank: boolean): string {
 async function renderRecommend() {
   const list = $("recommend-list");
   const status = $("rec-status");
-  const picker = $("rec-history-picker");
   try {
-    if (recTab === "current") {
-      picker.classList.add("hidden");
-      const view = await invoke<RecommendationRunView>("get_current_recommendation_run");
-      recPapers = view.items.map((i) => i.paper);
-      // 日期状态：cycle_key = 当前推荐日期；cutoff 未到显示"下一批 HH:MM"
-      const [, m, d] = view.run.cycleKey.split("-").map(Number);
-      const dtime = getDailyCheckTime();
-      const now = new Date();
-      const nowHm = now.getHours().toString().padStart(2, "0") + ":" + now.getMinutes().toString().padStart(2, "0");
-      const nextLabel = nowHm < dtime ? ` · 下一批 ${dtime} 自动更新` : "";
-      status.textContent = `推荐 · ${m}月${d}日${nextLabel}`;
-      list.innerHTML = view.items.length
-        ? view.items.map((v) => recCard(v, false)).join("")
-        : '<li class="empty">今天暂无新的推荐论文。同步并完成 AI 分析后，新论文会自动进入今日推荐。</li>';
-    } else {
-      // 历史 tab
-      recHistoryRuns = await invoke<RecommendationRun[]>("list_recommendation_runs");
-      if (!recSelectedRunId || !recHistoryRuns.some((r) => r.id === recSelectedRunId)) {
-        recSelectedRunId = recHistoryRuns.length ? recHistoryRuns[0].id : null;
-      }
-      picker.classList.remove("hidden");
-      picker.innerHTML = `
-        <select id="rec-history-select" class="rec-history-select">
-          ${recHistoryRuns
-            .map(
-              (r) =>
-                `<option value="${r.id}" ${r.id === recSelectedRunId ? "selected" : ""}>${fmtCycle(r.cycleKey)} · ${r.itemCount} 篇${r.status === "open" ? "（进行中）" : ""}</option>`,
-            )
-            .join("") || '<option value="">暂无历史</option>'}
-        </select>`;
-      ($("rec-history-select") as HTMLSelectElement).addEventListener("change", (e) => {
-        recSelectedRunId = parseInt((e.target as HTMLSelectElement).value, 10);
-        renderRecommend();
-      });
-      status.textContent = "历史推荐（当日排名与分数为当日快照）";
-      if (recSelectedRunId == null) {
-        list.innerHTML = '<li class="empty">暂无历史推荐</li>';
-        return;
-      }
-      const view = await invoke<RecommendationRunView>("get_recommendation_run", { id: recSelectedRunId });
-      recPapers = view.items.map((i) => i.paper);
-      list.innerHTML = view.items.length
-        ? view.items.map((v) => recCard(v, true)).join("")
-        : '<li class="empty">该日暂无推荐</li>';
-    }
+    const view = await invoke<RecommendationRunView>("get_current_recommendation_run");
+    recPapers = view.items.map((i) => i.paper);
+    const [, m, d] = view.run.cycleKey.split("-").map(Number);
+    const dtime = getDailyCheckTime();
+    const now = new Date();
+    const nowHm = now.getHours().toString().padStart(2, "0") + ":" + now.getMinutes().toString().padStart(2, "0");
+    const nextLabel = nowHm < dtime ? ` · 下一批 ${dtime} 自动更新` : "";
+    status.textContent = `今日推荐 · ${m}月${d}日 · ${view.items.length} 篇${nextLabel}`;
+    list.innerHTML = view.items.length
+      ? view.items.map((v) => recCard(v, false)).join("")
+      : '<li class="empty">今天暂无新的推荐论文。同步并完成 AI 分析后，新论文会自动进入今日推荐。</li>';
   } catch (err) {
     console.error("renderRecommend 失败:", err);
     list.innerHTML = '<li class="empty">暂无推荐。保存 API Key 后点「AI 分析」，或同步新论文后自动分析。</li>';
@@ -824,6 +782,44 @@ async function refreshRecommendations() {
     console.error("refresh_current_recommendations 失败:", err);
   }
   await renderRecommend();
+}
+
+/// 历史推荐独立页：日期列表 + 选中 run 快照（rank/score 用 snapshot）。
+async function renderRecommendHistory() {
+  const picker = $("rec-history-picker");
+  const list = $("recommend-history-list");
+  try {
+    recHistoryRuns = await invoke<RecommendationRun[]>("list_recommendation_runs");
+    if (!recSelectedRunId || !recHistoryRuns.some((r) => r.id === recSelectedRunId)) {
+      recSelectedRunId = recHistoryRuns.length ? recHistoryRuns[0].id : null;
+    }
+    picker.innerHTML = `
+      <div class="rec-head"><span class="title">历史推荐</span></div>
+      <select id="rec-history-select" class="rec-history-select">
+        ${recHistoryRuns
+          .map(
+            (r) =>
+              `<option value="${r.id}" ${r.id === recSelectedRunId ? "selected" : ""}>${fmtCycle(r.cycleKey)} · ${r.itemCount} 篇${r.status === "open" ? "（进行中）" : ""}</option>`,
+          )
+          .join("") || '<option value="">暂无历史</option>'}
+      </select>`;
+    ($("rec-history-select") as HTMLSelectElement).addEventListener("change", (e) => {
+      recSelectedRunId = parseInt((e.target as HTMLSelectElement).value, 10);
+      renderRecommendHistory();
+    });
+    if (recSelectedRunId == null) {
+      list.innerHTML = '<li class="empty">暂无历史推荐</li>';
+      return;
+    }
+    const view = await invoke<RecommendationRunView>("get_recommendation_run", { id: recSelectedRunId });
+    recPapers = view.items.map((i) => i.paper);
+    list.innerHTML = view.items.length
+      ? view.items.map((v) => recCard(v, true)).join("")
+      : '<li class="empty">该日暂无推荐</li>';
+  } catch (err) {
+    console.error("renderRecommendHistory 失败:", err);
+    list.innerHTML = '<li class="empty">暂无历史推荐</li>';
+  }
 }
 
 function renderFavorites() {
@@ -1124,13 +1120,15 @@ function switchView(name: string) {
   document.querySelectorAll(".nav-item").forEach((t) => t.classList.toggle("active", (t as HTMLElement).dataset.view === name));
   document.querySelectorAll(".view").forEach((v) => v.classList.toggle("active", v.id === `view-${name}`));
   const titles: Record<string, string> = {
-    recommend: "今日推荐", papers: "所有论文", favorites: "收藏", journals: "期刊订阅", tags: "标签", settings: "设置", activity: "活动",
+    recommend: "今日推荐", "recommend-history": "历史推荐", papers: "所有论文", favorites: "收藏", journals: "期刊订阅", tags: "标签", settings: "设置", activity: "活动",
   };
   $("view-title").textContent = titles[name] || name;
   // 进入活动页时渲染 master-detail（数据来自统一 activity + 批次查询）
   if (name === "activity") renderActivityCenter().catch(() => {});
   // 进入期刊订阅页时加载常用期刊目录
   if (name === "journals") renderCatalogCollections();
+  // 进入历史推荐页时渲染快照
+  if (name === "recommend-history") renderRecommendHistory();
 }
 
 interface SyncStartResult {
@@ -1535,12 +1533,17 @@ async function setupListeners() {
     }
     const del = t.closest("[data-action='delete']") as HTMLElement | null;
     if (del) {
-      if (confirm("删除该期刊及其所有论文？")) {
-        await invoke("delete_journal", { id: parseInt(del.dataset.id!, 10) });
-        await loadJournals();
-        await loadPapers();
-        await refreshWorkState();
-      }
+      const ok = await showConfirmModal({
+        title: "删除期刊",
+        message: "删除该期刊及其所有论文？此操作不可撤销。",
+        confirmText: "删除",
+        cancelText: "取消",
+      });
+      if (!ok) return;
+      await invoke("delete_journal", { id: parseInt(del.dataset.id!, 10) });
+      await loadJournals();
+      await loadPapers();
+      await refreshWorkState();
       return;
     }
     const fav = t.closest("[data-action='fav']") as HTMLElement | null;
@@ -1603,12 +1606,19 @@ async function setupListeners() {
       }
       return;
     }
-    const tagDelete = t.closest("[data-action='tag-delete']") as HTMLElement | null;
+    const tagDelete = t.closest("[data-action='delete-tag']") as HTMLElement | null;
     if (tagDelete) {
-      if (confirm("删除该标签？")) {
-        await invoke("delete_tag", { id: parseInt(tagDelete.dataset.id!, 10) });
-        await loadTags();
-      }
+      const id = parseInt(tagDelete.dataset.tagId!, 10);
+      const tg = tags.find((x) => x.id === id);
+      const ok = await showConfirmModal({
+        title: "删除标签",
+        message: `删除标签？\n“${tg ? escapeHtml(tg.name) : "该标签"}”将从研究标签中删除。`,
+        confirmText: "删除",
+        cancelText: "取消",
+      });
+      if (!ok) return;
+      await invoke("delete_tag", { id });
+      await loadTags();
       return;
     }
     // AI 控制
@@ -1626,29 +1636,13 @@ async function setupListeners() {
       return;
     }
     // Catalog 详情操作（统一事件委托；返回按钮不再依赖 render 后绑定）
-    if (t.closest("[data-action='catalog-back']")) {
-      selectedCatalogCode = null;
-      catalogChecked.clear();
-      ($("catalog-search") as HTMLInputElement).value = "";
-      ($("catalog-unsub-only") as HTMLInputElement).checked = false;
-      $("catalog-detail").classList.add("hidden");
-      renderCatalogCollections();
-      return;
-    }
-    if (t.closest("[data-action='catalog-select-all']")) {
+    if (t.closest("[data-action='catalog-select-unsub']")) {
+      // 全选未订阅：勾选所有未订阅项（已订阅 disabled 不可选）
       catalogChecked.clear();
       document.querySelectorAll("#catalog-detail input[type=checkbox]:not(:disabled)").forEach((el) => {
         const id = parseInt((el as HTMLInputElement).dataset.journalId!, 10);
         if (!isNaN(id)) catalogChecked.add(id);
         (el as HTMLInputElement).checked = true;
-      });
-      updateCatalogSelected();
-      return;
-    }
-    if (t.closest("[data-action='catalog-select-unsub']")) {
-      catalogChecked.clear();
-      document.querySelectorAll("#catalog-detail input[type=checkbox]:not(:disabled)").forEach((el) => {
-        (el as HTMLInputElement).checked = false;
       });
       updateCatalogSelected();
       return;
@@ -1724,18 +1718,6 @@ window.addEventListener("DOMContentLoaded", () => {
     }
   });
   $("btn-save-settings").addEventListener("click", saveSettings);
-  $("rec-tab-current").addEventListener("click", () => {
-    recTab = "current";
-    $("rec-tab-current").classList.add("active");
-    $("rec-tab-history").classList.remove("active");
-    renderRecommend();
-  });
-  $("rec-tab-history").addEventListener("click", () => {
-    recTab = "history";
-    $("rec-tab-history").classList.add("active");
-    $("rec-tab-current").classList.remove("active");
-    renderRecommend();
-  });
   $("journal-search").addEventListener("input", renderJournals);
   $("catalog-search").addEventListener("input", () => {
     if (selectedCatalogCode) renderCatalogRows();
