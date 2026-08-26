@@ -132,9 +132,20 @@ fn sync_task<R: Runtime>(app: &AppHandle<R>, db: &Db, ids: Option<Vec<i64>>) {
     let _ = app.emit("sync://done", &report);
 }
 
+/// worker 线程启动器类型（可注入，便于测试模拟 spawn 失败）。
+type WorkerSpawner = fn(Box<dyn FnOnce() + Send + 'static>) -> Result<(), String>;
+
+/// 默认启动器：使用 std::thread::Builder::spawn（显式返回 Result，失败不 panic）。
+fn default_spawner(worker: Box<dyn FnOnce() + Send + 'static>) -> Result<(), String> {
+    std::thread::Builder::new()
+        .name("cowpaper-sync".to_string())
+        .spawn(move || worker())
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
 /// 所有同步入口的唯一通道：经 SyncCoordinator 获取全局锁。
 /// 已运行 → 返回 syncAlreadyRunning，不启动第二个线程。
-/// panic-safe：RAII SyncGuard 保证无论任务正常返回还是 panic 都释放锁。
 fn start_sync_task<R: Runtime>(
     app: &AppHandle<R>,
     db: &Db,
@@ -142,14 +153,33 @@ fn start_sync_task<R: Runtime>(
     trigger: SyncTrigger,
     ids: Option<Vec<i64>>,
 ) -> SyncStartResult {
+    start_sync_task_with(app, db, sync, trigger, ids, default_spawner)
+}
+
+/// 带可注入 spawner 的实现（测试用 double 模拟 spawn 失败）。
+/// panic-safe 生命周期：try_acquire 成功 → 立即创建 SyncGuard（调用方作用域）→
+/// move 进 worker 闭包。因此：
+/// - spawn 失败：worker 闭包（含 guard）被丢弃 → guard Drop → release，返回 syncWorkerStartFailed；
+/// - worker panic：guard 在 unwind 时 Drop → release；
+/// - worker 正常结束：guard 在闭包结束时 Drop → release。
+/// 无需手写多个 release 分支。
+fn start_sync_task_with<R: Runtime>(
+    app: &AppHandle<R>,
+    db: &Db,
+    sync: &Arc<SyncCoordinator>,
+    trigger: SyncTrigger,
+    ids: Option<Vec<i64>>,
+    spawner: WorkerSpawner,
+) -> SyncStartResult {
     match sync.try_acquire(trigger) {
         Some(started_at) => {
+            // guard 在 spawn 之前创建：覆盖 try_acquire 之后的整个生命周期
+            let guard = SyncGuard::new(sync.clone());
             let app2 = app.clone();
             let db2 = db.clone();
-            let sync2 = sync.clone();
-            std::thread::spawn(move || {
-                // RAII guard：闭包正常结束或 panic 时都会 release()
-                let _guard = SyncGuard::new(sync2);
+            let app_err = app2.clone(); // spawn 失败分支使用（app2 将被 move 进 worker）
+            let worker: Box<dyn FnOnce() + Send + 'static> = Box::new(move || {
+                let _guard = guard; // move 进 worker：闭包结束 / panic 时 Drop → release
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     sync_task(&app2, &db2, ids);
                 }));
@@ -157,14 +187,27 @@ fn start_sync_task<R: Runtime>(
                     // 记录安全错误并发出同步失败事件；不静默吞掉 panic
                     let msg = panic_summary(&payload);
                     let _ = app2.emit("sync://error", format!("同步任务异常终止：{}", msg));
-                    std::panic::resume_unwind(payload); // 触发 _guard drop → release
+                    std::panic::resume_unwind(payload); // 触发 _guard Drop → release
                 }
             });
-            SyncStartResult {
-                started: true,
-                reason: "started".to_string(),
-                trigger: Some(trigger.as_str().to_string()),
-                started_at: Some(started_at),
+            match spawner(worker) {
+                Ok(()) => SyncStartResult {
+                    started: true,
+                    reason: "started".to_string(),
+                    trigger: Some(trigger.as_str().to_string()),
+                    started_at: Some(started_at),
+                },
+                Err(e) => {
+                    // spawn 失败：worker 闭包（含 guard）被丢弃 → guard Drop → release。
+                    // coordinator 恢复 idle，返回明确错误，不影响后续再次同步。
+                    let _ = app_err.emit("sync://error", format!("同步 worker 启动失败：{}", e));
+                    SyncStartResult {
+                        started: false,
+                        reason: "syncWorkerStartFailed".to_string(),
+                        trigger: None,
+                        started_at: None,
+                    }
+                }
             }
         }
         None => SyncStartResult {

@@ -1158,3 +1158,41 @@ fn test_keychain_test_namespace_isolation() {
     assert_ne!(test.service, PRODUCTION_SERVICE);
     assert_ne!(test.account, PRODUCTION_ACCOUNT);
 }
+
+/// spawn worker 失败路径：注入返回 Err 的 spawner，验证 guard 仍被 release。
+#[test]
+fn test_sync_worker_spawn_failure_releases() {
+    use std::sync::{Arc, Mutex};
+
+    use crate::models::SyncTrigger;
+    use crate::sync_coordinator::SyncCoordinator;
+
+    // 测试 double：模拟操作系统 thread creation 失败
+    fn failing_spawner(
+        _worker: Box<dyn FnOnce() + Send + 'static>,
+    ) -> Result<(), String> {
+        Err("simulated thread spawn failure".into())
+    }
+
+    let app = tauri::test::mock_builder()
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .expect("mock app");
+    let handle = app.handle().clone();
+    let conn = Arc::new(Mutex::new(mem_db()));
+    let sync = Arc::new(SyncCoordinator::new());
+
+    let result = crate::start_sync_task_with(
+        &handle,
+        &conn,
+        &sync,
+        SyncTrigger::Manual,
+        None,
+        failing_spawner,
+    );
+    assert!(!result.started, "spawn 失败应 started=false");
+    assert_eq!(result.reason, "syncWorkerStartFailed");
+    assert!(!sync.is_running(), "spawn 失败后必须 release（running=false）");
+    // 下一次 acquire 仍成功（不影响后续同步）
+    assert!(sync.try_acquire(SyncTrigger::Manual).is_some());
+    sync.release();
+}
