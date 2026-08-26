@@ -880,9 +880,84 @@ async function resumeAi() {
   await invoke("resume_ai", { model: getModel() });
 }
 async function stopAi() {
-  if (confirm("停止本次分析？已完成结果会保留，未完成论文回到待分析。")) {
+  const ok = await showConfirmModal({
+    title: "停止 AI 分析",
+    message: "停止本次分析？\n已完成结果会保留，未完成论文回到待分析。",
+    confirmText: "停止",
+    cancelText: "取消",
+  });
+  if (!ok) return; // 正常取消
+  try {
     await invoke("stop_ai");
+  } catch (err) {
+    setStatus("无法停止分析", "error");
+    console.error("stop_ai 调用失败:", err);
   }
+}
+
+// ---------- 应用内确认 Modal（替代 WebView 原生 confirm/alert/prompt） ----------
+
+interface ConfirmModalOptions {
+  title: string;
+  message: string;
+  confirmText?: string;
+  cancelText?: string;
+}
+
+/// 轻量应用内确认 Modal，返回 Promise<boolean>。
+/// 确认 → true；取消（取消按钮 / Escape / 点击遮罩）→ false。
+/// 不依赖 window.confirm/alert/prompt：macOS WKWebView 下原生 dialog 不可靠。
+function showConfirmModal(opts: ConfirmModalOptions): Promise<boolean> {
+  const overlay = $("confirm-modal");
+  const titleEl = $("confirm-modal-title");
+  const msgEl = $("confirm-modal-message");
+  const okBtn = $("confirm-modal-ok") as HTMLButtonElement;
+  const cancelBtn = $("confirm-modal-cancel") as HTMLButtonElement;
+  titleEl.textContent = opts.title;
+  msgEl.textContent = opts.message;
+  okBtn.textContent = opts.confirmText ?? "确认";
+  cancelBtn.textContent = opts.cancelText ?? "取消";
+  return new Promise<boolean>((resolve) => {
+    let done = false;
+    const finish = (result: boolean) => {
+      if (done) return;
+      done = true;
+      overlay.classList.add("hidden");
+      okBtn.removeEventListener("click", onOk);
+      cancelBtn.removeEventListener("click", onCancel);
+      overlay.removeEventListener("click", onOverlay);
+      window.removeEventListener("keydown", onKey);
+      resolve(result);
+    };
+    function onOk() {
+      finish(true);
+    }
+    function onCancel() {
+      finish(false);
+    }
+    function onOverlay(e: MouseEvent) {
+      if (e.target === overlay) finish(false);
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") finish(false);
+    }
+    okBtn.addEventListener("click", onOk);
+    cancelBtn.addEventListener("click", onCancel);
+    overlay.addEventListener("click", onOverlay);
+    window.addEventListener("keydown", onKey);
+    overlay.classList.remove("hidden");
+    cancelBtn.focus();
+  });
+}
+
+/// AI 分析确认：数量 + 费用提示，所有手动 AI 入口统一经它确认。
+function confirmAiAnalysis(count: number): Promise<boolean> {
+  return showConfirmModal({
+    title: "开始 AI 分析",
+    message: `当前有 ${count} 篇论文待分析。\n分析将调用 DeepSeek API，可能产生 API 使用费用。`,
+    confirmText: "开始分析",
+    cancelText: "取消",
+  });
 }
 
 /// 统一的重试失败入口（可指定来源批次）。
@@ -902,28 +977,44 @@ async function retryFailed(parentBatchId: number | null = null): Promise<boolean
 }
 
 /// 唯一的手动 AI 入口（顶部按钮 / Activity 待处理 / 所有论文轻入口都调它）。
-/// 边界：Key 未设置 / 已有运行 batch / 无待分析论文 / invoke 失败，全部显式处理。
+/// 确认环节使用应用内 Modal（WebView 原生 confirm 不可靠），整个调用链有顶层 try/catch，
+/// 任何环节失败都产生明确反馈，不允许 silent failure。
 async function manualAnalyze(): Promise<boolean> {
-  if (!(await hasKey())) {
-    setStatus("请先在设置中配置 DeepSeek API Key", "error");
-    switchView("settings");
+  try {
+    if (!(await hasKey())) {
+      setStatus("请先在设置中配置 DeepSeek API Key", "error");
+      switchView("settings");
+      return false;
+    }
+    if (aiStatus.state !== "idle" || aiStatus.remaining > 0) {
+      setStatus("已有 AI 分析任务正在运行", "error");
+      switchView("activity");
+      await renderActivityCenter();
+      return false;
+    }
+    let pending: number;
+    try {
+      pending = await invoke<number>("get_pending_ai_count");
+    } catch (err) {
+      setStatus("无法获取待分析论文数，请稍后重试", "error");
+      console.error("get_pending_ai_count 调用失败:", err);
+      return false;
+    }
+    if (pending <= 0) {
+      setStatus("当前没有待分析论文", "done");
+      return false;
+    }
+    // 应用内确认 Modal；用户取消 = 正常取消：不建 batch、不调用 DeepSeek、不显示错误
+    const confirmed = await confirmAiAnalysis(pending);
+    if (!confirmed) return false;
+    // 立即反馈：不等首篇 DeepSeek 返回、不等 ai://progress
+    setStatus(`正在准备 AI 分析 · ${pending} 篇`, "running");
+    return await startAnalyze(null, "manual");
+  } catch (err) {
+    setStatus("无法开始 AI 分析", "error");
+    console.error("manualAnalyze 失败:", err);
     return false;
   }
-  if (aiStatus.state !== "idle" || aiStatus.remaining > 0) {
-    setStatus("已有 AI 分析任务正在运行", "error");
-    switchView("activity");
-    await renderActivityCenter();
-    return false;
-  }
-  const pending = await invoke<number>("get_pending_ai_count").catch(() => 0);
-  if (pending <= 0) {
-    setStatus("当前没有待分析论文", "done");
-    return false;
-  }
-  if (!confirm(`待分析 ${pending} 篇，将调用 DeepSeek 产生费用。开始分析？`)) return false;
-  // 立即反馈：不等首篇 DeepSeek 返回
-  setStatus(`正在准备 AI 分析 · ${pending} 篇`, "running");
-  return await startAnalyze(null, "manual");
 }
 
 async function addJournalHandler(e: Event) {

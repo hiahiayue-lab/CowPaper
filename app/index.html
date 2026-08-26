@@ -164,5 +164,17 @@
         </section>
       </main>
     </div>
+
+    <!-- 应用内确认 Modal：替代 WebView 原生 confirm/alert/prompt（WKWebView 下原生 dialog 不可靠） -->
+    <div id="confirm-modal" class="modal-overlay hidden">
+      <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="confirm-modal-title">
+        <h3 id="confirm-modal-title" class="modal-title"></h3>
+        <p id="confirm-modal-message" class="modal-message"></p>
+        <div class="modal-actions">
+          <button id="confirm-modal-cancel" class="ghost">取消</button>
+          <button id="confirm-modal-ok" class="primary">确认</button>
+        </div>
+      </div>
+    </div>
   </body>
 </html>
