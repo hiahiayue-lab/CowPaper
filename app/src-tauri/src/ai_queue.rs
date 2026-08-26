@@ -119,7 +119,7 @@ impl Batch {
 }
 
 /// 全局唯一的 AI Queue 协调器主循环（应用生命周期内常驻）。
-/// API Key 由 SecureStore（macOS Keychain）读取，前端不传 Key。
+/// API Key 由 SecureStore（本地 secret 文件）读取，前端不传 Key。
 pub fn coordinator_loop<R: Runtime>(
     conn: Arc<Mutex<Connection>>,
     cmd_rx: Receiver<QueueCommand>,

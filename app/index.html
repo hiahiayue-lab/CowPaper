@@ -26,12 +26,11 @@
         <header class="topbar">
           <div class="topbar-title" id="view-title">今日推荐</div>
           <div class="topbar-actions">
-            <button id="ai-badge" class="ai-badge idle" title="AI 分析状态详情">AI</button>
             <span id="status" class="status idle">就绪</span>
           </div>
         </header>
 
-        <!-- 工作中心：统一状态 + 主操作（所有主页面共享） -->
+        <!-- 工作中心：唯一状态 + 主操作（所有主页面共享） -->
         <div id="work-center" class="work-center">
           <div id="work-status" class="work-status idle" title="查看活动中心"></div>
           <div class="work-actions">
@@ -39,8 +38,6 @@
             <button id="btn-ai-main" class="ghost">AI 分析</button>
           </div>
         </div>
-
-        <div id="ai-panel" class="ai-panel hidden"></div>
 
         <section id="view-recommend" class="view active">
           <div id="backlog-banner" class="banner hidden"></div>
@@ -96,9 +93,10 @@
           <div class="settings">
             <h3>DeepSeek</h3>
             <div class="settings-row">
-              <label for="api-key">API Key（保存到 macOS 钥匙串）</label>
+              <label for="api-key">DeepSeek API Key</label>
               <input id="api-key" type="password" placeholder="sk-..." autocomplete="off" />
               <span id="key-status" class="muted small"></span>
+              <p class="muted small">仅保存在此 Mac 的 CowPaper 本地应用数据中，仅当前用户可读。</p>
             </div>
             <div class="settings-row">
               <label for="model">模型</label>

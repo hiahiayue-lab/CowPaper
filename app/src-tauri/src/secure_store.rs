@@ -1,15 +1,18 @@
-//! API Key 安全存储抽象。
-//! 生产实现使用 macOS Keychain（keyring / Security framework）；
-//! 测试使用内存 Mock。Key 绝不写入 SQLite / app_state / 日志。
+//! API Key 本地文件存储（Round 5A.1）。
 //!
-//! 命名空间隔离：生产使用 `production()` 的正式 service/account；
-//! 测试必须使用完全独立的 test namespace（唯一后缀），
-//! 绝不触碰 production credential。
+//! 已停止使用 macOS Keychain：避免系统不定期弹出钥匙串授权弹窗。
+//! 生产实现 `LocalFileSecretStore` 把 Key 保存在本地 JSON 文件
+//! （Application Support/CowPaper/secrets.json），目录 0700、文件 0600，
+//! 通过 temp 文件 + fsync + atomic rename 写入，避免崩溃产生半截 JSON。
+//!
+//! Key 绝不写入 SQLite / app_state / localStorage / 日志。
+//! 前端只能调用 save/has/delete/test 命令，无法读取完整 Key（无 get 命令）。
 
-#[cfg(test)]
-use std::sync::Mutex;
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
-/// 安全存储抽象：生产用 macOS Keychain，测试用 Mock。
+/// 安全存储抽象：生产用本地文件，测试用临时目录/内存。
 pub trait SecureStore: Send + Sync {
     fn save(&self, key: &str) -> Result<(), String>;
     fn get(&self) -> Result<Option<String>, String>;
@@ -17,83 +20,162 @@ pub trait SecureStore: Send + Sync {
     fn has(&self) -> bool;
 }
 
-/// 生产命名空间（正式 CowPaper DeepSeek Key 所在）。
-pub const PRODUCTION_SERVICE: &str = "com.cowpaper.app";
-pub const PRODUCTION_ACCOUNT: &str = "deepseek_api_key";
+const SECRETS_FILENAME: &str = "secrets.json";
+const KEY_FIELD: &str = "deepseek_api_key";
 
-/// macOS Keychain 实现（Security framework，经 keyring crate）。
-/// service/account 可注入：生产用 production()，测试用唯一 test namespace。
-pub struct KeychainStore {
-    pub(crate) service: String,
-    pub(crate) account: String,
+/// 本地 secret 文件存储（production）。
+pub struct LocalFileSecretStore {
+    file: PathBuf,
 }
 
-impl KeychainStore {
-    /// 正式命名空间：生产 App 保存/读取真实 DeepSeek Key。
-    pub fn production() -> Self {
-        KeychainStore {
-            service: PRODUCTION_SERVICE.to_string(),
-            account: PRODUCTION_ACCOUNT.to_string(),
+impl LocalFileSecretStore {
+    pub fn new(dir: &Path) -> Self {
+        LocalFileSecretStore {
+            file: dir.join(SECRETS_FILENAME),
         }
     }
 
-    /// 测试命名空间：必须与 production service/account 完全不同。
-    /// 仅测试构建使用（live/keychain 冒烟测试）。
-    #[allow(dead_code)]
-    pub fn with_namespace(service: &str, account: &str) -> Self {
-        KeychainStore {
-            service: service.to_string(),
-            account: account.to_string(),
+    fn load_map(&self) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+        match fs::read(&self.file) {
+            Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|v| v.as_object().cloned())
+                .ok_or_else(|| "secret 文件损坏或格式无效".to_string()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(serde_json::Map::new()),
+            Err(e) => Err(format!("读取 secret 文件失败: {}", e)),
         }
     }
 
-    fn entry(&self) -> Result<keyring::Entry, String> {
-        keyring::Entry::new(&self.service, &self.account)
-            .map_err(|e| format!("Keychain 打开失败: {}", e))
+    fn write_map(&self, map: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+        let dir = self
+            .file
+            .parent()
+            .ok_or_else(|| "secret 文件无父目录".to_string())?;
+        fs::create_dir_all(dir).map_err(|e| format!("创建目录失败: {}", e))?;
+        // 目录权限 0700（仅当前用户）
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+        }
+        // 安全写入：temp 文件 → 权限 0600 → flush + sync → atomic rename
+        let tmp = self.file.with_extension("tmp");
+        {
+            let mut f = fs::File::create(&tmp).map_err(|e| format!("创建临时文件失败: {}", e))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = f.set_permissions(fs::Permissions::from_mode(0o600));
+            }
+            serde_json::to_writer(&mut f, map).map_err(|e| format!("写入 secret 失败: {}", e))?;
+            f.flush().map_err(|e| format!("flush 失败: {}", e))?;
+            f.sync_all().map_err(|e| format!("sync 失败: {}", e))?;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
+        }
+        fs::rename(&tmp, &self.file).map_err(|e| format!("原子替换 secret 失败: {}", e))?;
+        Ok(())
     }
 }
 
-impl SecureStore for KeychainStore {
+impl SecureStore for LocalFileSecretStore {
     fn save(&self, key: &str) -> Result<(), String> {
-        self.entry()?
-            .set_password(key)
-            .map_err(|e| format!("Keychain 写入失败: {}", e))
+        // 文件损坏时从空 map 重建（允许用户重新保存恢复），不静默丢 Key
+        let mut map = self.load_map().unwrap_or_default();
+        map.insert(KEY_FIELD.to_string(), serde_json::Value::String(key.to_string()));
+        self.write_map(&map)
     }
     fn get(&self) -> Result<Option<String>, String> {
-        match self.entry()?.get_password() {
-            Ok(v) => Ok(Some(v)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(e) => Err(format!("Keychain 读取失败: {}", e)),
-        }
+        let map = self.load_map()?;
+        Ok(map
+            .get(KEY_FIELD)
+            .and_then(|v| v.as_str())
+            .map(str::to_string))
     }
     fn delete(&self) -> Result<(), String> {
-        match self.entry()?.delete_credential() {
-            Ok(()) => Ok(()),
-            Err(keyring::Error::NoEntry) => Ok(()),
-            Err(e) => Err(format!("Keychain 删除失败: {}", e)),
-        }
+        let mut map = self.load_map().unwrap_or_default();
+        map.remove(KEY_FIELD);
+        self.write_map(&map)
     }
     fn has(&self) -> bool {
         self.get().map(|o| o.is_some()).unwrap_or(false)
     }
 }
 
-/// 测试用内存实现（仅测试构建；不得用于生产）。
+/// 测试用临时目录实现（绝不触碰用户真实目录）。
+/// 保存目录以便 restart 测试用同一路径重新打开。
+#[cfg(test)]
+pub struct TempDirSecretStore {
+    inner: LocalFileSecretStore,
+    dir: PathBuf,
+}
+
+#[cfg(test)]
+impl TempDirSecretStore {
+    pub fn new() -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "cowpaper-secrets-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        Self::new_in(&dir)
+    }
+
+    pub fn new_in(dir: &Path) -> Self {
+        let _ = fs::create_dir_all(dir);
+        TempDirSecretStore {
+            inner: LocalFileSecretStore::new(dir),
+            dir: dir.to_path_buf(),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.dir
+    }
+}
+
+#[cfg(test)]
+impl Default for TempDirSecretStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+impl SecureStore for TempDirSecretStore {
+    fn save(&self, key: &str) -> Result<(), String> {
+        self.inner.save(key)
+    }
+    fn get(&self) -> Result<Option<String>, String> {
+        self.inner.get()
+    }
+    fn delete(&self) -> Result<(), String> {
+        self.inner.delete()
+    }
+    fn has(&self) -> bool {
+        self.inner.has()
+    }
+}
+
+/// 测试用内存实现（仅测试构建；ai_queue 测试使用，不落盘）。
 #[cfg(test)]
 pub struct MockStore {
-    inner: Mutex<Option<String>>,
+    inner: std::sync::Mutex<Option<String>>,
 }
 
 #[cfg(test)]
 impl MockStore {
     pub fn new() -> Self {
         MockStore {
-            inner: Mutex::new(None),
+            inner: std::sync::Mutex::new(None),
         }
     }
     pub fn with_key(k: &str) -> Self {
         MockStore {
-            inner: Mutex::new(Some(k.to_string())),
+            inner: std::sync::Mutex::new(Some(k.to_string())),
         }
     }
 }
@@ -113,55 +195,5 @@ impl SecureStore for MockStore {
     }
     fn has(&self) -> bool {
         self.inner.lock().unwrap().is_some()
-    }
-}
-
-/// 清理守卫：即使测试 panic 也会删除自己创建的 test credential。
-#[cfg(test)]
-struct TestCleanup {
-    service: String,
-    account: String,
-}
-
-#[cfg(test)]
-impl Drop for TestCleanup {
-    fn drop(&mut self) {
-        let store = KeychainStore::with_namespace(&self.service, &self.account);
-        let _ = store.delete();
-    }
-}
-
-/// 真实 Keychain 冒烟测试（ignored，需钥匙串访问）：
-/// 使用唯一 test namespace（com.cowpaper.test.<unique>），
-/// 保存/读取/删除测试值，绝不触碰 production namespace。
-#[cfg(test)]
-pub fn keychain_smoke() -> Result<String, String> {
-    let unique = format!(
-        "{}-{}",
-        std::process::id(),
-        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
-    );
-    let service = format!("com.cowpaper.test.{}", unique);
-    let account = "cowpaper-test-credential";
-    debug_assert_ne!(service, PRODUCTION_SERVICE);
-    debug_assert_ne!(account, PRODUCTION_ACCOUNT);
-
-    let store = KeychainStore::with_namespace(&service, &account);
-    let _cleanup = TestCleanup {
-        service: service.clone(),
-        account: account.to_string(),
-    };
-
-    let test_value = "cowpaper-keychain-smoke";
-    store.save(test_value)?;
-    let got = store.get()?.unwrap_or_default();
-    store.delete()?;
-    if got == test_value {
-        Ok(format!(
-            "真实 macOS Keychain save/get/delete 验证通过（独立 test namespace: {}）",
-            service
-        ))
-    } else {
-        Err("Keychain 读写值不一致".to_string())
     }
 }

@@ -200,7 +200,6 @@ interface ActivityState {
   waitingForAbstract: number;
 }
 
-const KEY_NAME = "cowpaper_api_key"; // 旧版 localStorage Key（仅用于一次性迁移，不再写入）
 const MODEL_NAME = "cowpaper_model";
 const DEFAULT_MODEL = "deepseek-v4-flash"; // 已验证可用的模型
 
@@ -288,25 +287,12 @@ async function hasKey(): Promise<boolean> {
   }
 }
 
-/// 一次性迁移：把旧 localStorage Key 写入 Keychain，写入成功后才删除 localStorage。
-async function migrateLegacyKey() {
-  const legacy = localStorage.getItem(KEY_NAME);
-  if (!legacy) return;
-  try {
-    if (!(await hasKey())) {
-      await invoke("save_api_key", { key: legacy });
-    }
-    localStorage.removeItem(KEY_NAME); // 只有 Keychain 写入成功后才删旧 Key
-  } catch {
-    // 写入失败：保留 localStorage，下次启动再试；不在这里输出 Key
-  }
-}
-
+/// Key 状态（本地 secret 文件，经 Rust 命令；前端无法读取完整 Key）。
 async function refreshKeyStatus() {
   const el = $("key-status");
   if (!el) return;
   const has = await hasKey();
-  el.textContent = has ? "✓ 已保存到 macOS 钥匙串" : "未保存 Key";
+  el.textContent = has ? "✓ 已保存在本机" : "尚未配置 API Key";
   el.className = has ? "ok small" : "muted small";
 }
 
@@ -538,117 +524,6 @@ function renderFavorites() {
     : '<li class="empty">暂无收藏。在论文卡片上点 ☆ 收藏。</li>';
 }
 
-// ---------- AI 状态徽标 / 面板 / 积压 ----------
-
-/// AI 徽标：唯一 pending 来源是 activity.pendingAnalysis（实时 DB 计数），
-/// 绝不从 papers 数组重算，杜绝"上次批次 total"被误读为"待处理 N"。
-function renderAiBadge() {
-  const badge = $("ai-badge");
-  const s = aiStatus;
-  const pending = activity.pendingAnalysis;
-  const failed = activity.analysisFailed;
-  let text: string;
-  let cls = s.state;
-  if (s.state === "running" || s.state === "pausing") {
-    text = `AI ${s.completed}/${s.batchSize}`;
-  } else if (s.state === "paused") {
-    text = `AI 已暂停 · ${s.completed}/${s.batchSize}`;
-  } else if (s.state === "stopping") {
-    text = "AI 停止中";
-  } else if (s.remaining > 0) {
-    text = `AI 未完成 ${s.remaining}`;
-  } else if (failed > 0) {
-    text = `AI 失败 ${failed}`;
-    cls = "has-error";
-  } else if (pending > 0) {
-    text = `待分析 ${pending}`;
-    cls = "idle-has";
-  } else {
-    text = "✓ 已更新";
-  }
-  badge.textContent = text;
-  badge.className = `ai-badge ${cls}`;
-}
-
-function renderAiPanel() {
-  const panel = $("ai-panel");
-  const s = aiStatus;
-  const pending = activity.pendingAnalysis;
-  const failed = activity.analysisFailed;
-
-  // 上一次运行摘要（§七：批次结束后保留；stopped 时表达"已停止·已处理·剩余"）
-  const lastRun = s.lastRun
-    ? (() => {
-        const lr = s.lastRun!;
-        if (lr.finalStatus === "stopped") {
-          const processed = lr.total - lr.remaining;
-          return `<div class="ai-last-run muted small">任务已停止 · 已处理 ${processed}/${lr.total} · 剩余 ${lr.remaining}（成功 ${lr.success} · 失败 ${lr.failed}）</div>`;
-        }
-        return `<div class="ai-last-run muted small">上次分析：${lr.total} 篇 · 成功 ${lr.success} · 失败 ${lr.failed}${lr.finishedAt ? " · 完成于 " + new Date(lr.finishedAt).toLocaleTimeString() : ""}</div>`;
-      })()
-    : "";
-
-  // 任何状态都渲染有意义内容，绝不允许空白横条
-  if (s.state === "idle" && s.remaining === 0 && failed === 0 && pending === 0) {
-    panel.innerHTML = `
-      <div class="ai-panel-head"><strong>AI 分析</strong><span class="muted small">当前无待处理任务</span></div>
-      ${lastRun}`;
-    return;
-  }
-  if (s.state === "idle" && s.remaining === 0 && failed === 0) {
-    panel.innerHTML = `
-      <div class="ai-panel-head"><strong>AI 分析</strong><span class="muted small">待分析 ${pending} 篇</span></div>
-      ${lastRun}
-      <div class="ai-panel-actions"><button class="ghost small" data-action="ai-backlog">开始分析</button></div>`;
-    return;
-  }
-  if (s.state === "idle" && s.remaining === 0 && failed > 0) {
-    const reason = s.lastError
-      ? `<div class="ai-error">最近失败原因：${escapeHtml(s.lastError)}</div>`
-      : "";
-    panel.innerHTML = `
-      <div class="ai-panel-head"><strong>AI 分析</strong><span class="muted small">${failed} 篇分析失败</span></div>
-      ${reason}${lastRun}
-      <div class="ai-panel-actions"><button class="ghost small" data-action="ai-retry">重试失败论文</button></div>`;
-    return;
-  }
-
-  // running / pausing / paused / stopping：全量状态
-  const eta = s.etaSeconds != null ? `预计剩余约 ${fmtDur(s.etaSeconds)}（估算）` : "样本不足，暂无 ETA";
-  const current = s.currentPaperTitle
-    ? `<div class="ai-current"><span class="muted small">当前：</span>${escapeHtml(s.currentPaperTitle)}</div>`
-    : "";
-  const retry = s.retryWaiting ? `<div class="ai-retry">因网络 / API 限流等待重试</div>` : "";
-  const err = s.lastError ? `<div class="ai-error">${escapeHtml(s.lastError)}</div>` : "";
-  const slow =
-    s.state === "running" && s.currentPaperStartedAt
-      ? isStale(s.currentPaperStartedAt, 60000)
-        ? `<div class="ai-warn">当前请求耗时较长（超过 1 分钟），请检查网络或 API 状态。</div>`
-        : ""
-      : "";
-
-  panel.innerHTML = `
-    <div class="ai-panel-head">
-      <strong>AI 分析</strong>
-      <span class="muted small">总计 ${s.batchSize} · 已完成 ${s.completed} · 成功 ${s.success} · 失败 ${s.failed} · 跳过 ${s.skipped} · 剩余 ${s.remaining} · 并发 2</span>
-    </div>
-    <div class="ai-panel-meta muted small">
-      已运行 ${fmtDur(s.elapsedSeconds)} · 最近完成 ${s.lastProgressAt ? new Date(s.lastProgressAt).toLocaleTimeString() : "—"} · ${eta}
-    </div>
-    ${current}${retry}${slow}${err}
-    <div class="ai-panel-actions">
-      ${s.state === "running" || s.state === "pausing" ? `<button class="ghost small" data-action="ai-pause">暂停</button>` : ""}
-      ${s.state === "paused" ? `<button class="primary small" data-action="ai-resume">继续分析</button>` : ""}
-      ${s.state !== "idle" || s.remaining > 0 ? `<button class="ghost small" data-action="ai-stop">停止本次任务</button>` : ""}
-    </div>
-  `;
-}
-
-function isStale(iso: string, ms: number): boolean {
-  const t = new Date(iso).getTime();
-  return !isNaN(t) && Date.now() - t > ms;
-}
-
 function renderBacklog() {
   const banner = $("backlog-banner");
   const s = aiStatus;
@@ -681,15 +556,13 @@ const STATUS_ZH: Record<string, string> = {
   cancelled: "已取消", skipped: "跳过",
 };
 
-/// 统一工作状态刷新入口：所有界面（Work Center / AI 徽标 / AI 面板 / 积压横幅 /
+/// 统一工作状态刷新入口：所有界面（Work Center / 积压横幅 /
 /// Activity 待处理区 / 设置页计数）消费同一份 (aiStatus, activity) 全局状态。
 /// 调用时机：启动 / 同步开始·进度·完成 / 手动 AI 接受 / AI 进度·完成 /
 /// pause·resume·stop / retry 完成。任何事件都不允许绕过本函数单独刷新部分 UI。
 async function refreshWorkState() {
   await Promise.all([loadAiStatus(), loadActivity()]);
   renderWorkCenter();
-  renderAiBadge();
-  renderAiPanel();
   renderBacklog();
   renderPendingCount();
 }
@@ -908,7 +781,7 @@ async function renderActivityDetail() {
         <div class="paper-meta">开始 ${b.startedAt ? new Date(b.startedAt).toLocaleTimeString() : "—"} · 结束 ${b.finishedAt ? new Date(b.finishedAt).toLocaleTimeString() : "—"} · 耗时 ${dur}</div>
         <div class="paper-meta">总数 ${b.total} · 成功 ${b.succeeded} · 失败 ${b.failed} · 跳过 ${b.skipped} · 剩余 ${b.remaining}</div>
         ${failed.length ? `<div class="abstract muted small">失败论文：${failed.slice(0, 5).map((f) => activityItemTitle(f)).join("；")}${failed.length > 5 ? "…" : ""}</div>` : ""}
-        <div class="ai-panel-actions">${controls}</div>
+        <div class="activity-actions">${controls}</div>
       </div>`;
   }
   // 同步左侧选中态
@@ -1205,8 +1078,7 @@ async function saveKey() {
   try {
     await invoke("save_api_key", { key });
     ($("api-key") as HTMLInputElement).value = ""; // 不回显真实 Key
-    localStorage.removeItem(KEY_NAME); // 迁移完成，不再保留 localStorage
-    $("settings-msg").textContent = "已保存到 macOS 钥匙串";
+    $("settings-msg").textContent = "✓ API Key 已保存在本机";
     $("settings-msg").className = "ok small";
     await refreshKeyStatus();
   } catch (err) {
@@ -1284,8 +1156,6 @@ async function setupListeners() {
   await listen("ai://progress", (e) => {
     aiStatus = e.payload as AiStatus;
     renderWorkCenter();
-    renderAiBadge();
-    renderAiPanel();
     renderBacklog();
   });
   await listen("ai://retry", async () => {
@@ -1411,12 +1281,6 @@ async function setupListeners() {
       await manualAnalyze();
       return;
     }
-    if (t.closest("#ai-badge")) {
-      const panel = $("ai-panel");
-      const nowOpen = panel.classList.toggle("hidden") === false;
-      $("ai-badge").classList.toggle("open", nowOpen);
-      return;
-    }
     if (t.closest("#work-status")) {
       switchView("activity");
       return;
@@ -1461,9 +1325,8 @@ window.addEventListener("DOMContentLoaded", () => {
   $("btn-clear-key").addEventListener("click", async () => {
     try {
       await invoke("delete_api_key");
-      localStorage.removeItem(KEY_NAME);
       ($("api-key") as HTMLInputElement).value = "";
-      $("settings-msg").textContent = "已删除钥匙串中的 Key";
+      $("settings-msg").textContent = "已删除本机保存的 Key";
       $("settings-msg").className = "muted small";
       await refreshKeyStatus();
     } catch (err) {
@@ -1473,7 +1336,7 @@ window.addEventListener("DOMContentLoaded", () => {
   });
   $("btn-save-settings").addEventListener("click", saveSettings);
 
-  // Key 存 Keychain，不再回填到输入框（输入框仅用于「替换 Key」时输入）
+  // Key 保存在本地 secret 文件，不回填到输入框（输入框仅用于「替换 Key」时输入）
   ($("api-key") as HTMLInputElement).value = "";
   ($("model") as HTMLInputElement).value = getModel();
 
@@ -1481,11 +1344,9 @@ window.addEventListener("DOMContentLoaded", () => {
     await setupListeners();
     await Promise.all([loadJournals(), loadTags(), loadSettings()]);
     await loadPapers();
-    // 统一工作状态刷新（Work Center / 徽标 / 面板 / 积压 / 待处理区 / 计数）
+    // 统一工作状态刷新（Work Center / 积压 / 待处理区 / 计数）
     await refreshWorkState();
     renderNextCheck();
-    // 旧 localStorage Key 一次性迁移到 Keychain（写入成功后才删除旧 Key）
-    await migrateLegacyKey();
     await refreshKeyStatus();
     // 启动自动同步（阈值判断在 Rust 端）
     await invoke("maybe_auto_sync").catch(() => {});

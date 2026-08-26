@@ -793,16 +793,12 @@ fn live_deepseek_smoke() {
     assert!(!key.is_empty(), "COWPAPER_KEY 不能为空");
     println!("[live] model={}", model);
 
-    // 真实 macOS Keychain（独立 test namespace，绝不触碰 production）：
-    // 保存 → 队列经 Keychain 读取 → 用后删除（TestCleanup 兜底）
-    let test_service = format!(
-        "com.cowpaper.test.live.{}",
-        std::process::id()
-    );
-    let store: Arc<dyn crate::secure_store::SecureStore> = Arc::new(
-        crate::secure_store::KeychainStore::with_namespace(&test_service, "live-test-credential"),
-    );
-    store.save(&key).expect("真实 Keychain 写入失败");
+    // 本地 secret 文件（临时目录，绝不触碰用户真实目录）：
+    // 保存 → 队列经 LocalFileSecretStore 读取 → 用后删除
+    let secret_dir = std::env::temp_dir().join(format!("cowpaper-live-{}", std::process::id()));
+    let store: Arc<dyn crate::secure_store::SecureStore> =
+        Arc::new(crate::secure_store::TempDirSecretStore::new_in(&secret_dir));
+    store.save(&key).expect("本地 secret 写入失败");
 
     let app = tauri::test::mock_builder()
         .build(tauri::test::mock_context(tauri::test::noop_assets()))
@@ -943,9 +939,10 @@ fn live_deepseek_smoke() {
     assert_eq!(dup, 0, "不应有重复 evidence 的成功论文（未重复分析）");
     println!("[live-2] OK: batch 连续推进、成功计数正确、未重复分析");
 
-    // 清理：删除测试写入的 Keychain 条目，恢复环境原状
-    store.delete().expect("真实 Keychain 清理失败");
-    println!("[live] Keychain 清理完成");
+    // 清理：删除测试写入的本地 secret 文件，恢复环境原状
+    store.delete().expect("本地 secret 清理失败");
+    let _ = std::fs::remove_dir_all(&secret_dir);
+    println!("[live] 本地 secret 清理完成");
 }
 
 // ================= Round 3.5 hardening 测试 =================
@@ -1222,14 +1219,8 @@ fn test_migration_upgrade_preserves_data() {
     assert_eq!(v2, db::SCHEMA_VERSION);
 }
 
-/// 真实 macOS Keychain 冒烟（ignored）：save/get/has/delete 真实值。
-#[test]
-#[ignore]
-fn keychain_real_smoke() {
-    let msg = crate::secure_store::keychain_smoke().expect("真实 Keychain 验证失败");
-    println!("{}", msg);
-}
-
+/// Keychain 已停用（Round 5A.1）：CowPaper 不再使用 macOS Keychain。
+/// 原 keychain_real_smoke / namespace 隔离测试随 KeychainStore 一并移除。
 // ================= Round 3.6 hardening 测试 =================
 
 /// Test 1：SyncGuard 正常释放（normal return / drop）。
@@ -1316,19 +1307,70 @@ fn test_daily_rejected_when_busy_then_retryable() {
     sc.release();
 }
 
-/// Keychain 命名空间隔离：test namespace 与 production namespace 必须完全不同。
+/// 本地 secret 文件存储测试（Round 5A.1）。
 #[test]
-fn test_keychain_test_namespace_isolation() {
-    use crate::secure_store::{
-        KeychainStore, PRODUCTION_ACCOUNT, PRODUCTION_SERVICE,
-    };
+fn test_local_secret_store() {
+    use crate::secure_store::{SecureStore, TempDirSecretStore};
 
-    let prod = KeychainStore::production();
-    let test = KeychainStore::with_namespace("com.cowpaper.test.isolation", "test-credential");
-    assert_ne!(prod.service, test.service, "service 必须不同");
-    assert_ne!(prod.account, test.account, "account 必须不同");
-    assert_ne!(test.service, PRODUCTION_SERVICE);
-    assert_ne!(test.account, PRODUCTION_ACCOUNT);
+    // 1) save / has / load internal
+    let dir = std::env::temp_dir().join(format!("cowpaper-secrets-unit-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let store = TempDirSecretStore::new_in(&dir);
+    assert!(!store.has());
+    assert!(store.get().unwrap().is_none());
+    store.save("sk-test-12345").unwrap();
+    assert!(store.has());
+    assert_eq!(store.get().unwrap().unwrap(), "sk-test-12345");
+
+    // 2) replace（覆盖旧 Key）
+    store.save("sk-new-value").unwrap();
+    assert_eq!(store.get().unwrap().unwrap(), "sk-new-value");
+
+    // 3) delete
+    store.delete().unwrap();
+    assert!(!store.has());
+    assert!(store.get().unwrap().is_none());
+    // delete 幂等（文件不存在也成功）
+    store.delete().unwrap();
+
+    // 4) restart persistence：同路径重开仍可读
+    store.save("sk-restart").unwrap();
+    let store2 = TempDirSecretStore::new_in(&dir);
+    assert_eq!(store2.get().unwrap().unwrap(), "sk-restart");
+    assert!(store2.has());
+
+    // 5) invalid/corrupt file safe failure（坏 JSON → Err，不 panic）
+    let secret_file = dir.join("secrets.json");
+    std::fs::write(&secret_file, "{ not valid json !!").unwrap();
+    let store3 = TempDirSecretStore::new_in(&dir);
+    assert!(store3.get().is_err(), "损坏文件必须安全失败");
+    assert!(!store3.has(), "损坏文件 has() 不得误报");
+
+    // 6) 文件权限（Unix 可测）：secrets.json 应为 0600
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let store4 = TempDirSecretStore::new_in(&dir);
+        store4.save("sk-perm").unwrap();
+        let meta = std::fs::metadata(&secret_file).unwrap();
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "secret 文件权限应为 0600，实际 {:o}", mode);
+        let dmeta = std::fs::metadata(&dir).unwrap();
+        let dmode = dmeta.permissions().mode() & 0o777;
+        assert_eq!(dmode, 0o700, "目录权限应为 0700，实际 {:o}", dmode);
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 前端命令不得返回完整 Key：lib.rs 只注册 save/has/delete/test 命令，
+/// 不存在 get_api_key 命令。此处静态断言前端接口层无 Key 暴露路径。
+#[test]
+fn test_no_get_api_key_command() {
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs")).unwrap();
+    assert!(!src.contains("fn get_api_key"), "禁止存在 get_api_key 命令（前端不得读取完整 Key）");
+    assert!(!src.contains("KeychainStore"), "production 不得再引用 KeychainStore");
+    assert!(src.contains("LocalFileSecretStore"), "production 应使用本地 secret 文件");
 }
 
 /// spawn worker 失败路径：注入返回 Err 的 spawner，验证 guard 仍被 release。

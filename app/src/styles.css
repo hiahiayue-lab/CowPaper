@@ -124,99 +124,6 @@ body {
   display: block;
 }
 
-/* ---------- AI 徽标与面板 ---------- */
-
-.ai-badge {
-  font-size: 12px;
-  padding: 4px 12px;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-  background: #eef1f4;
-  color: var(--muted);
-  cursor: pointer;
-}
-.ai-badge.running,
-.ai-badge.pausing {
-  background: #eff6ff;
-  color: var(--accent);
-  border-color: #bfdbfe;
-}
-.ai-badge.paused {
-  background: #fffbeb;
-  color: #b45309;
-  border-color: #fde68a;
-}
-/* 待处理：中性橙（低强调），不用红色表示普通待处理 */
-.ai-badge.idle-has {
-  background: #fffbeb;
-  color: #b45309;
-  border-color: #fde68a;
-}
-/* 真失败：红色，需要用户处理 */
-.ai-badge.has-error {
-  background: #fef2f2;
-  color: var(--danger);
-  border-color: #fecaca;
-}
-.ai-badge.open {
-  outline: 2px solid var(--accent);
-  outline-offset: 1px;
-}
-
-.ai-panel {
-  margin: 12px 20px 0;
-  padding: 12px 16px;
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-}
-.ai-panel.hidden {
-  display: none;
-}
-.ai-panel-head {
-  display: flex;
-  justify-content: space-between;
-  align-items: baseline;
-  margin-bottom: 4px;
-}
-.ai-panel-meta {
-  margin-bottom: 6px;
-}
-.ai-last-run {
-  margin-top: 6px;
-  padding: 4px 8px;
-  background: #f4f6f8;
-  border-radius: 6px;
-}
-.ai-current {
-  margin: 4px 0;
-  color: #1e3a5f;
-  background: #f0f6ff;
-  border-left: 3px solid var(--accent);
-  padding: 4px 8px;
-  font-size: 13px;
-}
-.ai-retry {
-  color: var(--warn);
-  font-size: 12px;
-  margin: 4px 0;
-}
-.ai-warn {
-  color: var(--warn);
-  font-size: 12px;
-  margin: 4px 0;
-}
-.ai-error {
-  color: var(--danger);
-  font-size: 12px;
-  margin: 4px 0;
-}
-.ai-panel-actions {
-  display: flex;
-  gap: 8px;
-  margin-top: 8px;
-}
-
 /* ---------- 积压横幅 ---------- */
 
 .banner {
@@ -720,4 +627,12 @@ button.full {
   background: #fffbeb;
   color: #b45309;
   border: 1px solid #fde68a;
+}
+
+/* ---------- Round 5A.1：Activity 批次操作行 ---------- */
+
+.activity-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
 }

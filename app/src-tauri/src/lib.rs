@@ -23,7 +23,7 @@ use tauri_plugin_notification::NotificationExt;
 
 use crate::ai_queue::{AiQueue, QueueCommand};
 use crate::models::{SyncStartResult, SyncTrigger};
-use crate::secure_store::{KeychainStore, SecureStore};
+use crate::secure_store::{LocalFileSecretStore, SecureStore};
 use crate::sync_coordinator::{SyncCoordinator, SyncGuard};
 
 const MAILTO: &str = "dev@cowpaper.local";
@@ -469,7 +469,7 @@ fn delete_tag(id: i64, state: State<Db>) -> Result<(), String> {
     db::delete_tag(&conn, id).map_err(|e| e.to_string())
 }
 
-// ---------- API Key（macOS Keychain，经 SecureStore） ----------
+// ---------- API Key（本地 secret 文件，经 SecureStore；无 get 命令暴露给前端） ----------
 
 #[tauri::command]
 fn save_api_key(key: String, store: State<Secure>) -> Result<(), String> {
@@ -726,8 +726,9 @@ pub fn run() {
             let sync_arc = Arc::new(SyncCoordinator::new());
             app.manage(sync_arc.clone());
 
-            // 安全存储（macOS Keychain）
-            let store_arc: Secure = Arc::new(KeychainStore::production());
+            // 安全存储：本地 secret 文件（不再使用 macOS Keychain，避免系统授权弹窗）。
+            // 路径：Application Support/CowPaper/secrets.json，目录 0700 / 文件 0600。
+            let store_arc: Secure = Arc::new(LocalFileSecretStore::new(&data_dir));
             app.manage(store_arc.clone());
 
             // AI 队列协调器（全局唯一，§三十五）
