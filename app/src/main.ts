@@ -753,7 +753,7 @@ function setTagDirty(v: boolean) {
 /// saveScheduled = dirty；immediate = dirty || (存在 scheduled 且 scheduled != active)。
 function updateTagActionState() {
   const schedBtn = document.querySelector("[data-action='save-tag-config-scheduled']") as HTMLButtonElement | null;
-  const immBtn = document.querySelector("[data-action='save-tag-config-immediate']") as HTMLButtonElement | null;
+  const immBtn = document.querySelector("[data-action='activate-tag-config-now']") as HTMLButtonElement | null;
   const hasScheduled = tagBaselineSource === "scheduled";
   if (schedBtn) schedBtn.disabled = !tagConfigDirty;
   if (immBtn) immBtn.disabled = !(tagConfigDirty || hasScheduled);
@@ -844,39 +844,48 @@ function safeError(err: unknown): string {
   return m.length > 160 ? m.slice(0, 160) + "…" : m;
 }
 
-async function saveTagConfig(mode: "scheduled" | "immediate") {
+/// 保存，下个推荐周期生效：仅持久化 scheduled（需 dirty；不调 AI、不改 active、不重排）。
+async function saveTagConfigScheduled() {
   if (!tagConfigDirty) return;
   const items = tagDraft.filter((d) => !(d.deleted && d.id === 0));
-  if (mode === "scheduled") {
-    // 立即反馈 + try/catch（失败可见，dirty 保持）
-    setTagSaveStatus("正在保存…", "running");
-    try {
-      const res = await invoke<SaveTagConfigResult>("save_tag_config", { items, mode });
-      setTagSaveStatus(`已保存 · 将于 ${fmtCycle(res.effectiveCycleKey || "")} 生效`, "done");
-      await loadTagEditor();
-    } catch (err) {
-      setTagSaveStatus(`保存失败：${safeError(err)}`, "error");
-      return;
-    }
-    return;
+  setTagSaveStatus("正在保存…", "running");
+  try {
+    const res = await invoke<SaveTagConfigResult>("save_tag_config", { items, mode: "scheduled" });
+    setTagSaveStatus(`已保存 · 将于 ${fmtCycle(res.effectiveCycleKey || "")} 生效`, "done");
+    await loadTagEditor();
+  } catch (err) {
+    setTagSaveStatus(`保存失败：${safeError(err)}`, "error");
   }
-  // immediate：candidate = 用户最新意图（dirty → draft；否则 scheduled）
-  // 先算 candidate vs active 的 diff → 确认 → 才 persist + execute（禁止先保存再问）
-  const candidate =
-    tagConfigDirty
-      ? tagDraft.filter((d) => !(d.deleted && d.id === 0))
-      : tagBaselineSource === "scheduled"
-        ? tagBaseline.filter((d) => !d.deleted)
-        : [];
+}
+
+/// 纯逻辑（可测试）：immediate candidate 选择。
+/// dirty → draft（最新意图）；否则 scheduled（若存在且与 active 不同由调用方判断）；
+/// 否则空（无候选）。
+function getImmediateCandidateConfig(
+  dirty: boolean,
+  source: string,
+  draft: TagDraftItem[],
+  baseline: TagDraftItem[],
+): TagDraftItem[] {
+  if (dirty) return draft.filter((d) => !(d.deleted && d.id === 0));
+  if (source === "scheduled") return baseline.filter((d) => !d.deleted);
+  return [];
+}
+
+/// 立即更新排序：candidate = 用户最新意图（dirty → draft；否则 scheduled）。
+/// 不依赖 dirty；无候选时给出可见提示，绝不 silent return。
+async function activateTagConfigNow() {
+  setTagSaveStatus("正在准备更新排序…", "running");
+  const candidate = getImmediateCandidateConfig(tagConfigDirty, tagBaselineSource, tagDraft, tagBaseline);
   if (candidate.length === 0) {
-    setTagSaveStatus("没有可立即生效的配置变化", "idle");
+    setTagSaveStatus("当前没有需要立即生效的标签修改", "idle");
     return;
   }
   let activeItems: TagDraftItem[];
   try {
     activeItems = await invoke<TagDraftItem[]>("get_active_tag_config");
   } catch (err) {
-    setTagSaveStatus(`保存失败：${safeError(err)}`, "error");
+    setTagSaveStatus(`立即更新失败：${safeError(err)}`, "error");
     return;
   }
   const preview = computeTagSavePreview(candidate, activeItems);
@@ -892,10 +901,10 @@ async function saveTagConfig(mode: "scheduled" | "immediate") {
       return; // 不保存、不启动 AI；dirty/scheduled 均保持
     }
   } else {
-    setTagSaveStatus("正在更新排序…", "running");
+    setTagSaveStatus("正在重新计算排序…", "running");
   }
   try {
-    const res = await invoke<SaveTagConfigResult>("save_tag_config", { items: candidate, mode });
+    const res = await invoke<SaveTagConfigResult>("save_tag_config", { items: candidate, mode: "immediate" });
     setTagSaveStatus(
       res.aiNeededPapers > 0 ? "正在更新标签评分…" : "标签设置已生效 · 当前推荐已更新",
       res.aiNeededPapers > 0 ? "running" : "done",
@@ -904,9 +913,10 @@ async function saveTagConfig(mode: "scheduled" | "immediate") {
     await loadPapers();
     await refreshRecommendations();
   } catch (err) {
-    setTagSaveStatus(`保存失败：${safeError(err)}`, "error");
+    setTagSaveStatus(`立即更新失败：${safeError(err)}`, "error");
   }
 }
+
 function tagChips(matches: TagMatch[]): string {
   const shown = matches.filter((m) => m.score > 0);
   if (!shown.length) return "";
@@ -1976,11 +1986,11 @@ async function setupListeners() {
       return;
     }
     if (t.closest("[data-action='save-tag-config-scheduled']")) {
-      await saveTagConfig("scheduled");
+      await saveTagConfigScheduled();
       return;
     }
-    if (t.closest("[data-action='save-tag-config-immediate']")) {
-      await saveTagConfig("immediate");
+    if (t.closest("[data-action='activate-tag-config-now']")) {
+      await activateTagConfigNow();
       return;
     }
     // AI 控制
