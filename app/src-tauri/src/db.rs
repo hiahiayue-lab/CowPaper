@@ -87,7 +87,7 @@ pub fn open(path: &Path) -> Result<Connection> {
 /// 当前 schema 版本（Round 5B：abstract_quality / paper_abstract_sources 为 v4）。
 /// 生产构建中仅由迁移系统隐式使用；测试中直接断言。
 #[allow(dead_code)]
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 pub fn init(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
@@ -1103,7 +1103,15 @@ fn migrations() -> Vec<(i64, &'static str, fn(&Connection) -> Result<()>)> {
         (5, "round5c-catalog", migrate_to_v5),
         (6, "round6-recommendation-history", migrate_to_v6),
         (7, "round6.5-tag-config-versions", migrate_to_v7),
+        (8, "round6.5.4-tag-score-repair", migrate_to_v8),
     ]
+}
+
+/// v8：修复历史 tag score 数据——为无 tag_id 的记录补 identity + 当前 semantic hash，
+/// 按 tag_id 去重并重算 totalScore（不调用 AI、不删除 Paper）。
+fn migrate_to_v8(conn: &Connection) -> Result<()> {
+    repair_paper_tag_matches(conn)?;
+    Ok(())
 }
 
 /// v7：Versioned Tag Configuration。
@@ -2349,6 +2357,98 @@ pub fn create_active_tag_version(conn: &Connection) -> Result<i64> {
     Ok(vid)
 }
 
+/// Repair：为无 tag_id 的历史 tag 记录补 identity + 当前 semantic hash，并按 tag_id 去重。
+/// 幂等；不删除 Paper、不调用 AI。迁移与启动时执行。
+pub fn repair_paper_tag_matches(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("SELECT id, tag_matches_json FROM papers WHERE tag_matches_json IS NOT NULL")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+    let mut by_id: Vec<(i64, String)> = Vec::new();
+    for row in rows {
+        by_id.push(row?);
+    }
+    for (pid, json) in by_id {
+        let mut matches: Vec<crate::models::TagMatch> = serde_json::from_str(&json).unwrap_or_default();
+        let mut changed = false;
+        // 1) 补 tag_id + hash（按 name 匹配 tags 表）
+        for m in matches.iter_mut() {
+            if m.tag_id.is_none() {
+                if let Some(id) = find_tag_by_name(conn, &m.tag)? {
+                    if let Some(t) = get_tag_by_id(conn, id)? {
+                        m.tag_id = Some(id);
+                        m.semantic_hash = Some(crate::tag_config::tag_semantic_hash(
+                            id,
+                            &t.name,
+                            t.description.as_deref().unwrap_or_default(),
+                        ));
+                        changed = true;
+                    }
+                }
+            }
+        }
+        // 2) 同 tag_id 多条 → 保留 hash 匹配当前 active 语义的一条（active_tags 优先），否则保留第一条
+        let active = crate::tag_config::active_tags(conn).unwrap_or_default();
+        let mut seen: Vec<i64> = Vec::new();
+        let mut deduped: Vec<crate::models::TagMatch> = Vec::new();
+        let matches_len = matches.len();
+        for m in matches {
+            if let Some(tid) = m.tag_id {
+                if seen.contains(&tid) {
+                    // 重复：保留 hash 匹配 active 的
+                    let active_hit = active.iter().any(|(id, name, desc)| {
+                        *id == tid && {
+                            let expect = crate::tag_config::tag_semantic_hash(*id, name, desc);
+                            m.semantic_hash.as_deref() == Some(expect.as_str())
+                        }
+                    });
+                    if active_hit {
+                        if let Some(existing) = deduped.iter_mut().find(|d| d.tag_id == Some(tid)) {
+                            *existing = m;
+                        } else {
+                            deduped.push(m);
+                        }
+                        changed = true;
+                    }
+                    // 非 active 匹配的重复 → 丢弃
+                    continue;
+                }
+                seen.push(tid);
+                deduped.push(m);
+            } else {
+                deduped.push(m);
+            }
+        }
+        if changed || deduped.len() != matches_len {
+            let new_json = serde_json::to_string(&deduped).unwrap_or_else(|_| "[]".to_string());
+            conn.execute(
+                "UPDATE papers SET tag_matches_json = ?1, updated_at = ?2 WHERE id = ?3",
+                params![new_json, now_utc(), pid],
+            )?;
+            if let Ok(active) = &crate::tag_config::active_tags(conn) {
+                let _ = crate::tag_config::recompute_paper_total_score(conn, pid, active);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn get_tag_by_id(conn: &Connection, id: i64) -> Result<Option<crate::models::Tag>> {
+    conn.query_row(
+        "SELECT id, name, description, enabled, created_at, updated_at FROM tags WHERE id = ?1",
+        params![id],
+        |r| {
+            Ok(crate::models::Tag {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                description: r.get(2)?,
+                enabled: r.get::<_, i64>(3)? != 0,
+                created_at: r.get(4)?,
+                updated_at: r.get(5)?,
+            })
+        },
+    )
+    .optional()
+}
+
 pub fn find_tag_by_name(conn: &Connection, name: &str) -> Result<Option<i64>> {
     let id = conn
         .query_row("SELECT id FROM tags WHERE name = ?1", params![name], |r| r.get::<_, i64>(0))
@@ -2374,16 +2474,29 @@ pub fn set_paper_tag_scores(
     for (tid, score) in scores {
         if let Some((_, name, desc)) = semantic.iter().find(|(id, _, _)| id == tid) {
             let hash = crate::tag_config::tag_semantic_hash(*tid, name, desc);
-            if let Some(m) = matches.iter_mut().find(|m| m.tag_id == Some(*tid)) {
-                m.score = *score;
-                m.semantic_hash = Some(hash.clone());
-            } else {
-                matches.push(crate::models::TagMatch {
-                    tag: name.clone(),
-                    score: *score,
-                    tag_id: Some(*tid),
-                    semantic_hash: Some(hash),
-                });
+            // 先按 tag_id 精确匹配；旧数据无 tag_id → 按 name fallback 替换（避免同一逻辑 Tag 两条）
+            let hit = matches.iter_mut().find(|m| m.tag_id == Some(*tid));
+            match hit {
+                Some(m) => {
+                    m.score = *score;
+                    m.semantic_hash = Some(hash.clone());
+                    m.tag = name.clone();
+                }
+                None => {
+                    // name fallback：只替换无 tag_id 的同名记录（旧 Full AI 数据）；带其他 tag_id 的同名记录不误改
+                    if let Some(m) = matches.iter_mut().find(|m| m.tag_id.is_none() && m.tag == *name) {
+                        m.score = *score;
+                        m.semantic_hash = Some(hash.clone());
+                        m.tag_id = Some(*tid);
+                    } else {
+                        matches.push(crate::models::TagMatch {
+                            tag: name.clone(),
+                            score: *score,
+                            tag_id: Some(*tid),
+                            semantic_hash: Some(hash),
+                        });
+                    }
+                }
             }
         }
     }

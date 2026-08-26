@@ -40,6 +40,8 @@ interface Author {
 interface TagMatch {
   tag: string;
   score: number;
+  tagId?: number | null;
+  semanticHash?: string | null;
 }
 
 interface Paper {
@@ -918,7 +920,15 @@ async function activateTagConfigNow() {
 }
 
 function tagChips(matches: TagMatch[]): string {
-  const shown = matches.filter((m) => m.score > 0);
+  // 防御性去重：同一逻辑 Tag（按 tag_id，fallback name）最多一个 chip（root cause 在 merge 层已修）
+  const seen = new Map<string, TagMatch>();
+  for (const m of matches) {
+    if (m.score <= 0) continue;
+    const key = m.tagId != null ? `id:${m.tagId}` : `name:${m.tag}`;
+    const prev = seen.get(key);
+    if (!prev || m.score > prev.score) seen.set(key, m);
+  }
+  const shown = [...seen.values()];
   if (!shown.length) return "";
   return (
     `<div class="tags-line">` +

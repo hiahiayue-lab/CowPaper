@@ -1810,7 +1810,7 @@ fn test_migration_v2_to_v3_preserves_data() {
 
     // 迁移到 v3
     db::init(&conn).unwrap();
-    assert_eq!(db::SCHEMA_VERSION, 7);
+    assert_eq!(db::SCHEMA_VERSION, 8);
 
     // 8) 旧 issn 迁移进 journal_identifiers（类型按列，不猜）
     let ids = db::list_journal_identifiers(&conn, jid).unwrap();
@@ -1851,7 +1851,7 @@ fn test_database_restart_persistence() {
     {
         let conn = db::open(&path).unwrap();
         db::init(&conn).unwrap(); // 幂等：user_version=3 不重复迁移
-        assert_eq!(db::SCHEMA_VERSION, 7);
+        assert_eq!(db::SCHEMA_VERSION, 8);
         let j = db::get_journal(&conn, 1).unwrap().expect("期刊持久化");
         assert_eq!(j.print_issn.as_deref(), Some("0025-1909"));
         assert_eq!(j.identifiers.len(), 1);
@@ -2241,7 +2241,7 @@ fn test_migration_v4_abstract_quality_init() {
     .unwrap();
 
     db::init(&conn).unwrap();
-    assert_eq!(db::SCHEMA_VERSION, 7);
+    assert_eq!(db::SCHEMA_VERSION, 8);
 
     let papers = db::list_papers(&conn, Some(jid), 100).unwrap();
     assert_eq!(papers.len(), 3, "迁移不得丢论文");
@@ -3398,3 +3398,227 @@ fn test_scheduled_not_dirty_and_guard_semantics() {
     assert_eq!(tx.description.as_deref(), Some("旧"), "scheduled 保存不改 active（非 dirty 数据面）");
     assert!(db::scheduled_tag_config(&conn).unwrap().is_some());
 }
+
+// ================= Round 6.5.4：Incremental Tag Merge & TotalScore =================
+
+fn tag_match(id: Option<i64>, name: &str, score: f64, hash: Option<&str>) -> crate::models::TagMatch {
+    crate::models::TagMatch {
+        tag: name.to_string(),
+        score,
+        tag_id: id,
+        semantic_hash: hash.map(str::to_string),
+    }
+}
+
+/// 用户截图场景回归：old A=.8 B=.8 C=.8（旧数据无 tag_id/hash）→ tag-only C=1.0
+/// → final A=.8 B=.8 C=1.0，total=2.6，不得出现两条 C、不得 total=1.0。
+#[test]
+fn test_screenshot_regression_incremental_merge() {
+    use crate::models::TagDraftItem;
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let pa = seed_paper_with_score(&conn, jid, "10.1000/sc-a", "A", 0.0);
+    // 构造旧 Full AI 数据：A/B/C 均无 tag_id/hash（Round 6.5 前格式）
+    let old_json = serde_json::json!([
+        {"tag":"T平台","score":0.8},
+        {"tag":"T数字","score":0.8},
+        {"tag":"T定价","score":0.8}
+    ]);
+    conn.execute("UPDATE papers SET tag_matches_json=?1, total_score=2.4 WHERE id=?2", params![old_json.to_string(), pa]).unwrap();
+    // 三个 active tag（repair 按 tags 表补身份，故先建 tag）
+    let ta = db::add_tag(&conn, "T平台", Some("双边平台")).unwrap();
+    let tb = db::add_tag(&conn, "T数字", Some("数字产品")).unwrap();
+    let tc = db::add_tag(&conn, "T定价", Some("定价策略")).unwrap();
+    // 模拟生产 v8 迁移：repair 旧数据（补 tag_id + 当前 hash）
+    db::repair_paper_tag_matches(&conn).unwrap();
+    // tag-only：只请求 C（定价）→ 返回 1.0
+    let targets = vec![(tc.id, "T定价".to_string(), "定价策略".to_string())];
+    let scores = vec![(tc.id, 1.0)];
+    db::set_paper_tag_scores(&conn, pa, &scores, &targets).unwrap();
+    let json: String = conn.query_row("SELECT tag_matches_json FROM papers WHERE id=?1", params![pa], |r| r.get(0)).unwrap();
+    let ms: Vec<crate::models::TagMatch> = serde_json::from_str(&json).unwrap();
+    // 定价只一条（1.0）；A/B 保留 0.8
+    let c_list: Vec<&crate::models::TagMatch> = ms.iter().filter(|m| m.tag == "T定价").collect();
+    assert_eq!(c_list.len(), 1, "同一逻辑 Tag 不得出现两条：{:?}", c_list.iter().map(|m| m.score).collect::<Vec<_>>());
+    assert_eq!(c_list[0].score, 1.0);
+    assert_eq!(c_list[0].tag_id, Some(tc.id));
+    let a = ms.iter().find(|m| m.tag == "T平台").unwrap();
+    assert_eq!(a.score, 0.8, "未请求 tag 保留");
+    // totalScore = 全部 active = 0.8+0.8+1.0 = 2.6
+    let s: f64 = conn.query_row("SELECT total_score FROM papers WHERE id=?1", params![pa], |r| r.get(0)).unwrap();
+    assert!((s - 2.6).abs() < 1e-9, "totalScore 必须 2.6，实际 {}", s);
+    let _ = ta;
+    let _ = tb;
+}
+
+/// 多标签增量：requested B,D → A=.8 B=.9 C=.4 D=.7 → total=2.8（不是 1.6）。
+#[test]
+fn test_multi_tag_incremental_merge() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let pa = seed_paper_with_score(&conn, jid, "10.1000/mt-a", "A", 0.0);
+    let ta = db::add_tag(&conn, "TA", Some("a")).unwrap();
+    let tb = db::add_tag(&conn, "TB", Some("b")).unwrap();
+    let tc = db::add_tag(&conn, "TC", Some("c")).unwrap();
+    let td = db::add_tag(&conn, "TD", Some("d")).unwrap();
+    let ha = crate::tag_config::tag_semantic_hash(ta.id, "TA", "a");
+    let hb = crate::tag_config::tag_semantic_hash(tb.id, "TB", "b");
+    let hc = crate::tag_config::tag_semantic_hash(tc.id, "TC", "c");
+    let hd = crate::tag_config::tag_semantic_hash(td.id, "TD", "d");
+    let old_json = serde_json::json!([
+        {"tag":"TA","score":0.8,"tagId":ta.id,"semanticHash":ha},
+        {"tag":"TB","score":0.6,"tagId":tb.id,"semanticHash":hb},
+        {"tag":"TC","score":0.4,"tagId":tc.id,"semanticHash":hc},
+        {"tag":"TD","score":0.2,"tagId":td.id,"semanticHash":hd}
+    ]);
+    conn.execute("UPDATE papers SET tag_matches_json=?1, total_score=2.0 WHERE id=?2", params![old_json.to_string(), pa]).unwrap();
+    // requested B,D
+    let targets = vec![(tb.id, "TB".to_string(), "b".to_string()), (td.id, "TD".to_string(), "d".to_string())];
+    let scores = vec![(tb.id, 0.9), (td.id, 0.7)];
+    db::set_paper_tag_scores(&conn, pa, &scores, &targets).unwrap();
+    let json: String = conn.query_row("SELECT tag_matches_json FROM papers WHERE id=?1", params![pa], |r| r.get(0)).unwrap();
+    let ms: Vec<crate::models::TagMatch> = serde_json::from_str(&json).unwrap();
+    assert_eq!(ms.len(), 4, "未请求 tag 完全保留");
+    assert!((ms.iter().find(|m| m.tag == "TB").unwrap().score - 0.9).abs() < 1e-9);
+    assert!((ms.iter().find(|m| m.tag == "TD").unwrap().score - 0.7).abs() < 1e-9);
+    assert!((ms.iter().find(|m| m.tag == "TA").unwrap().score - 0.8).abs() < 1e-9);
+    let s: f64 = conn.query_row("SELECT total_score FROM papers WHERE id=?1", params![pa], |r| r.get(0)).unwrap();
+    assert!((s - 2.8).abs() < 1e-9, "totalScore 必须 2.8（非 1.6），实际 {}", s);
+}
+
+/// 新增 tag：A=.8 B=.6 → 新增 C=.9 → total=2.3。
+#[test]
+fn test_new_tag_adds_to_old_scores() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let pa = seed_paper_with_score(&conn, jid, "10.1000/nt-a", "A", 0.0);
+    let ta = db::add_tag(&conn, "NT-A", Some("a")).unwrap();
+    let tb = db::add_tag(&conn, "NT-B", Some("b")).unwrap();
+    let tc = db::add_tag(&conn, "NT-C", Some("c")).unwrap();
+    let ha = crate::tag_config::tag_semantic_hash(ta.id, "NT-A", "a");
+    let hb = crate::tag_config::tag_semantic_hash(tb.id, "NT-B", "b");
+    let old_json = serde_json::json!([
+        {"tag":"NT-A","score":0.8,"tagId":ta.id,"semanticHash":ha},
+        {"tag":"NT-B","score":0.6,"tagId":tb.id,"semanticHash":hb}
+    ]);
+    conn.execute("UPDATE papers SET tag_matches_json=?1 WHERE id=?2", params![old_json.to_string(), pa]).unwrap();
+    let targets = vec![(tc.id, "NT-C".to_string(), "c".to_string())];
+    let scores = vec![(tc.id, 0.9)];
+    db::set_paper_tag_scores(&conn, pa, &scores, &targets).unwrap();
+    let s: f64 = conn.query_row("SELECT total_score FROM papers WHERE id=?1", params![pa], |r| r.get(0)).unwrap();
+    assert!((s - 2.3).abs() < 1e-9, "新增 tag 加到旧分：total 2.3，实际 {}", s);
+}
+
+/// disabled：A+B+C 缓存保留，total 只计 enabled（A+C）；re-enable 且 hash 不变 → 重新计入（零 AI 语义由调度保证）。
+#[test]
+fn test_disabled_and_reenabled_total() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let pa = seed_paper_with_score(&conn, jid, "10.1000/ds-a", "A", 0.0);
+    let ta = db::add_tag(&conn, "DS-A", Some("a")).unwrap();
+    let tb = db::add_tag(&conn, "DS-B", Some("b")).unwrap();
+    let ha = crate::tag_config::tag_semantic_hash(ta.id, "DS-A", "a");
+    let hb = crate::tag_config::tag_semantic_hash(tb.id, "DS-B", "b");
+    let old_json = serde_json::json!([
+        {"tag":"DS-A","score":0.8,"tagId":ta.id,"semanticHash":ha},
+        {"tag":"DS-B","score":1.0,"tagId":tb.id,"semanticHash":hb}
+    ]);
+    conn.execute("UPDATE papers SET tag_matches_json=?1 WHERE id=?2", params![old_json.to_string(), pa]).unwrap();
+    let active = crate::tag_config::active_tags(&conn).unwrap();
+    crate::tag_config::recompute_paper_total_score(&conn, pa, &active).unwrap();
+    let s: f64 = conn.query_row("SELECT total_score FROM papers WHERE id=?1", params![pa], |r| r.get(0)).unwrap();
+    assert!((s - 1.8).abs() < 1e-9, "初始 1.8，实际 {}", s);
+    // disable B
+    db::update_tag(&conn, tb.id, "DS-B", Some("b"), false).unwrap();
+    let active2 = crate::tag_config::active_tags(&conn).unwrap();
+    crate::tag_config::recompute_paper_total_score(&conn, pa, &active2).unwrap();
+    let s2: f64 = conn.query_row("SELECT total_score FROM papers WHERE id=?1", params![pa], |r| r.get(0)).unwrap();
+    assert!((s2 - 0.8).abs() < 1e-9, "disabled 不计：0.8，实际 {}", s2);
+    // cache 保留
+    let json: String = conn.query_row("SELECT tag_matches_json FROM papers WHERE id=?1", params![pa], |r| r.get(0)).unwrap();
+    assert!(json.contains("DS-B"), "disabled 缓存保留");
+    // re-enable（hash 不变）→ 重新计入（无新 AI）
+    db::update_tag(&conn, tb.id, "DS-B", Some("b"), true).unwrap();
+    let active3 = crate::tag_config::active_tags(&conn).unwrap();
+    crate::tag_config::recompute_paper_total_score(&conn, pa, &active3).unwrap();
+    let s3: f64 = conn.query_row("SELECT total_score FROM papers WHERE id=?1", params![pa], |r| r.get(0)).unwrap();
+    assert!((s3 - 1.8).abs() < 1e-9, "re-enable 缓存计入：1.8，实际 {}", s3);
+}
+
+/// 部分失败：requested C,D；C 成功 D 失败 → A/B/C 计入，D 旧 score 保留但（hash 变化时）不计入，不破坏整篇。
+#[test]
+fn test_partial_incremental_failure_preserves_others() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let pa = seed_paper_with_score(&conn, jid, "10.1000/pf-a", "A", 0.0);
+    let ta = db::add_tag(&conn, "PF-A", Some("a")).unwrap();
+    let tc = db::add_tag(&conn, "PF-C", Some("c")).unwrap();
+    let td = db::add_tag(&conn, "PF-D", Some("d")).unwrap();
+    let ha = crate::tag_config::tag_semantic_hash(ta.id, "PF-A", "a");
+    let hc_old = crate::tag_config::tag_semantic_hash(tc.id, "PF-C", "旧");
+    let hd_old = crate::tag_config::tag_semantic_hash(td.id, "PF-D", "旧");
+    let old_json = serde_json::json!([
+        {"tag":"PF-A","score":0.8,"tagId":ta.id,"semanticHash":ha},
+        {"tag":"PF-C","score":0.6,"tagId":tc.id,"semanticHash":hc_old},
+        {"tag":"PF-D","score":0.5,"tagId":td.id,"semanticHash":hd_old}
+    ]);
+    conn.execute("UPDATE papers SET tag_matches_json=?1 WHERE id=?2", params![old_json.to_string(), pa]).unwrap();
+    // 模拟 immediate 保存：tags 表 desc 已更新（active 语义 = 新说明）→ 再 tag-only
+    db::update_tag(&conn, tc.id, "PF-C", Some("新说明"), true).unwrap();
+    db::update_tag(&conn, td.id, "PF-D", Some("新说明"), true).unwrap();
+    // requested C + D（D 失败未返回）
+    let targets = vec![
+        (tc.id, "PF-C".to_string(), "新说明".to_string()),
+        (td.id, "PF-D".to_string(), "新说明".to_string()),
+    ];
+    let scores = vec![(tc.id, 1.0)]; // D 失败未返回
+    db::set_paper_tag_scores(&conn, pa, &scores, &targets).unwrap();
+    let json: String = conn.query_row("SELECT tag_matches_json FROM papers WHERE id=?1", params![pa], |r| r.get(0)).unwrap();
+    let ms: Vec<crate::models::TagMatch> = serde_json::from_str(&json).unwrap();
+    assert_eq!(ms.len(), 3, "D 旧 score 保留（cache/history），不删除");
+    let s: f64 = conn.query_row("SELECT total_score FROM papers WHERE id=?1", params![pa], |r| r.get(0)).unwrap();
+    // A=.8 + C=1.0（新 hash 匹配）+ D stale（旧 hash ≠ 新语义 → 不计）= 1.8
+    assert!((s - 1.8).abs() < 1e-9, "A/C 正常计入，D stale 不计：total 1.8，实际 {}", s);
+}
+
+/// 未知 AI tag 被忽略（tag_only_analyze 过滤层；这里验证 merge 只接受 requested）。
+#[test]
+fn test_unknown_ai_tag_ignored() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let pa = seed_paper_with_score(&conn, jid, "10.1000/un-a", "A", 0.0);
+    let tc = db::add_tag(&conn, "UN-C", Some("c")).unwrap();
+    // requested 只有 C；scores 里混入未请求的 tag_id=9999
+    let targets = vec![(tc.id, "UN-C".to_string(), "c".to_string())];
+    let scores = vec![(tc.id, 0.9), (9999, 0.9)];
+    db::set_paper_tag_scores(&conn, pa, &scores, &targets).unwrap();
+    let json: String = conn.query_row("SELECT tag_matches_json FROM papers WHERE id=?1", params![pa], |r| r.get(0)).unwrap();
+    let ms: Vec<crate::models::TagMatch> = serde_json::from_str(&json).unwrap();
+    assert!(!ms.iter().any(|m| m.tag_id == Some(9999)), "未请求 tag 不得写入");
+}
+
+/// repair：旧数据无 tag_id → 补 identity + hash；同 tag 重复 → 去重保留 active 匹配者。
+#[test]
+fn test_duplicate_repair() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let pa = seed_paper_with_score(&conn, jid, "10.1000/rp-a", "A", 0.0);
+    let tc = db::add_tag(&conn, "RP-C", Some("说明")).unwrap();
+    let expect = crate::tag_config::tag_semantic_hash(tc.id, "RP-C", "说明");
+    // 模拟损坏数据：同 tag 两条（旧无 id + 新有 id）
+    let bad_json = serde_json::json!([
+        {"tag":"RP-C","score":0.8},
+        {"tag":"RP-C","score":1.0,"tagId":tc.id,"semanticHash":expect}
+    ]);
+    conn.execute("UPDATE papers SET tag_matches_json=?1 WHERE id=?2", params![bad_json.to_string(), pa]).unwrap();
+    db::repair_paper_tag_matches(&conn).unwrap();
+    let json: String = conn.query_row("SELECT tag_matches_json FROM papers WHERE id=?1", params![pa], |r| r.get(0)).unwrap();
+    let ms: Vec<crate::models::TagMatch> = serde_json::from_str(&json).unwrap();
+    let c_list: Vec<&crate::models::TagMatch> = ms.iter().filter(|m| m.tag == "RP-C").collect();
+    assert_eq!(c_list.len(), 1, "repair 后同 tag 只一条");
+    assert_eq!(c_list[0].score, 1.0, "保留 active hash 匹配的 score");
+    assert_eq!(c_list[0].tag_id, Some(tc.id));
+    let s: f64 = conn.query_row("SELECT total_score FROM papers WHERE id=?1", params![pa], |r| r.get(0)).unwrap();
+    assert!((s - 1.0).abs() < 1e-9);
+}
+
