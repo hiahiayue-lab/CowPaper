@@ -982,7 +982,22 @@ pub fn list_papers(conn: &Connection, journal_id: Option<i64>, limit: i64) -> Re
     };
     let mut papers: Vec<Paper> = rows.collect::<Result<Vec<_>>>()?;
     enrich_papers_collections(conn, &mut papers)?;
+    filter_current_tag_matches(conn, &mut papers)?;
     Ok(papers)
+}
+
+/// Paper DTO 过滤：只保留当前有效 tag score（active + enabled + tag_id 精确匹配 + hash 一致）。
+/// 不修改 tag_matches_json（cache 完整保留）。
+fn filter_current_tag_matches(conn: &Connection, papers: &mut [Paper]) -> Result<()> {
+    if papers.is_empty() {
+        return Ok(());
+    }
+    let active = crate::tag_config::active_tags(conn).unwrap_or_default();
+    for p in papers.iter_mut() {
+        p.tag_matches
+            .retain(|m| crate::tag_config::is_current_tag_match_valid(m, &active));
+    }
+    Ok(())
 }
 
 /// 一次查询填充全部 papers 的 collection codes（避免 N+1）。
@@ -1025,6 +1040,7 @@ pub fn get_paper(conn: &Connection, id: i64) -> Result<Option<Paper>> {
     if let Some(p) = p {
         v.push(p);
         enrich_papers_collections(conn, &mut v)?;
+        filter_current_tag_matches(conn, &mut v)?;
         Ok(v.pop())
     } else {
         Ok(None)

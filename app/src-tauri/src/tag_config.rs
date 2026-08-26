@@ -116,8 +116,23 @@ pub fn compute_diff(old_items: &[TagConfigItem], new_items: &[TagDraftItem]) -> 
     diff
 }
 
-/// 本地重算某 Paper 的 total_score：只加 active（非 deleted、enabled）且 semantic hash 匹配的 tag score。
-/// 保留 tag_matches_json 全部记录（disabled 作为缓存保留），只重算 total。
+/// 统一有效性规则（Round 6.5.6）：TagMatch 是否为「当前有效 score」。
+/// 规则：当前 active/enabled Tag 存在 + tag_id 精确匹配 + semantic_hash 与当前 Tag 语义一致。
+/// 禁止 name fallback（UI 可见性与 totalScore 计算共用同一规则）。
+/// cache 保留但无效的 score：不计 totalScore、不出现在 Paper DTO。
+pub fn is_current_tag_match_valid(m: &TagMatch, active_tags: &[(i64, String, String)]) -> bool {
+    let Some(tid) = m.tag_id else {
+        return false;
+    };
+    let Some((_, name, desc)) = active_tags.iter().find(|(id, _, _)| *id == tid) else {
+        return false;
+    };
+    let expect = tag_semantic_hash(tid, name, desc);
+    m.semantic_hash.as_deref() == Some(expect.as_str())
+}
+
+/// 本地重算某 Paper 的 total_score：只加当前有效 tag score（active + enabled + hash 匹配）。
+/// 保留 tag_matches_json 全部记录（disabled/deleted/stale 作为缓存），只重算 total。
 pub fn recompute_paper_total_score(conn: &Connection, paper_id: i64, active_tags: &[(i64, String, String)]) -> Result<(), String> {
     let matches_json: Option<String> = conn
         .query_row(
@@ -130,21 +145,11 @@ pub fn recompute_paper_total_score(conn: &Connection, paper_id: i64, active_tags
         return Ok(());
     };
     let matches: Vec<TagMatch> = serde_json::from_str(&json).unwrap_or_default();
-    let mut total: f64 = 0.0;
-    for m in &matches {
-        // 判定该 match 是否对应某个 active tag 且 hash 匹配
-        let active_hit = active_tags.iter().find(|(id, name, desc)| {
-            let id_match = m.tag_id == Some(*id) || (m.tag_id.is_none() && &m.tag == name);
-            if !id_match {
-                return false;
-            }
-            let expect = tag_semantic_hash(*id, name, desc);
-            m.semantic_hash.as_deref() == Some(expect.as_str())
-        });
-        if active_hit.is_some() {
-            total += m.score;
-        }
-    }
+    let total: f64 = matches
+        .iter()
+        .filter(|m| is_current_tag_match_valid(m, active_tags))
+        .map(|m| m.score)
+        .sum();
     conn.execute(
         "UPDATE papers SET total_score = ?1, updated_at = ?2 WHERE id = ?3",
         params![total, db::now_utc(), paper_id],

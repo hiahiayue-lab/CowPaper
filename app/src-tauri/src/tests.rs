@@ -3649,3 +3649,144 @@ fn test_name_edit_semantic_changed() {
     assert!(d.unchanged.contains(&"平台经济".to_string()), "未修改标签 unchanged");
     // 与 screenshot 等价：改 desc 后的 totalScore（A/C 保留、修改标签替换）已由 test_screenshot_regression 覆盖
 }
+
+// ================= Round 6.5.6：Tag Visibility（DTO 过滤） =================
+
+fn seed_abc_scores() -> (rusqlite::Connection, i64, i64, i64, i64) {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let pa = seed_paper_with_score(&conn, jid, "10.1000/vis-a", "A", 0.0);
+    let ta = db::add_tag(&conn, "VIS-A", Some("a")).unwrap();
+    let tb = db::add_tag(&conn, "VIS-B", Some("b")).unwrap();
+    let tc = db::add_tag(&conn, "VIS-C", Some("c")).unwrap();
+    let ha = crate::tag_config::tag_semantic_hash(ta.id, "VIS-A", "a");
+    let hb = crate::tag_config::tag_semantic_hash(tb.id, "VIS-B", "b");
+    let hc = crate::tag_config::tag_semantic_hash(tc.id, "VIS-C", "c");
+    let json = serde_json::json!([
+        {"tag":"VIS-A","score":0.8,"tagId":ta.id,"semanticHash":ha},
+        {"tag":"VIS-B","score":0.6,"tagId":tb.id,"semanticHash":hb},
+        {"tag":"VIS-C","score":1.0,"tagId":tc.id,"semanticHash":hc}
+    ]);
+    conn.execute("UPDATE papers SET tag_matches_json=?1 WHERE id=?2", params![json.to_string(), pa]).unwrap();
+    let active = crate::tag_config::active_tags(&conn).unwrap();
+    crate::tag_config::recompute_paper_total_score(&conn, pa, &active).unwrap();
+    (conn, pa, ta.id, tb.id, tc.id)
+}
+fn dto_tags(conn: &rusqlite::Connection, paper_id: i64) -> Vec<String> {
+    let p = db::get_paper(conn, paper_id).unwrap().unwrap();
+    p.tag_matches.iter().map(|m| m.tag.clone()).collect()
+}
+
+/// 1/2) delete → DTO 不含 deleted tag，totalScore 正确。
+#[test]
+fn test_delete_hides_from_dto() {
+    let (conn, pa, _ta, _tb, tc) = seed_abc_scores();
+    // delete C → 新 active（无 C）
+    db::delete_tag(&conn, tc).unwrap();
+    let active = crate::tag_config::active_tags(&conn).unwrap();
+    crate::tag_config::recompute_paper_total_score(&conn, pa, &active).unwrap();
+    let tags = dto_tags(&conn, pa);
+    assert!(!tags.contains(&"VIS-C".to_string()), "DTO 不得含 deleted tag: {:?}", tags);
+    assert!(tags.contains(&"VIS-A".to_string()));
+    let s: f64 = conn.query_row("SELECT total_score FROM papers WHERE id=?1", params![pa], |r| r.get(0)).unwrap();
+    assert!((s - 1.4).abs() < 1e-9, "delete 后 total=1.4，实际 {}", s);
+    // cache 保留
+    let json: String = conn.query_row("SELECT tag_matches_json FROM papers WHERE id=?1", params![pa], |r| r.get(0)).unwrap();
+    assert!(json.contains("VIS-C"), "cache 保留 deleted tag");
+}
+
+/// 3/4) disable → cache 保留但 DTO 隐藏；re-enable（hash 不变）→ cache 复用重新显示。
+#[test]
+fn test_disable_hide_and_reenable_show() {
+    let (conn, pa, _ta, tb, _tc) = seed_abc_scores();
+    // disable B
+    db::update_tag(&conn, tb, "VIS-B", Some("b"), false).unwrap();
+    let active = crate::tag_config::active_tags(&conn).unwrap();
+    crate::tag_config::recompute_paper_total_score(&conn, pa, &active).unwrap();
+    let tags = dto_tags(&conn, pa);
+    assert!(!tags.contains(&"VIS-B".to_string()), "disabled tag 不显示: {:?}", tags);
+    let s: f64 = conn.query_row("SELECT total_score FROM papers WHERE id=?1", params![pa], |r| r.get(0)).unwrap();
+    assert!((s - 1.8).abs() < 1e-9, "disabled 不计：1.8，实际 {}", s);
+    // re-enable（semantic 未变）→ cache 复用，重新显示
+    db::update_tag(&conn, tb, "VIS-B", Some("b"), true).unwrap();
+    let active2 = crate::tag_config::active_tags(&conn).unwrap();
+    crate::tag_config::recompute_paper_total_score(&conn, pa, &active2).unwrap();
+    let tags2 = dto_tags(&conn, pa);
+    assert!(tags2.contains(&"VIS-B".to_string()), "re-enable 后重新显示");
+    let s2: f64 = conn.query_row("SELECT total_score FROM papers WHERE id=?1", params![pa], |r| r.get(0)).unwrap();
+    assert!((s2 - 2.4).abs() < 1e-9, "re-enable 缓存计入：2.4，实际 {}", s2);
+}
+
+/// 5) scheduled delete 未生效 → 当前 active 仍含 C → DTO 仍显示（只有真正激活后才隐藏）。
+#[test]
+fn test_scheduled_delete_not_active_until_activation() {
+    use crate::models::TagDraftItem;
+    let (conn, pa, _ta, tb, tc) = seed_abc_scores();
+    // scheduled：删除 C（draft 不含 C）
+    let draft = vec![
+        TagDraftItem { id: _ta, name: "VIS-A".into(), description: Some("a".into()), enabled: true, deleted: false },
+        TagDraftItem { id: tb, name: "VIS-B".into(), description: Some("b".into()), enabled: true, deleted: false },
+    ];
+    crate::tag_config::save_scheduled_config(&conn, &draft, "2026-08-27").unwrap();
+    // 未激活 → active 仍含 C → DTO 显示 C
+    let tags = dto_tags(&conn, pa);
+    assert!(tags.contains(&"VIS-C".to_string()), "scheduled 未激活时 C 仍显示: {:?}", tags);
+    // 模拟 immediate 激活（scheduled items 作为 candidate）→ C 消失
+    crate::tag_config::save_immediate_config(&conn, &draft).unwrap();
+    let tags2 = dto_tags(&conn, pa);
+    assert!(!tags2.contains(&"VIS-C".to_string()), "激活后 C 隐藏: {:?}", tags2);
+    let _ = tc;
+}
+
+/// 6) immediate delete → tag 消失。
+#[test]
+fn test_immediate_delete_hides() {
+    use crate::models::TagDraftItem;
+    let (conn, pa, _ta, tb, tc) = seed_abc_scores();
+    let draft = vec![
+        TagDraftItem { id: _ta, name: "VIS-A".into(), description: Some("a".into()), enabled: true, deleted: false },
+        TagDraftItem { id: tb, name: "VIS-B".into(), description: Some("b".into()), enabled: true, deleted: false },
+    ];
+    crate::tag_config::save_immediate_config(&conn, &draft).unwrap();
+    let tags = dto_tags(&conn, pa);
+    assert!(!tags.contains(&"VIS-C".to_string()), "immediate delete 后隐藏");
+    let _ = tc;
+}
+
+/// 7) semanticChanged：旧 hash chip 隐藏；tag-only 更新成功 → 新 hash 生效显示。
+#[test]
+fn test_semantic_changed_hide_until_updated() {
+    let (conn, pa, _ta, _tb, tc) = seed_abc_scores();
+    // 修改 C description（simulate immediate 保存改 active）
+    db::update_tag(&conn, tc, "VIS-C", Some("新说明"), true).unwrap();
+    // 旧 cache hash（旧 c）≠ 新语义 → DTO 隐藏 C、total 不含 C
+    let active = crate::tag_config::active_tags(&conn).unwrap();
+    crate::tag_config::recompute_paper_total_score(&conn, pa, &active).unwrap();
+    let tags = dto_tags(&conn, pa);
+    assert!(!tags.contains(&"VIS-C".to_string()), "旧 hash chip 隐藏: {:?}", tags);
+    let s: f64 = conn.query_row("SELECT total_score FROM papers WHERE id=?1", params![pa], |r| r.get(0)).unwrap();
+    assert!((s - 1.4).abs() < 1e-9, "stale 不计：1.4，实际 {}", s);
+    // tag-only 更新 C = 1.0（新 hash）
+    let targets = vec![(tc, "VIS-C".to_string(), "新说明".to_string())];
+    let scores = vec![(tc, 1.0)];
+    db::set_paper_tag_scores(&conn, pa, &scores, &targets).unwrap();
+    let tags2 = dto_tags(&conn, pa);
+    assert!(tags2.contains(&"VIS-C".to_string()), "新 hash score 重新显示");
+    let s2: f64 = conn.query_row("SELECT total_score FROM papers WHERE id=?1", params![pa], |r| r.get(0)).unwrap();
+    assert!((s2 - 2.4).abs() < 1e-9, "更新后 total=2.4，实际 {}", s2);
+}
+
+/// 8) 历史推荐 rank/scoreSnapshot 不变（DTO 过滤不触碰 recommendation_items）。
+#[test]
+fn test_history_frozen_by_dto_filter() {
+    let (conn, pa, _ta, _tb, tc) = seed_abc_scores();
+    let r1 = crate::recommendation::refresh_current_recommendations(&conn, &local_dt(2026, 8, 26, 15, 0), "09:00").unwrap();
+    let snapshot = db::list_recommendation_items(&conn, r1).unwrap()[0].score_snapshot;
+    let _r2 = crate::recommendation::refresh_current_recommendations(&conn, &local_dt(2026, 8, 27, 9, 0), "09:00").unwrap();
+    // delete C + DTO 过滤 → finalized run 快照不变
+    db::delete_tag(&conn, tc).unwrap();
+    let active = crate::tag_config::active_tags(&conn).unwrap();
+    crate::tag_config::recompute_paper_total_score(&conn, pa, &active).unwrap();
+    let items = db::list_recommendation_items(&conn, r1).unwrap();
+    assert_eq!(items[0].score_snapshot, snapshot, "历史 rank/score 冻结");
+}
