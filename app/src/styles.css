@@ -784,3 +784,22 @@ button.full {
   border-color: var(--accent);
   outline: 2px solid #bfdbfe;
 }
+
+/* ---------- Round 6.2：手动添加页（已订阅期刊搜索） ---------- */
+
+.journal-sub-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 18px 0 8px;
+}
+.journal-sub-head input[type="text"] {
+  padding: 5px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 13px;
+  flex: 0 1 200px;
+  background: var(--panel);
+  color: var(--text);
+}

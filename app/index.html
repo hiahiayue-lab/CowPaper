@@ -103,11 +103,15 @@
           </div>
           <div id="manual-view" class="manual-view hidden">
             <form id="add-form" class="add-form">
-              <input id="add-name" type="text" placeholder="期刊名称（可选）" />
+              <input id="add-name" type="text" placeholder="期刊名称" />
               <input id="add-issn" type="text" placeholder="ISSN，如 0025-1909" />
-              <button type="submit" class="primary">添加</button>
+              <button type="submit" class="primary">添加期刊</button>
             </form>
             <p id="add-error" class="error"></p>
+            <div class="journal-sub-head">
+              <span class="title">已订阅期刊</span>
+              <input id="journal-search" type="text" placeholder="搜索…" />
+            </div>
             <ul id="journal-list" class="list"></ul>
           </div>
         </section>

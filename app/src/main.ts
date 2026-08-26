@@ -551,7 +551,20 @@ function renderJournals() {
     ul.innerHTML = '<li class="empty">暂无订阅，请在上方添加期刊</li>';
     return;
   }
-  for (const j of journals) {
+  const q = ($("journal-search") as HTMLInputElement).value.trim().toLowerCase();
+  const shown = q
+    ? journals.filter(
+        (j) =>
+          j.name.toLowerCase().includes(q) ||
+          (j.printIssn || "").toLowerCase().includes(q) ||
+          (j.onlineIssn || "").toLowerCase().includes(q),
+      )
+    : journals;
+  if (shown.length === 0) {
+    ul.innerHTML = '<li class="empty">没有符合条件的期刊</li>';
+    return;
+  }
+  for (const j of shown) {
     const rate = j.abstractCoverageRate != null ? Math.round(j.abstractCoverageRate * 100) + "%" : "—";
     // 多 ISSN / ISSN-L 显示：优先 identifiers（canonical），未知则不显示假值
     const print = j.identifiers.find((i) => i.identifierType === "print")?.value ?? j.printIssn ?? "";
@@ -1723,6 +1736,7 @@ window.addEventListener("DOMContentLoaded", () => {
     $("rec-tab-current").classList.remove("active");
     renderRecommend();
   });
+  $("journal-search").addEventListener("input", renderJournals);
   $("catalog-search").addEventListener("input", () => {
     if (selectedCatalogCode) renderCatalogRows();
   });
