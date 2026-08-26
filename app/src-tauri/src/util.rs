@@ -29,6 +29,43 @@ pub fn normalize_doi(raw: &str) -> Option<String> {
     }
 }
 
+/// ISSN 规范化（Round 5A）：接受 `0025-1909` / `00251909` / 带空格 / 小写 x 等，
+/// 统一为内部 canonical 形式 `NNNN-NNNX`（校验位大写 X）。
+/// 校验 ISSN-8 checksum（前 7 位加权 8..2，mod 11，余 10 → 'X'）。
+/// 非法/校验失败的输入返回 None（不得进入 canonical identifiers）。
+pub fn normalize_issn(raw: &str) -> Option<String> {
+    let digits: Vec<char> = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+    if digits.len() != 8 {
+        return None;
+    }
+    for (i, c) in digits.iter().enumerate() {
+        if i < 7 {
+            if !c.is_ascii_digit() {
+                return None;
+            }
+        } else if !(c.is_ascii_digit() || *c == 'X') {
+            return None;
+        }
+    }
+    let mut sum: u32 = 0;
+    for (i, c) in digits[..7].iter().enumerate() {
+        sum += c.to_digit(10).unwrap() * (8 - i as u32);
+    }
+    let check = (11 - (sum % 11)) % 11;
+    let expect = if check == 10 { 'X' } else { char::from_digit(check, 10).unwrap() };
+    if digits[7] != expect {
+        return None;
+    }
+    Some(format!(
+        "{}{}{}{}-{}{}{}{}",
+        digits[0], digits[1], digits[2], digits[3], digits[4], digits[5], digits[6], digits[7]
+    ))
+}
+
 /// 去掉 XML/HTML 标签并解码常见实体，折叠空白（用于摘要展示）。
 pub fn strip_html(input: &str) -> String {
     let mut out = String::new();

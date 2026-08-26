@@ -151,11 +151,26 @@ fn sync_journal(
     to: &str,
     report: &mut SyncReport,
 ) -> Result<JournalSyncResult, String> {
-    let issn = j
-        .print_issn
-        .as_deref()
-        .or(j.online_issn.as_deref())
-        .ok_or_else(|| "缺少 ISSN".to_string())?;
+    // 多 ISSN：收集该 canonical Journal 的全部 identifiers（print/online/other），
+    // normalize + 去重，同一 ISSN 只发起一次 API 查询。
+    let mut issns: Vec<String> = Vec::new();
+    for idf in &j.identifiers {
+        if let Some(n) = crate::util::normalize_issn(&idf.value) {
+            if !issns.contains(&n) {
+                issns.push(n);
+            }
+        }
+    }
+    for raw in [&j.print_issn, &j.online_issn].into_iter().flatten() {
+        if let Some(n) = crate::util::normalize_issn(raw) {
+            if !issns.contains(&n) {
+                issns.push(n);
+            }
+        }
+    }
+    if issns.is_empty() {
+        return Err("缺少 ISSN".to_string());
+    }
 
     // 增量起点：上次成功同步 - 24h（首次回溯 30 天），满足 §7.2。
     let from = {
@@ -169,11 +184,18 @@ fn sync_journal(
         }
     };
 
-    // 发现：Crossref 为主力，OpenAlex 补漏 + 补摘要。
+    // 发现：Crossref 为主力（多 ISSN 各自查询，DOI 去重由 upsert 的 normalized_doi 唯一索引保证），
+    // OpenAlex 补漏 + 补摘要。任一 ISSN 成功即继续；全部失败才报错。
     let mut candidates: Vec<PaperCandidate> = Vec::new();
-    match crossref.works(issn, &from, to) {
-        Some(w) => candidates.extend(w.candidates),
-        None => return Err("Crossref 获取失败".into()),
+    let mut crossref_ok = false;
+    for i in &issns {
+        if let Some(w) = crossref.works(i, &from, to) {
+            crossref_ok = true;
+            candidates.extend(w.candidates);
+        }
+    }
+    if !crossref_ok {
+        return Err("Crossref 获取失败".into());
     }
     if let Some(sid) = &j.openalex_source_id {
         if let Some(oa) = openalex.works(sid, &from, to) {

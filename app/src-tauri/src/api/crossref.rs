@@ -9,6 +9,8 @@ pub struct JournalMeta {
     pub publisher: Option<String>,
     pub print_issn: Option<String>,
     pub online_issn: Option<String>,
+    /// ISSN-L（linking ISSN），Crossref journal 端点提供
+    pub issn_l: Option<String>,
 }
 
 pub struct CrossrefWorks {
@@ -59,6 +61,12 @@ impl Crossref {
             publisher,
             print_issn,
             online_issn,
+            // Crossref 字段名为大写 "ISSN-L"；兼容小写变体
+            issn_l: m
+                .get("ISSN-L")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .or_else(|| m.get("issn-l").and_then(|v| v.as_str()).map(str::to_string)),
         })
     }
 

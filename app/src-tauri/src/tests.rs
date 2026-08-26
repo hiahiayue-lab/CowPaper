@@ -1650,3 +1650,274 @@ fn test_work_state_consistency() {
     assert_eq!(st.waiting_for_abstract, 1, "E: 1 篇等待摘要");
     assert_eq!(st.pending_analysis + st.waiting_for_abstract, 3, "E: 合计 3 篇");
 }
+
+// ================= Round 5A：Canonical Journal Identity & Collections =================
+
+#[test]
+fn test_issn_normalize_and_checksum() {
+    use crate::util::normalize_issn;
+    // 1) valid：带连字符 / 无连字符 / 空白 / 小写 x
+    assert_eq!(normalize_issn("0025-1909"), Some("0025-1909".to_string()));
+    assert_eq!(normalize_issn("00251909"), Some("0025-1909".to_string()));
+    assert_eq!(normalize_issn(" 0025-1909 "), Some("0025-1909".to_string()));
+    assert_eq!(normalize_issn("1526-5501"), Some("1526-5501".to_string()));
+    assert_eq!(normalize_issn("0306-4573"), Some("0306-4573".to_string()));
+    // 2) X checksum：前 7 位 1000002 → 校验位 X
+    assert_eq!(normalize_issn("1000-002X"), Some("1000-002X".to_string()));
+    assert_eq!(normalize_issn("1000002x"), Some("1000-002X".to_string()));
+    assert_eq!(normalize_issn("1000-002x"), Some("1000-002X".to_string()));
+    // 3) invalid checksum / 非法输入
+    assert_eq!(normalize_issn("0025-1900"), None, "校验位错误");
+    assert_eq!(normalize_issn("1000-0020"), None, "X 位置被数字替换");
+    assert_eq!(normalize_issn("0025-190"), None, "长度不足");
+    assert_eq!(normalize_issn("12345678"), None, "随机 8 位校验失败");
+    assert_eq!(normalize_issn(""), None);
+    assert_eq!(normalize_issn("abcdefgh"), None, "非数字");
+    assert_eq!(normalize_issn("0025-190Z"), None, "非法校验字符");
+}
+
+#[test]
+fn test_identifier_resolution_same_journal() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "Mgmt Sci", Some("0025-1909"), Some("1526-5501"), None, None).unwrap();
+    db::insert_identifier(&conn, jid, "print", "0025-1909", Some("crossref")).unwrap();
+    db::insert_identifier(&conn, jid, "online", "1526-5501", Some("crossref")).unwrap();
+    // 4) pISSN resolve 同一 journal
+    assert_eq!(db::resolve_journal_by_identifier(&conn, "0025-1909").unwrap(), Some(jid));
+    // 5) eISSN resolve 同一 journal
+    assert_eq!(db::resolve_journal_by_identifier(&conn, "1526-5501").unwrap(), Some(jid));
+    // 6) pISSN + eISSN → 同一个 canonical Journal
+    assert_eq!(
+        db::resolve_journal_by_identifier(&conn, "0025-1909").unwrap(),
+        db::resolve_journal_by_identifier(&conn, "1526-5501").unwrap()
+    );
+    // 未注册 ISSN → None
+    assert_eq!(db::resolve_journal_by_identifier(&conn, "0306-4573").unwrap(), None);
+}
+
+#[test]
+fn test_duplicate_identifier_rejected() {
+    let conn = mem_db();
+    let a = db::insert_journal(&conn, "Journal A", Some("0025-1909"), None, None, None).unwrap();
+    let b = db::insert_journal(&conn, "Journal B", Some("1526-5501"), None, None, None).unwrap();
+    db::insert_identifier(&conn, a, "print", "0025-1909", Some("crossref")).unwrap();
+    // 同一 ISSN 试图映射到 B：唯一索引拒绝，映射仍归 A
+    db::insert_identifier(&conn, b, "print", "0025-1909", Some("crossref")).unwrap();
+    assert_eq!(db::resolve_journal_by_identifier(&conn, "0025-1909").unwrap(), Some(a));
+    assert_eq!(db::list_journal_identifiers(&conn, b).unwrap().len(), 0, "重复 ISSN 不得写入第二个 journal");
+    // 幂等：同 journal 重复插入不产生重复行
+    db::insert_identifier(&conn, a, "print", "0025-1909", Some("crossref")).unwrap();
+    assert_eq!(db::list_journal_identifiers(&conn, a).unwrap().len(), 1);
+}
+
+#[test]
+fn test_migration_v2_to_v3_preserves_data() {
+    // 手工构造 v2 库（无 journal_identifiers / issn_l / collections），含旧数据，迁移到 v3
+    let conn = Connection::open_in_memory().unwrap();
+    conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+    conn.execute_batch(
+        r#"
+        CREATE TABLE journals (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, print_issn TEXT, online_issn TEXT, publisher TEXT, enabled INTEGER NOT NULL DEFAULT 1, priority INTEGER NOT NULL DEFAULT 0, rss_url TEXT, openalex_source_id TEXT, publisher_adapter TEXT, last_successful_sync_at TEXT, last_paper_date TEXT, coverage_status TEXT, abstract_coverage_rate REAL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+        CREATE TABLE papers (id INTEGER PRIMARY KEY AUTOINCREMENT, journal_id INTEGER NOT NULL, normalized_doi TEXT, original_doi TEXT, title TEXT, title_norm TEXT, authors_json TEXT, published_date TEXT, year INTEGER, abstract TEXT, abstract_source TEXT, abstract_retrieved_at TEXT, url TEXT, publisher_article_id TEXT, openalex_work_id TEXT, discovery_source TEXT, analysis_status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, chinese_title TEXT, chinese_abstract TEXT, one_sentence_summary TEXT, tag_matches_json TEXT, total_score REAL, model_name TEXT, prompt_version TEXT, evidence_hash TEXT, analyzed_at TEXT, is_favorite INTEGER NOT NULL DEFAULT 0, is_read INTEGER NOT NULL DEFAULT 0, is_ignored INTEGER NOT NULL DEFAULT 0, retry_count INTEGER NOT NULL DEFAULT 0, queued_at TEXT);
+        CREATE TABLE source_records (id INTEGER PRIMARY KEY AUTOINCREMENT, paper_id INTEGER NOT NULL, source TEXT NOT NULL, source_id TEXT, raw_json TEXT, retrieved_at TEXT NOT NULL);
+        CREATE TABLE sync_batches (id INTEGER PRIMARY KEY AUTOINCREMENT, trigger TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT, journal_total INTEGER NOT NULL DEFAULT 0, journal_completed INTEGER NOT NULL DEFAULT 0, journal_failed INTEGER NOT NULL DEFAULT 0, records_found INTEGER NOT NULL DEFAULT 0, papers_inserted INTEGER NOT NULL DEFAULT 0, papers_existing INTEGER NOT NULL DEFAULT 0, abstracts_added INTEGER NOT NULL DEFAULT 0, waiting_abstract INTEGER NOT NULL DEFAULT 0, error_summary TEXT);
+        CREATE TABLE sync_batch_papers (id INTEGER PRIMARY KEY AUTOINCREMENT, sync_batch_id INTEGER NOT NULL, paper_id INTEGER NOT NULL, result TEXT NOT NULL);
+        CREATE TABLE analysis_batches (id INTEGER PRIMARY KEY AUTOINCREMENT, source_sync_batch_id INTEGER, parent_batch_id INTEGER, trigger TEXT NOT NULL, status TEXT NOT NULL, model_name TEXT, prompt_version TEXT, created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT, total INTEGER NOT NULL DEFAULT 0, completed INTEGER NOT NULL DEFAULT 0, succeeded INTEGER NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0, skipped INTEGER NOT NULL DEFAULT 0, remaining INTEGER NOT NULL DEFAULT 0, error_summary TEXT);
+        CREATE TABLE analysis_batch_items (id INTEGER PRIMARY KEY AUTOINCREMENT, analysis_batch_id INTEGER NOT NULL, paper_id INTEGER NOT NULL, status TEXT NOT NULL, attempt_count INTEGER NOT NULL DEFAULT 0, started_at TEXT, finished_at TEXT, error_type TEXT, error_summary TEXT, previous_analysis_hash TEXT, result_analysis_hash TEXT);
+        "#,
+    )
+    .unwrap();
+    conn.pragma_update(None, "user_version", 2).unwrap();
+    let now = db::now_utc();
+    conn.execute(
+        "INSERT INTO journals (name, print_issn, online_issn, created_at, updated_at) VALUES ('Mgmt Sci','0025-1909','1526-5501',?1,?1)",
+        params![now],
+    )
+    .unwrap();
+    let jid = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO papers (journal_id, title, analysis_status, created_at, updated_at) VALUES (?1,'Paper One','analysisSucceeded',?2,?2)",
+        params![jid, now],
+    )
+    .unwrap();
+    let pid = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO sync_batches (trigger, status, created_at, journal_total, journal_completed) VALUES ('manual','completed',?1,1,1)",
+        params![now],
+    )
+    .unwrap();
+    let sb = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO sync_batch_papers (sync_batch_id, paper_id, result) VALUES (?1,?2,'new')",
+        params![sb, pid],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO analysis_batches (trigger, status, created_at, total, succeeded) VALUES ('manual','completed',?1,1,1)",
+        params![now],
+    )
+    .unwrap();
+    let ab = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO analysis_batch_items (analysis_batch_id, paper_id, status, attempt_count) VALUES (?1,?2,'succeeded',1)",
+        params![ab, pid],
+    )
+    .unwrap();
+
+    // 迁移到 v3
+    db::init(&conn).unwrap();
+    assert_eq!(db::SCHEMA_VERSION, 3);
+
+    // 8) 旧 issn 迁移进 journal_identifiers（类型按列，不猜）
+    let ids = db::list_journal_identifiers(&conn, jid).unwrap();
+    assert_eq!(ids.len(), 2);
+    let types: Vec<&str> = ids.iter().map(|i| i.identifier_type.as_str()).collect();
+    assert!(types.contains(&"print") && types.contains(&"online"), "print+online 各一");
+    assert!(ids.iter().any(|i| i.value == "0025-1909"));
+    assert!(ids.iter().any(|i| i.value == "1526-5501"));
+
+    // 9) papers 保留
+    let papers = db::list_papers(&conn, Some(jid), 100).unwrap();
+    assert_eq!(papers.len(), 1);
+    assert_eq!(papers[0].title.as_deref(), Some("Paper One"));
+
+    // 10) Batch history 保留
+    assert_eq!(db::list_sync_batches(&conn, 10).unwrap().len(), 1);
+    assert_eq!(db::list_analysis_batches(&conn, 10).unwrap().len(), 1);
+    let b = db::get_analysis_batch(&conn, ab).unwrap().unwrap();
+    assert_eq!(b.succeeded, 1);
+    assert_eq!(db::list_analysis_batch_items(&conn, ab).unwrap().len(), 1);
+}
+
+#[test]
+fn test_database_restart_persistence() {
+    let dir = std::env::temp_dir().join(format!("cowpaper_r5a_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("persist.db");
+    let _ = std::fs::remove_file(&path);
+    {
+        let conn = db::open(&path).unwrap();
+        db::init(&conn).unwrap();
+        let jid = db::insert_journal(&conn, "Persist J", Some("0025-1909"), None, None, None).unwrap();
+        db::insert_identifier(&conn, jid, "print", "0025-1909", Some("crossref")).unwrap();
+        db::set_journal_issn_l(&conn, jid, Some("0025-1909")).unwrap();
+        let cid = db::create_collection(&conn, "TEST-UTD", "UTD24 测试", None, None, Some("test"), None).unwrap();
+        db::add_collection_member(&conn, cid, jid).unwrap();
+    }
+    {
+        let conn = db::open(&path).unwrap();
+        db::init(&conn).unwrap(); // 幂等：user_version=3 不重复迁移
+        assert_eq!(db::SCHEMA_VERSION, 3);
+        let j = db::get_journal(&conn, 1).unwrap().expect("期刊持久化");
+        assert_eq!(j.print_issn.as_deref(), Some("0025-1909"));
+        assert_eq!(j.identifiers.len(), 1);
+        assert_eq!(j.identifiers[0].value, "0025-1909");
+        assert_eq!(j.collections, vec!["TEST-UTD".to_string()]);
+        assert_eq!(j.issn_l.as_deref(), Some("0025-1909"));
+        let colls = db::collections_for_journal(&conn, 1).unwrap();
+        assert_eq!(colls.len(), 1);
+        assert_eq!(colls[0].code, "TEST-UTD");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_collections_many_to_many_and_score_unaffected() {
+    let conn = mem_db();
+    let a = db::insert_journal(&conn, "Journal A", Some("0025-1909"), None, None, None).unwrap();
+    let b = db::insert_journal(&conn, "Journal B", Some("1526-5501"), None, None, None).unwrap();
+    let c = db::insert_journal(&conn, "Journal C", Some("0306-4573"), None, None, None).unwrap();
+    let utd = db::create_collection(&conn, "TEST-UTD", "UTD24 测试", None, None, Some("test"), None).unwrap();
+    let ft = db::create_collection(&conn, "TEST-FT", "FT50 测试", None, None, Some("test"), None).unwrap();
+    db::add_collection_member(&conn, utd, a).unwrap();
+    db::add_collection_member(&conn, utd, b).unwrap();
+    db::add_collection_member(&conn, ft, b).unwrap();
+    db::add_collection_member(&conn, ft, c).unwrap();
+
+    // 12) 同一 Journal 属于多个 collection
+    let b_colls = db::collections_for_journal(&conn, b).unwrap();
+    let codes: Vec<&str> = b_colls.iter().map(|x| x.code.as_str()).collect();
+    assert!(codes.contains(&"TEST-UTD") && codes.contains(&"TEST-FT"), "B ∈ UTD + FT");
+
+    // 13) 重复 membership 被拒（PRIMARY KEY，INSERT OR IGNORE）
+    db::add_collection_member(&conn, utd, a).unwrap();
+    let dup: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM (SELECT collection_id, journal_id, COUNT(*) c FROM journal_collection_members GROUP BY collection_id, journal_id HAVING c > 1)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(dup, 0, "不得存在重复 membership");
+
+    // 14) Paper 通过 journal → collections 派生（Paper 不冗余存集合）
+    let cand = candidate(Some("10.1000/coll"), "Collection Paper", Some("abs"), Some("crossref"));
+    let pid = match db::upsert_paper(&conn, a, &cand).unwrap() {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new"),
+    };
+    let p = db::list_papers(&conn, Some(a), 100).unwrap();
+    assert_eq!(p[0].id, pid);
+    let derived = db::collections_for_journal(&conn, p[0].journal_id).unwrap();
+    assert_eq!(derived.len(), 1);
+    assert_eq!(derived[0].code, "TEST-UTD");
+
+    // 15) totalScore 不受 collections 影响
+    conn.execute(
+        "UPDATE papers SET total_score = 42.5, analysis_status='analysisSucceeded' WHERE id = ?1",
+        params![pid],
+    )
+    .unwrap();
+    let before: f64 = conn
+        .query_row("SELECT total_score FROM papers WHERE id = ?1", params![pid], |r| r.get(0))
+        .unwrap();
+    // 加入/移除 collection 不影响 total_score
+    let ft2 = db::create_collection(&conn, "TEST-FT2", "FT50 测试 2", None, None, Some("test"), None).unwrap();
+    db::add_collection_member(&conn, ft2, a).unwrap();
+    let after: f64 = conn
+        .query_row("SELECT total_score FROM papers WHERE id = ?1", params![pid], |r| r.get(0))
+        .unwrap();
+    assert_eq!(before, after, "collection 不得改变 totalScore");
+    assert_eq!(after, 42.5);
+}
+
+#[test]
+fn test_two_identifiers_sync_doi_dedup() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), Some("1526-5501"), None, None).unwrap();
+    db::insert_identifier(&conn, jid, "print", "0025-1909", Some("crossref")).unwrap();
+    db::insert_identifier(&conn, jid, "online", "1526-5501", Some("crossref")).unwrap();
+    // 模拟：pISSN 与 eISSN 查询都返回同一 DOI 的候选
+    let c = candidate(Some("10.1000/dedup-r5a"), "Dedup Paper", Some("abs"), Some("crossref"));
+    assert!(matches!(db::upsert_paper(&conn, jid, &c).unwrap(), UpsertOutcome::New(_)));
+    assert!(matches!(
+        db::upsert_paper(&conn, jid, &c).unwrap(),
+        UpsertOutcome::Existing { .. }
+    ));
+    let papers = db::list_papers(&conn, Some(jid), 100).unwrap();
+    assert_eq!(papers.len(), 1, "多 ISSN 同步不得产生重复论文（normalized_doi 唯一）");
+    assert_eq!(papers[0].normalized_doi.as_deref(), Some("10.1000/dedup-r5a"));
+}
+
+#[test]
+fn test_issn_l_merge_and_possible_duplicate() {
+    let conn = mem_db();
+    // 两个期刊共享 ISSN-L → 标记 possible_duplicate（不自动合并，不破坏数据）
+    let a = db::insert_journal(&conn, "Mgmt Sci", Some("0025-1909"), None, None, None).unwrap();
+    let b = db::insert_journal(&conn, "Mgmt Science X", Some("1526-5501"), None, None, None).unwrap();
+    db::set_journal_issn_l(&conn, a, Some("0025-1909")).unwrap();
+    db::set_journal_issn_l(&conn, b, Some("0025-1909")).unwrap();
+    let list = db::list_journals(&conn).unwrap();
+    let ja = list.iter().find(|j| j.id == a).unwrap();
+    let jb = list.iter().find(|j| j.id == b).unwrap();
+    assert!(ja.possible_duplicate, "A 应标记疑似重复");
+    assert!(jb.possible_duplicate, "B 应标记疑似重复");
+    // 相同规范化标题也标记（"Management Science" 与 "management   science" 规范化相同）
+    let c = db::insert_journal(&conn, "Management Science", Some("0306-4573"), None, None, None).unwrap();
+    let d = db::insert_journal(&conn, "management   science", Some("1532-6934"), None, None, None).unwrap();
+    let list = db::list_journals(&conn).unwrap();
+    let jc = list.iter().find(|j| j.id == c).unwrap();
+    let jd = list.iter().find(|j| j.id == d).unwrap();
+    assert!(jc.possible_duplicate, "相同标题规范化应标记疑似重复");
+    assert!(jd.possible_duplicate, "相同标题规范化应标记疑似重复");
+}

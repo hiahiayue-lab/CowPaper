@@ -3,7 +3,8 @@ use std::path::Path;
 
 use crate::models::{
     AnalysisBatch, AnalysisBatchItem, Author, Journal, Paper, PaperCandidate, SyncBatch,
-    SyncBatchPaper, Tag, TagMatch, UpsertOutcome, ST_PENDING, ST_SUCCEEDED, ST_WAITING_ABSTRACT,
+    SyncBatchPaper, Tag, TagMatch, UpsertOutcome, IDT_ONLINE, IDT_PRINT, ST_PENDING,
+    ST_SUCCEEDED, ST_WAITING_ABSTRACT,
 };
 
 const SCHEMA: &str = r#"
@@ -83,10 +84,10 @@ pub fn open(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-/// 当前 schema 版本（下一轮 Batch 表将从 v2 开始递增）。
+/// 当前 schema 版本（Round 5A 引入 journal_identifiers / issn_l / journal_collections 为 v3）。
 /// 生产构建中仅由迁移系统隐式使用；测试中直接断言。
 #[allow(dead_code)]
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 pub fn init(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
@@ -136,6 +137,7 @@ fn row_to_journal(row: &rusqlite::Row) -> Result<Journal> {
         name: row.get("name")?,
         print_issn: row.get("print_issn")?,
         online_issn: row.get("online_issn")?,
+        issn_l: row.get("issn_l")?,
         publisher: row.get("publisher")?,
         enabled: row.get::<_, i64>("enabled")? != 0,
         priority: row.get("priority")?,
@@ -149,6 +151,9 @@ fn row_to_journal(row: &rusqlite::Row) -> Result<Journal> {
         paper_count: row.get("paper_count")?,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
+        identifiers: Vec::new(),
+        collections: Vec::new(),
+        possible_duplicate: false,
     })
 }
 
@@ -157,18 +162,116 @@ pub fn list_journals(conn: &Connection) -> Result<Vec<Journal>> {
         "SELECT j.*, (SELECT COUNT(*) FROM papers p WHERE p.journal_id = j.id) AS paper_count
          FROM journals j ORDER BY j.enabled DESC, j.priority DESC, j.name ASC",
     )?;
-    let rows = stmt.query_map([], row_to_journal)?;
-    rows.collect()
+    let mut journals: Vec<Journal> = stmt.query_map([], row_to_journal)?.collect::<Result<Vec<_>>>()?;
+    enrich_journals(conn, &mut journals)?;
+    Ok(journals)
 }
 
 pub fn get_journal(conn: &Connection, id: i64) -> Result<Option<Journal>> {
-    conn.query_row(
-        "SELECT j.*, (SELECT COUNT(*) FROM papers p WHERE p.journal_id = j.id) AS paper_count
-         FROM journals j WHERE j.id = ?1",
-        params![id],
-        row_to_journal,
-    )
-    .optional()
+    let mut j = conn
+        .query_row(
+            "SELECT j.*, (SELECT COUNT(*) FROM papers p WHERE p.journal_id = j.id) AS paper_count
+             FROM journals j WHERE j.id = ?1",
+            params![id],
+            row_to_journal,
+        )
+        .optional()?;
+    if let Some(j) = j.as_mut() {
+        let mut v = vec![j.clone()];
+        enrich_journals(conn, &mut v)?;
+        *j = v.remove(0);
+    }
+    Ok(j)
+}
+
+/// 给 journals 填充 identifiers / collections / possible_duplicate（一次查询，避免 N+1）。
+fn enrich_journals(conn: &Connection, journals: &mut [Journal]) -> Result<()> {
+    {
+        let mut stmt = conn.prepare(
+            "SELECT id, journal_id, identifier_type, value, source, created_at, updated_at
+             FROM journal_identifiers ORDER BY identifier_type, value",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(crate::models::JournalIdentifier {
+                id: r.get(0)?,
+                journal_id: r.get(1)?,
+                identifier_type: r.get(2)?,
+                value: r.get(3)?,
+                source: r.get(4)?,
+                created_at: r.get(5)?,
+                updated_at: r.get(6)?,
+            })
+        })?;
+        for idf in rows {
+            let idf = idf?;
+            if let Some(j) = journals.iter_mut().find(|j| j.id == idf.journal_id) {
+                j.identifiers.push(idf);
+            }
+        }
+    }
+    {
+        let mut stmt = conn.prepare(
+            "SELECT m.journal_id, c.code FROM journal_collection_members m
+             JOIN journal_collections c ON c.id = m.collection_id ORDER BY c.code",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        for row in rows {
+            let (jid, code) = row?;
+            if let Some(j) = journals.iter_mut().find(|j| j.id == jid) {
+                j.collections.push(code);
+            }
+        }
+    }
+    let dup_ids = possible_duplicate_journal_ids(conn)?;
+    for j in journals.iter_mut() {
+        j.possible_duplicate = dup_ids.contains(&j.id);
+    }
+    Ok(())
+}
+
+/// 疑似重复期刊：共享 ISSN-L 或相同规范化标题的期刊组（只标记，不自动合并）。
+fn possible_duplicate_journal_ids(conn: &Connection) -> Result<std::collections::HashSet<i64>> {
+    use std::collections::{HashMap, HashSet};
+    let mut out: HashSet<i64> = HashSet::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT issn_l FROM journals WHERE issn_l IS NOT NULL AND issn_l != '' GROUP BY issn_l HAVING COUNT(*) > 1",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        for issn_l in rows {
+            let issn_l = issn_l?;
+            let mut stmt2 = conn.prepare("SELECT id FROM journals WHERE issn_l = ?1")?;
+            let ids = stmt2.query_map(params![issn_l], |r| r.get::<_, i64>(0))?;
+            for id in ids {
+                out.insert(id?);
+            }
+        }
+    }
+    {
+        let mut stmt = conn.prepare("SELECT id, name FROM journals")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        let mut by_title: HashMap<String, Vec<i64>> = HashMap::new();
+        for row in rows {
+            let (id, name) = row?;
+            let key: String = name
+                .chars()
+                .filter(|c| c.is_alphanumeric())
+                .map(|c| c.to_ascii_lowercase())
+                .collect();
+            if key.is_empty() {
+                continue;
+            }
+            by_title.entry(key).or_default().push(id);
+        }
+        for v in by_title.values() {
+            if v.len() > 1 {
+                for id in v {
+                    out.insert(*id);
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 pub fn set_journal_enabled(conn: &Connection, id: i64, enabled: bool) -> Result<()> {
@@ -191,6 +294,156 @@ pub fn set_journal_rss(conn: &Connection, id: i64, rss_url: Option<&str>) -> Res
 pub fn delete_journal(conn: &Connection, id: i64) -> Result<()> {
     conn.execute("DELETE FROM journals WHERE id = ?1", params![id])?;
     Ok(())
+}
+
+// ---------- Round 5A：Canonical Journal Identity ----------
+
+/// 设置 ISSN-L（linking ISSN）。调用方需保证传入值已 normalize 或为 None。
+pub fn set_journal_issn_l(conn: &Connection, id: i64, issn_l: Option<&str>) -> Result<()> {
+    conn.execute(
+        "UPDATE journals SET issn_l = ?1, updated_at = ?2 WHERE id = ?3",
+        params![issn_l, now_utc(), id],
+    )?;
+    Ok(())
+}
+
+/// 写入规范化 identifier（幂等：INSERT OR IGNORE，value 唯一索引保证一个 ISSN 只映射一个 Journal）。
+/// 调用方必须传入已 normalize 的 value（canonical NNNN-NNNX）。
+pub fn insert_identifier(
+    conn: &Connection,
+    journal_id: i64,
+    identifier_type: &str,
+    value: &str,
+    source: Option<&str>,
+) -> Result<()> {
+    let now = now_utc();
+    conn.execute(
+        "INSERT OR IGNORE INTO journal_identifiers (journal_id, identifier_type, value, source, created_at, updated_at)
+         VALUES (?1,?2,?3,?4,?5,?5)",
+        params![journal_id, identifier_type, value, source, now],
+    )?;
+    Ok(())
+}
+
+/// 输入任意已知 ISSN（规范化后），返回其映射的 canonical Journal id（如有）。
+pub fn resolve_journal_by_identifier(conn: &Connection, value: &str) -> Result<Option<i64>> {
+    let id = conn
+        .query_row(
+            "SELECT journal_id FROM journal_identifiers WHERE value = ?1",
+            params![value],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()?;
+    Ok(id)
+}
+
+/// 按 ISSN-L（规范化后）查找 canonical Journal（journals.issn_l 列）。
+pub fn find_journal_by_issn_l(conn: &Connection, issn_l: &str) -> Result<Option<i64>> {
+    let id = conn
+        .query_row(
+            "SELECT id FROM journals WHERE issn_l = ?1",
+            params![issn_l],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()?;
+    Ok(id)
+}
+
+/// 某 Journal 的全部 identifiers。
+#[allow(dead_code)] // 测试辅助；生产路径由 enrich_journals 一次填充
+pub fn list_journal_identifiers(conn: &Connection, journal_id: i64) -> Result<Vec<crate::models::JournalIdentifier>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, journal_id, identifier_type, value, source, created_at, updated_at
+         FROM journal_identifiers WHERE journal_id = ?1 ORDER BY identifier_type, value",
+    )?;
+    let rows = stmt.query_map(params![journal_id], |r| {
+        Ok(crate::models::JournalIdentifier {
+            id: r.get(0)?,
+            journal_id: r.get(1)?,
+            identifier_type: r.get(2)?,
+            value: r.get(3)?,
+            source: r.get(4)?,
+            created_at: r.get(5)?,
+            updated_at: r.get(6)?,
+        })
+    })?;
+    rows.collect()
+}
+
+// ---------- Round 5A：Journal Collections ----------
+
+pub fn create_collection(
+    conn: &Connection,
+    code: &str,
+    name: &str,
+    version: Option<&str>,
+    effective_from: Option<&str>,
+    source_name: Option<&str>,
+    source_url: Option<&str>,
+) -> Result<i64> {
+    let now = now_utc();
+    conn.execute(
+        "INSERT INTO journal_collections (code, name, version, effective_from, source_name, source_url, created_at, updated_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?7)",
+        params![code, name, version, effective_from, source_name, source_url, now],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// 幂等加入集合成员（PRIMARY KEY (collection_id, journal_id) 拒绝重复）。
+pub fn add_collection_member(conn: &Connection, collection_id: i64, journal_id: i64) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO journal_collection_members (collection_id, journal_id) VALUES (?1,?2)",
+        params![collection_id, journal_id],
+    )?;
+    Ok(())
+}
+
+pub fn list_collections(conn: &Connection) -> Result<Vec<crate::models::JournalCollection>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, code, name, version, effective_from, source_name, source_url, last_verified_at, created_at, updated_at
+         FROM journal_collections ORDER BY code",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(crate::models::JournalCollection {
+            id: r.get(0)?,
+            code: r.get(1)?,
+            name: r.get(2)?,
+            version: r.get(3)?,
+            effective_from: r.get(4)?,
+            source_name: r.get(5)?,
+            source_url: r.get(6)?,
+            last_verified_at: r.get(7)?,
+            created_at: r.get(8)?,
+            updated_at: r.get(9)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// Journal 所属集合（Paper → journal → collections 的派生路径）。
+pub fn collections_for_journal(conn: &Connection, journal_id: i64) -> Result<Vec<crate::models::JournalCollection>> {
+    let mut stmt = conn.prepare(
+        "SELECT c.id, c.code, c.name, c.version, c.effective_from, c.source_name, c.source_url, c.last_verified_at, c.created_at, c.updated_at
+         FROM journal_collection_members m
+         JOIN journal_collections c ON c.id = m.collection_id
+         WHERE m.journal_id = ?1 ORDER BY c.code",
+    )?;
+    let rows = stmt.query_map(params![journal_id], |r| {
+        Ok(crate::models::JournalCollection {
+            id: r.get(0)?,
+            code: r.get(1)?,
+            name: r.get(2)?,
+            version: r.get(3)?,
+            effective_from: r.get(4)?,
+            source_name: r.get(5)?,
+            source_url: r.get(6)?,
+            last_verified_at: r.get(7)?,
+            created_at: r.get(8)?,
+            updated_at: r.get(9)?,
+        })
+    })?;
+    rows.collect()
 }
 
 pub fn update_journal_sync_state(
@@ -516,7 +769,95 @@ fn migrations() -> Vec<(i64, &'static str, fn(&Connection) -> Result<()>)> {
     vec![
         (1, "round3-baseline", migrate_to_v1),
         (2, "round4-batches", migrate_to_v2),
+        (3, "round5a-identity", migrate_to_v3),
     ]
+}
+
+/// v3：Canonical Journal Identity + Journal Collection 基础。
+/// - journals.issn_l（linking ISSN，nullable）
+/// - journal_identifiers：一个 canonical Journal 可有多 ISSN（print/online/other），
+///   规范化 value 全库唯一（一个 ISSN 只能映射一个 Journal）
+/// - journal_collections + journal_collection_members：many-to-many，集合是 Journal metadata
+///   不参与 AI 评分
+/// - 旧 print_issn/online_issn 按列可靠迁移进 journal_identifiers（不猜类型）
+fn migrate_to_v3(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "journals", "issn_l") {
+        conn.execute("ALTER TABLE journals ADD COLUMN issn_l TEXT", [])?;
+    }
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS journal_identifiers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            journal_id INTEGER NOT NULL REFERENCES journals(id) ON DELETE CASCADE,
+            identifier_type TEXT NOT NULL,
+            value TEXT NOT NULL,
+            source TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_ji_value ON journal_identifiers(value);
+        CREATE INDEX IF NOT EXISTS idx_ji_journal ON journal_identifiers(journal_id);
+
+        CREATE TABLE IF NOT EXISTS journal_collections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            version TEXT,
+            effective_from TEXT,
+            source_name TEXT,
+            source_url TEXT,
+            last_verified_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS journal_collection_members (
+            collection_id INTEGER NOT NULL REFERENCES journal_collections(id) ON DELETE CASCADE,
+            journal_id INTEGER NOT NULL REFERENCES journals(id) ON DELETE CASCADE,
+            PRIMARY KEY (collection_id, journal_id)
+        );
+        "#,
+    )?;
+    migrate_legacy_issns(conn)?;
+    Ok(())
+}
+
+/// 旧 issn 迁移：现有 journals.print_issn / online_issn 列已明确类型，按列迁移（不猜）；
+/// normalize 校验通过才入库；与已有 identifiers 冲突时保留已有映射（INSERT OR IGNORE）。
+fn migrate_legacy_issns(conn: &Connection) -> Result<()> {
+    let now = now_utc();
+    let rows: Vec<(i64, Option<String>, Option<String>)> = {
+        let mut stmt = conn.prepare("SELECT id, print_issn, online_issn FROM journals")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>>>()?
+    };
+    for (jid, print, online) in rows {
+        if let Some(p) = print {
+            if let Some(n) = crate::util::normalize_issn(&p) {
+                let _ = conn.execute(
+                    "INSERT OR IGNORE INTO journal_identifiers (journal_id, identifier_type, value, source, created_at, updated_at)
+                     VALUES (?1,?2,?3,'migration',?4,?4)",
+                    params![jid, IDT_PRINT, n, now],
+                );
+            }
+        }
+        if let Some(o) = online {
+            if let Some(n) = crate::util::normalize_issn(&o) {
+                let _ = conn.execute(
+                    "INSERT OR IGNORE INTO journal_identifiers (journal_id, identifier_type, value, source, created_at, updated_at)
+                     VALUES (?1,?2,?3,'migration',?4,?4)",
+                    params![jid, IDT_ONLINE, n, now],
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// v2：新增 Batch & Activity 表（事务内执行，由 run_migrations 统一驱动）。

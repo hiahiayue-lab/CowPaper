@@ -713,3 +713,11 @@ button.full {
   align-items: center;
   justify-content: center;
 }
+
+/* ---------- Round 5A：疑似重复 / 集合标记 ---------- */
+
+.warn-chip {
+  background: #fffbeb;
+  color: #b45309;
+  border: 1px solid #fde68a;
+}

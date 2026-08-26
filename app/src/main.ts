@@ -7,6 +7,7 @@ interface Journal {
   name: string;
   printIssn: string | null;
   onlineIssn: string | null;
+  issnL: string | null;
   publisher: string | null;
   enabled: boolean;
   coverageStatus: string | null;
@@ -14,6 +15,19 @@ interface Journal {
   lastSuccessfulSyncAt: string | null;
   lastPaperDate: string | null;
   paperCount: number;
+  identifiers: JournalIdentifier[];
+  collections: string[];
+  possibleDuplicate: boolean;
+}
+
+interface JournalIdentifier {
+  id: number;
+  journalId: number;
+  identifierType: string;
+  value: string;
+  source: string | null;
+  createdAt: string;
+  updatedAt: string;
 }
 
 interface Author {
@@ -351,19 +365,36 @@ function renderJournals() {
   }
   for (const j of journals) {
     const rate = j.abstractCoverageRate != null ? Math.round(j.abstractCoverageRate * 100) + "%" : "—";
+    // 多 ISSN / ISSN-L 显示：优先 identifiers（canonical），未知则不显示假值
+    const print = j.identifiers.find((i) => i.identifierType === "print")?.value ?? j.printIssn ?? "";
+    const online = j.identifiers.find((i) => i.identifierType === "online")?.value ?? j.onlineIssn ?? "";
+    const other = j.identifiers.filter((i) => i.identifierType === "other").map((i) => i.value);
+    const issnLine = [
+      print ? `Print: ${print}` : "",
+      online ? `Online: ${online}` : "",
+      j.issnL ? `ISSN-L: ${j.issnL}` : "",
+    ]
+      .filter(Boolean)
+      .concat(other)
+      .join(" · ");
+    const badge = j.possibleDuplicate ? '<span class="chip warn-chip">疑似重复</span>' : "";
+    const colls = j.collections.length
+      ? `<div class="muted small">集合：${j.collections.map((c) => escapeHtml(c)).join(" · ")}</div>`
+      : "";
     const li = document.createElement("li");
     li.className = "card journal";
     li.innerHTML = `
       <div class="row">
         <div class="grow">
-          <div class="title">${escapeHtml(j.name)}</div>
-          <div class="muted small">${escapeHtml(j.printIssn || "")} ${escapeHtml(j.onlineIssn || "")} · ${escapeHtml(j.publisher || "")}</div>
+          <div class="title">${escapeHtml(j.name)} ${badge}</div>
+          <div class="muted small">${escapeHtml(issnLine || "ISSN: 未知")}${j.publisher ? " · " + escapeHtml(j.publisher) : ""}</div>
         </div>
         <button class="ghost small" data-action="sync-one" data-id="${j.id}">同步</button>
         <button class="ghost small" data-action="toggle" data-id="${j.id}">${j.enabled ? "停用" : "启用"}</button>
         <button class="ghost small danger" data-action="delete" data-id="${j.id}">删除</button>
       </div>
       <div class="muted small">${escapeHtml(j.coverageStatus || "未同步")} · 摘要覆盖 ${rate} · 论文 ${j.paperCount} · 最近 ${fmtDate(j.lastPaperDate)}</div>
+      ${colls}
     `;
     ul.appendChild(li);
   }

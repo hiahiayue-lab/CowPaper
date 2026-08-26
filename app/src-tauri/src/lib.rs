@@ -62,13 +62,46 @@ fn add_journal(
                 .ok_or_else(|| "未找到匹配期刊，请改用 ISSN".to_string())?
         }
     };
-
-    let meta = crossref
-        .journal_meta(&issn_str)
-        .ok_or_else(|| "Crossref 未收录该 ISSN".to_string())?;
-    let oa_id = openalex.source_by_issn(&issn_str);
+    // 统一 normalize + checksum；非法 ISSN 不得进入 canonical identifiers
+    let norm = crate::util::normalize_issn(&issn_str).ok_or_else(|| "ISSN 格式无效".to_string())?;
 
     let conn = state.inner().lock().unwrap();
+    // 1) 已存在的 identifier 映射 → 返回已有 Journal，不创建重复
+    if let Some(jid) = db::resolve_journal_by_identifier(&conn, &norm).map_err(|e| e.to_string())? {
+        let journal = db::get_journal(&conn, jid)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "期刊不存在".to_string())?;
+        return Ok(models::AddJournalResult {
+            journal,
+            note: Some("该 ISSN 已对应已有期刊，未创建重复".to_string()),
+        });
+    }
+
+    let meta = crossref
+        .journal_meta(&norm)
+        .ok_or_else(|| "Crossref 未收录该 ISSN".to_string())?;
+    let oa_id = openalex.source_by_issn(&norm);
+
+    // 2) ISSN-L 归并：meta 的 ISSN-L 若命中已有期刊（issn_l 列或既有 identifier），
+    //    把输入 ISSN 归入该 canonical Journal，不创建新 Journal。
+    let issn_l_norm = meta.issn_l.as_deref().and_then(crate::util::normalize_issn);
+    if let Some(il) = &issn_l_norm {
+        let merged = db::find_journal_by_issn_l(&conn, il)
+            .map_err(|e| e.to_string())?
+            .or(db::resolve_journal_by_identifier(&conn, il).map_err(|e| e.to_string())?);
+        if let Some(jid) = merged {
+            let _ = db::insert_identifier(&conn, jid, models::IDT_OTHER, &norm, Some("manual"));
+            let journal = db::get_journal(&conn, jid)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "期刊不存在".to_string())?;
+            return Ok(models::AddJournalResult {
+                journal,
+                note: Some("通过 ISSN-L 归并到已有期刊，未创建重复".to_string()),
+            });
+        }
+    }
+
+    // 3) 创建新 Journal + identifiers（保守合并：Crossref 明确给出的 print/online 才入库）
     let id = db::insert_journal(
         &conn,
         &meta.title,
@@ -78,6 +111,31 @@ fn add_journal(
         oa_id.as_deref(),
     )
     .map_err(|e| e.to_string())?;
+    if let Some(p) = meta.print_issn.as_deref().and_then(crate::util::normalize_issn) {
+        let _ = db::insert_identifier(&conn, id, models::IDT_PRINT, &p, Some("crossref"));
+    }
+    if let Some(o) = meta.online_issn.as_deref().and_then(crate::util::normalize_issn) {
+        let _ = db::insert_identifier(&conn, id, models::IDT_ONLINE, &o, Some("crossref"));
+    }
+    // 输入 ISSN 若不在 print/online 中，以 other 补充（用户明确给出的 identifier）
+    let covered = meta
+        .print_issn
+        .as_deref()
+        .and_then(crate::util::normalize_issn)
+        .map(|x| x == norm)
+        .unwrap_or(false)
+        || meta
+            .online_issn
+            .as_deref()
+            .and_then(crate::util::normalize_issn)
+            .map(|x| x == norm)
+            .unwrap_or(false);
+    if !covered {
+        let _ = db::insert_identifier(&conn, id, models::IDT_OTHER, &norm, Some("manual"));
+    }
+    if let Some(il) = &issn_l_norm {
+        let _ = db::set_journal_issn_l(&conn, id, Some(il));
+    }
     let journal = db::get_journal(&conn, id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "插入后读取失败".to_string())?;
@@ -94,6 +152,51 @@ fn set_journal_enabled(id: i64, enabled: bool, state: State<Db>) -> Result<(), S
 fn delete_journal(id: i64, state: State<Db>) -> Result<(), String> {
     let conn = state.inner().lock().unwrap();
     db::delete_journal(&conn, id).map_err(|e| e.to_string())
+}
+
+// ---------- Round 5A：Journal Collections（Round 5C 真实目录导入的基础命令） ----------
+
+#[tauri::command]
+fn list_collections(state: State<Db>) -> Result<Vec<models::JournalCollection>, String> {
+    let conn = state.inner().lock().unwrap();
+    db::list_collections(&conn).map_err(|e| e.to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+fn create_collection(
+    code: String,
+    name: String,
+    version: Option<String>,
+    effective_from: Option<String>,
+    source_name: Option<String>,
+    source_url: Option<String>,
+    state: State<Db>,
+) -> Result<i64, String> {
+    let conn = state.inner().lock().unwrap();
+    db::create_collection(
+        &conn,
+        &code,
+        &name,
+        version.as_deref(),
+        effective_from.as_deref(),
+        source_name.as_deref(),
+        source_url.as_deref(),
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn add_collection_member(collection_id: i64, journal_id: i64, state: State<Db>) -> Result<(), String> {
+    let conn = state.inner().lock().unwrap();
+    db::add_collection_member(&conn, collection_id, journal_id).map_err(|e| e.to_string())
+}
+
+/// Paper → journal → collections 的派生查询（Paper 不冗余存集合）。
+#[tauri::command]
+fn get_journal_collections(journal_id: i64, state: State<Db>) -> Result<Vec<models::JournalCollection>, String> {
+    let conn = state.inner().lock().unwrap();
+    db::collections_for_journal(&conn, journal_id).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -721,7 +824,11 @@ pub fn run() {
             list_sync_batches,
             get_sync_batch,
             list_analysis_batches,
-            get_analysis_batch
+            get_analysis_batch,
+            list_collections,
+            create_collection,
+            add_collection_member,
+            get_journal_collections
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

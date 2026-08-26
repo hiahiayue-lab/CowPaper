@@ -67,6 +67,41 @@ pub struct LastAiRun {
     pub error_summary: Option<String>,
 }
 
+/// 期刊标识符类型（Round 5A canonical identity）。
+pub const IDT_PRINT: &str = "print";
+pub const IDT_ONLINE: &str = "online";
+pub const IDT_OTHER: &str = "other";
+
+/// 单个 ISSN 标识符（规范化后），属于某个 canonical Journal。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JournalIdentifier {
+    pub id: i64,
+    pub journal_id: i64,
+    pub identifier_type: String,
+    /// canonical 形式 NNNN-NNNX
+    pub value: String,
+    pub source: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// 期刊集合（UTD24 / FT50 等 Journal metadata，不参与 AI 评分）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JournalCollection {
+    pub id: i64,
+    pub code: String,
+    pub name: String,
+    pub version: Option<String>,
+    pub effective_from: Option<String>,
+    pub source_name: Option<String>,
+    pub source_url: Option<String>,
+    pub last_verified_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Journal {
@@ -74,6 +109,8 @@ pub struct Journal {
     pub name: String,
     pub print_issn: Option<String>,
     pub online_issn: Option<String>,
+    /// ISSN-L（linking ISSN），与媒介版本无关的 canonical 关联
+    pub issn_l: Option<String>,
     pub publisher: Option<String>,
     pub enabled: bool,
     pub priority: i64,
@@ -87,6 +124,12 @@ pub struct Journal {
     pub paper_count: i64,
     pub created_at: String,
     pub updated_at: String,
+    /// 该 journal 的全部标识符（print/online/other，canonical 形式）
+    pub identifiers: Vec<JournalIdentifier>,
+    /// 所属集合 code 列表（如 ["TEST-UTD","TEST-FT"]）
+    pub collections: Vec<String>,
+    /// 疑似重复（与另一 journal 共享 ISSN-L 或相同标题规范化），仅供人工处理
+    pub possible_duplicate: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
