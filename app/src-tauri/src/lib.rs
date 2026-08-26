@@ -1,6 +1,7 @@
 mod abstract_quality;
 mod catalog;
 mod recommendation;
+mod tag_config;
 mod ai_queue;
 mod analyze;
 mod api;
@@ -436,6 +437,213 @@ fn remove_collection_member(collection_id: i64, journal_id: i64, state: State<Db
 fn get_collection_journals(code: String, state: State<Db>) -> Result<Vec<models::Journal>, String> {
     let conn = state.inner().lock().unwrap();
     db::list_collection_journals(&conn, &code).map_err(|e| e.to_string())
+}
+
+// ---------- Round 6.5：Versioned Tag Configuration ----------
+
+/// Tags 页 baseline：scheduled 优先（继续编辑将生效的版本），否则 active。
+#[tauri::command]
+fn get_tag_config_baseline(state: State<Db>) -> Result<models::TagBaseline, String> {
+    let conn = state.inner().lock().unwrap();
+    if let Some(sched) = db::scheduled_tag_config(&conn).map_err(|e| e.to_string())? {
+        let items = db::list_tag_config_items(&conn, sched.id).map_err(|e| e.to_string())?;
+        let draft: Vec<models::TagDraftItem> = items
+            .iter()
+            .map(|it| models::TagDraftItem {
+                id: it.tag_id,
+                name: it.name.clone(),
+                description: it.description.clone(),
+                enabled: it.enabled,
+                deleted: it.deleted,
+            })
+            .collect();
+        return Ok(models::TagBaseline {
+            items: draft,
+            source: "scheduled".to_string(),
+            scheduled_effective_cycle_key: sched.effective_cycle_key,
+        });
+    }
+    let tags = db::list_tags(&conn).map_err(|e| e.to_string())?;
+    let items: Vec<models::TagDraftItem> = tags
+        .into_iter()
+        .map(|t| models::TagDraftItem {
+            id: t.id,
+            name: t.name,
+            description: t.description,
+            enabled: t.enabled,
+            deleted: false,
+        })
+        .collect();
+    Ok(models::TagBaseline {
+        items,
+        source: "active".to_string(),
+        scheduled_effective_cycle_key: None,
+    })
+}
+
+/// 保存 Tag 配置。
+/// mode="scheduled"：持久化为 scheduled（下个周期生效；不调 AI、不改 tags、不重排）。
+/// mode="immediate"：写入 active → diff → 本地重算；AI-needed 启动 tag-only batch。
+#[tauri::command]
+fn save_tag_config(items: Vec<models::TagDraftItem>, mode: String, state: State<Db>, queue: State<AiQueue>) -> Result<models::SaveTagConfigResult, String> {
+    if mode == "scheduled" {
+        let conn = state.inner().lock().unwrap();
+        let now = chrono::Local::now();
+        let dtime = current_daily_check_time(&conn);
+        // 下一推荐周期 key（当前 cycle 的下一天 cutoff 后）
+        let cur_key = recommendation::cycle_key_for(&now, &dtime);
+        let next_key = next_cycle_key(&cur_key);
+        return tag_config::save_scheduled_config(&conn, &items, &next_key);
+    }
+    if mode != "immediate" {
+        return Err("未知保存模式".to_string());
+    }
+    // immediate：先持久化（diff 需要新 active 生成）
+    let conn = state.inner().lock().unwrap();
+    let mut res = tag_config::save_immediate_config(&conn, &items)?;
+    // AI-needed：added + semanticChanged（active tags 语义）
+    let need_ai: Vec<String> = res
+        .diff
+        .added
+        .iter()
+        .chain(res.diff.semantic_changed.iter())
+        .cloned()
+        .collect();
+    if !need_ai.is_empty() {
+        // 目标 tags（active 中匹配名称）
+        let active = tag_config::active_tags(&conn)?;
+        let targets: Vec<(i64, String, String)> = active
+            .iter()
+            .filter(|(_, name, _)| need_ai.iter().any(|n| n == name))
+            .cloned()
+            .collect();
+        // eligible papers：有摘要且非已分析成功（或 hash stale）—— 简化：所有有摘要且 tag 缺失/stale
+        let paper_ids = db::papers_needing_tag_scores(&conn, &targets).map_err(|e| e.to_string())?;
+        res.ai_needed_papers = paper_ids.len() as i64;
+        if !paper_ids.is_empty() && !targets.is_empty() {
+            queue.cmd_tx
+                .send(crate::ai_queue::QueueCommand::TagOnlyBatch {
+                    paper_ids,
+                    tags: targets,
+                    model: get_model_default(),
+                    parent_batch_id: None,
+                })
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(res)
+}
+
+/// 到下一推荐周期时激活 scheduled Tag 配置：写 tags 表 → 新 active version → diff → 本地重算 + tag-only batch。
+fn activate_scheduled_tag_config_if_due(conn: &rusqlite::Connection, queue: &AiQueue, current_cycle_key: &str) -> Result<(), String> {
+    let Some(sched) = db::scheduled_tag_config(conn).map_err(|e| e.to_string())? else {
+        return Ok(());
+    };
+    let due = sched
+        .effective_cycle_key
+        .as_deref()
+        .map(|k| k <= current_cycle_key)
+        .unwrap_or(false);
+    if !due {
+        return Ok(());
+    }
+    let items = db::list_tag_config_items(conn, sched.id).map_err(|e| e.to_string())?;
+    // old = 激活前 tags 表（active 语义）
+    let old_tags = db::list_tags(conn).map_err(|e| e.to_string())?;
+    let old_items: Vec<models::TagConfigItem> = old_tags
+        .iter()
+        .map(|t| models::TagConfigItem {
+            version_id: 0,
+            tag_id: t.id,
+            name: t.name.clone(),
+            description: t.description.clone(),
+            enabled: t.enabled,
+            deleted: false,
+        })
+        .collect();
+    // 应用 scheduled items → tags 表
+    for it in &items {
+        if it.deleted {
+            if it.tag_id > 0 {
+                db::delete_tag(conn, it.tag_id).map_err(|e| e.to_string())?;
+            }
+        } else if it.tag_id > 0 {
+            db::update_tag(conn, it.tag_id, &it.name, it.description.as_deref(), it.enabled)
+                .map_err(|e| e.to_string())?;
+        } else {
+            match db::find_tag_by_name(conn, &it.name).map_err(|e| e.to_string())? {
+                Some(id) => {
+                    db::update_tag(conn, id, &it.name, it.description.as_deref(), it.enabled)
+                        .map_err(|e| e.to_string())?;
+                }
+                None => {
+                    db::add_tag(conn, &it.name, it.description.as_deref()).map_err(|e| e.to_string())?;
+                }
+            }
+        }
+    }
+    db::create_active_tag_version(conn).map_err(|e| e.to_string())?;
+    db::delete_scheduled_tag_config(conn).map_err(|e| e.to_string())?;
+    // diff（scheduled items 作为 new draft 语义）
+    let draft: Vec<models::TagDraftItem> = items
+        .iter()
+        .map(|it| models::TagDraftItem {
+            id: it.tag_id,
+            name: it.name.clone(),
+            description: it.description.clone(),
+            enabled: it.enabled,
+            deleted: it.deleted,
+        })
+        .collect();
+    let diff = tag_config::compute_diff(&old_items, &draft);
+    let need_ai: Vec<String> = diff
+        .added
+        .iter()
+        .chain(diff.semantic_changed.iter())
+        .cloned()
+        .collect();
+    // 本地重算 removed/disabled
+    if !diff.removed.is_empty() || !diff.disabled.is_empty() {
+        let local = db::paper_ids_with_tag_names(conn, &diff.removed, &diff.disabled)
+            .map_err(|e| e.to_string())?;
+        let active = tag_config::active_tags(conn)?;
+        for pid in local {
+            let _ = tag_config::recompute_paper_total_score(conn, pid, &active);
+        }
+    }
+    // tag-only batch
+    if !need_ai.is_empty() {
+        let active = tag_config::active_tags(conn)?;
+        let targets: Vec<(i64, String, String)> = active
+            .iter()
+            .filter(|(_, name, _)| need_ai.iter().any(|n| n == name))
+            .cloned()
+            .collect();
+        let paper_ids = db::papers_needing_tag_scores(conn, &targets).map_err(|e| e.to_string())?;
+        if !paper_ids.is_empty() && !targets.is_empty() {
+            let _ = queue.cmd_tx.send(crate::ai_queue::QueueCommand::TagOnlyBatch {
+                paper_ids,
+                tags: targets,
+                model: get_model_default(),
+                parent_batch_id: None,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn get_model_default() -> String {
+    // 前端通过 localStorage 保存模型；Rust 侧用默认
+    "deepseek-v4-flash".to_string()
+}
+
+/// 下一推荐周期 key（按 YYYY-MM-DD 加一天）。
+fn next_cycle_key(cur: &str) -> String {
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(cur, "%Y-%m-%d") {
+        (d + chrono::Days::new(1)).format("%Y-%m-%d").to_string()
+    } else {
+        chrono::Local::now().format("%Y-%m-%d").to_string()
+    }
 }
 
 /// 重算当前 open run（幂等；finalized 冻结不动）。
@@ -1028,7 +1236,17 @@ pub fn run() {
 
             // AI 队列协调器（全局唯一，§三十五）
             let (cmd_tx, cmd_rx) = mpsc::channel();
-            app.manage(AiQueue { cmd_tx });
+            let queue_handle = AiQueue { cmd_tx };
+            app.manage(queue_handle.clone_state());
+            // 激活到期 scheduled Tag 配置（需 queue 已 manage；仅本地 + 队列，不调旧周期重排）
+            {
+                let c = db_arc.lock().unwrap();
+                let now = chrono::Local::now();
+                let dtime = db::get_setting(&c, "settings.daily_sync_time")
+                    .unwrap_or_else(|| "09:00".into());
+                let key = recommendation::cycle_key_for(&now, &dtime);
+                let _ = activate_scheduled_tag_config_if_due(&c, &queue_handle, &key);
+            }
             {
                 let conn2 = db_arc.clone();
                 let app2 = app.handle().clone();
@@ -1136,7 +1354,9 @@ pub fn run() {
             rename_collection,
             delete_collection,
             remove_collection_member,
-            get_collection_journals
+            get_collection_journals,
+            save_tag_config,
+            get_tag_config_baseline
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

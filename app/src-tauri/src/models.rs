@@ -91,6 +91,72 @@ pub struct JournalIdentifier {
     pub updated_at: String,
 }
 
+/// Tag 配置版本（Round 6.5）：active / scheduled / retired。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TagConfigVersion {
+    pub id: i64,
+    pub status: String,
+    pub effective_cycle_key: Option<String>,
+    pub created_at: String,
+    pub activated_at: Option<String>,
+}
+
+/// Tag 配置版本项（name/description 快照；tag_id 是稳定 identity）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TagConfigItem {
+    pub version_id: i64,
+    pub tag_id: i64,
+    pub name: String,
+    pub description: Option<String>,
+    pub enabled: bool,
+    pub deleted: bool,
+}
+
+/// 前端 Draft 提交项（id=0 表示新增）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TagDraftItem {
+    pub id: i64,
+    pub name: String,
+    pub description: Option<String>,
+    pub enabled: bool,
+    pub deleted: bool,
+}
+
+/// Tag 配置 diff 分类（一次保存统一处理）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TagConfigDiff {
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    pub disabled: Vec<String>,
+    pub enabled: Vec<String>,
+    pub semantic_changed: Vec<String>,
+    pub unchanged: Vec<String>,
+}
+
+/// Tags 页 baseline（scheduled 优先，否则 active）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TagBaseline {
+    pub items: Vec<TagDraftItem>,
+    /// baseline 来源：active | scheduled
+    pub source: String,
+    pub scheduled_effective_cycle_key: Option<String>,
+}
+
+/// 保存结果（前端确认/提示用）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveTagConfigResult {
+    pub mode: String,
+    pub effective_cycle_key: Option<String>,
+    pub diff: TagConfigDiff,
+    pub ai_needed_papers: i64,
+}
+
 /// 推荐周期（每日 snapshot）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -244,6 +310,12 @@ pub struct Author {
 pub struct TagMatch {
     pub tag: String,
     pub score: f64,
+    /// 稳定 tag identity（Round 6.5；旧数据可能缺失 → 按 name 匹配）
+    #[serde(default)]
+    pub tag_id: Option<i64>,
+    /// tag 语义 hash（tag_id + name + description + score prompt version）
+    #[serde(default)]
+    pub semantic_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

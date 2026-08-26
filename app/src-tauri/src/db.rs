@@ -87,7 +87,7 @@ pub fn open(path: &Path) -> Result<Connection> {
 /// 当前 schema 版本（Round 5B：abstract_quality / paper_abstract_sources 为 v4）。
 /// 生产构建中仅由迁移系统隐式使用；测试中直接断言。
 #[allow(dead_code)]
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 pub fn init(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
@@ -1102,7 +1102,54 @@ fn migrations() -> Vec<(i64, &'static str, fn(&Connection) -> Result<()>)> {
         (4, "round5b-abstract-quality", migrate_to_v4),
         (5, "round5c-catalog", migrate_to_v5),
         (6, "round6-recommendation-history", migrate_to_v6),
+        (7, "round6.5-tag-config-versions", migrate_to_v7),
     ]
+}
+
+/// v7：Versioned Tag Configuration。
+/// - tag_config_versions（active/scheduled/retired）+ tag_config_version_items（name/desc 快照）
+/// - 一个 upcoming cycle 至多一个 scheduled config
+fn migrate_to_v7(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS tag_config_versions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            status TEXT NOT NULL,
+            effective_cycle_key TEXT,
+            created_at TEXT NOT NULL,
+            activated_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_tcv_status ON tag_config_versions(status);
+
+        CREATE TABLE IF NOT EXISTS tag_config_version_items (
+            version_id INTEGER NOT NULL REFERENCES tag_config_versions(id) ON DELETE CASCADE,
+            tag_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            deleted INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (version_id, tag_id)
+        );
+        "#,
+    )?;
+    // 初始化：若从未有版本 → 创建 v1 active（当前 tags 表快照）
+    let has: i64 = conn
+        .query_row("SELECT COUNT(*) FROM tag_config_versions", [], |r| r.get(0))
+        .unwrap_or(0);
+    if has == 0 {
+        let now = now_utc();
+        conn.execute(
+            "INSERT INTO tag_config_versions (status, created_at, activated_at) VALUES ('active', ?1, ?1)",
+            params![now],
+        )?;
+        let vid = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT OR IGNORE INTO tag_config_version_items (version_id, tag_id, name, description, enabled, deleted)
+             SELECT ?1, id, name, description, enabled, 0 FROM tags",
+            params![vid],
+        )?;
+    }
+    Ok(())
 }
 
 /// v6：每日推荐时间线与历史。
@@ -2210,4 +2257,214 @@ pub fn list_collection_journals(conn: &Connection, code: &str) -> Result<Vec<Jou
     let mut journals: Vec<Journal> = stmt.query_map(params![code], row_to_journal)?.collect::<Result<Vec<_>>>()?;
     enrich_journals(conn, &mut journals)?;
     Ok(journals)
+}
+
+// ---------- Round 6.5：Tag Config Versions ----------
+
+pub fn list_tag_config_items(conn: &Connection, version_id: i64) -> Result<Vec<crate::models::TagConfigItem>> {
+    let mut stmt = conn.prepare(
+        "SELECT version_id, tag_id, name, description, enabled, deleted
+         FROM tag_config_version_items WHERE version_id = ?1 ORDER BY tag_id",
+    )?;
+    let rows = stmt.query_map(params![version_id], |r| {
+        Ok(crate::models::TagConfigItem {
+            version_id: r.get(0)?,
+            tag_id: r.get(1)?,
+            name: r.get(2)?,
+            description: r.get(3)?,
+            enabled: r.get::<_, i64>(4)? != 0,
+            deleted: r.get::<_, i64>(5)? != 0,
+        })
+    })?;
+    rows.collect()
+}
+
+/// scheduled 配置（至多一个 pending）。
+pub fn scheduled_tag_config(conn: &Connection) -> Result<Option<crate::models::TagConfigVersion>> {
+    let v: Option<crate::models::TagConfigVersion> = conn
+        .query_row(
+            "SELECT id, status, effective_cycle_key, created_at, activated_at
+             FROM tag_config_versions WHERE status = 'scheduled' ORDER BY id DESC LIMIT 1",
+            [],
+            |r| {
+                Ok(crate::models::TagConfigVersion {
+                    id: r.get(0)?,
+                    status: r.get(1)?,
+                    effective_cycle_key: r.get(2)?,
+                    created_at: r.get(3)?,
+                    activated_at: r.get(4)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(v)
+}
+
+/// 替换 scheduled 配置（一个 upcoming cycle 至多一个）。
+pub fn replace_scheduled_tag_config(
+    conn: &Connection,
+    draft: &[crate::models::TagDraftItem],
+    effective_cycle_key: &str,
+) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("DELETE FROM tag_config_versions WHERE status = 'scheduled'", [])?;
+    let now = now_utc();
+    tx.execute(
+        "INSERT INTO tag_config_versions (status, effective_cycle_key, created_at) VALUES ('scheduled', ?1, ?2)",
+        params![effective_cycle_key, now],
+    )?;
+    let vid = tx.last_insert_rowid();
+    for item in draft {
+        // scheduled 中新增 tag 以 0 占位（激活时按 name 创建/匹配）
+        let tag_id = if item.id > 0 { item.id } else { 0 };
+        let _ = tx.execute(
+            "INSERT OR REPLACE INTO tag_config_version_items (version_id, tag_id, name, description, enabled, deleted)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![vid, tag_id, item.name, item.description, item.enabled as i64, item.deleted as i64],
+        );
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// 创建新 active version（当前 tags 表快照），并把旧 active 置 retired。
+pub fn create_active_tag_version(conn: &Connection) -> Result<i64> {
+    let tx = conn.unchecked_transaction()?;
+    let now = now_utc();
+    tx.execute(
+        "UPDATE tag_config_versions SET status = 'retired' WHERE status = 'active'",
+        [],
+    )?;
+    tx.execute(
+        "INSERT INTO tag_config_versions (status, created_at, activated_at) VALUES ('active', ?1, ?1)",
+        params![now],
+    )?;
+    let vid = tx.last_insert_rowid();
+    tx.execute(
+        "INSERT OR IGNORE INTO tag_config_version_items (version_id, tag_id, name, description, enabled, deleted)
+         SELECT ?1, id, name, description, enabled, 0 FROM tags",
+        params![vid],
+    )?;
+    tx.commit()?;
+    Ok(vid)
+}
+
+pub fn find_tag_by_name(conn: &Connection, name: &str) -> Result<Option<i64>> {
+    let id = conn
+        .query_row("SELECT id FROM tags WHERE name = ?1", params![name], |r| r.get::<_, i64>(0))
+        .optional()?;
+    Ok(id)
+}
+
+/// 合并 tag-only 评分结果到 paper（保留其他 tag 分数；写 semantic hash；本地重算 total）。
+pub fn set_paper_tag_scores(
+    conn: &Connection,
+    paper_id: i64,
+    scores: &[(i64, f64)],
+    semantic: &[(i64, String, String)],
+) -> Result<()> {
+    let json: Option<String> = conn
+        .query_row("SELECT tag_matches_json FROM papers WHERE id = ?1", params![paper_id], |r| r.get(0))
+        .optional()?
+        .flatten();
+    let mut matches: Vec<crate::models::TagMatch> = json
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+    for (tid, score) in scores {
+        if let Some((_, name, desc)) = semantic.iter().find(|(id, _, _)| id == tid) {
+            let hash = crate::tag_config::tag_semantic_hash(*tid, name, desc);
+            if let Some(m) = matches.iter_mut().find(|m| m.tag_id == Some(*tid)) {
+                m.score = *score;
+                m.semantic_hash = Some(hash.clone());
+            } else {
+                matches.push(crate::models::TagMatch {
+                    tag: name.clone(),
+                    score: *score,
+                    tag_id: Some(*tid),
+                    semantic_hash: Some(hash),
+                });
+            }
+        }
+    }
+    let new_json = serde_json::to_string(&matches).unwrap_or_else(|_| "[]".to_string());
+    conn.execute(
+        "UPDATE papers SET tag_matches_json = ?1, updated_at = ?2 WHERE id = ?3",
+        params![new_json, now_utc(), paper_id],
+    )?;
+    // 本地重算 total_score（active enabled + hash 匹配）；失败不阻塞评分写回
+    if let Ok(active) = crate::tag_config::active_tags(conn) {
+        let _ = crate::tag_config::recompute_paper_total_score(conn, paper_id, &active);
+    }
+    Ok(())
+}
+
+/// 需要 tag-only 评分的论文（有摘要；缺 requested tag 的 score 或 semantic hash stale）。
+pub fn papers_needing_tag_scores(
+    conn: &Connection,
+    tags: &[(i64, String, String)],
+) -> Result<Vec<i64>> {
+    if tags.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT id, tag_matches_json FROM papers
+         WHERE abstract IS NOT NULL AND abstract != '' AND analysis_status != 'waitingForAbstract'",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, json) = row?;
+        let matches: Vec<crate::models::TagMatch> = json
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+        let needs = tags.iter().any(|(tid, name, desc)| {
+            let expect = crate::tag_config::tag_semantic_hash(*tid, name, desc);
+            let hit = matches.iter().find(|m| m.tag_id == Some(*tid));
+            match hit {
+                Some(m) => m.semantic_hash.as_deref() != Some(expect.as_str()),
+                None => true,
+            }
+        });
+        if needs {
+            out.push(id);
+        }
+    }
+    Ok(out)
+}
+
+/// 含指定 tag 名（removed/disabled）的 paper id 列表（本地重算用）。
+pub fn paper_ids_with_tag_names(conn: &Connection, removed: &[String], disabled: &[String]) -> Result<Vec<i64>> {
+    let names: Vec<&str> = removed.iter().chain(disabled.iter()).map(|s| s.as_str()).collect();
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare("SELECT id, tag_matches_json FROM papers WHERE tag_matches_json IS NOT NULL")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, json) = row?;
+        let matches: Vec<crate::models::TagMatch> = serde_json::from_str(&json).unwrap_or_default();
+        if matches.iter().any(|m| names.contains(&m.tag.as_str())) {
+            out.push(id);
+        }
+    }
+    Ok(out)
+}
+
+/// Tag-only 入队：允许从 succeeded/failed/pendingAnalysis 进入 queued（不限于 pendingAnalysis）。
+pub fn enqueue_for_tag_update(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE papers SET analysis_status = 'queued', queued_at = ?1, retry_count = 0, updated_at = ?1
+         WHERE id = ?2 AND analysis_status IN ('analysisSucceeded','analysisFailed','pendingAnalysis')",
+        params![now_utc(), id],
+    )?;
+    Ok(())
+}
+
+/// 删除 scheduled 配置（激活后消费）。
+pub fn delete_scheduled_tag_config(conn: &Connection) -> Result<()> {
+    conn.execute("DELETE FROM tag_config_versions WHERE status = 'scheduled'", [])?;
+    Ok(())
 }

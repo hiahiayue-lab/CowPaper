@@ -984,6 +984,8 @@ fn test_duplicate_tag_normalization() {
     let t = |tag: &str, s: f64| TagMatch {
         tag: tag.into(),
         score: s,
+        tag_id: None,
+        semantic_hash: None,
     };
     let total = |out: &Vec<TagMatch>| out.iter().map(|m| m.score).sum::<f64>();
 
@@ -1808,7 +1810,7 @@ fn test_migration_v2_to_v3_preserves_data() {
 
     // 迁移到 v3
     db::init(&conn).unwrap();
-    assert_eq!(db::SCHEMA_VERSION, 6);
+    assert_eq!(db::SCHEMA_VERSION, 7);
 
     // 8) 旧 issn 迁移进 journal_identifiers（类型按列，不猜）
     let ids = db::list_journal_identifiers(&conn, jid).unwrap();
@@ -1849,7 +1851,7 @@ fn test_database_restart_persistence() {
     {
         let conn = db::open(&path).unwrap();
         db::init(&conn).unwrap(); // 幂等：user_version=3 不重复迁移
-        assert_eq!(db::SCHEMA_VERSION, 6);
+        assert_eq!(db::SCHEMA_VERSION, 7);
         let j = db::get_journal(&conn, 1).unwrap().expect("期刊持久化");
         assert_eq!(j.print_issn.as_deref(), Some("0025-1909"));
         assert_eq!(j.identifiers.len(), 1);
@@ -2239,7 +2241,7 @@ fn test_migration_v4_abstract_quality_init() {
     .unwrap();
 
     db::init(&conn).unwrap();
-    assert_eq!(db::SCHEMA_VERSION, 6);
+    assert_eq!(db::SCHEMA_VERSION, 7);
 
     let papers = db::list_papers(&conn, Some(jid), 100).unwrap();
     assert_eq!(papers.len(), 3, "迁移不得丢论文");
@@ -3106,4 +3108,192 @@ fn test_history_run_stats() {
     let _ = pa;
     let _ = pb;
     let _ = pc;
+}
+
+// ================= Round 6.5：Versioned Tag Configuration =================
+
+#[test]
+fn test_tag_semantic_hash() {
+    let h1 = crate::tag_config::tag_semantic_hash(1, "平台经济", "关注双边平台");
+    let h2 = crate::tag_config::tag_semantic_hash(1, "平台经济", "关注双边平台");
+    let h3 = crate::tag_config::tag_semantic_hash(1, "平台经济", "关注多边平台");
+    let h4 = crate::tag_config::tag_semantic_hash(2, "平台经济", "关注双边平台");
+    assert_eq!(h1, h2, "同 tag+name+desc → 相同 hash（cache 可复用）");
+    assert_ne!(h1, h3, "description 变化 → hash 变化（该 tag stale）");
+    assert_ne!(h1, h4, "tag_id 变化 → hash 变化");
+}
+
+#[test]
+fn test_tag_config_diff_classification() {
+    use crate::models::{TagConfigItem, TagDraftItem};
+    let mk = |id: i64, name: &str, desc: &str, enabled: bool| TagConfigItem {
+        version_id: 1,
+        tag_id: id,
+        name: name.to_string(),
+        description: Some(desc.to_string()),
+        enabled,
+        deleted: false,
+    };
+    let old = vec![
+        mk(1, "平台经济", "关注双边平台", true),
+        mk(2, "定价", "定价策略", true),
+        mk(3, "旧停用", "旧说明", false),
+        mk(5, "未变", "说明", true),
+    ];
+    let draft = vec![
+        TagDraftItem { id: 1, name: "平台经济".into(), description: Some("关注多边平台".into()), enabled: true, deleted: false }, // semanticChanged
+        TagDraftItem { id: 2, name: "定价".into(), description: Some("定价策略".into()), enabled: true, deleted: true },        // removed
+        TagDraftItem { id: 3, name: "旧停用".into(), description: Some("旧说明".into()), enabled: true, deleted: false },       // enabled
+        TagDraftItem { id: 0, name: "数字劳动".into(), description: Some("数字劳动".into()), enabled: true, deleted: false },   // added
+        TagDraftItem { id: 5, name: "未变".into(), description: Some("说明".into()), enabled: true, deleted: false },           // unchanged
+    ];
+    let d = crate::tag_config::compute_diff(&old, &draft);
+    assert_eq!(d.added, vec!["数字劳动"]);
+    assert_eq!(d.removed, vec!["定价"]);
+    assert_eq!(d.enabled, vec!["旧停用"]);
+    assert_eq!(d.semantic_changed, vec!["平台经济"]);
+    assert!(d.unchanged.contains(&"未变".to_string()));
+}
+
+#[test]
+fn test_scheduled_save_no_ai_no_rerank() {
+    use crate::models::TagDraftItem;
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let pa = seed_paper_with_score(&conn, jid, "10.1000/tc-a", "A", 1.0);
+    // 当前 open run
+    let r1 = crate::recommendation::refresh_current_recommendations(&conn, &local_dt(2026, 8, 26, 15, 0), "09:00").unwrap();
+    let items_before = db::list_recommendation_items(&conn, r1).unwrap();
+    // tags：tag1 存在（Full AI 已用 desc）
+    let tag = db::add_tag(&conn, "新标签X", Some("关注双边平台")).unwrap();
+    // scheduled 保存（仅改 description）
+    let draft = vec![TagDraftItem {
+        id: tag.id,
+        name: "新标签X".into(),
+        description: Some("关注多边平台".into()),
+        enabled: true,
+        deleted: false,
+    }];
+    let res = crate::tag_config::save_scheduled_config(&conn, &draft, "2026-08-27").unwrap();
+    assert_eq!(res.mode, "scheduled");
+    // 不改 tags 表（active 不变）
+    let t = db::list_tags(&conn).unwrap();
+    let tx = t.iter().find(|x| x.name == "新标签X").expect("新标签X 存在");
+    assert_eq!(tx.description.as_deref(), Some("关注双边平台"), "scheduled 保存不得改 active tags 表");
+    // 当前 run 不变（不重排）
+    assert_eq!(db::list_recommendation_items(&conn, r1).unwrap().len(), items_before.len());
+    // scheduled 持久化
+    let sched = db::scheduled_tag_config(&conn).unwrap().unwrap();
+    assert_eq!(sched.effective_cycle_key.as_deref(), Some("2026-08-27"));
+    // 可替换（同一 upcoming cycle 至多一个）
+    let draft2 = vec![TagDraftItem {
+        id: tag.id,
+        name: "新标签X".into(),
+        description: Some("平台治理视角".into()),
+        enabled: true,
+        deleted: false,
+    }];
+    crate::tag_config::save_scheduled_config(&conn, &draft2, "2026-08-27").unwrap();
+    let cnt: i64 = conn
+        .query_row("SELECT COUNT(*) FROM tag_config_versions WHERE status='scheduled'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(cnt, 1, "一个 upcoming cycle 至多一个 scheduled");
+    let _ = pa;
+}
+
+#[test]
+fn test_immediate_save_local_recompute_and_preserve() {
+    use crate::models::TagDraftItem;
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let pa = seed_paper_with_score(&conn, jid, "10.1000/tc-b", "B", 1.0);
+    // 构造 tag_matches（含 tag_id + semantic hash）
+    let t1 = db::add_tag(&conn, "t1", Some("说明1")).unwrap();
+    let t2 = db::add_tag(&conn, "t2", Some("说明2")).unwrap();
+    let h1 = crate::tag_config::tag_semantic_hash(t1.id, "t1", "说明1");
+    let h2 = crate::tag_config::tag_semantic_hash(t2.id, "t2", "说明2");
+    let matches = serde_json::json!([
+        {"tag":"t1","score":0.8,"tagId":t1.id,"semanticHash":h1},
+        {"tag":"t2","score":0.4,"tagId":t2.id,"semanticHash":h2}
+    ]);
+    conn.execute("UPDATE papers SET tag_matches_json=?1 WHERE id=?2", params![matches.to_string(), pa]).unwrap();
+    // 本地重算 → 1.2
+    let active = crate::tag_config::active_tags(&conn).unwrap();
+    crate::tag_config::recompute_paper_total_score(&conn, pa, &active).unwrap();
+    let s: f64 = conn.query_row("SELECT total_score FROM papers WHERE id=?1", params![pa], |r| r.get(0)).unwrap();
+    assert!((s - 1.2).abs() < 1e-9, "本地重算 1.2，实际 {}", s);
+    // immediate 保存：t2 disabled → 本地重算 0.8
+    let draft = vec![
+        TagDraftItem { id: t1.id, name: "t1".into(), description: Some("说明1".into()), enabled: true, deleted: false },
+        TagDraftItem { id: t2.id, name: "t2".into(), description: Some("说明2".into()), enabled: false, deleted: false },
+    ];
+    let res = crate::tag_config::save_immediate_config(&conn, &draft).unwrap();
+    assert!(res.diff.disabled.contains(&"t2".to_string()));
+    let s2: f64 = conn.query_row("SELECT total_score FROM papers WHERE id=?1", params![pa], |r| r.get(0)).unwrap();
+    assert!((s2 - 0.8).abs() < 1e-9, "t2 disabled 后本地重算 0.8，实际 {}", s2);
+    // tag_matches_json 保留 t2 分数（缓存）
+    let json: String = conn.query_row("SELECT tag_matches_json FROM papers WHERE id=?1", params![pa], |r| r.get(0)).unwrap();
+    assert!(json.contains("t2"), "disabled tag score 保留为缓存");
+}
+
+#[test]
+fn test_tag_only_merge_and_papers_needing() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let pa = seed_paper_with_score(&conn, jid, "10.1000/tc-c", "C", 1.0);
+    let t1 = db::add_tag(&conn, "平台治理", Some("平台治理研究")).unwrap();
+    let t2 = db::add_tag(&conn, "数字劳动", Some("数字劳动研究")).unwrap();
+    // paper 已有 t1 score（旧 hash）→ t1 需要更新；t2 缺失 → 需要
+    let old_h = crate::tag_config::tag_semantic_hash(t1.id, "平台治理", "旧说明");
+    let matches = serde_json::json!([{"tag":"平台治理","score":0.6,"tagId":t1.id,"semanticHash":old_h}]);
+    conn.execute("UPDATE papers SET tag_matches_json=?1 WHERE id=?2", params![matches.to_string(), pa]).unwrap();
+    // 目标 tags（t1 新说明 + t2）
+    let targets = vec![
+        (t1.id, "平台治理".to_string(), "平台治理研究".to_string()),
+        (t2.id, "数字劳动".to_string(), "数字劳动研究".to_string()),
+    ];
+    let need = db::papers_needing_tag_scores(&conn, &targets).unwrap();
+    assert_eq!(need, vec![pa], "t1 hash stale + t2 missing → 需要");
+    // merge 结果（模拟 tag-only 返回）
+    let scores = vec![(t1.id, 0.8), (t2.id, 0.4)];
+    db::set_paper_tag_scores(&conn, pa, &scores, &targets).unwrap();
+    let json: String = conn.query_row("SELECT tag_matches_json FROM papers WHERE id=?1", params![pa], |r| r.get(0)).unwrap();
+    assert!(json.contains("数字劳动"));
+    // 再次检查 → 不再需要（hash 匹配）
+    let need2 = db::papers_needing_tag_scores(&conn, &targets).unwrap();
+    assert!(need2.is_empty(), "merge 后 hash 匹配 → 不再需要");
+    // total 本地重算：0.8 + 0.4 = 1.2
+    let s: f64 = conn.query_row("SELECT total_score FROM papers WHERE id=?1", params![pa], |r| r.get(0)).unwrap();
+    assert!((s - 1.2).abs() < 1e-9, "total 1.2，实际 {}", s);
+}
+
+#[test]
+fn test_tag_config_does_not_change_finalized_history() {
+    use crate::models::TagDraftItem;
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let pa = seed_paper_with_score(&conn, jid, "10.1000/tc-d", "D", 2.0);
+    // 8-26 run（finalize）
+    let r1 = crate::recommendation::refresh_current_recommendations(&conn, &local_dt(2026, 8, 26, 15, 0), "09:00").unwrap();
+    let _r2 = crate::recommendation::refresh_current_recommendations(&conn, &local_dt(2026, 8, 27, 9, 0), "09:00").unwrap();
+    assert_eq!(db::get_recommendation_run(&conn, r1).unwrap().unwrap().status, "finalized");
+    let snapshot_before = db::list_recommendation_items(&conn, r1).unwrap()[0].score_snapshot;
+    // immediate 保存（t1 新增）→ 不重排 finalized run
+    let t1 = db::add_tag(&conn, "新标签", Some("说明")).unwrap();
+    let draft = vec![
+        TagDraftItem { id: t1.id, name: "新标签".into(), description: Some("说明".into()), enabled: true, deleted: false },
+    ];
+    crate::tag_config::save_immediate_config(&conn, &draft).unwrap();
+    let items = db::list_recommendation_items(&conn, r1).unwrap();
+    assert_eq!(items[0].score_snapshot, snapshot_before, "finalized history 冻结");
+    let _ = pa;
+}
+
+#[test]
+fn test_full_ai_prompt_uses_description() {
+    // 审计验证：build_context 把 description 带入 tag_pairs → prompt 输出含说明
+    let conn = mem_db();
+    db::add_tag(&conn, "新标签Y", Some("关注双边平台")).unwrap();
+    let ctx = crate::analyze::build_context(&std::sync::Arc::new(std::sync::Mutex::new(conn))).unwrap();
+    assert!(ctx.tag_pairs.iter().any(|(n, d)| n == "新标签Y" && d == "关注双边平台"), "description 必须进入 prompt 上下文");
 }

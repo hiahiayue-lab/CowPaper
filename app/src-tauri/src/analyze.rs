@@ -50,6 +50,8 @@ pub fn normalize_tag_matches(
             TagMatch {
                 tag: name.clone(),
                 score,
+                tag_id: None,
+                semantic_hash: None,
             }
         })
         .collect()
@@ -117,6 +119,40 @@ pub fn analyze_paper_once(
         .map_err(|e| AiError::Paper(e.to_string()))?;
     }
     Ok(true)
+}
+
+/// Tag-only 增量评分（多 tag 一次请求；只更新 requested tags，其余保留）。
+/// 返回 (tag_id, score)。
+pub fn tag_only_analyze(
+    conn: &Arc<Mutex<Connection>>,
+    ds: &DeepSeek,
+    api_key: &str,
+    model: &str,
+    paper_id: i64,
+    title: &str,
+    abstract_text: &str,
+    abstract_quality: &str,
+    tags: &[(i64, String, String)],
+) -> Result<Vec<(i64, f64)>, AiError> {
+    let id_strs: Vec<(String, String, String)> = tags
+        .iter()
+        .map(|(id, n, d)| (id.to_string(), n.clone(), d.clone()))
+        .collect();
+    let out = ds.analyze_tags(api_key, model, title, abstract_text, abstract_quality, &id_strs)?;
+    // 只保留 requested tags（trust only requested set），clamp 到合法档位
+    let mut scores: Vec<(i64, f64)> = Vec::new();
+    for (id_str, score) in out {
+        if let Ok(id) = id_str.parse::<i64>() {
+            if tags.iter().any(|(tid, _, _)| *tid == id) {
+                scores.push((id, clamp_score(score)));
+            }
+        }
+    }
+    {
+        let c = conn.lock().unwrap();
+        db::set_paper_tag_scores(&c, paper_id, &scores, tags).map_err(|e| AiError::Paper(e.to_string()))?;
+    }
+    Ok(scores)
 }
 
 fn clamp_score(s: f64) -> f64 {

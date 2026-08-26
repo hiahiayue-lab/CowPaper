@@ -874,3 +874,54 @@ button.full {
   gap: 10px;
   margin: 6px 0 4px;
 }
+
+/* ---------- Round 6.5：Tag Draft Editor ---------- */
+
+.tag-draft-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.tag-dirty {
+  color: #b45309;
+  font-size: 12px;
+}
+.tag-draft-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.tag-draft-row input[type="text"] {
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  font-size: 13px;
+  background: var(--panel);
+  color: var(--text);
+}
+.tag-draft-row .tag-name-input {
+  flex: 0 1 160px;
+  font-weight: 600;
+}
+.tag-draft-row .tag-desc-input {
+  flex: 1 1 240px;
+}
+.tag-action-bar {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 12px 16px;
+  margin-top: 14px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 -4px 12px rgba(0, 0, 0, 0.04);
+}
+.tag-action-bar .muted {
+  margin-right: auto;
+}

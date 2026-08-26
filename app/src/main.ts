@@ -71,13 +71,6 @@ interface Paper {
   collections: string[];
 }
 
-interface Tag {
-  id: number;
-  name: string;
-  description: string | null;
-  enabled: boolean;
-}
-
 interface AiStatus {
   state: string;
   batchSize: number;
@@ -265,7 +258,6 @@ const MODEL_NAME = "cowpaper_model";
 const DEFAULT_MODEL = "deepseek-v4-flash"; // 已验证可用的模型
 
 let journals: Journal[] = [];
-let tags: Tag[] = [];
 let papers: Paper[] = [];
 let aiStatus: AiStatus = emptyAiStatus();
 let activity: ActivityState = emptyActivity();
@@ -365,11 +357,6 @@ async function loadJournals() {
   journals = await invoke<Journal[]>("list_journals");
   renderJournals();
   renderFilter();
-}
-
-async function loadTags() {
-  tags = await invoke<Tag[]>("list_tags");
-  renderTags();
 }
 
 async function loadPapers() {
@@ -712,27 +699,132 @@ function renderFilter() {
     journals.map((j) => `<option value="${j.id}" ${String(j.id) === cur ? "selected" : ""}>${escapeHtml(j.name)}</option>`).join("");
 }
 
-function renderTags() {
+interface TagDraftItem {
+  id: number;
+  name: string;
+  description: string | null;
+  enabled: boolean;
+  deleted: boolean;
+}
+interface TagBaseline {
+  items: TagDraftItem[];
+  source: string;
+  scheduledEffectiveCycleKey: string | null;
+}
+interface TagConfigDiff {
+  added: string[];
+  removed: string[];
+  disabled: string[];
+  enabled: string[];
+  semanticChanged: string[];
+  unchanged: string[];
+}
+interface SaveTagConfigResult {
+  mode: string;
+  effectiveCycleKey: string | null;
+  diff: TagConfigDiff;
+  aiNeededPapers: number;
+}
+
+let tagBaseline: TagDraftItem[] = [];
+let tagDraft: TagDraftItem[] = [];
+let tagConfigDirty = false;
+
+function tagDraftEqual(a: TagDraftItem[], b: TagDraftItem[]): boolean {
+  if (a.length !== b.length) return false;
+  return a.every((x, i) => {
+    const y = b[i];
+    return x.id === y.id && x.name === y.name && (x.description ?? "") === (y.description ?? "") && x.enabled === y.enabled && x.deleted === y.deleted;
+  });
+}
+
+function setTagDirty(v: boolean) {
+  tagConfigDirty = v;
+  $("tag-draft-dirty").classList.toggle("hidden", !v);
+  ($("[data-action='tag-save-scheduled']") as HTMLButtonElement).disabled = !v;
+  ($("[data-action='tag-save-immediate']") as HTMLButtonElement).disabled = !v;
+  const n = draftChanges();
+  $("tag-action-summary").textContent = v ? `${n} 项未保存修改` : "";
+}
+
+function draftChanges(): number {
+  return tagDraft.filter((d, i) => {
+    const b = tagBaseline[i];
+    return !b || d.name !== b.name || (d.description ?? "") !== (b.description ?? "") || d.enabled !== b.enabled || d.deleted !== b.deleted;
+  }).length;
+}
+
+async function loadTagEditor() {
+  try {
+    const base = await invoke<TagBaseline>("get_tag_config_baseline");
+    tagBaseline = base.items;
+    tagDraft = base.items.map((x) => ({ ...x }));
+    tagConfigDirty = false;
+    $("tag-config-status").textContent = base.source === "scheduled"
+      ? `有一组标签设置将在 ${fmtCycle(base.scheduledEffectiveCycleKey || "")} 生效（当前编辑的是该版本）`
+      : "";
+  } catch (err) {
+    $("tag-config-status").textContent = "标签配置加载失败";
+    console.error(err);
+    tagDraft = [];
+  }
+  renderTagEditor();
+}
+
+/// Tags Draft Editor：只渲染 draft（修改不写 DB）。
+function renderTagEditor() {
   const ul = $("tag-list");
-  ul.innerHTML = "";
-  if (tags.length === 0) {
-    ul.innerHTML = '<li class="empty">暂无标签</li>';
+  ul.innerHTML = tagDraft
+    .map((d, i) => `
+      <li class="card tag tag-draft-row">
+        <label class="check"><input type="checkbox" data-action="tag-draft-toggle" data-idx="${i}" ${d.enabled ? "checked" : ""} /></label>
+        <input class="tag-name-input" type="text" data-action="tag-draft-name" data-idx="${i}" value="${escapeHtml(d.name)}" placeholder="标签名" />
+        <input class="tag-desc-input" type="text" data-action="tag-draft-desc" data-idx="${i}" value="${escapeHtml(d.description || "")}" placeholder="说明（作为 AI 评分标准）" />
+        <button class="ghost small danger" data-action="tag-draft-delete" data-idx="${i}">删除</button>
+      </li>`)
+    .join("") || '<li class="empty">暂无标签。点击「+ 新增标签」创建。</li>';
+  setTagDirty(!tagDraftEqual(tagDraft, tagBaseline));
+}
+
+/// 保存 draft。
+async function saveTagConfig(mode: "scheduled" | "immediate") {
+  const items = tagDraft.filter((d) => !(d.deleted && d.id === 0)); // 未保存过的新增且被删 → 丢弃
+  if (mode === "scheduled") {
+    try {
+      const res = await invoke<SaveTagConfigResult>("save_tag_config", { items, mode });
+      setStatus(`已保存，将于 ${fmtCycle(res.effectiveCycleKey || "")} 生效。`, "done");
+      await loadTagEditor();
+    } catch (err) {
+      setStatus(String(err), "error");
+    }
     return;
   }
-  for (const t of tags) {
-    const li = document.createElement("li");
-    li.className = "card tag";
-    li.innerHTML = `
-      <div class="row">
-        <div class="grow">
-          <div class="title">${escapeHtml(t.name)}</div>
-          <div class="muted small">${escapeHtml(t.description || "（无说明）")}</div>
-        </div>
-        <button class="ghost small" data-action="tag-toggle" data-id="${t.id}">${t.enabled ? "停用" : "启用"}</button>
-        <button class="ghost small danger" data-action="delete-tag" data-tag-id="${t.id}">删除</button>
-      </div>
-    `;
-    ul.appendChild(li);
+  // immediate：确认（若含 AI-needed）
+  const added = tagDraft.filter((d) => d.id === 0 && !d.deleted);
+  const semanticChanged = tagDraft.filter((d) => {
+    if (d.id === 0 || d.deleted) return false;
+    const b = tagBaseline.find((x) => x.id === d.id);
+    if (!b) return false;
+    const norm = (s: string) => s.replace(/\s/g, "").toLowerCase();
+    return norm(b.name) !== norm(d.name) || norm(b.description || "") !== norm(d.description || "");
+  });
+  if (added.length + semanticChanged.length > 0) {
+    const ok = await showConfirmModal({
+      title: "立即更新标签评分？",
+      message: `本次修改：\n新增标签 ${added.length} · 说明/名称修改 ${semanticChanged.length}\n\n需要为已有论文补充标签评分。\n只更新相关标签，不会重新生成标题、摘要或总结。`,
+      confirmText: "保存并更新",
+      cancelText: "取消",
+    });
+    if (!ok) return;
+  }
+  try {
+    const res = await invoke<SaveTagConfigResult>("save_tag_config", { items, mode });
+    setStatus(`已保存并立即更新排序${res.aiNeededPapers > 0 ? `（需为 ${res.aiNeededPapers} 篇论文补充标签评分）` : ""}`, "done");
+    await loadTagEditor();
+    await loadPapers();
+    await refreshRecommendations();
+  } catch (err) {
+    setStatus(String(err), "error");
   }
 }
 
@@ -1253,6 +1345,26 @@ function renderNextCheck() {
 // ---------- 动作 ----------
 
 function switchView(name: string) {
+  // Unsaved Guard（Round 6.5）：标签有未保存修改时拦截导航
+  if (tagConfigDirty && name !== "tags") {
+    showConfirmModal({
+      title: "标签设置尚未保存",
+      message: "放弃后将恢复到上次保存的标签设置。",
+      confirmText: "放弃修改",
+      cancelText: "继续编辑",
+    }).then((ok) => {
+      if (ok) {
+        tagDraft = tagBaseline.map((x) => ({ ...x }));
+        setTagDirty(false);
+        doSwitch(name);
+      }
+    });
+    return;
+  }
+  doSwitch(name);
+}
+
+function doSwitch(name: string) {
   document.querySelectorAll(".nav-item").forEach((t) => t.classList.toggle("active", (t as HTMLElement).dataset.view === name));
   document.querySelectorAll(".view").forEach((v) => v.classList.toggle("active", v.id === `view-${name}`));
   const titles: Record<string, string> = {
@@ -1268,6 +1380,8 @@ function switchView(name: string) {
     historyView = "overview";
     renderRecommendHistory();
   }
+  // 进入标签页时加载 Draft Editor
+  if (name === "tags") loadTagEditor();
 }
 
 interface SyncStartResult {
@@ -1509,25 +1623,6 @@ async function addJournalHandler(e: Event) {
   }
 }
 
-async function addTagHandler(e: Event) {
-  e.preventDefault();
-  const name = ($("tag-name") as HTMLInputElement).value.trim();
-  if (!name) {
-    $("tag-error").textContent = "请输入标签名";
-    return;
-  }
-  $("tag-error").textContent = "";
-  const desc = ($("tag-desc") as HTMLInputElement).value.trim();
-  try {
-    await invoke("add_tag", { name, description: desc || null });
-    ($("tag-name") as HTMLInputElement).value = "";
-    ($("tag-desc") as HTMLInputElement).value = "";
-    await loadTags();
-  } catch (err) {
-    $("tag-error").textContent = String(err);
-  }
-}
-
 async function setFlag(id: number, flag: string, value: boolean) {
   await invoke("set_paper_flag", { id, flag, value });
   const p = papers.find((x) => x.id === id);
@@ -1657,8 +1752,27 @@ async function setupListeners() {
   });
 
   // Catalog 详情 checkbox 选择（change 冒泡 → 委托处理）
+  document.addEventListener("input", (ev) => {
+    const el = ev.target as HTMLInputElement;
+    const action = el.dataset.action;
+    if (action === "tag-draft-name" || action === "tag-draft-desc") {
+      const i = parseInt(el.dataset.idx!, 10);
+      if (isNaN(i) || !tagDraft[i]) return;
+      if (action === "tag-draft-name") tagDraft[i].name = el.value;
+      else tagDraft[i].description = el.value;
+      setTagDirty(true);
+    }
+  });
   document.addEventListener("change", (ev) => {
     const el = ev.target as HTMLInputElement;
+    if (el.matches("[data-action='tag-draft-toggle']")) {
+      const i = parseInt(el.dataset.idx!, 10);
+      if (!isNaN(i) && tagDraft[i]) {
+        tagDraft[i].enabled = el.checked;
+        setTagDirty(true);
+      }
+      return;
+    }
     if (el.matches("#add-member-panel input[type=checkbox]")) {
       if (!addMemberState) return;
       const id = parseInt(el.dataset.journalId!, 10);
@@ -1767,29 +1881,27 @@ async function setupListeners() {
       rerenderPaperContext(id);
       return;
     }
-    const tagToggle = t.closest("[data-action='tag-toggle']") as HTMLElement | null;
-    if (tagToggle) {
-      const id = parseInt(tagToggle.dataset.id!, 10);
-      const tg = tags.find((x) => x.id === id);
-      if (tg) {
-        await invoke("update_tag", { id, name: tg.name, description: tg.description, enabled: !tg.enabled });
-        await loadTags();
+    // Tag Draft Editor 操作（Round 6.5：只改 draft，不写 DB）
+    if (t.closest("[data-action='tag-draft-add']")) {
+      tagDraft.push({ id: 0, name: "", description: "", enabled: true, deleted: false });
+      renderTagEditor();
+      return;
+    }
+    const tagDel = t.closest("[data-action='tag-draft-delete']") as HTMLElement | null;
+    if (tagDel) {
+      const i = parseInt(tagDel.dataset.idx!, 10);
+      if (!isNaN(i) && tagDraft[i]) {
+        tagDraft.splice(i, 1);
+        renderTagEditor();
       }
       return;
     }
-    const tagDelete = t.closest("[data-action='delete-tag']") as HTMLElement | null;
-    if (tagDelete) {
-      const id = parseInt(tagDelete.dataset.tagId!, 10);
-      const tg = tags.find((x) => x.id === id);
-      const ok = await showConfirmModal({
-        title: "删除标签",
-        message: `删除标签？\n“${tg ? escapeHtml(tg.name) : "该标签"}”将从研究标签中删除。`,
-        confirmText: "删除",
-        cancelText: "取消",
-      });
-      if (!ok) return;
-      await invoke("delete_tag", { id });
-      await loadTags();
+    if (t.closest("[data-action='tag-save-scheduled']")) {
+      await saveTagConfig("scheduled");
+      return;
+    }
+    if (t.closest("[data-action='tag-save-immediate']")) {
+      await saveTagConfig("immediate");
       return;
     }
     // AI 控制
@@ -1964,7 +2076,6 @@ async function setupListeners() {
 
 window.addEventListener("DOMContentLoaded", () => {
   $("add-form").addEventListener("submit", addJournalHandler);
-  $("tag-form").addEventListener("submit", addTagHandler);
   $("btn-refresh").addEventListener("click", loadPapers);
   $("journal-filter").addEventListener("change", renderPapers);
   $("ai-filter").addEventListener("change", renderPapers);
@@ -2003,7 +2114,7 @@ window.addEventListener("DOMContentLoaded", () => {
 
   (async () => {
     await setupListeners();
-    await Promise.all([loadJournals(), loadTags(), loadSettings()]);
+    await Promise.all([loadJournals(), loadSettings()]);
     await loadPapers();
     // 统一工作状态刷新（Work Center / 积压 / 待处理区 / 计数）
     await refreshWorkState();

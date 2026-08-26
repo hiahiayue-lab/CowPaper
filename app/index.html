@@ -118,13 +118,18 @@
         </section>
 
         <section id="view-tags" class="view">
-          <form id="tag-form" class="add-form">
-            <input id="tag-name" type="text" placeholder="标签名，如 平台经济" />
-            <input id="tag-desc" type="text" placeholder="说明（可选）" />
-            <button type="submit" class="primary">添加标签</button>
-          </form>
-          <p id="tag-error" class="error"></p>
+          <div id="tag-config-status" class="muted small"></div>
+          <div class="tag-draft-head">
+            <span class="muted small">标签说明会作为 AI 判断论文相关性的评分标准。</span>
+            <button class="ghost small" data-action="tag-draft-add">+ 新增标签</button>
+            <span id="tag-draft-dirty" class="tag-dirty hidden">● 有未保存的修改</span>
+          </div>
           <ul id="tag-list" class="list"></ul>
+          <div class="tag-action-bar">
+            <span id="tag-action-summary" class="muted small"></span>
+            <button class="ghost" data-action="tag-save-scheduled" disabled>保存，下个推荐周期生效</button>
+            <button class="primary" data-action="tag-save-immediate" disabled>保存并立即更新排序</button>
+          </div>
         </section>
 
         <section id="view-settings" class="view">

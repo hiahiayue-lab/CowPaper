@@ -40,11 +40,27 @@ pub enum QueueCommand {
         model: String,
         parent_batch_id: Option<i64>,
     },
+    /// Tag-only 增量评分（Round 6.5）：只对 requested tags 打分，不重新生成标题/摘要/总结。
+    TagOnlyBatch {
+        paper_ids: Vec<i64>,
+        tags: Vec<(i64, String, String)>,
+        model: String,
+        parent_batch_id: Option<i64>,
+    },
 }
 
 /// 全局唯一 AI 队列句柄（单一 coordinator，§三十五）。
 pub struct AiQueue {
     pub cmd_tx: Sender<QueueCommand>,
+}
+
+impl AiQueue {
+    /// 便于在 manage 后 clone 使用（scheduled 激活等场景）。
+    pub fn clone_state(&self) -> Self {
+        AiQueue {
+            cmd_tx: self.cmd_tx.clone(),
+        }
+    }
 }
 
 enum WorkerMsg {
@@ -82,6 +98,8 @@ struct Batch {
     last_error: Option<String>,
     retry_paper: Option<i64>,
     retry_until_iso: Option<String>,
+    /// Tag-only 批次的 requested tags（Some = tagConfigUpdate）
+    tag_only_tags: Option<Vec<(i64, String, String)>>,
 }
 
 impl Batch {
@@ -114,6 +132,7 @@ impl Batch {
             last_error: None,
             retry_paper: None,
             retry_until_iso: None,
+            tag_only_tags: None,
         }
     }
 }
@@ -276,6 +295,60 @@ fn handle_command<R: Runtime>(
             let (worker_tx, worker_rx) = mpsc::channel();
             let mut b = Batch::new(size, worker_tx, worker_rx, ctx, (api_key, model));
             b.analysis_batch_id = batch_id;
+            *batch = Some(b);
+            *state = QS_RUNNING.to_string();
+            pick_new.store(true, Ordering::SeqCst);
+            persist_queue_state(conn, state, batch.as_ref().unwrap());
+            emit_progress(app, conn, state, batch.as_ref().unwrap());
+        }
+        QueueCommand::TagOnlyBatch {
+            paper_ids,
+            tags,
+            model,
+            parent_batch_id,
+        } => {
+            if state.as_str() != QS_IDLE {
+                return; // 单一队列：已有批次时不重复启动
+            }
+            if paper_ids.is_empty() || tags.is_empty() {
+                return;
+            }
+            let Some(api_key) = read_api_key(store, app) else {
+                return;
+            };
+            // tag-only 不需要 enabled tag 上下文（requested tags 独立）
+            let ctx = Arc::new(analyze::AnalyzeContext {
+                tag_pairs: Vec::new(),
+            });
+            {
+                let c = conn.lock().unwrap();
+                for id in &paper_ids {
+                    let _ = db::enqueue_for_tag_update(&c, *id);
+                }
+            }
+            let (size, batch_id) = {
+                let c = conn.lock().unwrap();
+                let size = db::count_active_queue(&c).unwrap_or(0);
+                if size == 0 {
+                    return;
+                }
+                let queued = db::list_queued_ids(&c, size).unwrap_or_default();
+                let bid = db::create_analysis_batch(
+                    &c,
+                    "tagConfigUpdate",
+                    Some(&model),
+                    Some(analyze::PROMPT_VERSION),
+                    None,
+                    parent_batch_id,
+                    &queued,
+                )
+                .unwrap_or(0);
+                (size, bid)
+            };
+            let (worker_tx, worker_rx) = mpsc::channel();
+            let mut b = Batch::new(size, worker_tx, worker_rx, ctx, (api_key, model));
+            b.analysis_batch_id = batch_id;
+            b.tag_only_tags = Some(tags);
             *batch = Some(b);
             *state = QS_RUNNING.to_string();
             pick_new.store(true, Ordering::SeqCst);
@@ -575,8 +648,9 @@ fn step_batch<R: Runtime>(
             let conn2 = conn.clone();
             let ctx2 = b.ctx.clone();
             let creds2 = b.creds.clone();
+            let tag_only2 = b.tag_only_tags.clone();
             std::thread::spawn(move || {
-                worker_run(conn2, wtx, creds2, pid, ctx2);
+                worker_run(conn2, wtx, creds2, pid, ctx2, tag_only2);
             });
             emit_progress(app, conn, state, b);
         }
@@ -656,6 +730,7 @@ fn worker_run(
     creds: (String, String),
     paper_id: i64,
     ctx: Arc<AnalyzeContext>,
+    tag_only_tags: Option<Vec<(i64, String, String)>>,
 ) {
     let (api_key, model) = creds;
     let (title, abstract_text, abstract_quality) = {
@@ -675,17 +750,32 @@ fn worker_run(
                     return f(paper_id);
                 }
             }
-            analyze::analyze_paper_once(
-                &conn,
-                &ds,
-                &api_key,
-                &model,
-                paper_id,
-                &title,
-                &abstract_text,
-                &abstract_quality,
-                &ctx,
-            )
+            if let Some(tags) = &tag_only_tags {
+                analyze::tag_only_analyze(
+                    &conn,
+                    &ds,
+                    &api_key,
+                    &model,
+                    paper_id,
+                    &title,
+                    &abstract_text,
+                    &abstract_quality,
+                    tags,
+                )
+                .map(|_| true)
+            } else {
+                analyze::analyze_paper_once(
+                    &conn,
+                    &ds,
+                    &api_key,
+                    &model,
+                    paper_id,
+                    &title,
+                    &abstract_text,
+                    &abstract_quality,
+                    &ctx,
+                )
+            }
         },
         |attempt, wait_ms| {
             let _ = tx.send(WorkerMsg::Retrying {
