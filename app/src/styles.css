@@ -636,3 +636,21 @@ button.full {
   gap: 8px;
   margin-top: 10px;
 }
+
+/* ---------- Round 5B：摘要质量提示 ---------- */
+
+.abs-quality.partial {
+  display: inline-block;
+  font-size: 12px;
+  color: #b45309; /* 中性橙，低强调；不用 error red */
+  margin: 2px 0 4px;
+}
+.abs-partial-ai {
+  margin-top: 2px;
+  font-size: 12px;
+  color: #b45309;
+}
+.deepseek-status {
+  margin-top: 8px;
+  line-height: 1.5;
+}

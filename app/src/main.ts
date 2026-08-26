@@ -51,6 +51,8 @@ interface Paper {
   publishedDate: string | null;
   abstractText: string | null;
   abstractSource: string | null;
+  abstractQuality: string;
+  abstractRetrievedAt: string | null;
   url: string | null;
   discoverySource: string | null;
   analysisStatus: string;
@@ -435,7 +437,15 @@ function paperCard(p: Paper, withAbstract: boolean): string {
   const titleEn = p.chineseTitle
     ? `<div class="paper-title-en">${escapeHtml(p.title || "")}</div>`
     : `<div class="paper-title">${escapeHtml(p.title || "（无标题）")}</div>`;
-  const summary = p.oneSentenceSummary ? `<div class="paper-summary">${escapeHtml(p.oneSentenceSummary)}</div>` : "";
+  // 摘要质量提示（Round 5B）：partial → 低强调橙（非 error red）；基于 partial 的 AI 结果低调注明
+  const partialNote = p.abstractQuality === "partial" ? `<span class="abs-quality partial">摘要可能不完整${p.abstractSource ? " · " + escapeHtml(p.abstractSource) : ""}</span>` : "";
+  const partialAiNote =
+    p.abstractQuality === "partial" && p.analysisStatus === "analysisSucceeded"
+      ? `<div class="muted small abs-partial-ai">基于不完整摘要分析</div>`
+      : "";
+  const summary = p.oneSentenceSummary
+    ? `<div class="paper-summary">${escapeHtml(p.oneSentenceSummary)}${partialAiNote}</div>`
+    : partialAiNote;
   const score = p.totalScore != null ? `<span class="score-badge">总分 ${p.totalScore.toFixed(1)}</span>` : "";
 
   let abstractHtml = "";
@@ -454,13 +464,15 @@ function paperCard(p: Paper, withAbstract: boolean): string {
             <button class="abs-lang ${lang === "zh" ? "on" : ""}" data-action="abs-lang" data-id="${p.id}" data-lang="zh">中文</button>
             <button class="abs-lang ${lang === "en" ? "on" : ""}" data-action="abs-lang" data-id="${p.id}" data-lang="en">English</button>
           </div>
+          ${partialNote}
           <div class="abstract">${escapeHtml(trunc)}</div>
           ${text.length > 400 ? `<button class="ghost small abs-expand" data-action="abs-expand" data-id="${p.id}">${isExpanded ? "收起" : "展开完整摘要"}</button>` : ""}
         </div>`;
     } else if (lang === "zh" && !zhAbs) {
       abstractHtml = `<div class="abstract muted">中文摘要待生成</div>`;
     } else {
-      abstractHtml = `<div class="abstract muted">暂未取得摘要</div>`;
+      // missing：明确显示"暂无摘要"，不空白
+      abstractHtml = `<div class="abstract muted">暂无摘要</div>`;
     }
   }
 
@@ -488,9 +500,11 @@ function renderPapers() {
   const jsel = $("journal-filter") as HTMLSelectElement;
   const fsel = $("flag-filter") as HTMLSelectElement;
   const asel = $("ai-filter") as HTMLSelectElement;
+  const absel = $("abs-filter") as HTMLSelectElement;
   const jid = jsel.value ? parseInt(jsel.value, 10) : null;
   const flag = fsel.value;
   const aist = asel.value;
+  const abst = absel.value;
 
   let list = papers;
   if (jid != null) list = list.filter((p) => p.journalId === jid);
@@ -498,6 +512,7 @@ function renderPapers() {
   else if (flag === "favorite") list = list.filter((p) => p.isFavorite);
   else if (flag === "ignored") list = list.filter((p) => p.isIgnored);
   if (aist) list = list.filter((p) => p.analysisStatus === aist);
+  if (abst) list = list.filter((p) => p.abstractQuality === abst);
 
   $("paper-list").innerHTML = list.length
     ? list.map((p) => paperCard(p, true)).join("")
@@ -549,6 +564,7 @@ const TRIGGER_ZH: Record<string, string> = {
   manual: "手动检查", startup: "启动检查", daily: "每日检查", tray: "托盘检查",
   journalTest: "期刊测试", autoAfterSync: "同步后自动分析", retryFailed: "重试失败",
   resumeRecovered: "恢复继续",
+  abstractUpgraded: "摘要补全后重新分析",
 };
 const STATUS_ZH: Record<string, string> = {
   running: "运行中", paused: "已暂停", completed: "完成", completedWithErrors: "完成（有错误）",
@@ -1066,38 +1082,39 @@ async function setFlag(id: number, flag: string, value: boolean) {
   renderFavorites();
 }
 
+/// DeepSeek 模块内专用状态区（测试连接 / 保存 / 删除结果只显示在这里）。
+function setDeepSeekStatus(text: string, cls: string) {
+  const el = $("deepseek-status");
+  el.textContent = text;
+  el.className = `deepseek-status ${cls}`;
+}
+
 async function saveKey() {
   const key = ($("api-key") as HTMLInputElement).value.trim();
   const model = ($("model") as HTMLInputElement).value.trim() || DEFAULT_MODEL;
   localStorage.setItem(MODEL_NAME, model);
   if (!key) {
-    $("settings-msg").textContent = "请输入 API Key";
-    $("settings-msg").className = "error";
+    setDeepSeekStatus("请输入 API Key", "error");
     return;
   }
   try {
     await invoke("save_api_key", { key });
     ($("api-key") as HTMLInputElement).value = ""; // 不回显真实 Key
-    $("settings-msg").textContent = "✓ API Key 已保存在本机";
-    $("settings-msg").className = "ok small";
+    setDeepSeekStatus("✓ API Key 已保存在本机", "ok small");
     await refreshKeyStatus();
   } catch (err) {
-    $("settings-msg").textContent = String(err);
-    $("settings-msg").className = "error";
+    setDeepSeekStatus(String(err), "error");
   }
 }
 
 async function testConnection() {
   const model = ($("model") as HTMLInputElement).value.trim() || DEFAULT_MODEL;
-  $("settings-msg").textContent = "测试中…";
-  $("settings-msg").className = "muted small";
+  setDeepSeekStatus("测试中…", "muted small");
   try {
     const r = await invoke<{ ok: boolean; message: string }>("test_api_connection", { model });
-    $("settings-msg").textContent = r.message;
-    $("settings-msg").className = r.ok ? "ok small" : "error";
+    setDeepSeekStatus(r.message, r.ok ? "ok small" : "error");
   } catch (err) {
-    $("settings-msg").textContent = String(err);
-    $("settings-msg").className = "error";
+    setDeepSeekStatus(String(err), "error");
   }
 }
 
@@ -1136,7 +1153,7 @@ async function setupListeners() {
   });
   await listen("sync://done", async (e) => {
     const r = e.payload as any;
-    setStatus(`同步完成：新增 ${r.newPapers} · 已有 ${r.existingPapers} · 补摘要 ${r.abstractsFilled}`, "done");
+    setStatus(`同步完成：新增 ${r.newPapers} · 已有 ${r.existingPapers} · 补摘要 ${r.abstractsAdded || 0}${r.abstractsUpgraded ? " · 摘要升级 " + r.abstractsUpgraded : ""}`, "done");
     // 统一刷新：papers + 工作状态（Work Center / 徽标 / 面板 / 待处理区 / 计数）
     await loadJournals();
     await loadPapers();
@@ -1147,6 +1164,16 @@ async function setupListeners() {
         paperIds: r.newPaperIds,
         model: getModel(),
         trigger: "autoAfterSync",
+        sourceSyncBatchId: r.batchId || null,
+      });
+      await refreshWorkState();
+    }
+    // 摘要升级（partial→complete / missing→更完整）：自动重新分析并更新推荐（默认行为）
+    if (Array.isArray(r.abstractUpgradedIds) && r.abstractUpgradedIds.length > 0 && (await hasKey())) {
+      await invoke("start_ai", {
+        paperIds: r.abstractUpgradedIds,
+        model: getModel(),
+        trigger: "abstractUpgraded",
         sourceSyncBatchId: r.batchId || null,
       });
       await refreshWorkState();
@@ -1319,6 +1346,7 @@ window.addEventListener("DOMContentLoaded", () => {
   $("btn-refresh").addEventListener("click", loadPapers);
   $("journal-filter").addEventListener("change", renderPapers);
   $("ai-filter").addEventListener("change", renderPapers);
+  $("abs-filter").addEventListener("change", renderPapers);
   $("flag-filter").addEventListener("change", renderPapers);
   $("btn-save-key").addEventListener("click", saveKey);
   $("btn-test").addEventListener("click", testConnection);
@@ -1326,12 +1354,10 @@ window.addEventListener("DOMContentLoaded", () => {
     try {
       await invoke("delete_api_key");
       ($("api-key") as HTMLInputElement).value = "";
-      $("settings-msg").textContent = "已删除本机保存的 Key";
-      $("settings-msg").className = "muted small";
+      setDeepSeekStatus("已删除本机保存的 Key", "muted small");
       await refreshKeyStatus();
     } catch (err) {
-      $("settings-msg").textContent = String(err);
-      $("settings-msg").className = "error";
+      setDeepSeekStatus(String(err), "error");
     }
   });
   $("btn-save-settings").addEventListener("click", saveSettings);

@@ -66,6 +66,7 @@ pub fn analyze_paper_once(
     paper_id: i64,
     title: &str,
     abstract_text: &str,
+    abstract_quality: &str,
     ctx: &AnalyzeContext,
 ) -> Result<bool, AiError> {
     if title.is_empty() || abstract_text.is_empty() {
@@ -92,7 +93,7 @@ pub fn analyze_paper_once(
         }
     }
 
-    let out = ds.analyze(api_key, model, title, abstract_text, &ctx.tag_pairs)?;
+    let out = ds.analyze(api_key, model, title, abstract_text, abstract_quality, &ctx.tag_pairs)?;
 
     // 规范化：canonical 唯一标签集 + 最高合法分（重复 tag 不求和）。
     let tag_matches = normalize_tag_matches(out.tag_matches, &ctx.tag_pairs);

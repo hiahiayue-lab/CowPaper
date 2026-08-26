@@ -54,6 +54,12 @@
               <option value="analysisFailed">分析失败</option>
               <option value="waitingForAbstract">等待摘要</option>
             </select>
+            <select id="abs-filter">
+              <option value="">全部摘要</option>
+              <option value="complete">完整</option>
+              <option value="partial">可能不完整</option>
+              <option value="missing">缺失</option>
+            </select>
             <select id="flag-filter">
               <option value="">全部</option>
               <option value="unread">未读</option>
@@ -107,6 +113,8 @@
               <button id="btn-test" class="ghost">测试连接</button>
               <button id="btn-clear-key" class="ghost danger">删除 Key</button>
             </div>
+            <!-- DeepSeek 模块内专用状态区：测试连接 / 保存 / 删除结果只显示在这里 -->
+            <div id="deepseek-status" class="deepseek-status muted small"></div>
 
             <h3>AI 分析</h3>
             <div class="settings-row">

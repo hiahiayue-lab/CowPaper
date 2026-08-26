@@ -1808,7 +1808,7 @@ fn test_migration_v2_to_v3_preserves_data() {
 
     // 迁移到 v3
     db::init(&conn).unwrap();
-    assert_eq!(db::SCHEMA_VERSION, 3);
+    assert_eq!(db::SCHEMA_VERSION, 4);
 
     // 8) 旧 issn 迁移进 journal_identifiers（类型按列，不猜）
     let ids = db::list_journal_identifiers(&conn, jid).unwrap();
@@ -1849,7 +1849,7 @@ fn test_database_restart_persistence() {
     {
         let conn = db::open(&path).unwrap();
         db::init(&conn).unwrap(); // 幂等：user_version=3 不重复迁移
-        assert_eq!(db::SCHEMA_VERSION, 3);
+        assert_eq!(db::SCHEMA_VERSION, 4);
         let j = db::get_journal(&conn, 1).unwrap().expect("期刊持久化");
         assert_eq!(j.print_issn.as_deref(), Some("0025-1909"));
         assert_eq!(j.identifiers.len(), 1);
@@ -1962,4 +1962,299 @@ fn test_issn_l_merge_and_possible_duplicate() {
     let jd = list.iter().find(|j| j.id == d).unwrap();
     assert!(jc.possible_duplicate, "相同标题规范化应标记疑似重复");
     assert!(jd.possible_duplicate, "相同标题规范化应标记疑似重复");
+}
+
+// ================= Round 5B：Abstract Quality & Recovery =================
+
+#[test]
+fn test_abstract_quality_heuristic() {
+    use crate::abstract_quality::assess_abstract_quality as aq;
+    use crate::models::{ABQ_COMPLETE, ABQ_MISSING, ABQ_PARTIAL};
+    // missing：空 / 空白
+    assert_eq!(aq(""), (ABQ_MISSING, "missing"));
+    assert_eq!(aq("   "), (ABQ_MISSING, "missing"));
+    // partial：ASCII / Unicode 省略号截断
+    assert_eq!(
+        aq("This paper studies pricing in two-sided platforms and the effect of network externalities..."),
+        (ABQ_PARTIAL, "ellipsis_truncated")
+    );
+    assert_eq!(
+        aq("本论文研究双边平台定价与网络外部性对市场均衡的影响……"),
+        (ABQ_PARTIAL, "ellipsis_truncated")
+    );
+    // partial：极短且句法不完整
+    assert_eq!(aq("We study how platforms set prices"), (ABQ_PARTIAL, "very_short_incomplete_sentence"));
+    // complete：短但完整（70–100 词的真实摘要不得误判）
+    assert_eq!(
+        aq("We study how platforms set prices. Our model explains equilibrium market outcomes."),
+        (ABQ_COMPLETE, "full_text_like_abstract")
+    );
+    // complete：长完整摘要
+    let long = "We develop a model of platform pricing with network effects. ".repeat(12) + "Results follow.";
+    assert_eq!(aq(&long), (ABQ_COMPLETE, "full_text_like_abstract"));
+    // partial：长文本无结尾标点且以介词/连词结尾（句子中途断开）
+    assert_eq!(
+        aq(&(long.clone() + " and")),
+        (ABQ_PARTIAL, "truncated_sentence")
+    );
+    assert_eq!(aq(&(long.clone() + " of")), (ABQ_PARTIAL, "truncated_sentence"));
+}
+
+#[test]
+fn test_abstract_normalize_html_jats() {
+    use crate::abstract_quality::{assess_abstract_quality, normalize_abstract_text};
+    use crate::models::ABQ_COMPLETE;
+    let raw = "<jats:p>We study <b>pricing</b> in two-sided platforms.</jats:p><jats:p>Results show &amp; effects.</jats:p>";
+    let n = normalize_abstract_text(raw);
+    assert!(!n.contains('<'), "JATS/HTML 标签必须清除");
+    assert!(n.contains("pricing"));
+    assert!(n.contains('&'), "实体应解码（&amp; → &）");
+    assert!(!n.contains('\n'), "空白/换行折叠");
+    // 标签字符多 ≠ 更完整：normalize 后按真实内容判定
+    assert_eq!(assess_abstract_quality(&n).0, ABQ_COMPLETE);
+    // RSS snippet（带省略号）→ partial
+    let snippet = normalize_abstract_text("A teaser of the article about platform pricing and network effects...");
+    assert_eq!(assess_abstract_quality(&snippet).0, crate::models::ABQ_PARTIAL);
+}
+
+fn mk_candidate(src: &str, text: &str) -> crate::abstract_quality::AbstractCandidate {
+    use crate::abstract_quality::assess_abstract_quality;
+    let (q, r) = assess_abstract_quality(text);
+    crate::abstract_quality::AbstractCandidate {
+        source: src.to_string(),
+        text: text.to_string(),
+        quality: q.to_string(),
+        reason: r.to_string(),
+    }
+}
+
+#[test]
+fn test_canonical_selection() {
+    use crate::abstract_quality::select_canonical_abstract;
+    use crate::models::ABQ_COMPLETE;
+    // partial Crossref + complete OpenAlex → OpenAlex（质量优先于来源）
+    let short = "We study pricing in two-sided platforms and the effect of network externalities on market outcomes...";
+    let full = "We study pricing in two-sided platforms and the effect of network externalities on market outcomes. Our model shows that optimal prices internalize cross-side effects. ".repeat(3) + "We derive welfare implications.";
+    let best = select_canonical_abstract(vec![mk_candidate("crossref", short), mk_candidate("openalex", &full)]).unwrap();
+    assert_eq!(best.source, "openalex");
+    assert_eq!(best.quality, ABQ_COMPLETE);
+    // complete Crossref + partial OpenAlex → Crossref
+    let full_cr = "A complete abstract from crossref covering the model and results in detail. ".repeat(5) + "Conclusion.";
+    let short_oa = "A short snippet that is truncated...";
+    let best = select_canonical_abstract(vec![mk_candidate("openalex", short_oa), mk_candidate("crossref", &full_cr)]).unwrap();
+    assert_eq!(best.source, "crossref");
+    // 同 quality 前缀关系：A 是 B 的明显前缀 → B 胜出
+    let base = "We study platform pricing. Our model shows optimal prices depend on network effects and user elasticities.";
+    let p1 = format!("{} This is a longer complete version with additional welfare detail.", base);
+    let p2 = format!("{} This is a longer complete version with additional welfare detail. We also discuss market structure implications.", base);
+    let best = select_canonical_abstract(vec![mk_candidate("crossref", &p1), mk_candidate("openalex", &p2)]).unwrap();
+    assert_eq!(best.text.trim(), p2.trim(), "更长更完整的候选应胜出");
+    // 相同摘要去重：来源优先级更高者胜出
+    let same = "Identical abstract from both sources. Complete sentence here.";
+    let best = select_canonical_abstract(vec![mk_candidate("rss", same), mk_candidate("crossref", same)]).unwrap();
+    assert_eq!(best.source, "crossref");
+    // 空候选 → None
+    assert!(select_canonical_abstract(vec![mk_candidate("crossref", "   ")]).is_none());
+}
+
+#[test]
+fn test_missing_abstract_flow() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    // missing：无摘要 → waitingForAbstract + quality missing（不进 AI）
+    let c = candidate(Some("10.1000/noabs5b"), "No Abs Paper", None, None);
+    let id = match db::upsert_paper(&conn, jid, &c).unwrap() {
+        UpsertOutcome::New(i) => i,
+        _ => panic!("expected new"),
+    };
+    let p = db::list_papers(&conn, Some(jid), 100).unwrap();
+    assert_eq!(p[0].analysis_status, "waitingForAbstract");
+    assert_eq!(p[0].abstract_quality, "missing");
+    assert!(
+        db::list_pending_papers(&conn, None).unwrap().iter().all(|x| x.id != id),
+        "missing 论文不得进入 AI 待分析"
+    );
+    // missing → partial：可 AI（pendingAnalysis + quality partial）
+    let c2 = candidate(Some("10.1000/noabs5b"), "No Abs Paper", Some("Short snippet truncated..."), Some("crossref"));
+    match db::upsert_paper(&conn, jid, &c2).unwrap() {
+        UpsertOutcome::Existing { abstract_filled, .. } => assert!(abstract_filled),
+        _ => panic!("expected existing"),
+    }
+    let p = db::list_papers(&conn, Some(jid), 100).unwrap();
+    assert_eq!(p[0].analysis_status, "pendingAnalysis");
+    assert_eq!(p[0].abstract_quality, "partial");
+    // missing → complete：可 AI
+    let c3 = candidate(
+        Some("10.1000/noabs5b"),
+        "No Abs Paper",
+        Some(&("Full abstract now available with complete detail. ".repeat(8) + "Done.")),
+        Some("openalex"),
+    );
+    db::upsert_paper(&conn, jid, &c3).unwrap();
+    let p = db::list_papers(&conn, Some(jid), 100).unwrap();
+    assert_eq!(p[0].abstract_quality, "complete");
+    assert_eq!(p[0].analysis_status, "pendingAnalysis");
+    // 来源候选已记录（canonical source recorded）
+    let cnt: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM paper_abstract_sources WHERE paper_id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(cnt >= 2, "有摘要的来源候选都应记录（crossref/openalex），实际 {}", cnt);
+}
+
+#[test]
+fn test_abstract_upgrade_flow() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    // 初始 partial（crossref，省略号截断）
+    let c1 = candidate(
+        Some("10.1000/up5b"),
+        "Upgrade Paper",
+        Some("We study platform pricing and network effects..."),
+        Some("crossref"),
+    );
+    let id = match db::upsert_paper(&conn, jid, &c1).unwrap() {
+        UpsertOutcome::New(i) => i,
+        _ => panic!("expected new"),
+    };
+    let p = db::list_papers(&conn, Some(jid), 100).unwrap();
+    assert_eq!(p[0].abstract_quality, "partial");
+    // 模拟一次基于 partial 的 AI 分析（写入旧 evidence_hash）
+    db::save_analysis(&conn, id, "中文标题", "中文摘要", "一句话", "[]", 1.2, "m", "v1", "old-hash").unwrap();
+    // 完整摘要到达（同 DOI，OpenAlex complete）→ 升级
+    let full = "We study platform pricing and network effects in two-sided markets. ".repeat(10) + "We derive equilibrium and welfare results.";
+    let c2 = candidate(Some("10.1000/up5b"), "Upgrade Paper", Some(&full), Some("openalex"));
+    match db::upsert_paper(&conn, jid, &c2).unwrap() {
+        UpsertOutcome::Existing { abstract_upgraded, .. } => assert!(abstract_upgraded, "partial→complete 必须升级"),
+        _ => panic!("expected existing"),
+    }
+    let p = db::list_papers(&conn, Some(jid), 100).unwrap();
+    assert_eq!(p[0].abstract_quality, "complete");
+    assert_eq!(p[0].abstract_source.as_deref(), Some("openalex"));
+    assert_eq!(p[0].evidence_hash.as_deref(), None, "摘要改变后 evidenceHash 清空（旧分析视为 stale）");
+    // 禁降级：complete 时再来 partial → 不覆盖
+    let c3 = candidate(Some("10.1000/up5b"), "Upgrade Paper", Some("Shorter truncated version..."), Some("crossref"));
+    match db::upsert_paper(&conn, jid, &c3).unwrap() {
+        UpsertOutcome::Existing { abstract_upgraded, .. } => assert!(!abstract_upgraded, "complete 不得被 partial 降级"),
+        _ => panic!("expected existing"),
+    }
+    let p = db::list_papers(&conn, Some(jid), 100).unwrap();
+    assert_eq!(p[0].abstract_quality, "complete");
+    assert_eq!(p[0].abstract_source.as_deref(), Some("openalex"));
+    // 节流：每次检查更新 abstract_last_checked_at
+    assert!(p[0].abstract_last_checked_at.is_some());
+}
+
+#[test]
+fn test_abstract_upgraded_batch_and_reanalysis() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    // 5 篇论文（外键）
+    let mut ids = Vec::new();
+    for i in 0..5 {
+        let c = candidate(
+            Some(&format!("10.1000/upb{}", i)),
+            &format!("Upgrade Batch {}", i),
+            Some("abstract with full detail about pricing effects and outcomes."),
+            Some("crossref"),
+        );
+        match db::upsert_paper(&conn, jid, &c).unwrap() {
+            UpsertOutcome::New(id) => ids.push(id),
+            _ => panic!("expected new"),
+        }
+    }
+    // 旧批次（历史，不得修改）
+    let old_batch = db::create_analysis_batch(&conn, "manual", Some("m"), None, None, None, &ids).unwrap();
+    db::set_analysis_batch_status(&conn, old_batch, "completed", Some(&db::now_utc()), None).unwrap();
+    // 摘要升级后创建新批次（trigger=abstractUpgraded）
+    let new_ids = [ids[1], ids[2]];
+    let new_batch = db::create_analysis_batch(&conn, "abstractUpgraded", Some("m"), None, None, None, &new_ids).unwrap();
+    db::set_analysis_batch_status(&conn, new_batch, "completed", Some(&db::now_utc()), None).unwrap();
+    let old = db::get_analysis_batch(&conn, old_batch).unwrap().unwrap();
+    let new = db::get_analysis_batch(&conn, new_batch).unwrap().unwrap();
+    assert_eq!(old.trigger, "manual");
+    assert_eq!(new.trigger, "abstractUpgraded");
+    assert_eq!(new.total, 2);
+    // 旧批次未被改写
+    assert_eq!(old.total, 5);
+    assert_eq!(old.status, "completed");
+    // 两个批次都在历史中
+    assert_eq!(db::list_analysis_batches(&conn, 10).unwrap().len(), 2);
+}
+
+#[test]
+fn test_migration_v4_abstract_quality_init() {
+    // 手工构造 v3 库（含旧摘要数据与 batch 历史），迁移到 v4：
+    // 存量摘要分类、papers 保留、batch 保留、不调用任何外部服务
+    let conn = Connection::open_in_memory().unwrap();
+    conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+    conn.execute_batch(
+        r#"
+        CREATE TABLE journals (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, print_issn TEXT, online_issn TEXT, publisher TEXT, enabled INTEGER NOT NULL DEFAULT 1, priority INTEGER NOT NULL DEFAULT 0, rss_url TEXT, openalex_source_id TEXT, publisher_adapter TEXT, last_successful_sync_at TEXT, last_paper_date TEXT, coverage_status TEXT, abstract_coverage_rate REAL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+        CREATE TABLE papers (id INTEGER PRIMARY KEY AUTOINCREMENT, journal_id INTEGER NOT NULL, normalized_doi TEXT, original_doi TEXT, title TEXT, title_norm TEXT, authors_json TEXT, published_date TEXT, year INTEGER, abstract TEXT, abstract_source TEXT, abstract_retrieved_at TEXT, url TEXT, publisher_article_id TEXT, openalex_work_id TEXT, discovery_source TEXT, analysis_status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, chinese_title TEXT, chinese_abstract TEXT, one_sentence_summary TEXT, tag_matches_json TEXT, total_score REAL, model_name TEXT, prompt_version TEXT, evidence_hash TEXT, analyzed_at TEXT, is_favorite INTEGER NOT NULL DEFAULT 0, is_read INTEGER NOT NULL DEFAULT 0, is_ignored INTEGER NOT NULL DEFAULT 0, retry_count INTEGER NOT NULL DEFAULT 0, queued_at TEXT);
+        CREATE TABLE sync_batches (id INTEGER PRIMARY KEY AUTOINCREMENT, trigger TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT, journal_total INTEGER NOT NULL DEFAULT 0, journal_completed INTEGER NOT NULL DEFAULT 0, journal_failed INTEGER NOT NULL DEFAULT 0, records_found INTEGER NOT NULL DEFAULT 0, papers_inserted INTEGER NOT NULL DEFAULT 0, papers_existing INTEGER NOT NULL DEFAULT 0, abstracts_added INTEGER NOT NULL DEFAULT 0, waiting_abstract INTEGER NOT NULL DEFAULT 0, error_summary TEXT);
+        CREATE TABLE sync_batch_papers (id INTEGER PRIMARY KEY AUTOINCREMENT, sync_batch_id INTEGER NOT NULL, paper_id INTEGER NOT NULL, result TEXT NOT NULL);
+        CREATE TABLE analysis_batches (id INTEGER PRIMARY KEY AUTOINCREMENT, source_sync_batch_id INTEGER, parent_batch_id INTEGER, trigger TEXT NOT NULL, status TEXT NOT NULL, model_name TEXT, prompt_version TEXT, created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT, total INTEGER NOT NULL DEFAULT 0, completed INTEGER NOT NULL DEFAULT 0, succeeded INTEGER NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0, skipped INTEGER NOT NULL DEFAULT 0, remaining INTEGER NOT NULL DEFAULT 0, error_summary TEXT);
+        CREATE TABLE analysis_batch_items (id INTEGER PRIMARY KEY AUTOINCREMENT, analysis_batch_id INTEGER NOT NULL, paper_id INTEGER NOT NULL, status TEXT NOT NULL, attempt_count INTEGER NOT NULL DEFAULT 0, started_at TEXT, finished_at TEXT, error_type TEXT, error_summary TEXT, previous_analysis_hash TEXT, result_analysis_hash TEXT);
+        "#,
+    )
+    .unwrap();
+    conn.pragma_update(None, "user_version", 3).unwrap();
+    let now = db::now_utc();
+    conn.execute(
+        "INSERT INTO journals (name, print_issn, created_at, updated_at) VALUES ('J','0025-1909',?1,?1)",
+        params![now],
+    )
+    .unwrap();
+    let jid = conn.last_insert_rowid();
+    // 完整摘要 / 截断摘要 / 无摘要 三篇
+    conn.execute(
+        "INSERT INTO papers (journal_id, title, abstract, abstract_source, analysis_status, created_at, updated_at) VALUES (?1,'P1','A complete abstract about platform pricing with network effects.','crossref','pendingAnalysis',?2,?2)",
+        params![jid, now],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO papers (journal_id, title, abstract, abstract_source, analysis_status, created_at, updated_at) VALUES (?1,'P2','This is a truncated snippet about pricing and network effects...','crossref','pendingAnalysis',?2,?2)",
+        params![jid, now],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO papers (journal_id, title, abstract, analysis_status, created_at, updated_at) VALUES (?1,'P3',NULL,'waitingForAbstract',?2,?2)",
+        params![jid, now],
+    )
+    .unwrap();
+    // batch 历史
+    conn.execute(
+        "INSERT INTO sync_batches (trigger, status, created_at) VALUES ('manual','completed',?1)",
+        params![now],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO analysis_batches (trigger, status, created_at) VALUES ('manual','completed',?1)",
+        params![now],
+    )
+    .unwrap();
+
+    db::init(&conn).unwrap();
+    assert_eq!(db::SCHEMA_VERSION, 4);
+
+    let papers = db::list_papers(&conn, Some(jid), 100).unwrap();
+    assert_eq!(papers.len(), 3, "迁移不得丢论文");
+    let by_title = |t: &str| papers.iter().find(|p| p.title.as_deref() == Some(t)).unwrap();
+    assert_eq!(by_title("P1").abstract_quality, "complete");
+    assert_eq!(by_title("P2").abstract_quality, "partial");
+    assert_eq!(by_title("P3").abstract_quality, "missing");
+    // 无摘要论文保持 waitingForAbstract（与 missing 对齐）
+    assert_eq!(by_title("P3").analysis_status, "waitingForAbstract");
+    // batch 历史保留
+    assert_eq!(db::list_sync_batches(&conn, 10).unwrap().len(), 1);
+    assert_eq!(db::list_analysis_batches(&conn, 10).unwrap().len(), 1);
+    // 来源候选表已建立（migration 记录）
+    let cnt: i64 = conn
+        .query_row("SELECT COUNT(*) FROM paper_abstract_sources", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(cnt, 2, "两篇有摘要论文的 migration 来源候选已记录");
 }

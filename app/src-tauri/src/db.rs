@@ -84,10 +84,10 @@ pub fn open(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-/// 当前 schema 版本（Round 5A 引入 journal_identifiers / issn_l / journal_collections 为 v3）。
+/// 当前 schema 版本（Round 5B：abstract_quality / paper_abstract_sources 为 v4）。
 /// 生产构建中仅由迁移系统隐式使用；测试中直接断言。
 #[allow(dead_code)]
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 pub fn init(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
@@ -529,26 +529,157 @@ pub fn find_paper_id(conn: &Connection, journal_id: i64, c: &PaperCandidate) -> 
     Ok(None)
 }
 
-/// 补齐已有论文的缺失字段（只填空，不覆盖非空，满足 §8.3 来源优先级原则）。
-fn fill_missing_fields(conn: &Connection, id: i64, c: &PaperCandidate) -> Result<bool> {
-    let mut abstract_filled = false;
+/// 记录某来源的摘要候选（UNIQUE(paper_id, source)，upsert 保留最新版本）。
+fn record_abstract_source(
+    conn: &Connection,
+    paper_id: i64,
+    source: &str,
+    text: &str,
+    quality: &str,
+    reason: &str,
+) -> Result<()> {
+    let now = now_utc();
+    conn.execute(
+        "INSERT INTO paper_abstract_sources (paper_id, source, abstract_text, quality, quality_reason, fetched_at, updated_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?6)
+         ON CONFLICT(paper_id, source) DO UPDATE SET
+            abstract_text = excluded.abstract_text,
+            quality = excluded.quality,
+            quality_reason = excluded.quality_reason,
+            updated_at = excluded.updated_at",
+        params![paper_id, source, text, quality, reason, now],
+    )?;
+    Ok(())
+}
 
-    let current_abstract: Option<String> = conn
-        .query_row("SELECT abstract FROM papers WHERE id = ?1", params![id], |r| r.get(0))
-        .optional()?
-        .flatten();
-    if current_abstract.is_none() && c.abstract_text.is_some() {
-        conn.execute(
-            "UPDATE papers SET abstract = ?1, abstract_source = ?2, abstract_retrieved_at = ?3, updated_at = ?4 WHERE id = ?5",
-            params![c.abstract_text, c.abstract_source, now_utc(), now_utc(), id],
-        )?;
-        conn.execute(
-            "UPDATE papers SET analysis_status = 'pendingAnalysis' WHERE id = ?1 AND analysis_status = 'waitingForAbstract'",
-            params![id],
-        )?;
-        abstract_filled = true;
+fn quality_rank(q: &str) -> i8 {
+    match q {
+        crate::models::ABQ_COMPLETE => 2,
+        crate::models::ABQ_PARTIAL => 1,
+        _ => 0,
+    }
+}
+
+/// 合并摘要：记录新来源候选 → canonical selection → 升级（禁降级）→ 节流时间戳。
+/// 返回 (abstract_filled, abstract_upgraded)。
+fn merge_abstract(conn: &Connection, paper_id: i64, c: &PaperCandidate) -> Result<(bool, bool)> {
+    let now = now_utc();
+    let cand_source = c.abstract_source.clone().unwrap_or_else(|| "unknown".to_string());
+
+    // 1) 记录该来源候选（normalized）
+    let mut new_cand: Option<(String, &'static str, &'static str)> = None;
+    if let Some(ct) = &c.abstract_text {
+        let n = crate::abstract_quality::normalize_abstract_text(ct);
+        if !n.trim().is_empty() {
+            let (q, r) = crate::abstract_quality::assess_abstract_quality(&n);
+            record_abstract_source(conn, paper_id, &cand_source, &n, q, r)?;
+            new_cand = Some((n, q, r));
+        }
     }
 
+    // 2) 读取当前 canonical
+    let (cur_text, cur_source, cur_quality): (Option<String>, Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT abstract, abstract_source, abstract_quality FROM papers WHERE id = ?1",
+            params![paper_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?
+        .unwrap_or((None, None, None));
+
+    // 3) canonical selection：当前 + 新候选
+    let mut candidates: Vec<crate::abstract_quality::AbstractCandidate> = Vec::new();
+    if let Some(t) = &cur_text {
+        if !t.trim().is_empty() {
+            let q = cur_quality.as_deref().unwrap_or(crate::models::ABQ_MISSING).to_string();
+            let (cq, cr): (String, String) = if q.as_str() == crate::models::ABQ_MISSING {
+                let (x, y) = crate::abstract_quality::assess_abstract_quality(t);
+                (x.to_string(), y.to_string())
+            } else if q.as_str() == crate::models::ABQ_COMPLETE {
+                (q, "full_text_like_abstract".to_string())
+            } else {
+                (q, "prefix_of_longer_source".to_string())
+            };
+            candidates.push(crate::abstract_quality::AbstractCandidate {
+                source: cur_source.clone().unwrap_or_else(|| "unknown".to_string()),
+                text: t.clone(),
+                quality: cq,
+                reason: cr,
+            });
+        }
+    }
+    if let Some((t, q, r)) = &new_cand {
+        candidates.push(crate::abstract_quality::AbstractCandidate {
+            source: cand_source.clone(),
+            text: t.clone(),
+            quality: q.to_string(),
+            reason: r.to_string(),
+        });
+    }
+
+    let mut filled = false;
+    let mut upgraded = false;
+    let prev_quality = cur_quality.as_deref().unwrap_or(crate::models::ABQ_MISSING);
+
+    if let Some(best) = crate::abstract_quality::select_canonical_abstract(candidates) {
+        let cur_norm = cur_text.as_deref().map(crate::abstract_quality::normalize_abstract_text);
+        let same_text = cur_norm.as_deref().map(|t| t.trim() == best.text.trim()).unwrap_or(false);
+        let best_rank = quality_rank(&best.quality);
+        let cur_rank = quality_rank(prev_quality);
+        let should_update = if best_rank > cur_rank {
+            true // 升级：partial→complete / missing→(partial|complete)
+        } else if best_rank < cur_rank {
+            false // 禁降级：complete → partial 一律不覆盖
+        } else if same_text {
+            false
+        } else if best.quality == crate::models::ABQ_COMPLETE {
+            // 同 complete：来源优先级更可靠 或 明显更长（≥1.5x）才替换
+            let better_source = crate::abstract_quality::source_priority(&best.source)
+                < crate::abstract_quality::source_priority(cur_source.as_deref().unwrap_or(""));
+            let much_longer = best.text.len() >= cur_norm.as_deref().map(|t| t.len() * 15 / 10).unwrap_or(usize::MAX);
+            better_source || much_longer
+        } else {
+            // 同 partial：仅当来源优先级更可靠且文本不同才替换
+            crate::abstract_quality::source_priority(&best.source)
+                < crate::abstract_quality::source_priority(cur_source.as_deref().unwrap_or(""))
+        };
+
+        if should_update {
+            let had_abstract = cur_text.as_deref().map(|t| !t.trim().is_empty()).unwrap_or(false);
+            conn.execute(
+                "UPDATE papers SET abstract = ?1, abstract_source = ?2, abstract_quality = ?3,
+                    abstract_retrieved_at = ?4, abstract_last_checked_at = ?4, updated_at = ?4,
+                    evidence_hash = NULL
+                 WHERE id = ?5",
+                params![best.text, best.source, best.quality, now, paper_id],
+            )?;
+            if !had_abstract {
+                filled = true;
+            } else {
+                upgraded = true;
+            }
+            // 摘要补全/升级后回到可分析状态
+            conn.execute(
+                "UPDATE papers SET analysis_status = 'pendingAnalysis' WHERE id = ?1 AND analysis_status = 'waitingForAbstract'",
+                params![paper_id],
+            )?;
+        } else {
+            // 未升级也记录检查时间（节流依据）
+            conn.execute(
+                "UPDATE papers SET abstract_last_checked_at = ?1 WHERE id = ?2",
+                params![now, paper_id],
+            )?;
+        }
+    }
+
+    // 填充其他缺失字段（保持原有行为）
+    fill_other_fields(conn, paper_id, c)?;
+
+    Ok((filled, upgraded))
+}
+
+/// 填充非摘要缺失字段（从 fill_missing_fields 拆出，保持原有 §8.3 行为）。
+fn fill_other_fields(conn: &Connection, id: i64, c: &PaperCandidate) -> Result<()> {
     let authors_json = serde_json::to_string(&c.authors).unwrap_or_else(|_| "[]".to_string());
     conn.execute(
         "UPDATE papers SET
@@ -573,25 +704,35 @@ fn fill_missing_fields(conn: &Connection, id: i64, c: &PaperCandidate) -> Result
             id
         ],
     )?;
-
-    Ok(abstract_filled)
+    Ok(())
 }
 
 pub fn upsert_paper(conn: &Connection, journal_id: i64, c: &PaperCandidate) -> Result<UpsertOutcome> {
     if let Some(existing_id) = find_paper_id(conn, journal_id, c)? {
-        let abstract_filled = fill_missing_fields(conn, existing_id, c)?;
+        let (abstract_filled, abstract_upgraded) = merge_abstract(conn, existing_id, c)?;
         return Ok(UpsertOutcome::Existing {
             id: existing_id,
             abstract_filled,
+            abstract_upgraded,
         });
     }
 
     let authors_json = serde_json::to_string(&c.authors).unwrap_or_else(|_| "[]".to_string());
     let title_norm = c.title.as_deref().map(normalize_title);
-    let analysis_status = if c.abstract_text.is_some() {
-        ST_PENDING
-    } else {
+    // 摘要质量（本地判定）决定初始 analysis_status：
+    // missing → waitingForAbstract；partial/complete → pendingAnalysis
+    let (abs_norm, abs_quality) = match &c.abstract_text {
+        Some(a) => {
+            let n = crate::abstract_quality::normalize_abstract_text(a);
+            let (q, _r) = crate::abstract_quality::assess_abstract_quality(&n);
+            (Some(n), q)
+        }
+        None => (None, crate::models::ABQ_MISSING),
+    };
+    let analysis_status = if abs_quality == crate::models::ABQ_MISSING {
         ST_WAITING_ABSTRACT
+    } else {
+        ST_PENDING
     };
     let now = now_utc();
 
@@ -600,8 +741,8 @@ pub fn upsert_paper(conn: &Connection, journal_id: i64, c: &PaperCandidate) -> R
             journal_id, normalized_doi, original_doi, title, title_norm, authors_json,
             published_date, year, abstract, abstract_source, abstract_retrieved_at,
             url, publisher_article_id, openalex_work_id, discovery_source,
-            analysis_status, created_at, updated_at
-         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?17)",
+            analysis_status, abstract_quality, abstract_last_checked_at, created_at, updated_at
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?19)",
         params![
             journal_id,
             c.normalized_doi,
@@ -611,18 +752,25 @@ pub fn upsert_paper(conn: &Connection, journal_id: i64, c: &PaperCandidate) -> R
             authors_json,
             c.published_date,
             c.year,
-            c.abstract_text,
+            abs_norm,
             c.abstract_source,
-            c.abstract_text.as_ref().map(|_| now.clone()),
+            now.clone(),
             c.url,
             c.publisher_article_id,
             c.openalex_work_id,
             c.discovery_source,
             analysis_status,
+            abs_quality,
+            now.clone(),
             now
         ],
     )?;
     let id = conn.last_insert_rowid();
+    // 记录初始来源候选
+    if let (Some(t), Some(src)) = (&abs_norm, &c.abstract_source) {
+        let (q, r) = crate::abstract_quality::assess_abstract_quality(t);
+        let _ = record_abstract_source(conn, id, src, t, q, r);
+    }
     Ok(UpsertOutcome::New(id))
 }
 
@@ -664,6 +812,9 @@ fn row_to_paper(row: &rusqlite::Row) -> Result<Paper> {
         abstract_text: row.get("abstract")?,
         abstract_source: row.get("abstract_source")?,
         abstract_retrieved_at: row.get("abstract_retrieved_at")?,
+        abstract_quality: row.get("abstract_quality")?,
+        abstract_last_checked_at: row.get("abstract_last_checked_at")?,
+        abstract_retry_count: row.get("abstract_retry_count")?,
         url: row.get("url")?,
         publisher_article_id: row.get("publisher_article_id")?,
         openalex_work_id: row.get("openalex_work_id")?,
@@ -770,7 +921,95 @@ fn migrations() -> Vec<(i64, &'static str, fn(&Connection) -> Result<()>)> {
         (1, "round3-baseline", migrate_to_v1),
         (2, "round4-batches", migrate_to_v2),
         (3, "round5a-identity", migrate_to_v3),
+        (4, "round5b-abstract-quality", migrate_to_v4),
     ]
+}
+
+/// v4：Abstract Quality & Recovery。
+/// - papers 新增 abstract_quality（complete/partial/missing）、abstract_last_checked_at、
+///   abstract_retry_count
+/// - paper_abstract_sources：多来源摘要候选（UNIQUE(paper_id, source)，保留来源差异）
+/// - 存量摘要本地评估（normalize + heuristic），只标记质量、回写 normalized 文本；
+///   绝不调用 DeepSeek / 不触发 AI / 不收费
+fn migrate_to_v4(conn: &Connection) -> Result<()> {
+    for (name, ty) in [
+        ("abstract_quality", "TEXT NOT NULL DEFAULT 'missing'"),
+        ("abstract_last_checked_at", "TEXT"),
+        ("abstract_retry_count", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        if !column_exists(conn, "papers", name) {
+            conn.execute(&format!("ALTER TABLE papers ADD COLUMN {} {}", name, ty), [])?;
+        }
+    }
+    if !column_exists(conn, "sync_batches", "abstracts_upgraded") {
+        conn.execute(
+            "ALTER TABLE sync_batches ADD COLUMN abstracts_upgraded INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS paper_abstract_sources (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            paper_id INTEGER NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+            source TEXT NOT NULL,
+            abstract_text TEXT NOT NULL,
+            quality TEXT NOT NULL,
+            quality_reason TEXT,
+            fetched_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE (paper_id, source)
+        );
+        CREATE INDEX IF NOT EXISTS idx_pas_paper ON paper_abstract_sources(paper_id);
+        "#,
+    )?;
+    initialize_abstract_quality(conn)?;
+    Ok(())
+}
+
+/// 存量摘要质量初始化：本地 normalize + heuristic 判定。
+/// missing → quality=missing（waitingForAbstract 对齐在正常同步流程完成）；
+/// 非空 → 回写 normalized 纯文本并评估 complete/partial。
+fn initialize_abstract_quality(conn: &Connection) -> Result<()> {
+    let rows: Vec<(i64, Option<String>)> = {
+        let mut stmt = conn.prepare("SELECT id, abstract FROM papers")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+        })?;
+        rows.collect::<Result<Vec<_>>>()?
+    };
+    let now = now_utc();
+    for (id, abstract_text) in rows {
+        match abstract_text {
+            None => {
+                conn.execute(
+                    "UPDATE papers SET abstract_quality = ?1, abstract_last_checked_at = ?2 WHERE id = ?3",
+                    params![crate::models::ABQ_MISSING, now, id],
+                )?;
+            }
+            Some(raw) => {
+                let normalized = crate::abstract_quality::normalize_abstract_text(&raw);
+                if normalized.trim().is_empty() {
+                    conn.execute(
+                        "UPDATE papers SET abstract = NULL, abstract_quality = ?1, abstract_last_checked_at = ?2 WHERE id = ?3",
+                        params![crate::models::ABQ_MISSING, now, id],
+                    )?;
+                    continue;
+                }
+                let (q, r) = crate::abstract_quality::assess_abstract_quality(&normalized);
+                conn.execute(
+                    "UPDATE papers SET abstract = ?1, abstract_quality = ?2, abstract_last_checked_at = ?3 WHERE id = ?4",
+                    params![normalized, q, now, id],
+                )?;
+                let _ = conn.execute(
+                    "INSERT OR IGNORE INTO paper_abstract_sources (paper_id, source, abstract_text, quality, quality_reason, fetched_at, updated_at)
+                     VALUES (?1, 'migration', ?2, ?3, ?4, ?5, ?5)",
+                    params![id, normalized, q, r, now],
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// v3：Canonical Journal Identity + Journal Collection 基础。
@@ -1144,11 +1383,18 @@ pub fn get_analysis_status(conn: &Connection, id: i64) -> Result<Option<String>>
 }
 
 /// 取单篇论文的 (标题, 摘要)，用于 AI 队列。
-pub fn get_paper_title_abstract(conn: &Connection, id: i64) -> Result<Option<(String, String)>> {
+/// 返回 (title, abstract, abstract_quality)。
+pub fn get_paper_title_abstract(conn: &Connection, id: i64) -> Result<Option<(String, String, String)>> {
     conn.query_row(
-        "SELECT COALESCE(title,''), COALESCE(abstract,'') FROM papers WHERE id=?1",
+        "SELECT COALESCE(title,''), COALESCE(abstract,''), COALESCE(abstract_quality,'missing') FROM papers WHERE id=?1",
         params![id],
-        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        },
     )
     .optional()
 }
@@ -1290,11 +1536,20 @@ pub fn update_sync_batch_counts(
     papers_inserted: i64,
     papers_existing: i64,
     abstracts_added: i64,
+    abstracts_upgraded: i64,
     waiting_abstract: i64,
 ) -> Result<()> {
     conn.execute(
-        "UPDATE sync_batches SET records_found=?1, papers_inserted=?2, papers_existing=?3, abstracts_added=?4, waiting_abstract=?5 WHERE id=?6",
-        params![records_found, papers_inserted, papers_existing, abstracts_added, waiting_abstract, id],
+        "UPDATE sync_batches SET records_found=?1, papers_inserted=?2, papers_existing=?3, abstracts_added=?4, abstracts_upgraded=?5, waiting_abstract=?6 WHERE id=?7",
+        params![
+            records_found,
+            papers_inserted,
+            papers_existing,
+            abstracts_added,
+            abstracts_upgraded,
+            waiting_abstract,
+            id
+        ],
     )?;
     Ok(())
 }

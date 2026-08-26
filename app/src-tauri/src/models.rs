@@ -10,6 +10,11 @@ pub const ST_SUCCEEDED: &str = "analysisSucceeded";
 #[allow(dead_code)]
 pub const ST_FAILED: &str = "analysisFailed";
 
+// 摘要质量（Round 5B）：由本地确定性 heuristic 判定并持久化，与 analysis_status 独立维度。
+pub const ABQ_MISSING: &str = "missing";
+pub const ABQ_PARTIAL: &str = "partial";
+pub const ABQ_COMPLETE: &str = "complete";
+
 // AI 队列自身状态
 pub const QS_IDLE: &str = "idle";
 pub const QS_RUNNING: &str = "running";
@@ -173,6 +178,12 @@ pub struct Paper {
     pub abstract_text: Option<String>,
     pub abstract_source: Option<String>,
     pub abstract_retrieved_at: Option<String>,
+    /// 摘要质量（complete / partial / missing），由 Rust 本地判定持久化
+    pub abstract_quality: String,
+    /// 上次摘要检查时间（recovery 节流依据）
+    pub abstract_last_checked_at: Option<String>,
+    /// 摘要补抓失败计数
+    pub abstract_retry_count: i64,
     pub url: Option<String>,
     pub publisher_article_id: Option<String>,
     pub openalex_work_id: Option<String>,
@@ -210,7 +221,9 @@ pub struct SyncReport {
     pub found_records: i64,
     pub new_papers: i64,
     pub existing_papers: i64,
-    pub abstracts_filled: i64,
+    pub abstracts_added: i64,
+    /// 摘要升级（质量提高 / 更完整版本被采纳）数量
+    pub abstracts_upgraded: i64,
     pub waiting_for_abstract: i64,
     pub ai_success: i64,
     pub ai_failed: i64,
@@ -218,6 +231,8 @@ pub struct SyncReport {
     pub duration_ms: i64,
     /// 本次同步新增的论文 id（供前端自动入队 AI 分析）。
     pub new_paper_ids: Vec<i64>,
+    /// 本次同步摘要升级的论文 id（供前端自动触发 abstractUpgraded 重新分析）。
+    pub abstract_upgraded_ids: Vec<i64>,
 }
 
 /// 内部使用的候选论文（来自某个数据源），由同步引擎合并入库。
@@ -284,7 +299,12 @@ pub struct ConnectionTestResult {
 #[derive(Debug, Clone)]
 pub enum UpsertOutcome {
     New(i64),
-    Existing { id: i64, abstract_filled: bool },
+    Existing {
+        id: i64,
+        abstract_filled: bool,
+        /// canonical 摘要升级（质量提高或更完整版本被采纳）
+        abstract_upgraded: bool,
+    },
 }
 
 // ================= Round 4：Batch & Activity =================

@@ -85,7 +85,7 @@ pub fn run_sync<R: Runtime>(
             report.found_records,
             report.new_papers,
             report.existing_papers,
-            report.abstracts_filled,
+            report.abstracts_added,
         );
         match sync_journal(conn, &crossref, &openalex, j, &to, &mut report) {
             Ok(res) => {
@@ -122,7 +122,7 @@ pub fn run_sync<R: Runtime>(
             report.found_records,
             report.new_papers,
             report.existing_papers,
-            report.abstracts_filled,
+            report.abstracts_added,
         );
     }
 
@@ -135,7 +135,8 @@ pub fn run_sync<R: Runtime>(
             report.found_records,
             report.new_papers,
             report.existing_papers,
-            report.abstracts_filled,
+            report.abstracts_added,
+            report.abstracts_upgraded,
             report.waiting_for_abstract,
         );
     }
@@ -225,12 +226,16 @@ fn sync_journal(
                     cand.raw_json.as_deref(),
                 );
             }
-            Ok(UpsertOutcome::Existing { id, abstract_filled }) => {
+            Ok(UpsertOutcome::Existing { id, abstract_filled, abstract_upgraded }) => {
                 report.existing_papers += 1;
                 res.existing.push(id);
                 if abstract_filled {
-                    report.abstracts_filled += 1;
+                    report.abstracts_added += 1;
                     res.abstract_updated.push(id);
+                }
+                if abstract_upgraded {
+                    report.abstracts_upgraded += 1;
+                    report.abstract_upgraded_ids.push(id);
                 }
                 let _ = db::insert_source_record(
                     &tx,

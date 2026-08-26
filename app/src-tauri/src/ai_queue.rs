@@ -558,7 +558,7 @@ fn step_batch<R: Runtime>(
                 db::list_queued_ids(&c, 1).unwrap_or_default().first().copied()
             };
             let Some(pid) = pid else { break };
-            let (title, _abs) = {
+            let (title, _abs, _q) = {
                 let c = conn.lock().unwrap();
                 db::get_paper_title_abstract(&c, pid)
                     .unwrap_or_default()
@@ -658,7 +658,7 @@ fn worker_run(
     ctx: Arc<AnalyzeContext>,
 ) {
     let (api_key, model) = creds;
-    let (title, abstract_text) = {
+    let (title, abstract_text, abstract_quality) = {
         let c = conn.lock().unwrap();
         db::get_paper_title_abstract(&c, paper_id)
             .unwrap_or_default()
@@ -683,6 +683,7 @@ fn worker_run(
                 paper_id,
                 &title,
                 &abstract_text,
+                &abstract_quality,
                 &ctx,
             )
         },
@@ -840,7 +841,7 @@ pub fn status_from_db(conn: &Arc<Mutex<Connection>>) -> AiStatus {
     let current_paper_id: Option<i64> = g("queue.current_paper_id").parse().ok().filter(|i| *i > 0);
     let current_paper_title = current_paper_id
         .and_then(|id| db::get_paper_title_abstract(&c, id).ok().flatten())
-        .map(|(t, _)| t);
+        .map(|(t, _, _)| t);
     let retry_waiting = g("queue.retry_waiting") == "1";
     let bsa = g("queue.batch_started_at");
     let elapsed = if !bsa.is_empty() {

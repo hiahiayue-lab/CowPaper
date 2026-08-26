@@ -1,3 +1,4 @@
+mod abstract_quality;
 mod ai_queue;
 mod analyze;
 mod api;
