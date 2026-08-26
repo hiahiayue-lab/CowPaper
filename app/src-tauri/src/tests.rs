@@ -3622,3 +3622,30 @@ fn test_duplicate_repair() {
     assert!((s - 1.0).abs() < 1e-9);
 }
 
+
+/// Round 6.5.5：修改 tag name → semanticChanged 识别（B 场景），其他标签评分不变。
+#[test]
+fn test_name_edit_semantic_changed() {
+    use crate::models::{TagConfigItem, TagDraftItem};
+    let mk = |id: i64, name: &str, desc: &str, enabled: bool| TagConfigItem {
+        version_id: 1,
+        tag_id: id,
+        name: name.to_string(),
+        description: Some(desc.to_string()),
+        enabled,
+        deleted: false,
+    };
+    let old = vec![
+        mk(1, "定价", "定价策略", true),
+        mk(2, "平台经济", "双边平台", true),
+    ];
+    // name 修改（定价 → 价格策略）
+    let draft = vec![
+        TagDraftItem { id: 1, name: "价格策略".into(), description: Some("定价策略".into()), enabled: true, deleted: false },
+        TagDraftItem { id: 2, name: "平台经济".into(), description: Some("双边平台".into()), enabled: true, deleted: false },
+    ];
+    let d = crate::tag_config::compute_diff(&old, &draft);
+    assert!(d.semantic_changed.contains(&"价格策略".to_string()), "name 修改 → semanticChanged: {:?}", d.semantic_changed);
+    assert!(d.unchanged.contains(&"平台经济".to_string()), "未修改标签 unchanged");
+    // 与 screenshot 等价：改 desc 后的 totalScore（A/C 保留、修改标签替换）已由 test_screenshot_regression 覆盖
+}

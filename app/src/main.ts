@@ -1864,6 +1864,17 @@ async function setupListeners() {
   });
   document.addEventListener("change", (ev) => {
     const el = ev.target as HTMLInputElement;
+    // 中文 IME 兜底：input 事件在 composition 期间可能延迟/丢失，
+    // change 在失焦/回车时可靠触发，确保 draft 始终同步（否则 dirty=false → 按钮 disabled → 点击无反应）
+    const action = el.dataset.action;
+    if (action === "tag-draft-name" || action === "tag-draft-desc") {
+      const i = parseInt(el.dataset.idx!, 10);
+      if (isNaN(i) || !tagDraft[i]) return;
+      if (action === "tag-draft-name") tagDraft[i].name = el.value;
+      else tagDraft[i].description = el.value;
+      setTagDirty(true);
+      return;
+    }
     if (el.matches("[data-action='tag-draft-toggle']")) {
       const i = parseInt(el.dataset.idx!, 10);
       if (!isNaN(i) && tagDraft[i]) {
