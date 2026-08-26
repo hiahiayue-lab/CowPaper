@@ -473,6 +473,23 @@ fn test_ai_queue_scenarios() {
             model: "m".into(),
         })
         .unwrap();
+    // J: resume 后仍在 running、仍有待分析论文时，第二次 Start 必须被忽略（不建第二个 batch）
+    cmd_tx
+        .send(QueueCommand::Start {
+            paper_ids: None,
+            model: "m".into(),
+            trigger: "manual".into(),
+            source_sync_batch_id: None,
+        })
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(400));
+    {
+        let c = conn.lock().unwrap();
+        let batches = db::list_analysis_batches(&c, 10).unwrap();
+        let running: Vec<_> = batches.iter().filter(|b| b.status == "running").collect();
+        assert_eq!(running.len(), 1, "J: running 时第二次 Start 不得创建第二个 running batch");
+        assert_eq!(running[0].id, bid_pause, "J: 运行中的 batch 必须是原 batch");
+    }
     let s = wait(&conn, Duration::from_secs(15), &|s, conn| {
         if s.state != "idle" {
             return false;
@@ -724,6 +741,30 @@ fn test_ai_queue_scenarios() {
         assert_eq!(e2.status, "completedWithErrors");
         assert_eq!(e2.failed, 1);
         assert_eq!(e2.succeeded, 19);
+    }
+    let batch_count_before_i = {
+        let c = conn.lock().unwrap();
+        db::list_analysis_batches(&c, 100).unwrap().len()
+    };
+
+    // ===== 场景 I：无待分析论文 → Start 不创建空 AnalysisBatch =====
+    {
+        let c = conn.lock().unwrap();
+        let _ = c.execute("UPDATE papers SET analysis_status='analysisSucceeded'", []);
+    }
+    cmd_tx
+        .send(QueueCommand::Start {
+            paper_ids: None,
+            model: "m".into(),
+            trigger: "manual".into(),
+            source_sync_batch_id: None,
+        })
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(400));
+    {
+        let c = conn.lock().unwrap();
+        let now_count = db::list_analysis_batches(&c, 100).unwrap().len();
+        assert_eq!(now_count, batch_count_before_i, "I: 无待分析论文不得创建空 batch");
     }
 
     ai_queue::set_mock_analyzer(None);
@@ -1497,4 +1538,24 @@ fn test_reanalysis_updates_totalscore() {
     sorted.sort_by(|x, y| y.total_score.unwrap().partial_cmp(&x.total_score.unwrap()).unwrap());
     assert_eq!(sorted[0].id, a);
     assert_eq!(sorted[1].id, b);
+}
+
+// ================= Round 4.1 测试 =================
+
+/// SyncBatch journal 计数：total 持久化 + completed(成功)/failed 定义 + 不变量。
+#[test]
+fn test_sync_batch_journal_counters() {
+    let conn = mem_db();
+    let b = db::create_sync_batch(&conn, "manual").unwrap();
+    db::set_sync_batch_journal_total(&conn, b, 3).unwrap();
+    db::update_sync_batch_journal_progress(&conn, b, 2, 1).unwrap();
+    let sb = db::get_sync_batch(&conn, b).unwrap().unwrap();
+    assert_eq!(sb.journal_total, 3, "journal_total 必须持久化");
+    assert_eq!(sb.journal_completed, 2, "journal_completed = 成功期刊数");
+    assert_eq!(sb.journal_failed, 1, "journal_failed = 失败期刊数");
+    assert!(
+        sb.journal_completed + sb.journal_failed <= sb.journal_total,
+        "journal_completed + journal_failed 不得超过 total"
+    );
+    assert_eq!(sb.journal_completed + sb.journal_failed, sb.journal_total, "正常结束应相等");
 }

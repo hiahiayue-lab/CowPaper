@@ -41,6 +41,8 @@ pub fn run_sync<R: Runtime>(
     report.checked_journals = journals.len() as i64;
     {
         let c = conn.lock().unwrap();
+        // journal_total 必须持久化（Activity 历史显示 期刊 x/y）
+        let _ = db::set_sync_batch_journal_total(&c, batch_id, journals.len() as i64);
         let _ = db::update_sync_batch_journal_progress(&c, batch_id, 0, 0);
     }
 

@@ -29,7 +29,7 @@
         <header class="topbar">
           <div class="topbar-title" id="view-title">今日推荐</div>
           <div class="topbar-actions">
-            <button id="btn-ai-manual" class="primary small">AI 分析</button>
+            <button id="btn-ai-manual" class="ghost small">AI 分析</button>
             <button id="ai-badge" class="ai-badge idle" title="AI 分析状态详情">AI</button>
             <span id="status" class="status idle">就绪</span>
           </div>
@@ -118,8 +118,6 @@
             </div>
             <div class="settings-row">
               <span class="muted small" id="pending-count"></span>
-              <button id="btn-analyze-backlog" class="ghost">分析历史待处理论文</button>
-              <button id="btn-retry-failed" class="ghost">重试失败论文</button>
             </div>
 
             <h3>摘要</h3>
@@ -152,10 +150,17 @@
           </div>
         </section>
         <section id="view-activity" class="view">
-          <div id="activity-current"></div>
-          <h3 class="section-title">最近活动</h3>
-          <ul id="activity-history" class="list"></ul>
-          <div id="activity-detail" class="activity-detail hidden"></div>
+          <div id="activity-pending" class="card pending-card"></div>
+          <div class="activity-master-detail">
+            <div class="activity-list-pane">
+              <h3 class="section-title">最近活动</h3>
+              <ul id="activity-history" class="list"></ul>
+            </div>
+            <div class="activity-detail-pane">
+              <h3 class="section-title">批次详情</h3>
+              <div id="activity-detail" class="activity-detail"></div>
+            </div>
+          </div>
         </section>
       </main>
     </div>

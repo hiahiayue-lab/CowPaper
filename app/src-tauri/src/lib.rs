@@ -457,6 +457,18 @@ fn get_pending_ai_count(state: State<Db>) -> Result<i64, String> {
     db::count_pending_papers(&conn).map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn get_failed_ai_count(state: State<Db>) -> Result<i64, String> {
+    let conn = state.inner().lock().unwrap();
+    db::count_by_status(&conn, "analysisFailed").map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_waiting_abstract_count(state: State<Db>) -> Result<i64, String> {
+    let conn = state.inner().lock().unwrap();
+    db::count_waiting_for_abstract(&conn).map_err(|e| e.to_string())
+}
+
 /// 测试 DeepSeek 连接：Key 由 Rust 从 Keychain 读取，前端不传 Key。
 #[tauri::command]
 fn test_api_connection(model: String, store: State<Secure>) -> Result<models::ConnectionTestResult, String> {
@@ -690,6 +702,8 @@ pub fn run() {
             retry_failed_ai,
             get_ai_status,
             get_pending_ai_count,
+            get_failed_ai_count,
+            get_waiting_abstract_count,
             test_api_connection,
             get_settings,
             set_settings,

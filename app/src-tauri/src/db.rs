@@ -921,6 +921,14 @@ pub fn create_sync_batch(conn: &Connection, trigger: &str) -> Result<i64> {
     Ok(conn.last_insert_rowid())
 }
 
+pub fn set_sync_batch_journal_total(conn: &Connection, id: i64, total: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE sync_batches SET journal_total=?1 WHERE id=?2",
+        params![total, id],
+    )?;
+    Ok(())
+}
+
 pub fn update_sync_batch_journal_progress(
     conn: &Connection,
     id: i64,

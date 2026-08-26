@@ -681,50 +681,42 @@ function activityItemTitle(p: { title: string | null; paperId: number }): string
   return p.title || `论文 #${p.paperId}`;
 }
 
-function renderActivityCenter() {
-  const a = activity;
-  // 当前任务
-  const cur = $("activity-current");
-  let html = "";
-  if (a.analysisBatch) {
-    const ab = a.analysisBatch;
-    const btn =
-      ab.status === "running" || ab.status === "paused"
-        ? `<div class="row">
-             ${ab.status === "running" ? `<button class="ghost small" data-action="ai-pause">暂停</button>` : `<button class="primary small" data-action="ai-resume">继续分析</button>`}
-             <button class="ghost small" data-action="ai-stop">停止本次任务</button>
-           </div>`
-        : "";
-    html += `
-      <div class="card">
-        <div class="row">
-          <div class="grow">
-            <div class="title">AI 分析 #${ab.id} <span class="chip muted-chip">${STATUS_ZH[ab.status] || ab.status}</span></div>
-            <div class="muted small">${TRIGGER_ZH[ab.trigger] || ab.trigger}${ab.sourceSyncBatchId ? ` · 来自同步 #${ab.sourceSyncBatchId}` : ""}${ab.parentBatchId ? ` · 重试自 #${ab.parentBatchId}` : ""}</div>
-          </div>
-        </div>
-        <div class="paper-meta">${ab.completed} / ${ab.total} · 成功 ${ab.succeeded} · 失败 ${ab.failed} · 跳过 ${ab.skipped} · 剩余 ${ab.remaining}</div>
-        ${btn}
-      </div>`;
-  }
-  if (a.syncBatch) {
-    const sb = a.syncBatch;
-    html += `
-      <div class="card">
-        <div class="row">
-          <div class="grow">
-            <div class="title">同步 #${sb.id} <span class="chip muted-chip">${STATUS_ZH[sb.status] || sb.status}</span></div>
-            <div class="muted small">${TRIGGER_ZH[sb.trigger] || sb.trigger}</div>
-          </div>
-        </div>
-        <div class="paper-meta">期刊 ${sb.journalCompleted}/${sb.journalTotal} · 新增 ${sb.papersInserted} · 已有 ${sb.papersExisting} · 补摘要 ${sb.abstractsAdded}</div>
-      </div>`;
-  }
-  cur.innerHTML = html || '<div class="empty">当前没有运行中的任务</div>';
+let selectedActivity: { type: string; id: number } | null = null;
 
-  // 历史
-  renderActivityHistory();
+/// 待处理区（待分析 / 失败重试 / 等待摘要）。
+async function renderActivityPending() {
+  const box = $("activity-pending");
+  const [pending, failed, waiting] = await Promise.all([
+    invoke<number>("get_pending_ai_count").catch(() => 0),
+    invoke<number>("get_failed_ai_count").catch(() => 0),
+    invoke<number>("get_waiting_abstract_count").catch(() => 0),
+  ]);
+  box.innerHTML = `
+    <div class="title">待处理</div>
+    <div class="pending-rows">
+      <div class="pending-row"><span>待 AI 分析</span><strong>${pending} 篇</strong>
+        ${pending > 0 ? `<button class="ghost small" data-action="manual-analyze">开始分析</button>` : ""}</div>
+      <div class="pending-row"><span>AI 分析失败</span><strong>${failed} 篇</strong>
+        ${failed > 0 ? `<button class="ghost small" data-action="retry-failed">重新分析</button>` : ""}</div>
+      <div class="pending-row"><span>等待摘要</span><strong>${waiting} 篇</strong></div>
+    </div>`;
 }
+
+/// master-detail：左侧最近活动列表 + 右侧选中批次详情。默认选中最近一条。
+async function renderActivityCenter() {
+  await renderActivityPending();
+  await renderActivityHistory();
+  if (!selectedActivity) {
+    // 默认选中最近一条 activity
+    const items = recentActivityItems;
+    if (items.length > 0) {
+      selectedActivity = { type: items[0].type, id: items[0].id };
+    }
+  }
+  await renderActivityDetail();
+}
+
+let recentActivityItems: Array<{ time: string; kind: string; line: string; status: string; id: number; type: string }> = [];
 
 async function renderActivityHistory() {
   const ul = $("activity-history");
@@ -732,7 +724,7 @@ async function renderActivityHistory() {
     invoke<SyncBatch[]>("list_sync_batches", { limit: 25 }).catch(() => []),
     invoke<AnalysisBatch[]>("list_analysis_batches", { limit: 25 }).catch(() => []),
   ]);
-  const items: Array<{ time: string; kind: string; line: string; status: string; id: number; type: string }> = [];
+  const items: typeof recentActivityItems = [];
   for (const b of sbs) {
     const t = b.finishedAt || b.startedAt || b.createdAt;
     const extra = b.status === "completed" ? `新增 ${b.papersInserted} · 补摘要 ${b.abstractsAdded}` : b.errorSummary || STATUS_ZH[b.status] || b.status;
@@ -744,55 +736,74 @@ async function renderActivityHistory() {
     items.push({ time: t, kind: "ai", type: "analysis", id: b.id, status: b.status, line });
   }
   items.sort((x, y) => (y.time || "").localeCompare(x.time || ""));
-  ul.innerHTML = items
-    .slice(0, 50)
+  recentActivityItems = items.slice(0, 50);
+  ul.innerHTML = recentActivityItems
     .map(
       (i) => `
-      <li class="card activity-item" data-activity-type="${i.type}" data-activity-id="${i.id}">
+      <li class="card activity-item ${selectedActivity && selectedActivity.type === i.type && selectedActivity.id === i.id ? "selected" : ""}" data-activity-type="${i.type}" data-activity-id="${i.id}">
         <div class="row">
           <div class="grow">
             <div class="title">${i.kind === "sync" ? "检查新论文" : "AI 分析"} #${i.id} <span class="chip muted-chip">${STATUS_ZH[i.status] || i.status}</span></div>
             <div class="muted small">${i.line}</div>
           </div>
-          <span class="muted small">${i.time ? new Date(i.time).toLocaleString() : "—"}</span>
+          <span class="muted small">${i.time ? new Date(i.time).toLocaleTimeString() : "—"}</span>
         </div>
       </li>`,
     )
     .join("") || '<li class="empty">暂无活动记录</li>';
 }
 
-async function showActivityDetail(type: string, id: number) {
+async function renderActivityDetail() {
   const box = $("activity-detail");
-  box.classList.remove("hidden");
+  if (!selectedActivity) {
+    box.innerHTML = '<div class="empty">请选择一项活动查看详情</div>';
+    return;
+  }
+  const { type, id } = selectedActivity;
   if (type === "sync") {
     const [b, papers] = await invoke<[SyncBatch, SyncBatchPaper[]]>("get_sync_batch", { id });
     const groups: Record<string, number> = {};
     for (const p of papers) groups[p.result] = (groups[p.result] || 0) + 1;
+    const dur = b.startedAt && b.finishedAt ? fmtDur(Math.max(0, Math.round((new Date(b.finishedAt).getTime() - new Date(b.startedAt).getTime()) / 1000))) : "—";
     box.innerHTML = `
       <div class="card">
         <div class="title">同步 #${b.id} <span class="chip muted-chip">${STATUS_ZH[b.status] || b.status}</span></div>
-        <div class="muted small">${TRIGGER_ZH[b.trigger] || b.trigger} · 开始 ${b.startedAt ? new Date(b.startedAt).toLocaleString() : "—"} · 结束 ${b.finishedAt ? new Date(b.finishedAt).toLocaleString() : "—"}</div>
-        <div class="paper-meta">期刊 ${b.journalCompleted}/${b.journalTotal}（失败 ${b.journalFailed}）· 记录 ${b.recordsFound} · 新增 ${b.papersInserted} · 已有 ${b.papersExisting} · 补摘要 ${b.abstractsAdded}</div>
+        <div class="muted small">${TRIGGER_ZH[b.trigger] || b.trigger} · ${b.startedAt ? new Date(b.startedAt).toLocaleTimeString() : "—"} → ${b.finishedAt ? new Date(b.finishedAt).toLocaleTimeString() : "—"} · 耗时 ${dur}</div>
+        <div class="paper-meta">期刊：${b.journalCompleted} / ${b.journalTotal}（失败 ${b.journalFailed}）</div>
+        <div class="paper-meta">记录：发现 ${b.recordsFound} · 新增 ${b.papersInserted} · 已有 ${b.papersExisting} · 补摘要 ${b.abstractsAdded}</div>
         <div class="paper-meta muted small">本次涉及论文 ${papers.length} 篇（${Object.entries(groups).map(([k, v]) => `${k} ${v}`).join(" · ")}）</div>
-        <button class="ghost small" data-action="detail-close">收起</button>
       </div>`;
   } else {
     const [b, items] = await invoke<[AnalysisBatch, AnalysisBatchItem[]]>("get_analysis_batch", { id });
     const failed = items.filter((i) => i.status === "failed");
+    const dur = b.startedAt && b.finishedAt ? fmtDur(Math.max(0, Math.round((new Date(b.finishedAt).getTime() - new Date(b.startedAt).getTime()) / 1000))) : "—";
+    const controls =
+      b.status === "running"
+        ? `<button class="ghost small" data-action="ai-pause">暂停</button><button class="ghost small" data-action="ai-stop">停止本次任务</button>`
+        : b.status === "paused"
+          ? `<button class="primary small" data-action="ai-resume">继续分析</button><button class="ghost small" data-action="ai-stop">停止本次任务</button>`
+          : b.failed > 0
+            ? `<button class="ghost small" data-action="ai-retry" data-batch="${b.id}">重试失败论文</button>`
+            : "";
     box.innerHTML = `
       <div class="card">
         <div class="row">
           <div class="grow">
             <div class="title">AI 分析 #${b.id} <span class="chip muted-chip">${STATUS_ZH[b.status] || b.status}</span></div>
-            <div class="muted small">${TRIGGER_ZH[b.trigger] || b.trigger} · model ${b.modelName || "—"} · 开始 ${b.startedAt ? new Date(b.startedAt).toLocaleString() : "—"}</div>
+            <div class="muted small">${TRIGGER_ZH[b.trigger] || b.trigger}${b.sourceSyncBatchId ? ` · 来自同步 #${b.sourceSyncBatchId}` : ""}${b.parentBatchId ? ` · 重试自 #${b.parentBatchId}` : ""} · model ${b.modelName || "—"}</div>
           </div>
-          ${b.status !== "running" && b.status !== "paused" && b.failed > 0 ? `<button class="ghost small" data-action="ai-retry" data-batch="${b.id}">重试失败论文</button>` : ""}
         </div>
-        <div class="paper-meta">${b.completed} / ${b.total} · 成功 ${b.succeeded} · 失败 ${b.failed} · 跳过 ${b.skipped} · 剩余 ${b.remaining}</div>
+        <div class="paper-meta">开始 ${b.startedAt ? new Date(b.startedAt).toLocaleTimeString() : "—"} · 结束 ${b.finishedAt ? new Date(b.finishedAt).toLocaleTimeString() : "—"} · 耗时 ${dur}</div>
+        <div class="paper-meta">总数 ${b.total} · 成功 ${b.succeeded} · 失败 ${b.failed} · 跳过 ${b.skipped} · 剩余 ${b.remaining}</div>
         ${failed.length ? `<div class="abstract muted small">失败论文：${failed.slice(0, 5).map((f) => activityItemTitle(f)).join("；")}${failed.length > 5 ? "…" : ""}</div>` : ""}
-        <button class="ghost small" data-action="detail-close">收起</button>
+        <div class="ai-panel-actions">${controls}</div>
       </div>`;
   }
+  // 同步左侧选中态
+  document.querySelectorAll(".activity-item").forEach((el) => {
+    const e = el as HTMLElement;
+    e.classList.toggle("selected", e.dataset.activityType === type && parseInt(e.dataset.activityId!, 10) === id);
+  });
 }
 
 function renderNextCheck() {
@@ -846,10 +857,19 @@ async function requireKey(): Promise<boolean> {
   return false;
 }
 
-async function startAnalyze(paperIds: number[] | null) {
-  if (!(await requireKey())) return;
-  await invoke("start_ai", { paperIds, model: getModel() });
-  setStatus("AI 分析已开始", "running");
+/// 统一的 start_ai 调用（所有入口必须走这里）：带 trigger + 错误捕获 + 即时反馈。
+async function startAnalyze(paperIds: number[] | null, trigger: string, sourceSyncBatchId: number | null = null): Promise<boolean> {
+  if (!(await requireKey())) return false;
+  try {
+    await invoke("start_ai", { paperIds, model: getModel(), trigger, sourceSyncBatchId });
+    await loadAiStatus();
+    await loadActivity();
+    return true;
+  } catch (err) {
+    setStatus("无法开始 AI 分析", "error");
+    console.error("start_ai 调用失败:", err); // 二级技术原因
+    return false;
+  }
 }
 
 async function pauseAi() {
@@ -864,28 +884,46 @@ async function stopAi() {
     await invoke("stop_ai");
   }
 }
-async function retryFailedAi() {
-  if (!(await requireKey())) return;
-  await invoke("retry_failed_ai", { model: getModel() });
+
+/// 统一的重试失败入口（可指定来源批次）。
+async function retryFailed(parentBatchId: number | null = null): Promise<boolean> {
+  if (!(await requireKey())) return false;
+  try {
+    await invoke("retry_failed_ai", { model: getModel(), parentBatchId });
+    setStatus("已加入失败论文重试队列", "running");
+    await loadAiStatus();
+    await loadActivity();
+    return true;
+  } catch (err) {
+    setStatus("无法开始重试", "error");
+    console.error("retry_failed_ai 调用失败:", err);
+    return false;
+  }
 }
 
-/// 顶部「AI 分析」手动入口：只处理有摘要、尚未成功、且当前无其他 batch 的论文。
-async function manualAnalyze() {
-  if (!(await requireKey())) return;
+/// 唯一的手动 AI 入口（顶部按钮 / Activity 待处理 / 所有论文轻入口都调它）。
+/// 边界：Key 未设置 / 已有运行 batch / 无待分析论文 / invoke 失败，全部显式处理。
+async function manualAnalyze(): Promise<boolean> {
+  if (!(await hasKey())) {
+    setStatus("请先在设置中配置 DeepSeek API Key", "error");
+    switchView("settings");
+    return false;
+  }
   if (aiStatus.state !== "idle" || aiStatus.remaining > 0) {
-    setStatus("已有 AI 任务在运行，可在 AI 面板暂停或停止", "error");
-    $("ai-panel").classList.remove("hidden");
-    $("ai-badge").classList.add("open");
-    return;
+    setStatus("已有 AI 分析任务正在运行", "error");
+    switchView("activity");
+    await renderActivityCenter();
+    return false;
   }
   const pending = await invoke<number>("get_pending_ai_count").catch(() => 0);
   if (pending <= 0) {
-    setStatus("当前没有待分析的论文", "done");
-    return;
+    setStatus("当前没有待分析论文", "done");
+    return false;
   }
-  if (!confirm(`待分析 ${pending} 篇，将调用 DeepSeek 产生费用。开始分析？`)) return;
-  await startAnalyze(null);
-  await loadAiStatus();
+  if (!confirm(`待分析 ${pending} 篇，将调用 DeepSeek 产生费用。开始分析？`)) return false;
+  // 立即反馈：不等首篇 DeepSeek 返回
+  setStatus(`正在准备 AI 分析 · ${pending} 篇`, "running");
+  return await startAnalyze(null, "manual");
 }
 
 async function addJournalHandler(e: Event) {
@@ -1144,12 +1182,14 @@ async function setupListeners() {
     if (t.closest("[data-action='ai-pause']")) { await pauseAi(); return; }
     if (t.closest("[data-action='ai-resume']")) { await resumeAi(); return; }
     if (t.closest("[data-action='ai-stop']")) { await stopAi(); return; }
-    if (t.closest("[data-action='ai-retry']")) { await retryFailedAi(); return; }
+    if (t.closest("[data-action='ai-retry']")) {
+      const el = t.closest("[data-action='ai-retry']") as HTMLElement;
+      const parent = el.dataset.batch ? parseInt(el.dataset.batch, 10) : null;
+      await retryFailed(parent);
+      return;
+    }
     if (t.closest("[data-action='ai-backlog']")) {
-      const pending = papers.filter((p) => p.analysisStatus === "pendingAnalysis" && p.abstractText).length;
-      if (confirm(`本次最多有 ${pending} 篇论文待分析，将调用 DeepSeek 产生费用。开始分析？`)) {
-        await startAnalyze(null);
-      }
+      await manualAnalyze();
       return;
     }
     if (t.closest("#ai-badge")) {
@@ -1164,19 +1204,19 @@ async function setupListeners() {
     }
     const actItem = t.closest("[data-activity-type]") as HTMLElement | null;
     if (actItem) {
-      await showActivityDetail(actItem.dataset.activityType!, parseInt(actItem.dataset.activityId!, 10));
+      selectedActivity = { type: actItem.dataset.activityType!, id: parseInt(actItem.dataset.activityId!, 10) };
+      renderActivityHistory();
+      await renderActivityDetail();
       return;
     }
-    if (t.closest("[data-action='detail-close']")) {
-      $("activity-detail").classList.add("hidden");
+    if (t.closest("[data-action='manual-analyze']")) {
+      await manualAnalyze();
+      await loadActivity();
       return;
     }
-    const aiRetryBatch = t.closest("[data-action='ai-retry']") as HTMLElement | null;
-    if (aiRetryBatch) {
-      const parent = aiRetryBatch.dataset.batch ? parseInt(aiRetryBatch.dataset.batch, 10) : null;
-      if (!(await hasKey())) { setStatus("请先在设置保存 API Key", "error"); return; }
-      await invoke("retry_failed_ai", { model: getModel(), parentBatchId: parent });
-      setStatus("已加入失败论文重试队列", "running");
+    if (t.closest("[data-action='retry-failed']")) {
+      await retryFailed(null);
+      await loadActivity();
       return;
     }
   });
@@ -1206,21 +1246,8 @@ window.addEventListener("DOMContentLoaded", () => {
     }
   });
   $("btn-save-settings").addEventListener("click", saveSettings);
-  $("btn-analyze-backlog").addEventListener("click", async () => {
-    const pending = await invoke<number>("get_pending_ai_count").catch(() => 0);
-    if (confirm(`本次最多有 ${pending} 篇论文待分析，将调用 DeepSeek 产生费用。开始分析？`)) {
-      await startAnalyze(null);
-    }
-  });
+  // 唯一手动 AI 入口（顶部按钮；Activity 待处理区按钮走 data-action）
   $("btn-ai-manual").addEventListener("click", manualAnalyze);
-  $("btn-retry-failed").addEventListener("click", async () => {
-    if (aiStatus.state !== "idle" || aiStatus.remaining > 0) {
-      setStatus("请先等待当前任务结束或停止后再重试失败论文", "error");
-      return;
-    }
-    await retryFailedAi();
-    setStatus("已加入失败论文重试队列", "running");
-  });
 
   // Key 存 Keychain，不再回填到输入框（输入框仅用于「替换 Key」时输入）
   ($("api-key") as HTMLInputElement).value = "";

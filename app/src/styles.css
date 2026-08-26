@@ -563,3 +563,47 @@ button.full {
 .activity-detail.hidden {
   display: none;
 }
+
+/* ---------- Round 4.1：Activity master-detail ---------- */
+
+.activity-master-detail {
+  display: grid;
+  grid-template-columns: 340px 1fr;
+  gap: 16px;
+  align-items: start;
+}
+
+.activity-list-pane .list {
+  max-height: calc(100vh - 320px);
+  overflow-y: auto;
+}
+
+.activity-item.selected {
+  border-color: var(--accent);
+  background: #f5f8ff;
+}
+
+.pending-card {
+  margin-bottom: 12px;
+}
+.pending-card .title {
+  margin-bottom: 6px;
+}
+.pending-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.pending-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+}
+.pending-row span {
+  color: var(--muted);
+  flex: 1;
+}
+.pending-row strong {
+  min-width: 44px;
+}
