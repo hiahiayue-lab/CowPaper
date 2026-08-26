@@ -70,6 +70,8 @@ struct Batch {
     creds: (String, String),
     done: bool,
     final_state: String,
+    /// 终态：completed（自然完成）| stopped（用户停止）
+    final_status: String,
     last_error: Option<String>,
     retry_paper: Option<i64>,
     retry_until_iso: Option<String>,
@@ -100,6 +102,7 @@ impl Batch {
             creds,
             done: false,
             final_state: QS_IDLE.to_string(),
+            final_status: "completed".to_string(),
             last_error: None,
             retry_paper: None,
             retry_until_iso: None,
@@ -144,6 +147,9 @@ pub fn coordinator_loop<R: Runtime>(
                     set("ai.last_skipped", &b.skipped.to_string());
                     set("ai.last_started_at", &b.batch_started_at_iso);
                     set("ai.last_finished_at", &now_iso());
+                    set("ai.last_final_status", &b.final_status);
+                    let remaining = b.size - b.success - b.failed - b.skipped;
+                    set("ai.last_remaining", &remaining.max(0).to_string());
                     match &b.last_error {
                         Some(e) => set("ai.last_error_summary", e),
                         None => {
@@ -292,6 +298,7 @@ fn handle_command<R: Runtime>(
                 if let Some(b) = batch {
                     b.done = true;
                     b.final_state = QS_IDLE.to_string();
+                    b.final_status = "stopped".to_string();
                 }
                 *state = QS_IDLE.to_string();
             }
@@ -467,6 +474,7 @@ fn step_batch<R: Runtime>(
             QS_RUNNING if remaining == 0 => {
                 b.done = true;
                 b.final_state = QS_IDLE.to_string();
+                b.final_status = "completed".to_string();
             }
             QS_PAUSING => {
                 pick_new.store(false, Ordering::SeqCst);
@@ -480,6 +488,7 @@ fn step_batch<R: Runtime>(
                 drop(c);
                 b.done = true;
                 b.final_state = QS_IDLE.to_string();
+                b.final_status = "stopped".to_string();
             }
             _ => {}
         }
@@ -660,6 +669,13 @@ fn last_run_from(conn: &Connection) -> Option<LastAiRun> {
     let started = g("ai.last_started_at");
     let finished = g("ai.last_finished_at");
     let err = g("ai.last_error_summary");
+    let remaining: i64 = g("ai.last_remaining").parse().unwrap_or(0);
+    let final_status = g("ai.last_final_status");
+    let final_status = if final_status.is_empty() {
+        "completed".to_string()
+    } else {
+        final_status
+    };
     if total == 0 && success == 0 && failed == 0 && skipped == 0 && started.is_empty() {
         return None;
     }
@@ -668,6 +684,8 @@ fn last_run_from(conn: &Connection) -> Option<LastAiRun> {
         success,
         failed,
         skipped,
+        remaining,
+        final_status,
         started_at: if started.is_empty() { None } else { Some(started) },
         finished_at: if finished.is_empty() { None } else { Some(finished) },
         error_summary: if err.is_empty() { None } else { Some(err) },

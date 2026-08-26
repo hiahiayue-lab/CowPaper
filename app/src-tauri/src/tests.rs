@@ -396,12 +396,14 @@ fn test_ai_queue_scenarios() {
         assert_eq!(db::count_by_status(&c, "analysisSucceeded").unwrap(), 20);
         assert_eq!(db::count_active_queue(&c).unwrap(), 0);
     }
-    // 上次运行摘要应保留（§七：批次结束后不清零历史统计）
+    // 上次运行摘要应保留（§七：批次结束后不清零历史统计）；自然完成 → completed
     {
         let lr = ai_queue::status_from_db(&conn).last_run.expect("应有 last_run 摘要");
         assert_eq!(lr.total, 20, "last_run.total");
         assert_eq!(lr.success, 20, "last_run.success");
         assert_eq!(lr.failed, 0, "last_run.failed");
+        assert_eq!(lr.remaining, 0, "last_run.remaining（自然完成为 0）");
+        assert_eq!(lr.final_status, "completed", "last_run.final_status");
         assert!(lr.finished_at.is_some(), "last_run.finished_at");
     }
 
@@ -430,6 +432,12 @@ fn test_ai_queue_scenarios() {
     assert_eq!(s.state, "paused", "B: 应进入 paused（state={}）", s.state);
     assert_eq!(s.success, 2, "B: 暂停时已完成 2 篇（success={}）", s.success);
     assert_eq!(s.remaining, 18, "B: 剩余 18 篇（remaining={}）", s.remaining);
+    // pause 不生成新的 completed last-run（仍是场景 A 的摘要）
+    {
+        let lr = ai_queue::status_from_db(&conn).last_run.expect("应有 last_run");
+        assert_eq!(lr.final_status, "completed", "B: pause 不得写 completed/部分摘要");
+        assert_eq!(lr.total, 20, "B: last_run 仍为上一轮（A）摘要");
+    }
     cmd_tx
         .send(QueueCommand::Resume {
             model: "m".into(),
@@ -443,6 +451,11 @@ fn test_ai_queue_scenarios() {
         db::count_by_status(&c, "analysisSucceeded").unwrap() == 20
     });
     assert_eq!(s.state, "idle", "B: 继续后应全部完成（state={}）", s.state);
+    {
+        let lr = ai_queue::status_from_db(&conn).last_run.expect("应有 last_run");
+        assert_eq!(lr.final_status, "completed", "B: resume 后自然结束应为 completed");
+        assert_eq!(lr.total, 20);
+    }
 
     // ===== 场景 D：停止 =====
     reset_pending(&conn);
@@ -477,6 +490,14 @@ fn test_ai_queue_scenarios() {
         assert_eq!(pending, 18, "D: 未完成回退 pending（pending={}）", pending);
         assert_eq!(failed, 0, "D: 不得标记失败（failed={}）", failed);
         assert_eq!(db::count_active_queue(&c).unwrap(), 0);
+    }
+    // D: stop 终态 → stopped + remaining 正确（未执行 18 篇不算 failed）
+    {
+        let lr = ai_queue::status_from_db(&conn).last_run.expect("应有 last_run");
+        assert_eq!(lr.final_status, "stopped", "D: 停止后终态应为 stopped（实际 {}）", lr.final_status);
+        assert_eq!(lr.total, 20);
+        assert_eq!(lr.success, 2, "D: 已完成结果保留");
+        assert_eq!(lr.remaining, 18, "D: 未执行论文数应计为 remaining=18（实际 {}）", lr.remaining);
     }
 
     // ===== 场景 E：单篇失败不影响后续 =====
@@ -564,6 +585,32 @@ fn test_ai_queue_scenarios() {
     };
     assert!(retries >= 2, "F: 应收到 ≥2 次 ai://retry 事件（实际 {}）", retries);
 
+    // ===== 场景 G：全局配置错误 → 暂停整队（不得逐篇重复失败） =====
+    reset_pending(&conn);
+    ai_queue::set_mock_analyzer(Some(Arc::new(|_id| {
+        Err(AiError::GlobalConfig {
+            status: 401,
+            code: Some("invalid_api_key".into()),
+            message: "invalid api key".into(),
+        })
+    })));
+    cmd_tx
+        .send(QueueCommand::Start {
+            paper_ids: None,
+            model: "m".into(),
+        })
+        .unwrap();
+    let s = wait(&conn, Duration::from_secs(10), &|s, _| s.state == "paused");
+    assert_eq!(s.state, "paused", "G: 全局配置错误应暂停整队（state={}）", s.state);
+    {
+        let c = conn.lock().unwrap();
+        let failed = db::count_by_status(&c, "analysisFailed").unwrap();
+        // 并发 2：最多 2 篇 in-flight 触发配置错误；其余不得逐篇失败
+        assert!(failed <= 2, "G: 只有 in-flight 的少数篇标 failed（实际 {}）", failed);
+        let active = db::count_active_queue(&c).unwrap();
+        assert!(active >= 1, "G: 未执行论文应保留在队列（queued/analyzing），实际 {}", active);
+    }
+
     ai_queue::set_mock_analyzer(None);
 }
 
@@ -580,7 +627,7 @@ fn live_deepseek_smoke() {
     use std::time::{Duration, Instant};
 
     use crate::ai_queue::{self, AiQueue, QueueCommand};
-    use tauri::{Listener, Manager};
+    use tauri::Manager;
 
     // 关键：确保不命中 mock（本测试必须走真实 DeepSeek）
     ai_queue::set_mock_analyzer(None);
@@ -590,9 +637,15 @@ fn live_deepseek_smoke() {
     assert!(!key.is_empty(), "COWPAPER_KEY 不能为空");
     println!("[live] model={}", model);
 
-    // 真实 macOS Keychain：保存 → 队列经 Keychain 读取 → 用后删除
-    let store: Arc<dyn crate::secure_store::SecureStore> =
-        Arc::new(crate::secure_store::KeychainStore::new());
+    // 真实 macOS Keychain（独立 test namespace，绝不触碰 production）：
+    // 保存 → 队列经 Keychain 读取 → 用后删除（TestCleanup 兜底）
+    let test_service = format!(
+        "com.cowpaper.test.live.{}",
+        std::process::id()
+    );
+    let store: Arc<dyn crate::secure_store::SecureStore> = Arc::new(
+        crate::secure_store::KeychainStore::with_namespace(&test_service, "live-test-credential"),
+    );
     store.save(&key).expect("真实 Keychain 写入失败");
 
     let app = tauri::test::mock_builder()
@@ -1003,4 +1056,105 @@ fn test_migration_upgrade_preserves_data() {
 fn keychain_real_smoke() {
     let msg = crate::secure_store::keychain_smoke().expect("真实 Keychain 验证失败");
     println!("{}", msg);
+}
+
+// ================= Round 3.6 hardening 测试 =================
+
+/// Test 1：SyncGuard 正常释放（normal return / drop）。
+#[test]
+fn test_sync_guard_normal_release() {
+    use std::sync::Arc;
+
+    use crate::models::SyncTrigger;
+    use crate::sync_coordinator::{SyncCoordinator, SyncGuard};
+
+    let sc = Arc::new(SyncCoordinator::new());
+    assert!(sc.try_acquire(SyncTrigger::Manual).is_some());
+    {
+        let _g = SyncGuard::new(sc.clone());
+    } // drop → release
+    assert!(!sc.is_running(), "guard drop 后必须释放");
+    assert!(sc.try_acquire(SyncTrigger::Manual).is_some(), "释放后可再次 acquire");
+    sc.release();
+}
+
+/// Test 2：SyncGuard panic 释放（unwind 后 running=false，可再次 acquire）。
+#[test]
+fn test_sync_guard_panic_release() {
+    use std::sync::Arc;
+
+    use crate::models::SyncTrigger;
+    use crate::sync_coordinator::{SyncCoordinator, SyncGuard};
+
+    let sc = Arc::new(SyncCoordinator::new());
+    assert!(sc.try_acquire(SyncTrigger::Manual).is_some());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _g = SyncGuard::new(sc.clone());
+        panic!("sync 任务模拟 panic");
+    }));
+    assert!(result.is_err(), "panic 应被 catch_unwind 捕获");
+    assert!(!sc.is_running(), "panic/unwind 后 running 必须被释放");
+    assert!(sc.try_acquire(SyncTrigger::Manual).is_some(), "panic 后可再次 acquire");
+    sc.release();
+}
+
+/// daily 标记语义：仅 coordinator 接受（started=true）才写 last_daily_sync_date。
+#[test]
+fn test_daily_mark_only_on_accept() {
+    use std::sync::{Arc, Mutex};
+
+    let conn = mem_db();
+    let db = Arc::new(Mutex::new(conn));
+    // started=false（syncAlreadyRunning / 被拒）→ 不标记
+    assert!(!crate::mark_daily_if_started(false, &db, "2026-08-25"));
+    {
+        let c = db.lock().unwrap();
+        assert_eq!(
+            db::get_setting(&c, "sync.last_daily_sync_date"),
+            None,
+            "被拒时不得标记今日已执行"
+        );
+    }
+    // started=true（accepted）→ 标记
+    assert!(crate::mark_daily_if_started(true, &db, "2026-08-25"));
+    {
+        let c = db.lock().unwrap();
+        assert_eq!(
+            db::get_setting(&c, "sync.last_daily_sync_date").as_deref(),
+            Some("2026-08-25")
+        );
+    }
+}
+
+/// daily 冲突：coordinator busy 时 daily 被拒；释放后下一 evaluation 可再次尝试。
+#[test]
+fn test_daily_rejected_when_busy_then_retryable() {
+    use std::sync::Arc;
+
+    use crate::models::SyncTrigger;
+    use crate::sync_coordinator::SyncCoordinator;
+
+    let sc = Arc::new(SyncCoordinator::new());
+    assert!(sc.try_acquire(SyncTrigger::Manual).is_some());
+    // busy → daily 被拒（语义上 started=false → 不标记）
+    assert!(sc.try_acquire(SyncTrigger::Daily).is_none());
+    sc.release();
+    // 释放后下一 evaluation 允许 daily 启动
+    assert!(sc.try_acquire(SyncTrigger::Daily).is_some());
+    sc.release();
+}
+
+/// Keychain 命名空间隔离：test namespace 与 production namespace 必须完全不同。
+#[test]
+fn test_keychain_test_namespace_isolation() {
+    use crate::secure_store::{
+        KeychainStore, PRODUCTION_ACCOUNT, PRODUCTION_SERVICE,
+    };
+
+    let prod = KeychainStore::production();
+    let test = KeychainStore::with_namespace("com.cowpaper.test.isolation", "test-credential");
+    assert_ne!(prod.service, test.service, "service 必须不同");
+    assert_ne!(prod.account, test.account, "account 必须不同");
+    assert_ne!(test.service, PRODUCTION_SERVICE);
+    assert_ne!(test.account, PRODUCTION_ACCOUNT);
 }

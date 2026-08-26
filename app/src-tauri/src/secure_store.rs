@@ -1,6 +1,10 @@
 //! API Key 安全存储抽象。
 //! 生产实现使用 macOS Keychain（keyring / Security framework）；
 //! 测试使用内存 Mock。Key 绝不写入 SQLite / app_state / 日志。
+//!
+//! 命名空间隔离：生产使用 `production()` 的正式 service/account；
+//! 测试必须使用完全独立的 test namespace（唯一后缀），
+//! 绝不触碰 production credential。
 
 #[cfg(test)]
 use std::sync::Mutex;
@@ -13,18 +17,38 @@ pub trait SecureStore: Send + Sync {
     fn has(&self) -> bool;
 }
 
-const KEYCHAIN_SERVICE: &str = "com.cowpaper.app";
-const KEYCHAIN_ACCOUNT: &str = "deepseek_api_key";
+/// 生产命名空间（正式 CowPaper DeepSeek Key 所在）。
+pub const PRODUCTION_SERVICE: &str = "com.cowpaper.app";
+pub const PRODUCTION_ACCOUNT: &str = "deepseek_api_key";
 
 /// macOS Keychain 实现（Security framework，经 keyring crate）。
-pub struct KeychainStore;
+/// service/account 可注入：生产用 production()，测试用唯一 test namespace。
+pub struct KeychainStore {
+    pub(crate) service: String,
+    pub(crate) account: String,
+}
 
 impl KeychainStore {
-    pub fn new() -> Self {
-        KeychainStore
+    /// 正式命名空间：生产 App 保存/读取真实 DeepSeek Key。
+    pub fn production() -> Self {
+        KeychainStore {
+            service: PRODUCTION_SERVICE.to_string(),
+            account: PRODUCTION_ACCOUNT.to_string(),
+        }
     }
+
+    /// 测试命名空间：必须与 production service/account 完全不同。
+    /// 仅测试构建使用（live/keychain 冒烟测试）。
+    #[allow(dead_code)]
+    pub fn with_namespace(service: &str, account: &str) -> Self {
+        KeychainStore {
+            service: service.to_string(),
+            account: account.to_string(),
+        }
+    }
+
     fn entry(&self) -> Result<keyring::Entry, String> {
-        keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+        keyring::Entry::new(&self.service, &self.account)
             .map_err(|e| format!("Keychain 打开失败: {}", e))
     }
 }
@@ -92,16 +116,51 @@ impl SecureStore for MockStore {
     }
 }
 
-/// 真实 Keychain 冒烟测试（ignored）：save/get/has/delete 一个测试值，验证真实钥匙串可用。
+/// 清理守卫：即使测试 panic 也会删除自己创建的 test credential。
+#[cfg(test)]
+struct TestCleanup {
+    service: String,
+    account: String,
+}
+
+#[cfg(test)]
+impl Drop for TestCleanup {
+    fn drop(&mut self) {
+        let store = KeychainStore::with_namespace(&self.service, &self.account);
+        let _ = store.delete();
+    }
+}
+
+/// 真实 Keychain 冒烟测试（ignored，需钥匙串访问）：
+/// 使用唯一 test namespace（com.cowpaper.test.<unique>），
+/// 保存/读取/删除测试值，绝不触碰 production namespace。
 #[cfg(test)]
 pub fn keychain_smoke() -> Result<String, String> {
-    let store = KeychainStore::new();
+    let unique = format!(
+        "{}-{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+    );
+    let service = format!("com.cowpaper.test.{}", unique);
+    let account = "cowpaper-test-credential";
+    debug_assert_ne!(service, PRODUCTION_SERVICE);
+    debug_assert_ne!(account, PRODUCTION_ACCOUNT);
+
+    let store = KeychainStore::with_namespace(&service, &account);
+    let _cleanup = TestCleanup {
+        service: service.clone(),
+        account: account.to_string(),
+    };
+
     let test_value = "cowpaper-keychain-smoke";
     store.save(test_value)?;
     let got = store.get()?.unwrap_or_default();
     store.delete()?;
     if got == test_value {
-        Ok("真实 macOS Keychain save/get/delete 验证通过".to_string())
+        Ok(format!(
+            "真实 macOS Keychain save/get/delete 验证通过（独立 test namespace: {}）",
+            service
+        ))
     } else {
         Err("Keychain 读写值不一致".to_string())
     }

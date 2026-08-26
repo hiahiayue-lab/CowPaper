@@ -85,6 +85,8 @@ interface LastAiRun {
   success: number;
   failed: number;
   skipped: number;
+  remaining: number;
+  finalStatus: string;
   startedAt: string | null;
   finishedAt: string | null;
   errorSummary: string | null;
@@ -444,9 +446,16 @@ function renderAiPanel() {
   const s = aiStatus;
   const pending = papers.filter((p) => p.analysisStatus === "pendingAnalysis" && p.abstractText).length;
 
-  // 上一次运行摘要（§七：批次结束后保留，直到下一次运行完成覆盖）
+  // 上一次运行摘要（§七：批次结束后保留；stopped 时表达"已停止·已处理·剩余"）
   const lastRun = s.lastRun
-    ? `<div class="ai-last-run muted small">上次分析：${s.lastRun.total} 篇 · 成功 ${s.lastRun.success} · 失败 ${s.lastRun.failed}${s.lastRun.finishedAt ? " · 完成于 " + new Date(s.lastRun.finishedAt).toLocaleTimeString() : ""}</div>`
+    ? (() => {
+        const lr = s.lastRun!;
+        if (lr.finalStatus === "stopped") {
+          const processed = lr.total - lr.remaining;
+          return `<div class="ai-last-run muted small">任务已停止 · 已处理 ${processed}/${lr.total} · 剩余 ${lr.remaining}（成功 ${lr.success} · 失败 ${lr.failed}）</div>`;
+        }
+        return `<div class="ai-last-run muted small">上次分析：${lr.total} 篇 · 成功 ${lr.success} · 失败 ${lr.failed}${lr.finishedAt ? " · 完成于 " + new Date(lr.finishedAt).toLocaleTimeString() : ""}</div>`;
+      })()
     : "";
 
   // 任何状态都渲染有意义内容，绝不允许空白横条

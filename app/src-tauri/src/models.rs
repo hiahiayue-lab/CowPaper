@@ -58,6 +58,10 @@ pub struct LastAiRun {
     pub success: i64,
     pub failed: i64,
     pub skipped: i64,
+    /// 停止时未执行的论文数；正常完成为 0。
+    pub remaining: i64,
+    /// 终态：completed | stopped（未来可扩展 failed/cancelled）。
+    pub final_status: String,
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
     pub error_summary: Option<String>,

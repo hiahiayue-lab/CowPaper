@@ -1,8 +1,10 @@
 //! 全局同步协调器：同一时间只允许一个同步任务运行。
 //! 所有入口（manual / startup / daily / tray / journalTest）都必须经过 try_acquire。
+//! `SyncGuard` 提供 RAII 释放：无论同步任务正常返回、提前 return 还是 panic/unwind，
+//! running 状态最终都会被释放（panic-safe）。
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::models::{SyncStartResult, SyncTrigger};
 
@@ -37,7 +39,7 @@ impl SyncCoordinator {
         }
     }
 
-    /// 同步结束后释放锁。
+    /// 同步结束后释放锁（由 SyncGuard::drop 调用，保证 panic-safe）。
     pub fn release(&self) {
         self.running.store(false, Ordering::SeqCst);
         *self.current_trigger.lock().unwrap() = None;
@@ -69,5 +71,23 @@ impl SyncCoordinator {
                 started_at: None,
             }
         }
+    }
+}
+
+/// RAII 释放守卫：Drop 时无条件调用 coordinator.release()。
+/// 持有者被 unwind（panic）或正常 drop 时都会释放同步锁。
+pub struct SyncGuard {
+    coord: Arc<SyncCoordinator>,
+}
+
+impl SyncGuard {
+    pub fn new(coord: Arc<SyncCoordinator>) -> Self {
+        SyncGuard { coord }
+    }
+}
+
+impl Drop for SyncGuard {
+    fn drop(&mut self) {
+        self.coord.release();
     }
 }

@@ -24,7 +24,7 @@ use tauri_plugin_notification::NotificationExt;
 use crate::ai_queue::{AiQueue, QueueCommand};
 use crate::models::{SyncStartResult, SyncTrigger};
 use crate::secure_store::{KeychainStore, SecureStore};
-use crate::sync_coordinator::SyncCoordinator;
+use crate::sync_coordinator::{SyncCoordinator, SyncGuard};
 
 const MAILTO: &str = "dev@cowpaper.local";
 /// 启动自动同步的最小间隔（避免频繁重启触发大量请求）。
@@ -134,6 +134,7 @@ fn sync_task<R: Runtime>(app: &AppHandle<R>, db: &Db, ids: Option<Vec<i64>>) {
 
 /// 所有同步入口的唯一通道：经 SyncCoordinator 获取全局锁。
 /// 已运行 → 返回 syncAlreadyRunning，不启动第二个线程。
+/// panic-safe：RAII SyncGuard 保证无论任务正常返回还是 panic 都释放锁。
 fn start_sync_task<R: Runtime>(
     app: &AppHandle<R>,
     db: &Db,
@@ -147,8 +148,17 @@ fn start_sync_task<R: Runtime>(
             let db2 = db.clone();
             let sync2 = sync.clone();
             std::thread::spawn(move || {
-                sync_task(&app2, &db2, ids);
-                sync2.release();
+                // RAII guard：闭包正常结束或 panic 时都会 release()
+                let _guard = SyncGuard::new(sync2);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    sync_task(&app2, &db2, ids);
+                }));
+                if let Err(payload) = result {
+                    // 记录安全错误并发出同步失败事件；不静默吞掉 panic
+                    let msg = panic_summary(&payload);
+                    let _ = app2.emit("sync://error", format!("同步任务异常终止：{}", msg));
+                    std::panic::resume_unwind(payload); // 触发 _guard drop → release
+                }
             });
             SyncStartResult {
                 started: true,
@@ -164,6 +174,27 @@ fn start_sync_task<R: Runtime>(
             started_at: None,
         },
     }
+}
+
+/// 从 panic payload 提取安全摘要（不包含敏感数据；未知类型返回通用文本）。
+fn panic_summary(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "未知 panic".to_string()
+    }
+}
+
+/// daily 标记：仅当 coordinator 真正接受 daily 任务（started=true）才写入 last_daily_sync_date。
+/// syncAlreadyRunning 不算 daily 已执行，不标记，下一 tick 可重试。
+fn mark_daily_if_started(started: bool, db: &Db, today: &str) -> bool {
+    if started {
+        let c = db.lock().unwrap();
+        let _ = db::set_setting(&c, "sync.last_daily_sync_date", today);
+    }
+    started
 }
 
 fn start_sync_global<R: Runtime>(app: &AppHandle<R>, trigger: SyncTrigger, ids: Option<Vec<i64>>) -> SyncStartResult {
@@ -233,12 +264,10 @@ fn scheduler_loop(db: Db, app: AppHandle, sync: Arc<SyncCoordinator>) {
         }
         let now_hm = now_local.format("%H:%M").to_string();
         if now_hm >= time {
-            {
-                let c = db.lock().unwrap();
-                let _ = db::set_setting(&c, "sync.last_daily_sync_date", &today);
-            }
-            // 若已有同步在运行，coordinator 返回 syncAlreadyRunning，不会重入
-            let _ = start_sync_task(&app, &db, &sync, SyncTrigger::Daily, None);
+            // 只有 daily 被 coordinator 接受（started=true）才标记"今日已计划"；
+            // syncAlreadyRunning 不算执行，不标记，下一 tick 若空闲会再次尝试。
+            let started = start_sync_task(&app, &db, &sync, SyncTrigger::Daily, None).started;
+            mark_daily_if_started(started, &db, &today);
         }
     }
 }
@@ -451,7 +480,7 @@ pub fn run() {
             app.manage(sync_arc.clone());
 
             // 安全存储（macOS Keychain）
-            let store_arc: Secure = Arc::new(KeychainStore::new());
+            let store_arc: Secure = Arc::new(KeychainStore::production());
             app.manage(store_arc.clone());
 
             // AI 队列协调器（全局唯一，§三十五）
