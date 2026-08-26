@@ -1,0 +1,920 @@
+{
+  "catalogVersion": 1,
+  "generatedAt": "2026-08-26",
+  "collections": [
+    {
+      "code": "UTD24",
+      "name": "UTD24",
+      "version": "current",
+      "effectiveFrom": null,
+      "sourceName": "University of Texas at Dallas, Naveen Jindal School of Management",
+      "sourceUrl": "https://jsom.utdallas.edu/the-utd-top-100-business-school-research-rankings/",
+      "lastVerifiedAt": "2026-08-26"
+    },
+    {
+      "code": "FT50",
+      "name": "FT50",
+      "version": "2026",
+      "effectiveFrom": "2026-04-29",
+      "sourceName": "Financial Times",
+      "sourceUrl": "https://www.ft.com/ft50-journals",
+      "lastVerifiedAt": "2026-08-26"
+    }
+  ],
+  "journals": [
+    {
+      "catalogId": "the-accounting-review",
+      "canonicalTitle": "The Accounting Review",
+      "publisher": "American Accounting Association",
+      "printIssn": "0001-4826",
+      "onlineIssn": "1558-7967",
+      "issnL": null,
+      "aliases": [
+        "Accounting Review"
+      ],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "UTD24",
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "journal-of-accounting-and-economics",
+      "canonicalTitle": "Journal of Accounting and Economics",
+      "publisher": "Elsevier",
+      "printIssn": "0165-4101",
+      "onlineIssn": null,
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "UTD24",
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "journal-of-accounting-research",
+      "canonicalTitle": "Journal of Accounting Research",
+      "publisher": "Wiley (Blackwell Publishing)",
+      "printIssn": "0021-8456",
+      "onlineIssn": "1475-679X",
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "UTD24",
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "journal-of-finance",
+      "canonicalTitle": "Journal of Finance",
+      "publisher": "Apex Publishing",
+      "printIssn": "0022-1082",
+      "onlineIssn": "1540-6261",
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "UTD24",
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "journal-of-financial-economics",
+      "canonicalTitle": "Journal of Financial Economics",
+      "publisher": "Elsevier",
+      "printIssn": "0304-405X",
+      "onlineIssn": null,
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "UTD24",
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "the-review-of-financial-studies",
+      "canonicalTitle": "Review of Financial Studies",
+      "publisher": "Oxford University Press",
+      "printIssn": "0893-9454",
+      "onlineIssn": "1465-7368",
+      "issnL": null,
+      "aliases": [
+        "Review of Financial Studies"
+      ],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "UTD24",
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "information-systems-research",
+      "canonicalTitle": "Information Systems Research",
+      "publisher": "Institute for Operations Research and the Management Sciences",
+      "printIssn": "1047-7047",
+      "onlineIssn": "1526-5536",
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "UTD24",
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "informs-journal-on-computing",
+      "canonicalTitle": "INFORMS Journal on Computing",
+      "publisher": "Institute for Operations Research and the Management Sciences",
+      "printIssn": "0899-1499",
+      "onlineIssn": "1526-5528",
+      "issnL": null,
+      "aliases": [
+        "Journal on Computing"
+      ],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "UTD24"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "mis-quarterly",
+      "canonicalTitle": "MIS Quarterly",
+      "publisher": "MIS Quarterly",
+      "printIssn": "0276-7783",
+      "onlineIssn": "2162-9730",
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "UTD24",
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "journal-of-consumer-research",
+      "canonicalTitle": "Journal of Consumer Research",
+      "publisher": "Oxford University Press",
+      "printIssn": "0093-5301",
+      "onlineIssn": "1537-5277",
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "UTD24",
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "journal-of-marketing",
+      "canonicalTitle": "Journal of Marketing",
+      "publisher": "SAGE Publications",
+      "printIssn": "0022-2429",
+      "onlineIssn": "0022-2429",
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "UTD24",
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "journal-of-marketing-research",
+      "canonicalTitle": "Journal of Marketing Research",
+      "publisher": "SAGE Publications",
+      "printIssn": "0022-2437",
+      "onlineIssn": "1547-7193",
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "UTD24",
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "marketing-science",
+      "canonicalTitle": "Marketing Science",
+      "publisher": "Institute for Operations Research and the Management Sciences",
+      "printIssn": "0732-2399",
+      "onlineIssn": "1526-548X",
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "UTD24",
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "management-science",
+      "canonicalTitle": "Management Science",
+      "publisher": "Institute for Operations Research and the Management Sciences",
+      "printIssn": "0025-1909",
+      "onlineIssn": "1526-5501",
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "UTD24",
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "operations-research",
+      "canonicalTitle": "Operations Research",
+      "publisher": "Institute for Operations Research and the Management Sciences",
+      "printIssn": "0030-364X",
+      "onlineIssn": "1526-5463",
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "UTD24",
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "journal-of-operations-management",
+      "canonicalTitle": "Journal of Operations Management",
+      "publisher": "Wiley (Blackwell Publishing)",
+      "printIssn": "0272-6963",
+      "onlineIssn": "1873-1317",
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "UTD24",
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "manufacturing-and-service-operations-management",
+      "canonicalTitle": "Manufacturing & Service Operations Management",
+      "publisher": "Institute for Operations Research and the Management Sciences",
+      "printIssn": "1523-4614",
+      "onlineIssn": "1526-5498",
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "UTD24",
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "production-and-operations-management",
+      "canonicalTitle": "Production and Operations Management",
+      "publisher": "SAGE Publications",
+      "printIssn": "1059-1478",
+      "onlineIssn": "1937-5956",
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "UTD24",
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "academy-of-management-journal",
+      "canonicalTitle": "Academy of Management Journal",
+      "publisher": "Academy of Management",
+      "printIssn": "0001-4273",
+      "onlineIssn": "1948-0989",
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "UTD24",
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "academy-of-management-review",
+      "canonicalTitle": "Academy of Management Review",
+      "publisher": "Academy of Management",
+      "printIssn": "0363-7425",
+      "onlineIssn": "1930-3807",
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "UTD24",
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "administrative-science-quarterly",
+      "canonicalTitle": "Administrative Science Quarterly",
+      "publisher": "SAGE Publications",
+      "printIssn": "0001-8392",
+      "onlineIssn": "1930-3815",
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "UTD24",
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "organization-science",
+      "canonicalTitle": "Organization Science",
+      "publisher": "Institute for Operations Research and the Management Sciences",
+      "printIssn": "1047-7039",
+      "onlineIssn": "1526-5455",
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "UTD24",
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "journal-of-international-business-studies",
+      "canonicalTitle": "Journal of International Business Studies",
+      "publisher": "Springer Science and Business Media LLC",
+      "printIssn": "0047-2506",
+      "onlineIssn": "1478-6990",
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "UTD24",
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "strategic-management-journal",
+      "canonicalTitle": "Strategic Management Journal",
+      "publisher": "Wiley (John Wiley & Sons)",
+      "printIssn": "0143-2095",
+      "onlineIssn": "1097-0266",
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "UTD24",
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "accounting-organizations-and-society",
+      "canonicalTitle": "Accounting Organizations and Society",
+      "publisher": "Elsevier",
+      "printIssn": "0361-3682",
+      "onlineIssn": null,
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "contemporary-accounting-research",
+      "canonicalTitle": "Contemporary Accounting Research",
+      "publisher": "Wiley (Blackwell Publishing)",
+      "printIssn": "0823-9150",
+      "onlineIssn": "1911-3846",
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "review-of-accounting-studies",
+      "canonicalTitle": "Review of Accounting Studies",
+      "publisher": "Springer-Verlag",
+      "printIssn": "1380-6653",
+      "onlineIssn": "1573-7136",
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "american-economic-review",
+      "canonicalTitle": "American Economic Review",
+      "publisher": "American Economic Association",
+      "printIssn": "0002-8282",
+      "onlineIssn": "1944-7981",
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "econometrica",
+      "canonicalTitle": "Econometrica",
+      "publisher": "The Econometric Society",
+      "printIssn": "0012-9682",
+      "onlineIssn": "1468-0262",
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "journal-of-political-economy",
+      "canonicalTitle": "Journal of Political Economy",
+      "publisher": "The University of Chicago Press",
+      "printIssn": "0022-3808",
+      "onlineIssn": "1537-534X",
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "quarterly-journal-of-economics",
+      "canonicalTitle": "The Quarterly Journal of Economics",
+      "publisher": "Oxford University Press",
+      "printIssn": "0033-5533",
+      "onlineIssn": "1531-4650",
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "research-policy",
+      "canonicalTitle": "Research Policy",
+      "publisher": "Elsevier",
+      "printIssn": "0048-7333",
+      "onlineIssn": null,
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "review-of-economic-studies",
+      "canonicalTitle": "The Review of Economic Studies",
+      "publisher": "Oxford University Press",
+      "printIssn": "0034-6527",
+      "onlineIssn": "1467-937X",
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "entrepreneurship-theory-and-practice",
+      "canonicalTitle": "Entrepreneurship Theory and Practice",
+      "publisher": "SAGE Publications",
+      "printIssn": "1042-2587",
+      "onlineIssn": "1540-8520",
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "journal-of-business-venturing",
+      "canonicalTitle": "Journal of Business Venturing",
+      "publisher": "Elsevier",
+      "printIssn": "0883-9026",
+      "onlineIssn": null,
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "strategic-entrepreneurship-journal",
+      "canonicalTitle": "Strategic Entrepreneurship Journal",
+      "publisher": "Wiley (John Wiley & Sons)",
+      "printIssn": "1932-4391",
+      "onlineIssn": "1932-443X",
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "journal-of-financial-and-quantitative-analysis",
+      "canonicalTitle": "Journal of Financial and Quantitative Analysis",
+      "publisher": "Cambridge University Press",
+      "printIssn": "0022-1090",
+      "onlineIssn": "1756-6916",
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "review-of-finance",
+      "canonicalTitle": "Review of Finance",
+      "publisher": "Oxford University Press",
+      "printIssn": "1572-3097",
+      "onlineIssn": "1573-692X",
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "human-resource-management",
+      "canonicalTitle": "Human Resource Management",
+      "publisher": "Wiley (John Wiley & Sons)",
+      "printIssn": "0090-4848",
+      "onlineIssn": "1099-050X",
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "journal-of-management-information-systems",
+      "canonicalTitle": "Journal of Management Information Systems",
+      "publisher": "Informa UK (Taylor & Francis)",
+      "printIssn": "0742-1222",
+      "onlineIssn": "1557-928X",
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "academy-of-management-annals",
+      "canonicalTitle": "Academy of Management Annals",
+      "publisher": "Academy of Management",
+      "printIssn": "1941-6520",
+      "onlineIssn": "1941-6067",
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "harvard-business-review",
+      "canonicalTitle": "Harvard Business Review",
+      "publisher": "Harvard Business Publishing",
+      "printIssn": null,
+      "onlineIssn": null,
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "FT50"
+      ],
+      "metadataNeedsReview": true
+    },
+    {
+      "catalogId": "journal-of-management",
+      "canonicalTitle": "Journal of Management",
+      "publisher": "SAGE Publications",
+      "printIssn": "0149-2063",
+      "onlineIssn": "1557-1211",
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "journal-of-management-studies",
+      "canonicalTitle": "Journal of Management Studies",
+      "publisher": "Wiley (Blackwell Publishing)",
+      "printIssn": "0022-2380",
+      "onlineIssn": "1467-6486",
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "mit-sloan-management-review",
+      "canonicalTitle": "MIT Sloan Management Review",
+      "publisher": "MIT Sloan School of Management",
+      "printIssn": "1532-9194",
+      "onlineIssn": "1532-8937",
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "journal-of-consumer-psychology",
+      "canonicalTitle": "Journal of Consumer Psychology",
+      "publisher": "Wiley (John Wiley & Sons)",
+      "printIssn": "1057-7408",
+      "onlineIssn": "1532-7663",
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "journal-of-the-academy-of-marketing-science",
+      "canonicalTitle": "Journal of the Academy of Marketing Science",
+      "publisher": "Springer-Verlag",
+      "printIssn": "0092-0703",
+      "onlineIssn": "1552-7824",
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "organizational-behavior-and-human-decision-processes",
+      "canonicalTitle": "Organizational Behavior and Human Decision Processes",
+      "publisher": "Elsevier",
+      "printIssn": "0749-5978",
+      "onlineIssn": "1095-9920",
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "journal-of-applied-psychology",
+      "canonicalTitle": "Journal of Applied Psychology",
+      "publisher": "American Psychological Association",
+      "printIssn": "0021-9010",
+      "onlineIssn": "1939-1854",
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "psychological-science",
+      "canonicalTitle": "Psychological Science",
+      "publisher": "SAGE Publications",
+      "printIssn": "0956-7976",
+      "onlineIssn": "1467-9280",
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    },
+    {
+      "catalogId": "american-sociological-review",
+      "canonicalTitle": "American Sociological Review",
+      "publisher": "SAGE Publications",
+      "printIssn": "0003-1224",
+      "onlineIssn": "1939-8271",
+      "issnL": null,
+      "aliases": [],
+      "metadataSources": [
+        "crossref"
+      ],
+      "lastVerifiedAt": "2026-08-26",
+      "collections": [
+        "FT50"
+      ],
+      "metadataNeedsReview": false
+    }
+  ]
+}

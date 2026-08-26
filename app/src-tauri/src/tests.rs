@@ -1808,7 +1808,7 @@ fn test_migration_v2_to_v3_preserves_data() {
 
     // 迁移到 v3
     db::init(&conn).unwrap();
-    assert_eq!(db::SCHEMA_VERSION, 4);
+    assert_eq!(db::SCHEMA_VERSION, 5);
 
     // 8) 旧 issn 迁移进 journal_identifiers（类型按列，不猜）
     let ids = db::list_journal_identifiers(&conn, jid).unwrap();
@@ -1849,7 +1849,7 @@ fn test_database_restart_persistence() {
     {
         let conn = db::open(&path).unwrap();
         db::init(&conn).unwrap(); // 幂等：user_version=3 不重复迁移
-        assert_eq!(db::SCHEMA_VERSION, 4);
+        assert_eq!(db::SCHEMA_VERSION, 5);
         let j = db::get_journal(&conn, 1).unwrap().expect("期刊持久化");
         assert_eq!(j.print_issn.as_deref(), Some("0025-1909"));
         assert_eq!(j.identifiers.len(), 1);
@@ -2202,7 +2202,7 @@ fn test_migration_v4_abstract_quality_init() {
         "#,
     )
     .unwrap();
-    conn.pragma_update(None, "user_version", 3).unwrap();
+    conn.pragma_update(None, "user_version", 2).unwrap();
     let now = db::now_utc();
     conn.execute(
         "INSERT INTO journals (name, print_issn, created_at, updated_at) VALUES ('J','0025-1909',?1,?1)",
@@ -2239,7 +2239,7 @@ fn test_migration_v4_abstract_quality_init() {
     .unwrap();
 
     db::init(&conn).unwrap();
-    assert_eq!(db::SCHEMA_VERSION, 4);
+    assert_eq!(db::SCHEMA_VERSION, 5);
 
     let papers = db::list_papers(&conn, Some(jid), 100).unwrap();
     assert_eq!(papers.len(), 3, "迁移不得丢论文");
@@ -2401,4 +2401,142 @@ fn test_upgrade_recommendation_reorder() {
     // A 摘要升级 + 重新分析（新 score 3）→ A 排前（不修改推荐算法，仅验证数据层排序）
     db::save_analysis(&conn, ida, "A2", "a2", "s2", "[]", 3.0, "m", "v1", "HA2").unwrap();
     assert_eq!(rank(&conn), vec![ida, idb], "新：A(3) > B(2)");
+}
+
+// ================= Round 5C：Verified Journal Catalog =================
+
+#[test]
+fn test_catalog_import_counts_and_idempotent() {
+    use crate::catalog::{self, CatalogImportReport};
+    let conn = mem_db();
+    // 首次导入
+    let r1: CatalogImportReport = catalog::import_catalog(&conn).unwrap();
+    let list = db::list_journals(&conn).unwrap();
+    assert_eq!(list.len(), 51, "unique canonical journals = 51");
+    assert!(r1.journals_created >= 45, "多数期刊应新建，实际 {}", r1.journals_created);
+    // UTD24 = 24 / FT50 = 50
+    let utd = db::count_collection_members(&conn, "UTD24").unwrap();
+    let ft = db::count_collection_members(&conn, "FT50").unwrap();
+    assert_eq!(utd, 24, "UTD24 必须严格 24");
+    assert_eq!(ft, 50, "FT50-2026 必须严格 50");
+    // overlap / unique
+    let colls: Vec<String> = db::list_journals(&conn).unwrap().into_iter().map(|j| j.collections.join(",")).collect();
+    let both = colls.iter().filter(|c| c.contains("UTD24") && c.contains("FT50")).count();
+    assert_eq!(both, 23, "overlap = 23");
+    // 幂等：重复导入不产生重复
+    let r2: CatalogImportReport = catalog::import_catalog(&conn).unwrap();
+    assert_eq!(db::list_journals(&conn).unwrap().len(), 51, "重复导入不得新增 journal");
+    assert_eq!(db::count_collection_members(&conn, "UTD24").unwrap(), 24);
+    assert_eq!(db::count_collection_members(&conn, "FT50").unwrap(), 50);
+    assert_eq!(r2.journals_created, 0, "重复导入不得新建 journal");
+    assert_eq!(r2.memberships_added, 0, "重复导入不得新增 membership");
+    assert_eq!(r2.identifiers_added, 0, "重复导入不得新增 identifier");
+    // 2026 三进三出 regression
+    let ft_journals = db::list_journals(&conn).unwrap();
+    let has_ft = |title: &str| ft_journals.iter().any(|j| j.name == title && j.collections.iter().any(|c| c == "FT50"));
+    assert!(has_ft("Academy of Management Annals"), "2026 FT50 含 Academy of Management Annals");
+    assert!(has_ft("American Sociological Review"));
+    assert!(has_ft("Psychological Science"));
+    assert!(!has_ft("Human Relations"), "2026 FT50 不含 Human Relations");
+    assert!(!has_ft("Journal of Business Ethics"));
+    assert!(!has_ft("Organization Studies"));
+}
+
+#[test]
+fn test_catalog_existing_journal_enrichment() {
+    use crate::catalog;
+    let conn = mem_db();
+    // 用户已订阅 Management Science（与 catalog 中 Management Science 同 ISSN）
+    let jid = db::insert_journal(&conn, "Management Science", Some("0025-1909"), Some("1526-5501"), Some("INFORMS"), None).unwrap();
+    db::set_journal_enabled(&conn, jid, true).unwrap();
+    let _ = db::insert_identifier(&conn, jid, "print", "0025-1909", Some("manual"));
+    let _ = db::insert_identifier(&conn, jid, "online", "1526-5501", Some("manual"));
+    // 导入 catalog → enrichment
+    catalog::import_catalog(&conn).unwrap();
+    let list = db::list_journals(&conn).unwrap();
+    assert_eq!(list.len(), 51, "已有期刊不得重复创建");
+    let ms = list.iter().find(|j| j.id == jid).expect("Management Science 保留原 id");
+    assert!(ms.enabled, "用户订阅状态不被覆盖");
+    assert!(ms.collections.contains(&"UTD24".to_string()), "获得 UTD24 membership");
+    assert!(ms.collections.contains(&"FT50".to_string()), "获得 FT50 membership");
+    assert_eq!(ms.identifiers.len(), 2, "identifiers 保持");
+    // metadata_needs_review：仅 HBR 标记
+    let hbr = list.iter().find(|j| j.name == "Harvard Business Review").expect("HBR 在 catalog 中");
+    assert!(hbr.metadata_needs_review, "HBR identifier 未解决应标记 review");
+}
+
+#[test]
+fn test_catalog_bulk_subscribe() {
+    use crate::catalog;
+    let conn = mem_db();
+    catalog::import_catalog(&conn).unwrap();
+    let list = db::list_journals(&conn).unwrap();
+    let ms = list.iter().find(|j| j.name == "Management Science").unwrap();
+    let or = list.iter().find(|j| j.name == "Operations Research").unwrap();
+    let hbr = list.iter().find(|j| j.name == "Harvard Business Review").unwrap();
+    // 仅选择部分期刊批量订阅
+    let result = crate::subscribe_journals_logic(&conn, vec![ms.id, or.id]).unwrap();
+    assert_eq!(result.subscribed, 2);
+    assert_eq!(result.already, 0);
+    // 重复订阅：already 计数，不重复
+    let result2 = crate::subscribe_journals_logic(&conn, vec![ms.id]).unwrap();
+    assert_eq!(result2.subscribed, 0);
+    assert_eq!(result2.already, 1);
+    // 未选期刊不订阅
+    assert!(!db::get_journal(&conn, hbr.id).unwrap().unwrap().enabled, "未选择期刊不得订阅");
+    // 无效 id：failed 计数，不整体失败
+    let result3 = crate::subscribe_journals_logic(&conn, vec![99999]).unwrap();
+    assert_eq!(result3.failed, 1);
+    assert_eq!(result3.subscribed, 0);
+}
+
+#[test]
+fn test_collection_total_score_invariant() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let cand = candidate(Some("10.1000/score5c"), "Score Paper", Some("abstract with full detail about pricing and markets."), Some("crossref"));
+    let pid = match db::upsert_paper(&conn, jid, &cand).unwrap() {
+        UpsertOutcome::New(i) => i,
+        _ => panic!(),
+    };
+    db::save_analysis(&conn, pid, "中", "摘要", "句", "[{\"tag\":\"A\",\"score\":0.8},{\"tag\":\"B\",\"score\":0.7}]", 1.5, "m", "v1", "H").unwrap();
+    let before = db::list_papers(&conn, None, 100).unwrap()[0].total_score;
+    assert_eq!(before, Some(1.5), "tags A=0.8 + B=0.7 → 1.5");
+    // 加入 UTD24 + FT50 collections → totalScore 不变
+    let utd = db::create_collection(&conn, "UTD24", "UTD24", None, None, Some("test"), None).unwrap();
+    let ft = db::create_collection(&conn, "FT50", "FT50", None, None, Some("test"), None).unwrap();
+    db::add_collection_member(&conn, utd, jid).unwrap();
+    db::add_collection_member(&conn, ft, jid).unwrap();
+    let after = db::list_papers(&conn, None, 100).unwrap()[0].total_score;
+    assert_eq!(after, Some(1.5), "collection 不得改变 totalScore");
+    // 删除 collection membership → 仍 1.5
+    conn.execute("DELETE FROM journal_collection_members WHERE collection_id=?1", params![utd]).unwrap();
+    let p = db::list_papers(&conn, None, 100).unwrap()[0].clone();
+    assert_eq!(p.total_score, Some(1.5));
+    assert_eq!(p.collections, vec!["FT50".to_string()], "paper 派生 collections");
+}
+
+#[test]
+fn test_recommendation_ordering_unaffected_by_collections() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let a = match db::upsert_paper(&conn, jid, &candidate(Some("10.1000/rr1"), "R1", Some("abstract one here with full detail."), Some("crossref"))).unwrap() {
+        UpsertOutcome::New(i) => i, _ => panic!(),
+    };
+    let b = match db::upsert_paper(&conn, jid, &candidate(Some("10.1000/rr2"), "R2", Some("abstract two here with full detail."), Some("crossref"))).unwrap() {
+        UpsertOutcome::New(i) => i, _ => panic!(),
+    };
+    db::save_analysis(&conn, a, "A", "a", "s", "[]", 1.0, "m", "v1", "H1").unwrap();
+    db::save_analysis(&conn, b, "B", "b", "s", "[]", 2.0, "m", "v1", "H2").unwrap();
+    let order = || -> Vec<i64> {
+        let mut ps = db::list_papers(&conn, None, 100).unwrap();
+        ps.retain(|p| p.total_score.is_some());
+        ps.sort_by(|x, y| y.total_score.unwrap().total_cmp(&x.total_score.unwrap()).then(y.published_date.cmp(&x.published_date)));
+        ps.iter().map(|p| p.id).collect()
+    };
+    assert_eq!(order(), vec![b, a]);
+    // 加入 collection → 排序不变
+    let utd = db::create_collection(&conn, "UTD24", "UTD24", None, None, Some("test"), None).unwrap();
+    db::add_collection_member(&conn, utd, jid).unwrap();
+    assert_eq!(order(), vec![b, a], "collection filter 不改变排序");
 }

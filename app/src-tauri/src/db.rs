@@ -87,7 +87,7 @@ pub fn open(path: &Path) -> Result<Connection> {
 /// 当前 schema 版本（Round 5B：abstract_quality / paper_abstract_sources 为 v4）。
 /// 生产构建中仅由迁移系统隐式使用；测试中直接断言。
 #[allow(dead_code)]
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 pub fn init(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
@@ -154,6 +154,7 @@ fn row_to_journal(row: &rusqlite::Row) -> Result<Journal> {
         identifiers: Vec::new(),
         collections: Vec::new(),
         possible_duplicate: false,
+        metadata_needs_review: row.get("metadata_needs_review").unwrap_or(false),
     })
 }
 
@@ -337,6 +338,58 @@ pub fn resolve_journal_by_identifier(conn: &Connection, value: &str) -> Result<O
     Ok(id)
 }
 
+/// 按集合 code 查找 collection id。
+pub fn find_collection_by_code(conn: &Connection, code: &str) -> Result<Option<i64>> {
+    let id = conn
+        .query_row(
+            "SELECT id FROM journal_collections WHERE code = ?1",
+            params![code],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()?;
+    Ok(id)
+}
+
+/// 读取 journals.issn_l（用于只填空、不覆盖）。
+pub fn get_journal_issn_l(conn: &Connection, id: i64) -> Result<Option<String>> {
+    let v: Option<String> = conn
+        .query_row("SELECT issn_l FROM journals WHERE id = ?1", params![id], |r| r.get(0))
+        .optional()?
+        .flatten();
+    Ok(v)
+}
+
+/// 设置 metadata_needs_review（幂等：仅置 true）。
+pub fn set_journal_review_flag(conn: &Connection, id: i64, review: bool) -> Result<()> {
+    if review {
+        conn.execute(
+            "UPDATE journals SET metadata_needs_review = 1, updated_at = ?1 WHERE id = ?2",
+            params![now_utc(), id],
+        )?;
+    }
+    Ok(())
+}
+
+/// 标题规范化匹配（仅作为 identifier 缺失时的辅助；title alias 不能用于自动合并冲突期刊）。
+pub fn find_journal_by_title_alias(conn: &Connection, title: &str) -> Result<Option<i64>> {
+    let key: String = title
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    if key.is_empty() {
+        return Ok(None);
+    }
+    let id = conn
+        .query_row(
+            "SELECT id FROM journals WHERE lower(name) = lower(?1) OR lower(name) = ?2",
+            params![title, key],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()?;
+    Ok(id)
+}
+
 /// 按 ISSN-L（规范化后）查找 canonical Journal（journals.issn_l 列）。
 pub fn find_journal_by_issn_l(conn: &Connection, issn_l: &str) -> Result<Option<i64>> {
     let id = conn
@@ -350,7 +403,6 @@ pub fn find_journal_by_issn_l(conn: &Connection, issn_l: &str) -> Result<Option<
 }
 
 /// 某 Journal 的全部 identifiers。
-#[allow(dead_code)] // 测试辅助；生产路径由 enrich_journals 一次填充
 pub fn list_journal_identifiers(conn: &Connection, journal_id: i64) -> Result<Vec<crate::models::JournalIdentifier>> {
     let mut stmt = conn.prepare(
         "SELECT id, journal_id, identifier_type, value, source, created_at, updated_at
@@ -391,12 +443,13 @@ pub fn create_collection(
 }
 
 /// 幂等加入集合成员（PRIMARY KEY (collection_id, journal_id) 拒绝重复）。
-pub fn add_collection_member(conn: &Connection, collection_id: i64, journal_id: i64) -> Result<()> {
-    conn.execute(
+/// 返回是否实际新增（false = 已存在）。
+pub fn add_collection_member(conn: &Connection, collection_id: i64, journal_id: i64) -> Result<bool> {
+    let n = conn.execute(
         "INSERT OR IGNORE INTO journal_collection_members (collection_id, journal_id) VALUES (?1,?2)",
         params![collection_id, journal_id],
     )?;
-    Ok(())
+    Ok(n > 0)
 }
 
 pub fn list_collections(conn: &Connection) -> Result<Vec<crate::models::JournalCollection>> {
@@ -419,6 +472,15 @@ pub fn list_collections(conn: &Connection) -> Result<Vec<crate::models::JournalC
         })
     })?;
     rows.collect()
+}
+
+/// 某集合的 membership 数（按 code）。
+pub fn count_collection_members(conn: &Connection, code: &str) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM journal_collection_members m JOIN journal_collections c ON c.id = m.collection_id WHERE c.code = ?1",
+        params![code],
+        |r| r.get(0),
+    )
 }
 
 /// Journal 所属集合（Paper → journal → collections 的派生路径）。
@@ -836,6 +898,7 @@ fn row_to_paper(row: &rusqlite::Row) -> Result<Paper> {
         analyzed_at: row.get("analyzed_at")?,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
+        collections: Vec::new(),
     })
 }
 
@@ -852,7 +915,36 @@ pub fn list_papers(conn: &Connection, journal_id: Option<i64>, limit: i64) -> Re
     } else {
         stmt.query_map(params![limit], row_to_paper)?
     };
-    rows.collect()
+    let mut papers: Vec<Paper> = rows.collect::<Result<Vec<_>>>()?;
+    enrich_papers_collections(conn, &mut papers)?;
+    Ok(papers)
+}
+
+/// 一次查询填充全部 papers 的 collection codes（避免 N+1）。
+fn enrich_papers_collections(conn: &Connection, papers: &mut [Paper]) -> Result<()> {
+    if papers.is_empty() {
+        return Ok(());
+    }
+    // 简化实现：为每篇 paper 查询其 journal 的 collections（论文量通常 < 1000，一次查询足够）
+    let mut all: Vec<(i64, String)> = Vec::new();
+    {
+        let mut stmt2 = conn.prepare(
+            "SELECT m.journal_id, c.code FROM journal_collection_members m
+             JOIN journal_collections c ON c.id = m.collection_id ORDER BY c.code",
+        )?;
+        let rows = stmt2.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        for row in rows {
+            all.push(row?);
+        }
+    }
+    for p in papers.iter_mut() {
+        p.collections = all
+            .iter()
+            .filter(|(jid, _)| *jid == p.journal_id)
+            .map(|(_, code)| code.clone())
+            .collect();
+    }
+    Ok(())
 }
 
 pub fn count_waiting_for_abstract(conn: &Connection) -> Result<i64> {
@@ -924,7 +1016,20 @@ fn migrations() -> Vec<(i64, &'static str, fn(&Connection) -> Result<()>)> {
         (2, "round4-batches", migrate_to_v2),
         (3, "round5a-identity", migrate_to_v3),
         (4, "round5b-abstract-quality", migrate_to_v4),
+        (5, "round5c-catalog", migrate_to_v5),
     ]
+}
+
+/// v5：Verified Journal Catalog 支持。
+/// - journals.metadata_needs_review：identifier 未可靠解决时标记（不阻塞导入）
+fn migrate_to_v5(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "journals", "metadata_needs_review") {
+        conn.execute(
+            "ALTER TABLE journals ADD COLUMN metadata_needs_review INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 /// v4：Abstract Quality & Recovery。

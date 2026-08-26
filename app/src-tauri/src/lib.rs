@@ -1,4 +1,5 @@
 mod abstract_quality;
+mod catalog;
 mod ai_queue;
 mod analyze;
 mod api;
@@ -203,7 +204,7 @@ fn create_collection(
 }
 
 #[tauri::command]
-fn add_collection_member(collection_id: i64, journal_id: i64, state: State<Db>) -> Result<(), String> {
+fn add_collection_member(collection_id: i64, journal_id: i64, state: State<Db>) -> Result<bool, String> {
     let conn = state.inner().lock().unwrap();
     db::add_collection_member(&conn, collection_id, journal_id).map_err(|e| e.to_string())
 }
@@ -213,6 +214,112 @@ fn add_collection_member(collection_id: i64, journal_id: i64, state: State<Db>) 
 fn get_journal_collections(journal_id: i64, state: State<Db>) -> Result<Vec<models::JournalCollection>, String> {
     let conn = state.inner().lock().unwrap();
     db::collections_for_journal(&conn, journal_id).map_err(|e| e.to_string())
+}
+
+// ---------- Round 5C：Verified Journal Catalog ----------
+
+fn load_catalog() -> Result<catalog::CatalogFile, String> {
+    serde_json::from_str(catalog::CATALOG_JSON).map_err(|e| format!("catalog 解析失败: {}", e))
+}
+
+#[tauri::command]
+fn list_catalog_collections(state: State<Db>) -> Result<Vec<models::CatalogCollectionView>, String> {
+    let data = load_catalog()?;
+    let conn = state.inner().lock().unwrap();
+    let mut out = Vec::new();
+    for c in &data.collections {
+        let count = db::count_collection_members(&conn, &c.code).unwrap_or(0);
+        out.push(models::CatalogCollectionView {
+            code: c.code.clone(),
+            name: c.name.clone(),
+            version: c.version.clone(),
+            effective_from: c.effective_from.clone(),
+            source_name: c.source_name.clone(),
+            source_url: c.source_url.clone(),
+            count,
+        });
+    }
+    Ok(out)
+}
+
+fn resolve_catalog_journal(conn: &rusqlite::Connection, j: &catalog::CatalogJournalDef) -> Result<Option<i64>, String> {
+    let print_norm = j.print_issn.as_deref().and_then(crate::util::normalize_issn);
+    let online_norm = j.online_issn.as_deref().and_then(crate::util::normalize_issn);
+    let issn_l_norm = j.issn_l.as_deref().and_then(crate::util::normalize_issn);
+    for n in [&print_norm, &online_norm].into_iter().flatten() {
+        if let Some(id) = db::resolve_journal_by_identifier(conn, n).map_err(|e| e.to_string())? {
+            return Ok(Some(id));
+        }
+    }
+    if let Some(il) = &issn_l_norm {
+        if let Some(id) = db::find_journal_by_issn_l(conn, il).map_err(|e| e.to_string())? {
+            return Ok(Some(id));
+        }
+    }
+    db::find_journal_by_title_alias(conn, &j.canonical_title).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn list_catalog_journals(code: String, state: State<Db>) -> Result<Vec<models::CatalogJournalView>, String> {
+    let data = load_catalog()?;
+    let conn = state.inner().lock().unwrap();
+    let mut out = Vec::new();
+    for j in &data.journals {
+        if !j.collections.iter().any(|c| c == &code) {
+            continue;
+        }
+        let jid = resolve_catalog_journal(&conn, j)?;
+        let subscribed = match jid {
+            Some(id) => db::get_journal(&conn, id)
+                .map_err(|e| e.to_string())?
+                .map(|j| j.enabled)
+                .unwrap_or(false),
+            None => false,
+        };
+        out.push(models::CatalogJournalView {
+            catalog_id: j.catalog_id.clone(),
+            canonical_title: j.canonical_title.clone(),
+            publisher: j.publisher.clone(),
+            print_issn: j.print_issn.clone(),
+            online_issn: j.online_issn.clone(),
+            issn_l: j.issn_l.clone(),
+            collections: j.collections.clone(),
+            metadata_needs_review: j.metadata_needs_review,
+            journal_id: jid,
+            subscribed,
+        });
+    }
+    Ok(out)
+}
+
+/// 批量订阅逻辑（命令与测试共用）：只做订阅记录（enabled=1），不同步；
+/// 已订阅期刊计入 already；无效 id 计入 failed，不整体失败。
+pub(crate) fn subscribe_journals_logic(
+    conn: &rusqlite::Connection,
+    ids: Vec<i64>,
+) -> Result<models::BulkSubscribeResult, String> {
+    let mut r = models::BulkSubscribeResult::default();
+    for id in ids {
+        match db::get_journal(conn, id).map_err(|e| e.to_string())? {
+            Some(j) => {
+                if j.enabled {
+                    r.already += 1;
+                } else {
+                    db::set_journal_enabled(conn, id, true).map_err(|e| e.to_string())?;
+                    r.subscribed += 1;
+                }
+            }
+            None => r.failed += 1,
+        }
+    }
+    Ok(r)
+}
+
+/// 批量订阅：只做订阅记录（enabled=1），不同步；不重复订阅已订阅期刊。
+#[tauri::command]
+fn subscribe_journals(ids: Vec<i64>, state: State<Db>) -> Result<models::BulkSubscribeResult, String> {
+    let conn = state.inner().lock().unwrap();
+    subscribe_journals_logic(&conn, ids)
 }
 
 #[tauri::command]
@@ -747,6 +854,24 @@ pub fn run() {
             let store_arc: Secure = Arc::new(LocalFileSecretStore::new(&data_dir));
             app.manage(store_arc.clone());
 
+            // Verified Journal Catalog（Round 5C）：安装 UTD24 / FT50-2026 metadata。
+            // 幂等导入；只 enrich collection membership 与 identifiers，不自动订阅任何期刊。
+            {
+                let c = db_arc.lock().unwrap();
+                let rep = catalog::import_catalog(&c).unwrap_or_default();
+                let _ = db::set_setting(
+                    &c,
+                    "catalog.last_import",
+                    &format!(
+                        "created={} merged={} members={} ids={}",
+                        rep.journals_created,
+                        rep.journals_merged,
+                        rep.memberships_added,
+                        rep.identifiers_added
+                    ),
+                );
+            }
+
             // AI 队列协调器（全局唯一，§三十五）
             let (cmd_tx, cmd_rx) = mpsc::channel();
             app.manage(AiQueue { cmd_tx });
@@ -845,7 +970,10 @@ pub fn run() {
             list_collections,
             create_collection,
             add_collection_member,
-            get_journal_collections
+            get_journal_collections,
+            list_catalog_collections,
+            list_catalog_journals,
+            subscribe_journals
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

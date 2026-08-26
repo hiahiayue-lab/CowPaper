@@ -654,3 +654,82 @@ button.full {
   margin-top: 8px;
   line-height: 1.5;
 }
+
+/* ---------- Round 5C：Journal Catalog & Collection Badge ---------- */
+
+.journal-tabs {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+.tab {
+  padding: 6px 14px;
+  border: 1px solid var(--border);
+  background: transparent;
+  border-radius: 8px;
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
+}
+.tab.active {
+  background: var(--panel);
+  color: var(--accent);
+  border-color: var(--accent);
+  font-weight: 600;
+}
+.catalog-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 12px;
+}
+.catalog-col {
+  text-align: left;
+  cursor: pointer;
+}
+.catalog-col:hover {
+  border-color: #bfdbfe;
+}
+.catalog-detail-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.catalog-tools {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.catalog-journal .check {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+}
+.catalog-journal .check input {
+  margin-top: 3px;
+}
+.catalog-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 14px;
+}
+.ok-chip {
+  background: #f0fdf4;
+  color: var(--ok);
+  border: 1px solid #bbf7d0;
+}
+/* Collection badge：小、低强调、无 score（与 AI tag 评分视觉分层） */
+.coll-badges {
+  display: flex;
+  gap: 6px;
+  margin: 4px 0;
+}
+.coll-badge {
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: #f1f5f9;
+  color: #475569;
+  border: 1px solid #e2e8f0;
+}

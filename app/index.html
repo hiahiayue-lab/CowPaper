@@ -60,6 +60,11 @@
               <option value="partial">可能不完整</option>
               <option value="missing">缺失</option>
             </select>
+            <select id="coll-filter">
+              <option value="">全部集合</option>
+              <option value="UTD24">UTD24</option>
+              <option value="FT50">FT50</option>
+            </select>
             <select id="flag-filter">
               <option value="">全部</option>
               <option value="unread">未读</option>
@@ -76,13 +81,23 @@
         </section>
 
         <section id="view-journals" class="view">
-          <form id="add-form" class="add-form">
-            <input id="add-name" type="text" placeholder="期刊名称（可选）" />
-            <input id="add-issn" type="text" placeholder="ISSN，如 0025-1909" />
-            <button type="submit" class="primary">添加</button>
-          </form>
-          <p id="add-error" class="error"></p>
-          <ul id="journal-list" class="list"></ul>
+          <div class="journal-tabs">
+            <button id="tab-common" class="tab active">常用期刊</button>
+            <button id="tab-manual" class="tab">手动添加</button>
+          </div>
+          <div id="catalog-view">
+            <div id="catalog-collections" class="catalog-collections"></div>
+            <div id="catalog-detail" class="catalog-detail hidden"></div>
+          </div>
+          <div id="manual-view" class="manual-view hidden">
+            <form id="add-form" class="add-form">
+              <input id="add-name" type="text" placeholder="期刊名称（可选）" />
+              <input id="add-issn" type="text" placeholder="ISSN，如 0025-1909" />
+              <button type="submit" class="primary">添加</button>
+            </form>
+            <p id="add-error" class="error"></p>
+            <ul id="journal-list" class="list"></ul>
+          </div>
         </section>
 
         <section id="view-tags" class="view">

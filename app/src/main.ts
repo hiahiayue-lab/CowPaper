@@ -66,6 +66,8 @@ interface Paper {
   isIgnored: boolean;
   /** 卡片内摘要语言覆盖（仅 UI 状态，不持久化） */
   _lang?: "zh" | "en";
+  /** 所属期刊的 collection code（paper → journal → collections 派生） */
+  collections: string[];
 }
 
 interface Tag {
@@ -200,6 +202,35 @@ interface ActivityState {
   analysisFailed: number;
   /** 等待摘要数量（不计入 pendingAnalysis） */
   waitingForAbstract: number;
+}
+
+interface CatalogCollectionView {
+  code: string;
+  name: string;
+  version: string;
+  effectiveFrom: string | null;
+  sourceName: string;
+  sourceUrl: string;
+  count: number;
+}
+
+interface CatalogJournalView {
+  catalogId: string;
+  canonicalTitle: string;
+  publisher: string | null;
+  printIssn: string | null;
+  onlineIssn: string | null;
+  issnL: string | null;
+  collections: string[];
+  metadataNeedsReview: boolean;
+  journalId: number | null;
+  subscribed: boolean;
+}
+
+interface BulkSubscribeResult {
+  subscribed: number;
+  already: number;
+  failed: number;
 }
 
 const MODEL_NAME = "cowpaper_model";
@@ -344,6 +375,166 @@ async function loadSettings() {
 
 // ---------- 渲染 ----------
 
+let catalogCollections: CatalogCollectionView[] = [];
+let catalogDetail: CatalogJournalView[] = [];
+let selectedCatalogCode: string | null = null;
+const catalogChecked = new Set<number>(); // 选中的 journal_id
+
+/// 常用期刊页：集合列表。
+async function renderCatalogCollections() {
+  const box = $("catalog-collections");
+  if (catalogCollections.length === 0) {
+    try {
+      catalogCollections = await invoke<CatalogCollectionView[]>("list_catalog_collections");
+    } catch {
+      box.innerHTML = '<div class="empty">常用期刊目录加载失败</div>';
+      return;
+    }
+  }
+  box.innerHTML = `
+    <div class="catalog-grid">
+      ${catalogCollections
+        .map(
+          (c) => `
+        <button class="card catalog-col" data-catalog-code="${escapeHtml(c.code)}">
+          <div class="title">${escapeHtml(c.name)}<span class="muted small"> · ${c.count} 本期刊</span></div>
+          <div class="muted small">${escapeHtml(c.version === "current" ? "当前版" : "版本 " + c.version)}${c.effectiveFrom ? " · 更新 " + escapeHtml(c.effectiveFrom) : ""}</div>
+          <div class="muted small">${escapeHtml(c.sourceName)}</div>
+        </button>`,
+        )
+        .join("")}
+    </div>`;
+}
+
+/// 集合详情：期刊 checkbox 列表 + 批量操作。
+async function renderCatalogDetail(code: string) {
+  selectedCatalogCode = code;
+  catalogChecked.clear();
+  const box = $("catalog-detail");
+  box.classList.remove("hidden");
+  try {
+    catalogDetail = await invoke<CatalogJournalView[]>("list_catalog_journals", { code });
+  } catch {
+    box.innerHTML = '<div class="empty">期刊列表加载失败</div>';
+    return;
+  }
+  const coll = catalogCollections.find((c) => c.code === code);
+  const head = coll
+    ? `<div class="title">${escapeHtml(coll.name)}<span class="muted small"> · ${catalogDetail.length} 本期刊</span></div>
+       <div class="muted small">${escapeHtml(coll.sourceName)}${coll.effectiveFrom ? " · 更新日期 " + escapeHtml(coll.effectiveFrom) : ""}</div>`
+    : "";
+  const rows = catalogDetail
+    .map((j) => {
+      const subscribed = j.subscribed;
+      const disabled = subscribed;
+      const checked = subscribed ? "checked disabled" : "";
+      const badge = j.collections.map((c) => `<span class="coll-badge">${escapeHtml(c)}</span>`).join("");
+      const review = j.metadataNeedsReview ? '<span class="muted small">需复核</span>' : "";
+      return `
+        <li class="card catalog-journal">
+          <label class="check grow">
+            <input type="checkbox" data-journal-id="${j.journalId ?? ""}" ${checked} ${disabled} />
+            <span>
+              <span class="title">${escapeHtml(j.canonicalTitle)} ${badge} ${review}</span>
+              <span class="muted small">${j.printIssn ? "Print " + escapeHtml(j.printIssn) : ""}${j.onlineIssn ? " · Online " + escapeHtml(j.onlineIssn) : ""}${j.issnL ? " · ISSN-L " + escapeHtml(j.issnL) : ""}</span>
+              ${subscribed ? '<span class="chip ok-chip">已订阅</span>' : ""}
+            </span>
+          </label>
+        </li>`;
+    })
+    .join("");
+  box.innerHTML = `
+    <div class="catalog-detail-head">
+      <button class="ghost small" id="catalog-back">← 返回</button>
+      ${head}
+    </div>
+    <div class="catalog-tools">
+      <button class="ghost small" id="catalog-select-all">全选</button>
+      <button class="ghost small" id="catalog-select-unsub">仅选择未订阅</button>
+      <button class="ghost small" id="catalog-clear">取消全选</button>
+    </div>
+    <ul class="list">${rows || '<li class="empty">无期刊</li>'}</ul>
+    <div class="catalog-actions"><span id="catalog-selected" class="muted small">已选择 0 本</span>
+      <button class="primary" id="catalog-subscribe">添加 N 本</button>
+    </div>`;
+  $("catalog-back").addEventListener("click", () => {
+    box.classList.add("hidden");
+    renderCatalogCollections();
+  });
+  $("catalog-select-all").addEventListener("click", () => {
+    catalogChecked.clear();
+    document.querySelectorAll("#catalog-detail input[type=checkbox]:not(:disabled)").forEach((el) => {
+      const id = parseInt((el as HTMLInputElement).dataset.journalId!, 10);
+      if (!isNaN(id)) catalogChecked.add(id);
+      (el as HTMLInputElement).checked = true;
+    });
+    updateCatalogSelected();
+  });
+  $("catalog-select-unsub").addEventListener("click", () => {
+    catalogChecked.clear();
+    document.querySelectorAll("#catalog-detail input[type=checkbox]:not(:disabled)").forEach((el) => {
+      (el as HTMLInputElement).checked = false;
+    });
+    updateCatalogSelected();
+  });
+  $("catalog-clear").addEventListener("click", () => {
+    catalogChecked.clear();
+    document.querySelectorAll("#catalog-detail input[type=checkbox]:not(:disabled)").forEach((el) => {
+      (el as HTMLInputElement).checked = false;
+    });
+    updateCatalogSelected();
+  });
+  document.querySelectorAll("#catalog-detail input[type=checkbox]:not(:disabled)").forEach((el) => {
+    el.addEventListener("change", () => {
+      const id = parseInt((el as HTMLInputElement).dataset.journalId!, 10);
+      if (isNaN(id)) return;
+      if ((el as HTMLInputElement).checked) catalogChecked.add(id);
+      else catalogChecked.delete(id);
+      updateCatalogSelected();
+    });
+  });
+  const subBtn = $("catalog-subscribe") as HTMLButtonElement;
+  subBtn.addEventListener("click", () => doCatalogSubscribe());
+  updateCatalogSelected();
+}
+
+function updateCatalogSelected() {
+  const n = catalogChecked.size;
+  $("catalog-selected").textContent = `已选择 ${n} 本`;
+  ($("catalog-subscribe") as HTMLButtonElement).textContent = `添加 ${n} 本`;
+  ($("catalog-subscribe") as HTMLButtonElement).disabled = n === 0;
+}
+
+/// 批量添加（只做订阅记录，不同步）；结果摘要 + 询问是否同步。
+async function doCatalogSubscribe() {
+  const ids = [...catalogChecked];
+  if (ids.length === 0) return;
+  let res: BulkSubscribeResult;
+  try {
+    res = await invoke<BulkSubscribeResult>("subscribe_journals", { ids });
+  } catch (err) {
+    setStatus("批量添加失败", "error");
+    console.error(err);
+    return;
+  }
+  setStatus(`已添加 ${res.subscribed} 本期刊（已订阅 ${res.already} · 失败 ${res.failed}）`, "done");
+  await loadJournals();
+  catalogChecked.clear();
+  await renderCatalogDetail(selectedCatalogCode!);
+  if (res.subscribed > 0) {
+    const goSync = await showConfirmModal({
+      title: "批量添加完成",
+      message: `已添加 ${res.subscribed} 本期刊。\n是否现在检查新论文？`,
+      confirmText: "开始同步",
+      cancelText: "稍后",
+    });
+    if (goSync) {
+      const idsToSync = catalogDetail.filter((j) => j.journalId != null && res.subscribed > 0).map((j) => j.journalId!) as number[];
+      await startSync(idsToSync.length ? idsToSync : null);
+    }
+  }
+}
+
 function renderJournals() {
   const ul = $("journal-list");
   ul.innerHTML = "";
@@ -367,7 +558,7 @@ function renderJournals() {
       .join(" · ");
     const badge = j.possibleDuplicate ? '<span class="chip warn-chip">疑似重复</span>' : "";
     const colls = j.collections.length
-      ? `<div class="muted small">集合：${j.collections.map((c) => escapeHtml(c)).join(" · ")}</div>`
+      ? `<div class="coll-badges">${j.collections.map((c) => `<span class="coll-badge">${escapeHtml(c)}</span>`).join("")}</div>`
       : "";
     const li = document.createElement("li");
     li.className = "card journal";
@@ -447,6 +638,10 @@ function paperCard(p: Paper, withAbstract: boolean): string {
     ? `<div class="paper-summary">${escapeHtml(p.oneSentenceSummary)}${partialAiNote}</div>`
     : partialAiNote;
   const score = p.totalScore != null ? `<span class="score-badge">总分 ${p.totalScore.toFixed(1)}</span>` : "";
+  // Collection badge：小、低强调、无 score（与 AI tag 评分视觉分层）
+  const collBadges = p.collections.length
+    ? `<div class="coll-badges">${p.collections.map((c) => `<span class="coll-badge">${escapeHtml(c)}</span>`).join("")}</div>`
+    : "";
 
   let abstractHtml = "";
   if (withAbstract) {
@@ -483,6 +678,7 @@ function paperCard(p: Paper, withAbstract: boolean): string {
       ${titleEn}
       ${summary}
       <div class="paper-meta">${escapeHtml(authorText(p.authors))} · ${escapeHtml(p.journalName || "")} · ${fmtDate(p.publishedDate)}</div>
+      ${collBadges}
       ${tagChips(p.tagMatches)} ${score}
       ${abstractHtml}
       <div class="paper-actions">
@@ -501,10 +697,12 @@ function renderPapers() {
   const fsel = $("flag-filter") as HTMLSelectElement;
   const asel = $("ai-filter") as HTMLSelectElement;
   const absel = $("abs-filter") as HTMLSelectElement;
+  const csel = $("coll-filter") as HTMLSelectElement;
   const jid = jsel.value ? parseInt(jsel.value, 10) : null;
   const flag = fsel.value;
   const aist = asel.value;
   const abst = absel.value;
+  const collt = csel.value;
 
   let list = papers;
   if (jid != null) list = list.filter((p) => p.journalId === jid);
@@ -513,6 +711,7 @@ function renderPapers() {
   else if (flag === "ignored") list = list.filter((p) => p.isIgnored);
   if (aist) list = list.filter((p) => p.analysisStatus === aist);
   if (abst) list = list.filter((p) => p.abstractQuality === abst);
+  if (collt) list = list.filter((p) => p.collections.includes(collt));
 
   $("paper-list").innerHTML = list.length
     ? list.map((p) => paperCard(p, true)).join("")
@@ -835,6 +1034,8 @@ function switchView(name: string) {
   $("view-title").textContent = titles[name] || name;
   // 进入活动页时渲染 master-detail（数据来自统一 activity + 批次查询）
   if (name === "activity") renderActivityCenter().catch(() => {});
+  // 进入期刊订阅页时加载常用期刊目录
+  if (name === "journals") renderCatalogCollections();
 }
 
 interface SyncStartResult {
@@ -1306,6 +1507,11 @@ async function setupListeners() {
       await manualAnalyze();
       return;
     }
+    const catalogCol = t.closest("[data-catalog-code]") as HTMLElement | null;
+    if (catalogCol) {
+      await renderCatalogDetail(catalogCol.dataset.catalogCode!);
+      return;
+    }
     if (t.closest("#work-status")) {
       switchView("activity");
       return;
@@ -1345,6 +1551,7 @@ window.addEventListener("DOMContentLoaded", () => {
   $("journal-filter").addEventListener("change", renderPapers);
   $("ai-filter").addEventListener("change", renderPapers);
   $("abs-filter").addEventListener("change", renderPapers);
+  $("coll-filter").addEventListener("change", renderPapers);
   $("flag-filter").addEventListener("change", renderPapers);
   $("btn-save-key").addEventListener("click", saveKey);
   $("btn-test").addEventListener("click", testConnection);
@@ -1359,6 +1566,19 @@ window.addEventListener("DOMContentLoaded", () => {
     }
   });
   $("btn-save-settings").addEventListener("click", saveSettings);
+  $("tab-common").addEventListener("click", () => {
+    $("tab-common").classList.add("active");
+    $("tab-manual").classList.remove("active");
+    $("catalog-view").classList.remove("hidden");
+    $("manual-view").classList.add("hidden");
+    renderCatalogCollections();
+  });
+  $("tab-manual").addEventListener("click", () => {
+    $("tab-manual").classList.add("active");
+    $("tab-common").classList.remove("active");
+    $("catalog-view").classList.add("hidden");
+    $("manual-view").classList.remove("hidden");
+  });
 
   // Key 保存在本地 secret 文件，不回填到输入框（输入框仅用于「替换 Key」时输入）
   ($("api-key") as HTMLInputElement).value = "";

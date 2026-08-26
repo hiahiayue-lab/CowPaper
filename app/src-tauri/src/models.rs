@@ -91,6 +91,47 @@ pub struct JournalIdentifier {
     pub updated_at: String,
 }
 
+/// 集合视图（前端常用期刊页）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogCollectionView {
+    pub code: String,
+    pub name: String,
+    pub version: String,
+    pub effective_from: Option<String>,
+    pub source_name: String,
+    pub source_url: String,
+    /// 当前 DB 中该集合的 membership 数（导入后）
+    pub count: i64,
+}
+
+/// Catalog 期刊视图（常用期刊页列表项）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogJournalView {
+    pub catalog_id: String,
+    pub canonical_title: String,
+    pub publisher: Option<String>,
+    pub print_issn: Option<String>,
+    pub online_issn: Option<String>,
+    pub issn_l: Option<String>,
+    pub collections: Vec<String>,
+    pub metadata_needs_review: bool,
+    /// DB 中对应的 canonical Journal（resolve 后）
+    pub journal_id: Option<i64>,
+    /// 是否已订阅（enabled）
+    pub subscribed: bool,
+}
+
+/// 批量订阅结果摘要。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkSubscribeResult {
+    pub subscribed: i64,
+    pub already: i64,
+    pub failed: i64,
+}
+
 /// 期刊集合（UTD24 / FT50 等 Journal metadata，不参与 AI 评分）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -135,6 +176,8 @@ pub struct Journal {
     pub collections: Vec<String>,
     /// 疑似重复（与另一 journal 共享 ISSN-L 或相同标题规范化），仅供人工处理
     pub possible_duplicate: bool,
+    /// catalog identifier 未可靠解决（需人工复核）
+    pub metadata_needs_review: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -203,6 +246,8 @@ pub struct Paper {
     pub analyzed_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// 所属期刊的 collection code 列表（paper → journal → collections 派生，不冗余）
+    pub collections: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
