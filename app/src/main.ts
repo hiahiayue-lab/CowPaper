@@ -100,6 +100,86 @@ interface Settings {
   defaultAbstractLang: string;
 }
 
+interface SyncProgress {
+  batchId: number;
+  trigger: string;
+  journalTotal: number;
+  journalCompleted: number;
+  journalFailed: number;
+  currentJournal: string | null;
+  recordsFound: number;
+  papersInserted: number;
+  papersExisting: number;
+  abstractsAdded: number;
+  startedAt: string;
+}
+
+interface SyncBatch {
+  id: number;
+  trigger: string;
+  status: string;
+  createdAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+  journalTotal: number;
+  journalCompleted: number;
+  journalFailed: number;
+  recordsFound: number;
+  papersInserted: number;
+  papersExisting: number;
+  abstractsAdded: number;
+  waitingAbstract: number;
+  errorSummary: string | null;
+}
+
+interface SyncBatchPaper {
+  syncBatchId: number;
+  paperId: number;
+  result: string;
+  title: string | null;
+}
+
+interface AnalysisBatch {
+  id: number;
+  sourceSyncBatchId: number | null;
+  parentBatchId: number | null;
+  trigger: string;
+  status: string;
+  modelName: string | null;
+  promptVersion: string | null;
+  createdAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+  total: number;
+  completed: number;
+  succeeded: number;
+  failed: number;
+  skipped: number;
+  remaining: number;
+  errorSummary: string | null;
+}
+
+interface AnalysisBatchItem {
+  id: number;
+  analysisBatchId: number;
+  paperId: number;
+  status: string;
+  attemptCount: number;
+  startedAt: string | null;
+  finishedAt: string | null;
+  errorType: string | null;
+  errorSummary: string | null;
+  title: string | null;
+}
+
+interface ActivityState {
+  syncBatch: SyncBatch | null;
+  analysisBatch: AnalysisBatch | null;
+  lastSync: SyncBatch | null;
+  lastAnalysis: AnalysisBatch | null;
+  retryWaiting: boolean;
+}
+
 const KEY_NAME = "cowpaper_api_key"; // 旧版 localStorage Key（仅用于一次性迁移，不再写入）
 const MODEL_NAME = "cowpaper_model";
 const DEFAULT_MODEL = "deepseek-v4-flash"; // 已验证可用的模型
@@ -108,6 +188,7 @@ let journals: Journal[] = [];
 let tags: Tag[] = [];
 let papers: Paper[] = [];
 let aiStatus: AiStatus = emptyAiStatus();
+let activity: ActivityState = { syncBatch: null, analysisBatch: null, lastSync: null, lastAnalysis: null, retryWaiting: false };
 let settings: Settings | null = null;
 let abstractLang: "zh" | "en" = "zh";
 const expandedAbstracts = new Set<number>();
@@ -538,13 +619,205 @@ function renderBacklog() {
   banner.innerHTML = "";
 }
 
+
+// ================= Round 4B：Activity Bar / Center =================
+
+const TRIGGER_ZH: Record<string, string> = {
+  manual: "手动检查", startup: "启动检查", daily: "每日检查", tray: "托盘检查",
+  journalTest: "期刊测试", autoAfterSync: "同步后自动分析", retryFailed: "重试失败",
+  resumeRecovered: "恢复继续",
+};
+const STATUS_ZH: Record<string, string> = {
+  running: "运行中", paused: "已暂停", completed: "完成", completedWithErrors: "完成（有错误）",
+  stopped: "已停止", failed: "失败", queued: "排队中", succeeded: "成功",
+  cancelled: "已取消", skipped: "跳过",
+};
+
+async function loadActivity() {
+  try {
+    activity = await invoke<ActivityState>("get_activity_state");
+  } catch {
+    activity = { syncBatch: null, analysisBatch: null, lastSync: null, lastAnalysis: null, retryWaiting: false };
+  }
+  renderActivityBar();
+  renderActivityCenter();
+}
+
+function renderActivityBar() {
+  const el = $("activity-text");
+  const a = activity;
+  if (a.syncBatch && a.syncBatch.status === "running") {
+    const sb = a.syncBatch;
+    el.textContent = `正在检查期刊 · ${sb.journalCompleted}/${sb.journalTotal}`;
+    return;
+  }
+  if (a.analysisBatch && (a.analysisBatch.status === "running" || a.analysisBatch.status === "paused")) {
+    const ab = a.analysisBatch;
+    const prefix = ab.status === "paused" ? "Ⅱ AI 已暂停" : "AI 分析";
+    el.textContent = `${prefix} · ${ab.completed}/${ab.total}`;
+    return;
+  }
+  if (a.analysisBatch && a.analysisBatch.status === "running" && a.retryWaiting) {
+    el.textContent = "AI 等待重试";
+    return;
+  }
+  if (a.lastAnalysis && a.lastAnalysis.failed > 0 && a.lastAnalysis.status !== "running") {
+    el.textContent = `⚠ AI 有 ${a.lastAnalysis.failed} 篇失败`;
+    return;
+  }
+  if (a.lastSync && a.lastSync.status === "completed") {
+    el.textContent = `✓ 同步完成 · 新增 ${a.lastSync.papersInserted} 篇`;
+    return;
+  }
+  if (a.lastAnalysis && a.lastAnalysis.status === "completed") {
+    el.textContent = `✓ AI 完成 · ${a.lastAnalysis.succeeded}/${a.lastAnalysis.total}`;
+    return;
+  }
+  const now = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  el.textContent = `✓ 已更新 · ${now}`;
+}
+
+function activityItemTitle(p: { title: string | null; paperId: number }): string {
+  return p.title || `论文 #${p.paperId}`;
+}
+
+function renderActivityCenter() {
+  const a = activity;
+  // 当前任务
+  const cur = $("activity-current");
+  let html = "";
+  if (a.analysisBatch) {
+    const ab = a.analysisBatch;
+    const btn =
+      ab.status === "running" || ab.status === "paused"
+        ? `<div class="row">
+             ${ab.status === "running" ? `<button class="ghost small" data-action="ai-pause">暂停</button>` : `<button class="primary small" data-action="ai-resume">继续分析</button>`}
+             <button class="ghost small" data-action="ai-stop">停止本次任务</button>
+           </div>`
+        : "";
+    html += `
+      <div class="card">
+        <div class="row">
+          <div class="grow">
+            <div class="title">AI 分析 #${ab.id} <span class="chip muted-chip">${STATUS_ZH[ab.status] || ab.status}</span></div>
+            <div class="muted small">${TRIGGER_ZH[ab.trigger] || ab.trigger}${ab.sourceSyncBatchId ? ` · 来自同步 #${ab.sourceSyncBatchId}` : ""}${ab.parentBatchId ? ` · 重试自 #${ab.parentBatchId}` : ""}</div>
+          </div>
+        </div>
+        <div class="paper-meta">${ab.completed} / ${ab.total} · 成功 ${ab.succeeded} · 失败 ${ab.failed} · 跳过 ${ab.skipped} · 剩余 ${ab.remaining}</div>
+        ${btn}
+      </div>`;
+  }
+  if (a.syncBatch) {
+    const sb = a.syncBatch;
+    html += `
+      <div class="card">
+        <div class="row">
+          <div class="grow">
+            <div class="title">同步 #${sb.id} <span class="chip muted-chip">${STATUS_ZH[sb.status] || sb.status}</span></div>
+            <div class="muted small">${TRIGGER_ZH[sb.trigger] || sb.trigger}</div>
+          </div>
+        </div>
+        <div class="paper-meta">期刊 ${sb.journalCompleted}/${sb.journalTotal} · 新增 ${sb.papersInserted} · 已有 ${sb.papersExisting} · 补摘要 ${sb.abstractsAdded}</div>
+      </div>`;
+  }
+  cur.innerHTML = html || '<div class="empty">当前没有运行中的任务</div>';
+
+  // 历史
+  renderActivityHistory();
+}
+
+async function renderActivityHistory() {
+  const ul = $("activity-history");
+  const [sbs, abs] = await Promise.all([
+    invoke<SyncBatch[]>("list_sync_batches", { limit: 25 }).catch(() => []),
+    invoke<AnalysisBatch[]>("list_analysis_batches", { limit: 25 }).catch(() => []),
+  ]);
+  const items: Array<{ time: string; kind: string; line: string; status: string; id: number; type: string }> = [];
+  for (const b of sbs) {
+    const t = b.finishedAt || b.startedAt || b.createdAt;
+    const extra = b.status === "completed" ? `新增 ${b.papersInserted} · 补摘要 ${b.abstractsAdded}` : b.errorSummary || STATUS_ZH[b.status] || b.status;
+    items.push({ time: t, kind: "sync", type: "sync", id: b.id, status: b.status, line: `${TRIGGER_ZH[b.trigger] || b.trigger} · ${b.journalTotal} 本期刊 · ${extra}` });
+  }
+  for (const b of abs) {
+    const t = b.finishedAt || b.startedAt || b.createdAt;
+    const line = `${TRIGGER_ZH[b.trigger] || b.trigger} · ${b.total} 篇 · 成功 ${b.succeeded}${b.failed ? " · 失败 " + b.failed : ""}`;
+    items.push({ time: t, kind: "ai", type: "analysis", id: b.id, status: b.status, line });
+  }
+  items.sort((x, y) => (y.time || "").localeCompare(x.time || ""));
+  ul.innerHTML = items
+    .slice(0, 50)
+    .map(
+      (i) => `
+      <li class="card activity-item" data-activity-type="${i.type}" data-activity-id="${i.id}">
+        <div class="row">
+          <div class="grow">
+            <div class="title">${i.kind === "sync" ? "检查新论文" : "AI 分析"} #${i.id} <span class="chip muted-chip">${STATUS_ZH[i.status] || i.status}</span></div>
+            <div class="muted small">${i.line}</div>
+          </div>
+          <span class="muted small">${i.time ? new Date(i.time).toLocaleString() : "—"}</span>
+        </div>
+      </li>`,
+    )
+    .join("") || '<li class="empty">暂无活动记录</li>';
+}
+
+async function showActivityDetail(type: string, id: number) {
+  const box = $("activity-detail");
+  box.classList.remove("hidden");
+  if (type === "sync") {
+    const [b, papers] = await invoke<[SyncBatch, SyncBatchPaper[]]>("get_sync_batch", { id });
+    const groups: Record<string, number> = {};
+    for (const p of papers) groups[p.result] = (groups[p.result] || 0) + 1;
+    box.innerHTML = `
+      <div class="card">
+        <div class="title">同步 #${b.id} <span class="chip muted-chip">${STATUS_ZH[b.status] || b.status}</span></div>
+        <div class="muted small">${TRIGGER_ZH[b.trigger] || b.trigger} · 开始 ${b.startedAt ? new Date(b.startedAt).toLocaleString() : "—"} · 结束 ${b.finishedAt ? new Date(b.finishedAt).toLocaleString() : "—"}</div>
+        <div class="paper-meta">期刊 ${b.journalCompleted}/${b.journalTotal}（失败 ${b.journalFailed}）· 记录 ${b.recordsFound} · 新增 ${b.papersInserted} · 已有 ${b.papersExisting} · 补摘要 ${b.abstractsAdded}</div>
+        <div class="paper-meta muted small">本次涉及论文 ${papers.length} 篇（${Object.entries(groups).map(([k, v]) => `${k} ${v}`).join(" · ")}）</div>
+        <button class="ghost small" data-action="detail-close">收起</button>
+      </div>`;
+  } else {
+    const [b, items] = await invoke<[AnalysisBatch, AnalysisBatchItem[]]>("get_analysis_batch", { id });
+    const failed = items.filter((i) => i.status === "failed");
+    box.innerHTML = `
+      <div class="card">
+        <div class="row">
+          <div class="grow">
+            <div class="title">AI 分析 #${b.id} <span class="chip muted-chip">${STATUS_ZH[b.status] || b.status}</span></div>
+            <div class="muted small">${TRIGGER_ZH[b.trigger] || b.trigger} · model ${b.modelName || "—"} · 开始 ${b.startedAt ? new Date(b.startedAt).toLocaleString() : "—"}</div>
+          </div>
+          ${b.status !== "running" && b.status !== "paused" && b.failed > 0 ? `<button class="ghost small" data-action="ai-retry" data-batch="${b.id}">重试失败论文</button>` : ""}
+        </div>
+        <div class="paper-meta">${b.completed} / ${b.total} · 成功 ${b.succeeded} · 失败 ${b.failed} · 跳过 ${b.skipped} · 剩余 ${b.remaining}</div>
+        ${failed.length ? `<div class="abstract muted small">失败论文：${failed.slice(0, 5).map((f) => activityItemTitle(f)).join("；")}${failed.length > 5 ? "…" : ""}</div>` : ""}
+        <button class="ghost small" data-action="detail-close">收起</button>
+      </div>`;
+  }
+}
+
+function renderNextCheck() {
+  const el = $("next-check");
+  if (!settings) return;
+  if (!settings.dailyAutoSync) {
+    el.textContent = "每日自动检查已关闭";
+    return;
+  }
+  const now = new Date();
+  const [h, m] = settings.dailySyncTime.split(":").map(Number);
+  const next = new Date(now);
+  next.setHours(h || 9, m || 0, 0, 0);
+  if (next <= now) next.setDate(next.getDate() + 1);
+  const prefix = next.toDateString() === now.toDateString() ? "今天" : "明天";
+  el.textContent = `下一次计划检查：${prefix} ${settings.dailySyncTime}（CowPaper 运行时按计划检查；完全退出后会在下次启动时补检查）`;
+}
+
 // ---------- 动作 ----------
 
 function switchView(name: string) {
   document.querySelectorAll(".nav-item").forEach((t) => t.classList.toggle("active", (t as HTMLElement).dataset.view === name));
   document.querySelectorAll(".view").forEach((v) => v.classList.toggle("active", v.id === `view-${name}`));
   const titles: Record<string, string> = {
-    recommend: "今日推荐", papers: "所有论文", favorites: "收藏", journals: "期刊订阅", tags: "标签", settings: "设置",
+    recommend: "今日推荐", papers: "所有论文", favorites: "收藏", journals: "期刊订阅", tags: "标签", settings: "设置", activity: "活动",
   };
   $("view-title").textContent = titles[name] || name;
 }
@@ -714,7 +987,8 @@ async function saveSettings() {
   settings = s;
   abstractLang = s.defaultAbstractLang === "en" ? "en" : "zh";
   renderPapers();
-  $("settings-msg").textContent = "设置已保存";
+  renderNextCheck();
+  $("settings-msg").textContent = "设置已保存（每日时间修改后，运行中的调度器将在 30s 内采用）";
   $("settings-msg").className = "ok small";
 }
 
@@ -724,15 +998,26 @@ async function setupListeners() {
   await listen("sync://start", () => setStatus("同步中…", "running"));
   await listen("sync://journal-start", (e) => setStatus(`正在同步 ${e.payload}`, "running"));
   await listen("sync://journal-error", (e) => setStatus(`同步错误：${e.payload}`, "error"));
+  await listen("sync://progress", async (e) => {
+    const p = e.payload as SyncProgress;
+    $("activity-text").textContent = `正在检查期刊 · ${p.journalCompleted}/${p.journalTotal}`;
+  });
   await listen("sync://done", async (e) => {
     const r = e.payload as any;
     setStatus(`同步完成：新增 ${r.newPapers} · 已有 ${r.existingPapers} · 补摘要 ${r.abstractsFilled}`, "done");
     ($("btn-sync") as HTMLButtonElement).disabled = false;
     await loadJournals();
     await loadPapers();
-    // 同步后自动分析新论文（§十一）
+    await loadActivity();
+    // 同步后自动分析新论文（§十一）：新 AnalysisBatch trigger=autoAfterSync，关联 source_sync_batch_id
     if (settings?.autoAnalyzeNew && Array.isArray(r.newPaperIds) && r.newPaperIds.length > 0 && (await hasKey())) {
-      await invoke("start_ai", { paperIds: r.newPaperIds, model: getModel() });
+      await invoke("start_ai", {
+        paperIds: r.newPaperIds,
+        model: getModel(),
+        trigger: "autoAfterSync",
+        sourceSyncBatchId: r.batchId || null,
+      });
+      await loadActivity();
     }
   });
 
@@ -741,8 +1026,14 @@ async function setupListeners() {
     renderAiBadge();
     renderAiPanel();
     renderBacklog();
+    if (aiStatus.state === "running" || aiStatus.state === "pausing") {
+      $("activity-text").textContent = `AI 分析 · ${aiStatus.completed}/${aiStatus.batchSize}`;
+    } else if (aiStatus.state === "paused") {
+      $("activity-text").textContent = `Ⅱ AI 已暂停 · ${aiStatus.completed}/${aiStatus.batchSize}`;
+    }
   });
   await listen("ai://retry", async () => {
+    $("activity-text").textContent = "AI 等待重试";
     await loadAiStatus();
   });
   await listen("ai://error", (e) => setStatus(`AI：${e.payload}`, "error"));
@@ -750,6 +1041,7 @@ async function setupListeners() {
     setStatus("AI 分析批次结束", "done");
     await loadAiStatus();
     await loadPapers();
+    await loadActivity();
   });
 
   document.addEventListener("click", async (ev) => {
@@ -866,6 +1158,27 @@ async function setupListeners() {
       $("ai-badge").classList.toggle("open", nowOpen);
       return;
     }
+    if (t.closest("#activity-bar")) {
+      switchView("activity");
+      return;
+    }
+    const actItem = t.closest("[data-activity-type]") as HTMLElement | null;
+    if (actItem) {
+      await showActivityDetail(actItem.dataset.activityType!, parseInt(actItem.dataset.activityId!, 10));
+      return;
+    }
+    if (t.closest("[data-action='detail-close']")) {
+      $("activity-detail").classList.add("hidden");
+      return;
+    }
+    const aiRetryBatch = t.closest("[data-action='ai-retry']") as HTMLElement | null;
+    if (aiRetryBatch) {
+      const parent = aiRetryBatch.dataset.batch ? parseInt(aiRetryBatch.dataset.batch, 10) : null;
+      if (!(await hasKey())) { setStatus("请先在设置保存 API Key", "error"); return; }
+      await invoke("retry_failed_ai", { model: getModel(), parentBatchId: parent });
+      setStatus("已加入失败论文重试队列", "running");
+      return;
+    }
   });
 }
 
@@ -918,6 +1231,8 @@ window.addEventListener("DOMContentLoaded", () => {
     await Promise.all([loadJournals(), loadTags(), loadSettings()]);
     await loadAiStatus();
     await loadPapers();
+    await loadActivity();
+    renderNextCheck();
     // 旧 localStorage Key 一次性迁移到 Keychain（写入成功后才删除旧 Key）
     await migrateLegacyKey();
     await refreshKeyStatus();

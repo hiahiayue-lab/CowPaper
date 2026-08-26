@@ -518,3 +518,48 @@ button.full {
   background: #fef2f2;
   color: var(--danger);
 }
+
+/* ---------- Round 4B：Activity ---------- */
+
+.activity-bar {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 6px 20px;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  background: #fbfcfe;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+.activity-bar:hover {
+  background: #f2f5f9;
+}
+.activity-text {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.section-title {
+  font-size: 14px;
+  font-weight: 650;
+  margin: 16px 0 8px;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 6px;
+}
+
+.activity-item {
+  cursor: pointer;
+}
+.activity-item:hover {
+  border-color: #bfdbfe;
+}
+
+.activity-detail {
+  margin-top: 12px;
+}
+.activity-detail.hidden {
+  display: none;
+}

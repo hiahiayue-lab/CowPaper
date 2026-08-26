@@ -18,6 +18,7 @@
           <button class="nav-item" data-view="journals">期刊订阅</button>
           <button class="nav-item" data-view="tags">标签</button>
           <button class="nav-item" data-view="settings">设置</button>
+          <button class="nav-item" data-view="activity">活动</button>
         </nav>
         <div class="sidebar-foot">
           <button id="btn-sync" class="ghost full">检查新论文</button>
@@ -33,6 +34,10 @@
             <span id="status" class="status idle">就绪</span>
           </div>
         </header>
+
+        <button id="activity-bar" class="activity-bar" title="查看活动中心">
+          <span id="activity-text" class="activity-text">✓ 已更新</span>
+        </button>
 
         <div id="ai-panel" class="ai-panel hidden"></div>
 
@@ -137,11 +142,20 @@
               <label for="set-daily-time">每日检查时间</label>
               <input id="set-daily-time" type="time" value="09:00" />
             </div>
+            <div class="settings-row">
+              <span class="muted small" id="next-check"></span>
+            </div>
             <p class="muted small">CowPaper 运行时按计划自动检查；完全退出后将在下次启动时补同步。</p>
 
             <button id="btn-save-settings" class="primary">保存设置</button>
             <p id="settings-msg" class="muted small"></p>
           </div>
+        </section>
+        <section id="view-activity" class="view">
+          <div id="activity-current"></div>
+          <h3 class="section-title">最近活动</h3>
+          <ul id="activity-history" class="list"></ul>
+          <div id="activity-detail" class="activity-detail hidden"></div>
         </section>
       </main>
     </div>
