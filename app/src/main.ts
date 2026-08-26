@@ -233,6 +233,36 @@ interface BulkSubscribeResult {
   failed: number;
 }
 
+interface RecommendationRun {
+  id: number;
+  cycleKey: string;
+  cycleStart: string;
+  cycleEnd: string | null;
+  status: string;
+  createdAt: string;
+  finalizedAt: string | null;
+  itemCount: number;
+}
+
+interface RecommendationItemView {
+  runId: number;
+  paperId: number;
+  rank: number;
+  scoreSnapshot: number;
+  paper: Paper;
+}
+
+interface RecommendationRunView {
+  run: RecommendationRun;
+  items: RecommendationItemView[];
+}
+
+let recTab: "current" | "history" = "current";
+let recHistoryRuns: RecommendationRun[] = [];
+let recSelectedRunId: number | null = null;
+/// 推荐区渲染的 Paper 副本（run 命令返回；供卡片交互查用）
+let recPapers: Paper[] = [];
+
 const MODEL_NAME = "cowpaper_model";
 const DEFAULT_MODEL = "deepseek-v4-flash"; // 已验证可用的模型
 
@@ -445,56 +475,18 @@ async function renderCatalogDetail(code: string) {
     .join("");
   box.innerHTML = `
     <div class="catalog-detail-head">
-      <button class="ghost small" id="catalog-back">← 返回</button>
+      <button class="ghost small" data-action="catalog-back">← 返回</button>
       ${head}
     </div>
     <div class="catalog-tools">
-      <button class="ghost small" id="catalog-select-all">全选</button>
-      <button class="ghost small" id="catalog-select-unsub">仅选择未订阅</button>
-      <button class="ghost small" id="catalog-clear">取消全选</button>
+      <button class="ghost small" data-action="catalog-select-all">全选</button>
+      <button class="ghost small" data-action="catalog-select-unsub">仅选择未订阅</button>
+      <button class="ghost small" data-action="catalog-clear">取消全选</button>
     </div>
     <ul class="list">${rows || '<li class="empty">无期刊</li>'}</ul>
     <div class="catalog-actions"><span id="catalog-selected" class="muted small">已选择 0 本</span>
-      <button class="primary" id="catalog-subscribe">添加 N 本</button>
+      <button class="primary" data-action="catalog-subscribe">添加 N 本</button>
     </div>`;
-  $("catalog-back").addEventListener("click", () => {
-    box.classList.add("hidden");
-    renderCatalogCollections();
-  });
-  $("catalog-select-all").addEventListener("click", () => {
-    catalogChecked.clear();
-    document.querySelectorAll("#catalog-detail input[type=checkbox]:not(:disabled)").forEach((el) => {
-      const id = parseInt((el as HTMLInputElement).dataset.journalId!, 10);
-      if (!isNaN(id)) catalogChecked.add(id);
-      (el as HTMLInputElement).checked = true;
-    });
-    updateCatalogSelected();
-  });
-  $("catalog-select-unsub").addEventListener("click", () => {
-    catalogChecked.clear();
-    document.querySelectorAll("#catalog-detail input[type=checkbox]:not(:disabled)").forEach((el) => {
-      (el as HTMLInputElement).checked = false;
-    });
-    updateCatalogSelected();
-  });
-  $("catalog-clear").addEventListener("click", () => {
-    catalogChecked.clear();
-    document.querySelectorAll("#catalog-detail input[type=checkbox]:not(:disabled)").forEach((el) => {
-      (el as HTMLInputElement).checked = false;
-    });
-    updateCatalogSelected();
-  });
-  document.querySelectorAll("#catalog-detail input[type=checkbox]:not(:disabled)").forEach((el) => {
-    el.addEventListener("change", () => {
-      const id = parseInt((el as HTMLInputElement).dataset.journalId!, 10);
-      if (isNaN(id)) return;
-      if ((el as HTMLInputElement).checked) catalogChecked.add(id);
-      else catalogChecked.delete(id);
-      updateCatalogSelected();
-    });
-  });
-  const subBtn = $("catalog-subscribe") as HTMLButtonElement;
-  subBtn.addEventListener("click", () => doCatalogSubscribe());
   updateCatalogSelected();
 }
 
@@ -718,17 +710,90 @@ function renderPapers() {
     : '<li class="empty">暂无符合条件的论文</li>';
 }
 
-function renderRecommend() {
-  const analyzed = papers
-    .filter((p) => p.totalScore != null && !p.isIgnored)
-    .sort((a, b) => {
-      const d = (b.totalScore ?? 0) - (a.totalScore ?? 0);
-      if (d !== 0) return d;
-      return (b.publishedDate || "").localeCompare(a.publishedDate || "");
-    });
-  $("recommend-list").innerHTML = analyzed.length
-    ? analyzed.map((p) => paperCard(p, true)).join("")
-    : '<li class="empty">暂无推荐。保存 API Key 后点「AI 分析」，或同步新论文后自动分析。</li>';
+/// 推荐卡：当前推荐不加排名；历史加"当日排名/当日总分"快照行。
+function recCard(v: RecommendationItemView, withRank: boolean): string {
+  const rankLine = withRank
+    ? `<div class="rec-rank muted small">当日排名 #${v.rank} · 当日总分 ${v.scoreSnapshot.toFixed(1)}</div>`
+    : "";
+  return rankLine + paperCard(v.paper, true);
+}
+
+/// 推荐数据源（Round 6）：当前推荐 = open run；历史 = finalized run。
+/// 前端不得再从所有 papers 自行推导历史推荐。
+async function renderRecommend() {
+  const list = $("recommend-list");
+  const status = $("rec-status");
+  const picker = $("rec-history-picker");
+  try {
+    if (recTab === "current") {
+      picker.classList.add("hidden");
+      const view = await invoke<RecommendationRunView>("get_current_recommendation_run");
+      recPapers = view.items.map((i) => i.paper);
+      // 日期状态：cycle_key = 当前推荐日期；cutoff 未到显示"下一批 HH:MM"
+      const [, m, d] = view.run.cycleKey.split("-").map(Number);
+      const dtime = getDailyCheckTime();
+      const now = new Date();
+      const nowHm = now.getHours().toString().padStart(2, "0") + ":" + now.getMinutes().toString().padStart(2, "0");
+      const nextLabel = nowHm < dtime ? ` · 下一批 ${dtime} 自动更新` : "";
+      status.textContent = `推荐 · ${m}月${d}日${nextLabel}`;
+      list.innerHTML = view.items.length
+        ? view.items.map((v) => recCard(v, false)).join("")
+        : '<li class="empty">今天暂无新的推荐论文。同步并完成 AI 分析后，新论文会自动进入今日推荐。</li>';
+    } else {
+      // 历史 tab
+      recHistoryRuns = await invoke<RecommendationRun[]>("list_recommendation_runs");
+      if (!recSelectedRunId || !recHistoryRuns.some((r) => r.id === recSelectedRunId)) {
+        recSelectedRunId = recHistoryRuns.length ? recHistoryRuns[0].id : null;
+      }
+      picker.classList.remove("hidden");
+      picker.innerHTML = `
+        <select id="rec-history-select" class="rec-history-select">
+          ${recHistoryRuns
+            .map(
+              (r) =>
+                `<option value="${r.id}" ${r.id === recSelectedRunId ? "selected" : ""}>${fmtCycle(r.cycleKey)} · ${r.itemCount} 篇${r.status === "open" ? "（进行中）" : ""}</option>`,
+            )
+            .join("") || '<option value="">暂无历史</option>'}
+        </select>`;
+      ($("rec-history-select") as HTMLSelectElement).addEventListener("change", (e) => {
+        recSelectedRunId = parseInt((e.target as HTMLSelectElement).value, 10);
+        renderRecommend();
+      });
+      status.textContent = "历史推荐（当日排名与分数为当日快照）";
+      if (recSelectedRunId == null) {
+        list.innerHTML = '<li class="empty">暂无历史推荐</li>';
+        return;
+      }
+      const view = await invoke<RecommendationRunView>("get_recommendation_run", { id: recSelectedRunId });
+      recPapers = view.items.map((i) => i.paper);
+      list.innerHTML = view.items.length
+        ? view.items.map((v) => recCard(v, true)).join("")
+        : '<li class="empty">该日暂无推荐</li>';
+    }
+  } catch (err) {
+    console.error("renderRecommend 失败:", err);
+    list.innerHTML = '<li class="empty">暂无推荐。保存 API Key 后点「AI 分析」，或同步新论文后自动分析。</li>';
+  }
+}
+
+function getDailyCheckTime(): string {
+  const el = $("set-daily-time") as HTMLInputElement | null;
+  return el?.value || "09:00";
+}
+
+function fmtCycle(key: string): string {
+  const [y, m, d] = key.split("-").map(Number);
+  return `${y}年${m}月${d}日`;
+}
+
+/// 统一刷新当前推荐（open run 幂等重算；finalized 冻结）。
+async function refreshRecommendations() {
+  try {
+    await invoke<number>("refresh_current_recommendations");
+  } catch (err) {
+    console.error("refresh_current_recommendations 失败:", err);
+  }
+  await renderRecommend();
 }
 
 function renderFavorites() {
@@ -1360,6 +1425,8 @@ async function setupListeners() {
     await loadJournals();
     await loadPapers();
     await refreshWorkState();
+    // 今日推荐随同步结果更新（Round 6：open run 自动重算）
+    await refreshRecommendations();
     // Post-Sync 自动分析（Round 5B.1）：一次 sync 最多启动一个 AnalysisBatch。
     // 新论文受「同步后自动分析新论文」checkbox 控制；摘要升级论文默认自动重新分析。
     // 两类目标合并为单一 batch（trigger=syncAutoAnalysis），按 paper id 去重，只调用一次 start_ai。
@@ -1391,9 +1458,21 @@ async function setupListeners() {
   await listen("ai://finished", async () => {
     setStatus("AI 分析批次结束", "done");
     // 必须统一刷新：papers（论文列表/推荐）+ 工作状态（pending 计数立即归零，
-    // 杜绝"AI 待处理 7"与"无待处理"并存）
+    // 杜绝"AI 待处理 7"与"无待处理"并存）+ 今日推荐（Round 6）
     await loadPapers();
     await refreshWorkState();
+    await refreshRecommendations();
+  });
+
+  // Catalog 详情 checkbox 选择（change 冒泡 → 委托处理）
+  document.addEventListener("change", (ev) => {
+    const el = ev.target as HTMLInputElement;
+    if (!el.matches("#catalog-detail input[type=checkbox]:not(:disabled)")) return;
+    const id = parseInt(el.dataset.journalId!, 10);
+    if (isNaN(id)) return;
+    if (el.checked) catalogChecked.add(id);
+    else catalogChecked.delete(id);
+    updateCatalogSelected();
   });
 
   document.addEventListener("click", async (ev) => {
@@ -1437,32 +1516,41 @@ async function setupListeners() {
     const fav = t.closest("[data-action='fav']") as HTMLElement | null;
     if (fav) {
       const id = parseInt(fav.dataset.id!, 10);
-      const p = papers.find((x) => x.id === id);
-      if (p) await setFlag(id, "favorite", !p.isFavorite);
+      const p = papers.find((x) => x.id === id) ?? recPapers.find((x) => x.id === id);
+      if (p) {
+        await setFlag(id, "favorite", !p.isFavorite);
+        if (recPapers.some((x) => x.id === id)) await renderRecommend();
+      }
       return;
     }
     const read = t.closest("[data-action='read']") as HTMLElement | null;
     if (read) {
       const id = parseInt(read.dataset.id!, 10);
-      const p = papers.find((x) => x.id === id);
-      if (p) await setFlag(id, "read", !p.isRead);
+      const p = papers.find((x) => x.id === id) ?? recPapers.find((x) => x.id === id);
+      if (p) {
+        await setFlag(id, "read", !p.isRead);
+        if (recPapers.some((x) => x.id === id)) await renderRecommend();
+      }
       return;
     }
     const ignore = t.closest("[data-action='ignore']") as HTMLElement | null;
     if (ignore) {
       const id = parseInt(ignore.dataset.id!, 10);
-      const p = papers.find((x) => x.id === id);
-      if (p) await setFlag(id, "ignored", !p.isIgnored);
+      const p = papers.find((x) => x.id === id) ?? recPapers.find((x) => x.id === id);
+      if (p) {
+        await setFlag(id, "ignored", !p.isIgnored);
+        if (recPapers.some((x) => x.id === id)) await renderRecommend();
+      }
       return;
     }
     const absLang = t.closest("[data-action='abs-lang']") as HTMLElement | null;
     if (absLang) {
       const id = parseInt(absLang.dataset.id!, 10);
-      const p = papers.find((x) => x.id === id);
+      const p = papers.find((x) => x.id === id) ?? recPapers.find((x) => x.id === id);
       if (p) {
         p._lang = absLang.dataset.lang as "zh" | "en";
-        renderPapers();
-        renderRecommend();
+        if (recPapers.some((x) => x.id === id)) renderRecommend();
+        else renderPapers();
       }
       return;
     }
@@ -1505,6 +1593,42 @@ async function setupListeners() {
     }
     if (t.closest("[data-action='ai-backlog']")) {
       await manualAnalyze();
+      return;
+    }
+    // Catalog 详情操作（统一事件委托；返回按钮不再依赖 render 后绑定）
+    if (t.closest("[data-action='catalog-back']")) {
+      $("catalog-detail").classList.add("hidden");
+      renderCatalogCollections();
+      return;
+    }
+    if (t.closest("[data-action='catalog-select-all']")) {
+      catalogChecked.clear();
+      document.querySelectorAll("#catalog-detail input[type=checkbox]:not(:disabled)").forEach((el) => {
+        const id = parseInt((el as HTMLInputElement).dataset.journalId!, 10);
+        if (!isNaN(id)) catalogChecked.add(id);
+        (el as HTMLInputElement).checked = true;
+      });
+      updateCatalogSelected();
+      return;
+    }
+    if (t.closest("[data-action='catalog-select-unsub']")) {
+      catalogChecked.clear();
+      document.querySelectorAll("#catalog-detail input[type=checkbox]:not(:disabled)").forEach((el) => {
+        (el as HTMLInputElement).checked = false;
+      });
+      updateCatalogSelected();
+      return;
+    }
+    if (t.closest("[data-action='catalog-clear']")) {
+      catalogChecked.clear();
+      document.querySelectorAll("#catalog-detail input[type=checkbox]:not(:disabled)").forEach((el) => {
+        (el as HTMLInputElement).checked = false;
+      });
+      updateCatalogSelected();
+      return;
+    }
+    if (t.closest("[data-action='catalog-subscribe']")) {
+      await doCatalogSubscribe();
       return;
     }
     const catalogCol = t.closest("[data-catalog-code]") as HTMLElement | null;
@@ -1566,6 +1690,18 @@ window.addEventListener("DOMContentLoaded", () => {
     }
   });
   $("btn-save-settings").addEventListener("click", saveSettings);
+  $("rec-tab-current").addEventListener("click", () => {
+    recTab = "current";
+    $("rec-tab-current").classList.add("active");
+    $("rec-tab-history").classList.remove("active");
+    renderRecommend();
+  });
+  $("rec-tab-history").addEventListener("click", () => {
+    recTab = "history";
+    $("rec-tab-history").classList.add("active");
+    $("rec-tab-current").classList.remove("active");
+    renderRecommend();
+  });
   $("tab-common").addEventListener("click", () => {
     $("tab-common").classList.add("active");
     $("tab-manual").classList.remove("active");
@@ -1590,6 +1726,8 @@ window.addEventListener("DOMContentLoaded", () => {
     await loadPapers();
     // 统一工作状态刷新（Work Center / 积压 / 待处理区 / 计数）
     await refreshWorkState();
+    // 每日推荐：启动时前滚周期并填充当前推荐（Rust 侧已 ensure；此处同步 UI）
+    await refreshRecommendations();
     renderNextCheck();
     await refreshKeyStatus();
     // 启动自动同步（阈值判断在 Rust 端）

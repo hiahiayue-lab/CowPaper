@@ -2,9 +2,9 @@ use rusqlite::{params, Connection, OptionalExtension, Result};
 use std::path::Path;
 
 use crate::models::{
-    AnalysisBatch, AnalysisBatchItem, Author, Journal, Paper, PaperCandidate, SyncBatch,
-    SyncBatchPaper, Tag, TagMatch, UpsertOutcome, IDT_ONLINE, IDT_PRINT, ST_PENDING,
-    ST_SUCCEEDED, ST_WAITING_ABSTRACT,
+    AnalysisBatch, AnalysisBatchItem, Author, Journal, Paper, PaperCandidate,
+    RecommendationItem, RecommendationRun, SyncBatch, SyncBatchPaper, Tag, TagMatch,
+    UpsertOutcome, IDT_ONLINE, IDT_PRINT, ST_PENDING, ST_SUCCEEDED, ST_WAITING_ABSTRACT,
 };
 
 const SCHEMA: &str = r#"
@@ -87,7 +87,7 @@ pub fn open(path: &Path) -> Result<Connection> {
 /// 当前 schema 版本（Round 5B：abstract_quality / paper_abstract_sources 为 v4）。
 /// 生产构建中仅由迁移系统隐式使用；测试中直接断言。
 #[allow(dead_code)]
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 pub fn init(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
@@ -1008,6 +1008,25 @@ fn enrich_papers_collections(conn: &Connection, papers: &mut [Paper]) -> Result<
     Ok(())
 }
 
+/// 单篇论文（含 collections 派生）。
+pub fn get_paper(conn: &Connection, id: i64) -> Result<Option<Paper>> {
+    let p = conn
+        .query_row(
+            "SELECT p.*, j.name AS journal_name FROM papers p LEFT JOIN journals j ON j.id = p.journal_id WHERE p.id = ?1",
+            params![id],
+            row_to_paper,
+        )
+        .optional()?;
+    let mut v = Vec::new();
+    if let Some(p) = p {
+        v.push(p);
+        enrich_papers_collections(conn, &mut v)?;
+        Ok(v.pop())
+    } else {
+        Ok(None)
+    }
+}
+
 pub fn count_waiting_for_abstract(conn: &Connection) -> Result<i64> {
     conn.query_row(
         "SELECT COUNT(*) FROM papers WHERE analysis_status = 'waitingForAbstract'",
@@ -1078,7 +1097,43 @@ fn migrations() -> Vec<(i64, &'static str, fn(&Connection) -> Result<()>)> {
         (3, "round5a-identity", migrate_to_v3),
         (4, "round5b-abstract-quality", migrate_to_v4),
         (5, "round5c-catalog", migrate_to_v5),
+        (6, "round6-recommendation-history", migrate_to_v6),
     ]
+}
+
+/// v6：每日推荐时间线与历史。
+/// - recommendation_runs：每日周期（cycle_key=本地时区日期，open/finalized）
+/// - recommendation_items：rank + score_snapshot；UNIQUE(run_id, paper_id)；
+///   UNIQUE(paper_id) 硬约束——同一 Paper 一生只进入一个推荐周期
+fn migrate_to_v6(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS recommendation_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cycle_key TEXT NOT NULL UNIQUE,
+            cycle_start TEXT NOT NULL,
+            cycle_end TEXT,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            finalized_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_rr_cycle ON recommendation_runs(cycle_key);
+
+        CREATE TABLE IF NOT EXISTS recommendation_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL REFERENCES recommendation_runs(id) ON DELETE CASCADE,
+            paper_id INTEGER NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+            rank INTEGER NOT NULL,
+            score_snapshot REAL NOT NULL,
+            added_at TEXT NOT NULL,
+            UNIQUE (run_id, paper_id),
+            UNIQUE (paper_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_ri_run ON recommendation_items(run_id, rank);
+        CREATE INDEX IF NOT EXISTS idx_ri_paper ON recommendation_items(paper_id);
+        "#,
+    )?;
+    Ok(())
 }
 
 /// v5：Verified Journal Catalog 支持。
@@ -2001,6 +2056,94 @@ pub fn list_analysis_batch_items(conn: &Connection, batch_id: i64) -> Result<Vec
             error_type: r.get("error_type")?,
             error_summary: r.get("error_summary")?,
             title: r.get("title")?,
+        })
+    })?;
+    rows.collect()
+}
+
+// ---------- Round 6：Recommendation Runs / Items ----------
+
+pub fn create_recommendation_run(conn: &Connection, cycle_key: &str, status: &str) -> Result<i64> {
+    let now = now_utc();
+    conn.execute(
+        "INSERT OR IGNORE INTO recommendation_runs (cycle_key, cycle_start, status, created_at)
+         VALUES (?1, ?2, ?3, ?2)",
+        params![cycle_key, now, status],
+    )?;
+    let id = conn.query_row(
+        "SELECT id FROM recommendation_runs WHERE cycle_key = ?1",
+        params![cycle_key],
+        |r| r.get::<_, i64>(0),
+    )?;
+    Ok(id)
+}
+
+pub fn find_recommendation_run_by_cycle_key(conn: &Connection, cycle_key: &str) -> Result<Option<i64>> {
+    let id = conn
+        .query_row(
+            "SELECT id FROM recommendation_runs WHERE cycle_key = ?1",
+            params![cycle_key],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()?;
+    Ok(id)
+}
+
+/// finalize 所有非当前 cycle_key 的 open run。
+pub fn finalize_open_runs_except(conn: &Connection, cycle_key: &str, finalized_at: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE recommendation_runs SET status = 'finalized', cycle_end = ?1, finalized_at = ?1
+         WHERE status = 'open' AND cycle_key != ?2",
+        params![finalized_at, cycle_key],
+    )?;
+    Ok(())
+}
+
+fn row_to_recommendation_run(row: &rusqlite::Row) -> Result<RecommendationRun> {
+    Ok(RecommendationRun {
+        id: row.get("id")?,
+        cycle_key: row.get("cycle_key")?,
+        cycle_start: row.get("cycle_start")?,
+        cycle_end: row.get("cycle_end")?,
+        status: row.get("status")?,
+        created_at: row.get("created_at")?,
+        finalized_at: row.get("finalized_at")?,
+        item_count: row.get("item_count")?,
+    })
+}
+
+pub fn get_recommendation_run(conn: &Connection, id: i64) -> Result<Option<RecommendationRun>> {
+    conn.query_row(
+        "SELECT r.*, (SELECT COUNT(*) FROM recommendation_items i WHERE i.run_id = r.id) AS item_count
+         FROM recommendation_runs r WHERE r.id = ?1",
+        params![id],
+        row_to_recommendation_run,
+    )
+    .optional()
+}
+
+pub fn list_recommendation_runs(conn: &Connection) -> Result<Vec<RecommendationRun>> {
+    let mut stmt = conn.prepare(
+        "SELECT r.*, (SELECT COUNT(*) FROM recommendation_items i WHERE i.run_id = r.id) AS item_count
+         FROM recommendation_runs r ORDER BY r.cycle_key DESC, r.id DESC",
+    )?;
+    let rows = stmt.query_map([], row_to_recommendation_run)?;
+    rows.collect()
+}
+
+pub fn list_recommendation_items(conn: &Connection, run_id: i64) -> Result<Vec<RecommendationItem>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, run_id, paper_id, rank, score_snapshot, added_at
+         FROM recommendation_items WHERE run_id = ?1 ORDER BY rank ASC",
+    )?;
+    let rows = stmt.query_map(params![run_id], |r| {
+        Ok(RecommendationItem {
+            id: r.get(0)?,
+            run_id: r.get(1)?,
+            paper_id: r.get(2)?,
+            rank: r.get(3)?,
+            score_snapshot: r.get(4)?,
+            added_at: r.get(5)?,
         })
     })?;
     rows.collect()

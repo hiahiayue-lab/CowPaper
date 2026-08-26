@@ -733,3 +733,32 @@ button.full {
   color: #475569;
   border: 1px solid #e2e8f0;
 }
+
+/* ---------- Round 6：每日推荐时间线与历史 ---------- */
+
+.rec-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.rec-tabs {
+  display: flex;
+  gap: 6px;
+}
+.rec-rank {
+  margin: 2px 0 4px;
+  font-size: 12px;
+}
+.rec-history-picker {
+  margin-bottom: 10px;
+}
+.rec-history-select {
+  padding: 5px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 13px;
+  background: var(--panel);
+  color: var(--text);
+}

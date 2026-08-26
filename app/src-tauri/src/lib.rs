@@ -1,5 +1,6 @@
 mod abstract_quality;
 mod catalog;
+mod recommendation;
 mod ai_queue;
 mod analyze;
 mod api;
@@ -335,6 +336,54 @@ fn subscribe_journals(ids: Vec<i64>, state: State<Db>) -> Result<models::BulkSub
     subscribe_journals_logic(&conn, ids)
 }
 
+// ---------- Round 6：每日推荐时间线与历史 ----------
+
+fn current_daily_check_time(conn: &rusqlite::Connection) -> String {
+    db::get_setting(conn, "settings.daily_sync_time")
+        .unwrap_or_else(|| "09:00".into())
+}
+
+/// 当前推荐周期 + 内容（items 含 Paper 当前内容；rank/score 用 snapshot）。
+#[tauri::command]
+fn get_current_recommendation_run(state: State<Db>) -> Result<models::RecommendationRunView, String> {
+    let now = chrono::Local::now();
+    let conn = state.inner().lock().unwrap();
+    let dtime = current_daily_check_time(&conn);
+    let run_id = recommendation::ensure_current_recommendation_cycle(&conn, &now, &dtime)?;
+    let run = db::get_recommendation_run(&conn, run_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "推荐周期不存在".to_string())?;
+    let items = recommendation::run_items_with_papers(&conn, run_id)?;
+    Ok(models::RecommendationRunView { run, items })
+}
+
+/// 重算当前 open run（幂等；finalized 冻结不动）。
+#[tauri::command]
+fn refresh_current_recommendations(state: State<Db>) -> Result<i64, String> {
+    let now = chrono::Local::now();
+    let conn = state.inner().lock().unwrap();
+    let dtime = current_daily_check_time(&conn);
+    recommendation::refresh_current_recommendations(&conn, &now, &dtime)
+}
+
+/// 历史周期列表（按日期倒序）。
+#[tauri::command]
+fn list_recommendation_runs(state: State<Db>) -> Result<Vec<models::RecommendationRun>, String> {
+    let conn = state.inner().lock().unwrap();
+    db::list_recommendation_runs(&conn).map_err(|e| e.to_string())
+}
+
+/// 指定周期内容（历史快照：rank/score 用 snapshot）。
+#[tauri::command]
+fn get_recommendation_run(id: i64, state: State<Db>) -> Result<models::RecommendationRunView, String> {
+    let conn = state.inner().lock().unwrap();
+    let run = db::get_recommendation_run(&conn, id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "推荐周期不存在".to_string())?;
+    let items = recommendation::run_items_with_papers(&conn, id)?;
+    Ok(models::RecommendationRunView { run, items })
+}
+
 #[tauri::command]
 fn list_papers(journal_id: Option<i64>, state: State<Db>) -> Result<Vec<models::Paper>, String> {
     let conn = state.inner().lock().unwrap();
@@ -565,6 +614,12 @@ fn scheduler_loop(db: Db, app: AppHandle, sync: Arc<SyncCoordinator>) {
         }
         let now_hm = now_local.format("%H:%M").to_string();
         if now_hm >= time {
+            // 每日推荐周期前滚（Round 6）：finalize 昨日 open run、确保今日 open run；
+            // 推荐内容由 sync://done / ai://finished 触发前端 refresh 填充。
+            {
+                let c = db.lock().unwrap();
+                let _ = recommendation::ensure_current_recommendation_cycle(&c, &chrono::Local::now(), &time);
+            }
             // 只有 daily 被 coordinator 接受（started=true）才标记"今日已计划"；
             // syncAlreadyRunning 不算执行，不标记，下一 tick 若空闲会再次尝试。
             let started = start_sync_task(&app, &db, &sync, SyncTrigger::Daily, None).started;
@@ -883,6 +938,11 @@ pub fn run() {
                         rep.identifiers_added
                     ),
                 );
+                // 每日推荐周期（Round 6）：启动时前滚周期并填充当前推荐（仅本地计算，不触发 AI/Sync）
+                let now = chrono::Local::now();
+                let dtime = db::get_setting(&c, "settings.daily_sync_time")
+                    .unwrap_or_else(|| "09:00".into());
+                let _ = recommendation::refresh_current_recommendations(&c, &now, &dtime);
             }
 
             // AI 队列协调器（全局唯一，§三十五）
@@ -986,7 +1046,11 @@ pub fn run() {
             get_journal_collections,
             list_catalog_collections,
             list_catalog_journals,
-            subscribe_journals
+            subscribe_journals,
+            get_current_recommendation_run,
+            refresh_current_recommendations,
+            list_recommendation_runs,
+            get_recommendation_run
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -91,6 +91,51 @@ pub struct JournalIdentifier {
     pub updated_at: String,
 }
 
+/// 推荐周期（每日 snapshot）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecommendationRun {
+    pub id: i64,
+    pub cycle_key: String,
+    pub cycle_start: String,
+    pub cycle_end: Option<String>,
+    pub status: String,
+    pub created_at: String,
+    pub finalized_at: Option<String>,
+    pub item_count: i64,
+}
+
+/// 推荐项（只存 paper_id + rank + score_snapshot，不复制 Paper 内容）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecommendationItem {
+    pub id: i64,
+    pub run_id: i64,
+    pub paper_id: i64,
+    pub rank: i64,
+    pub score_snapshot: f64,
+    pub added_at: String,
+}
+
+/// 推荐项 + Paper 内容（历史/当前页展示用）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecommendationItemView {
+    pub run_id: i64,
+    pub paper_id: i64,
+    pub rank: i64,
+    pub score_snapshot: f64,
+    pub paper: Paper,
+}
+
+/// 推荐周期视图（run + items）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecommendationRunView {
+    pub run: RecommendationRun,
+    pub items: Vec<RecommendationItemView>,
+}
+
 /// 集合视图（前端常用期刊页）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

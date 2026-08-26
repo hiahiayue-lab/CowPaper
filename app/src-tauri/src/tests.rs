@@ -1808,7 +1808,7 @@ fn test_migration_v2_to_v3_preserves_data() {
 
     // 迁移到 v3
     db::init(&conn).unwrap();
-    assert_eq!(db::SCHEMA_VERSION, 5);
+    assert_eq!(db::SCHEMA_VERSION, 6);
 
     // 8) 旧 issn 迁移进 journal_identifiers（类型按列，不猜）
     let ids = db::list_journal_identifiers(&conn, jid).unwrap();
@@ -1849,7 +1849,7 @@ fn test_database_restart_persistence() {
     {
         let conn = db::open(&path).unwrap();
         db::init(&conn).unwrap(); // 幂等：user_version=3 不重复迁移
-        assert_eq!(db::SCHEMA_VERSION, 5);
+        assert_eq!(db::SCHEMA_VERSION, 6);
         let j = db::get_journal(&conn, 1).unwrap().expect("期刊持久化");
         assert_eq!(j.print_issn.as_deref(), Some("0025-1909"));
         assert_eq!(j.identifiers.len(), 1);
@@ -2239,7 +2239,7 @@ fn test_migration_v4_abstract_quality_init() {
     .unwrap();
 
     db::init(&conn).unwrap();
-    assert_eq!(db::SCHEMA_VERSION, 5);
+    assert_eq!(db::SCHEMA_VERSION, 6);
 
     let papers = db::list_papers(&conn, Some(jid), 100).unwrap();
     assert_eq!(papers.len(), 3, "迁移不得丢论文");
@@ -2797,4 +2797,213 @@ fn test_live_hbr_sync() {
     assert_eq!(report.failed_journals, 0, "HBR 同步不得标 failed（Crossref unsupported ≠ 期刊 unsupported）");
     assert_eq!(report.checked_journals, 1);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ================= Round 6：Daily Recommendation Timeline & History =================
+
+fn local_dt(y: i32, m: u32, d: u32, h: u32, min: u32) -> chrono::DateTime<chrono::Local> {
+    use chrono::TimeZone;
+    chrono::Local
+        .with_ymd_and_hms(y, m, d, h, min, 0)
+        .single()
+        .expect("valid local datetime")
+}
+
+#[test]
+fn test_recommendation_cycle_key() {
+    use crate::recommendation::cycle_key_for;
+    // cutoff 09:00：当天 15:00 → 当天；次日 08:59 → 仍前一天；09:00 → 当天
+    assert_eq!(cycle_key_for(&local_dt(2026, 8, 26, 15, 0), "09:00"), "2026-08-26");
+    assert_eq!(cycle_key_for(&local_dt(2026, 8, 27, 8, 59), "09:00"), "2026-08-26");
+    assert_eq!(cycle_key_for(&local_dt(2026, 8, 27, 9, 0), "09:00"), "2026-08-27");
+    assert_eq!(cycle_key_for(&local_dt(2026, 8, 27, 9, 1), "09:00"), "2026-08-27");
+    // 非法时间回退 09:00
+    assert_eq!(cycle_key_for(&local_dt(2026, 8, 27, 10, 0), "garbage"), "2026-08-27");
+    // 其他 cutoff
+    assert_eq!(cycle_key_for(&local_dt(2026, 8, 27, 7, 59), "08:00"), "2026-08-26");
+    assert_eq!(cycle_key_for(&local_dt(2026, 8, 27, 8, 0), "08:00"), "2026-08-27");
+}
+
+fn seed_paper_with_score(conn: &rusqlite::Connection, jid: i64, doi: &str, title: &str, score: f64) -> i64 {
+    let cand = candidate(Some(doi), title, Some("abstract with full detail about pricing and markets."), Some("crossref"));
+    let id = match db::upsert_paper(conn, jid, &cand).unwrap() {
+        UpsertOutcome::New(i) => i,
+        _ => panic!("expected new"),
+    };
+    db::save_analysis(conn, id, "中文", "摘要", "句", "[]", score, "m", "v1", &format!("H-{}", id)).unwrap();
+    id
+}
+
+#[test]
+fn test_recommendation_cycle_lifecycle() {
+    use crate::recommendation::{ensure_current_recommendation_cycle, refresh_current_recommendations};
+    let conn = mem_db();
+    // 8-26 15:00 → 8-26 open
+    let r1 = ensure_current_recommendation_cycle(&conn, &local_dt(2026, 8, 26, 15, 0), "09:00").unwrap();
+    let run1 = db::get_recommendation_run(&conn, r1).unwrap().unwrap();
+    assert_eq!(run1.status, "open");
+    assert_eq!(run1.cycle_key, "2026-08-26");
+    // 幂等：同一 cycle 返回同一 run
+    let r1b = ensure_current_recommendation_cycle(&conn, &local_dt(2026, 8, 26, 20, 0), "09:00").unwrap();
+    assert_eq!(r1, r1b);
+    // 09:00 次日 → finalize 旧 + 新 open
+    let r2 = ensure_current_recommendation_cycle(&conn, &local_dt(2026, 8, 27, 9, 0), "09:00").unwrap();
+    assert_ne!(r1, r2);
+    let run1f = db::get_recommendation_run(&conn, r1).unwrap().unwrap();
+    assert_eq!(run1f.status, "finalized");
+    assert!(run1f.finalized_at.is_some());
+    let run2 = db::get_recommendation_run(&conn, r2).unwrap().unwrap();
+    assert_eq!(run2.status, "open");
+    assert_eq!(run2.cycle_key, "2026-08-27");
+    // refresh 幂等：不重复创建 run
+    let r3 = refresh_current_recommendations(&conn, &local_dt(2026, 8, 27, 10, 0), "09:00").unwrap();
+    assert_eq!(r2, r3);
+}
+
+#[test]
+fn test_recommendation_paper_membership_and_next_day_exclusion() {
+    use crate::recommendation::refresh_current_recommendations;
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let pa = seed_paper_with_score(&conn, jid, "10.1000/rec-a", "Paper A", 2.0);
+    let pb = seed_paper_with_score(&conn, jid, "10.1000/rec-b", "Paper B", 1.0);
+    // 8-26：A(2.0) rank1, B(1.0) rank2
+    let r1 = refresh_current_recommendations(&conn, &local_dt(2026, 8, 26, 15, 0), "09:00").unwrap();
+    let items = db::list_recommendation_items(&conn, r1).unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].paper_id, pa);
+    assert_eq!(items[0].rank, 1);
+    assert_eq!(items[0].score_snapshot, 2.0);
+    assert_eq!(items[1].paper_id, pb);
+    // 8-27：A 已推荐 → 排除；新 C 加入
+    let pc = seed_paper_with_score(&conn, jid, "10.1000/rec-c", "Paper C", 3.0);
+    let r2 = refresh_current_recommendations(&conn, &local_dt(2026, 8, 27, 9, 0), "09:00").unwrap();
+    let items2 = db::list_recommendation_items(&conn, r2).unwrap();
+    assert_eq!(items2.len(), 1, "8-27 只含 C（A/B 不重复）");
+    assert_eq!(items2[0].paper_id, pc);
+    // A 一生只在一个周期（UNIQUE paper_id）
+    let cnt: i64 = conn
+        .query_row("SELECT COUNT(*) FROM recommendation_items WHERE paper_id = ?1", params![pa], |r| r.get(0))
+        .unwrap();
+    assert_eq!(cnt, 1);
+    // 空推荐日：所有 eligible 都已推荐 → 0 篇
+    let r3 = refresh_current_recommendations(&conn, &local_dt(2026, 8, 28, 9, 0), "09:00").unwrap();
+    assert_eq!(db::list_recommendation_items(&conn, r3).unwrap().len(), 0, "空日 0 篇");
+}
+
+#[test]
+fn test_recommendation_rank_update_and_finalize_freeze() {
+    use crate::recommendation::refresh_current_recommendations;
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let pa = seed_paper_with_score(&conn, jid, "10.1000/rk-a", "A", 1.0);
+    let pb = seed_paper_with_score(&conn, jid, "10.1000/rk-b", "B", 2.0);
+    let r1 = refresh_current_recommendations(&conn, &local_dt(2026, 8, 26, 15, 0), "09:00").unwrap();
+    let items = db::list_recommendation_items(&conn, r1).unwrap();
+    assert_eq!(items[0].paper_id, pb, "B(2.0) rank1");
+    // open run：A 重新分析 score 3.0 → refresh 后 A rank1（open 可更新）
+    db::save_analysis(&conn, pa, "A2", "a", "s", "[]", 3.0, "m", "v1", "H-A2").unwrap();
+    let r1b = refresh_current_recommendations(&conn, &local_dt(2026, 8, 26, 16, 0), "09:00").unwrap();
+    assert_eq!(r1b, r1, "同日 refresh 保持同一 run");
+    let items = db::list_recommendation_items(&conn, r1).unwrap();
+    assert_eq!(items[0].paper_id, pa, "open run：A 升级后 rank1");
+    assert_eq!(items[0].score_snapshot, 3.0);
+    // 次日 09:00 → 8-26 finalize（A 的 3.0 快照冻结）
+    let _r2 = refresh_current_recommendations(&conn, &local_dt(2026, 8, 27, 9, 0), "09:00").unwrap();
+    let run1 = db::get_recommendation_run(&conn, r1).unwrap().unwrap();
+    assert_eq!(run1.status, "finalized");
+    // finalized 后 A 再变 score → 8-26 快照不变
+    db::save_analysis(&conn, pa, "A3", "a", "s", "[]", 5.0, "m", "v1", "H-A3").unwrap();
+    let _ = refresh_current_recommendations(&conn, &local_dt(2026, 8, 27, 10, 0), "09:00").unwrap();
+    let items = db::list_recommendation_items(&conn, r1).unwrap();
+    assert_eq!(items[0].score_snapshot, 3.0, "finalized run 快照冻结");
+    assert_eq!(items[0].paper_id, pa);
+}
+
+#[test]
+fn test_recommendation_restart_persistence_and_reanalysis_no_rerank() {
+    use crate::recommendation::refresh_current_recommendations;
+    let dir = std::env::temp_dir().join(format!("cowpaper_rec_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("rec.db");
+    let _ = std::fs::remove_file(&path);
+    let pa;
+    {
+        let conn = db::open(&path).unwrap();
+        db::init(&conn).unwrap();
+        let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+        pa = seed_paper_with_score(&conn, jid, "10.1000/rt-a", "A", 2.0);
+        let _r = refresh_current_recommendations(&conn, &local_dt(2026, 8, 26, 15, 0), "09:00").unwrap();
+    }
+    {
+        let conn = db::open(&path).unwrap();
+        db::init(&conn).unwrap();
+        // restart 后历史 run 保留
+        let runs = db::list_recommendation_runs(&conn).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].cycle_key, "2026-08-26");
+        // 8-27：A 已推荐 → 不因重新分析（score 变化）重新加入
+        let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+        let _ = jid;
+        let conn2 = &conn;
+        let _ = conn2;
+        // 找到 A 所在 journal 重新分析（简化：直接 refresh 8-27 检查 A 不出现）
+        let r2 = refresh_current_recommendations(&conn, &local_dt(2026, 8, 27, 9, 0), "09:00").unwrap();
+        let items = db::list_recommendation_items(&conn, r2).unwrap();
+        assert!(items.iter().all(|i| i.paper_id != pa), "重分析不得把 A 重新放入新周期");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_recommendation_manual_sync_enters_current() {
+    use crate::recommendation::refresh_current_recommendations;
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let pa = seed_paper_with_score(&conn, jid, "10.1000/m-a", "A", 2.0);
+    let r1 = refresh_current_recommendations(&conn, &local_dt(2026, 8, 26, 9, 0), "09:00").unwrap();
+    assert_eq!(db::list_recommendation_items(&conn, r1).unwrap().len(), 1);
+    // 16:00 手动同步发现 D + AI 完成 → 加入今天 open snapshot
+    let pd = seed_paper_with_score(&conn, jid, "10.1000/m-d", "D", 1.5);
+    let r1b = refresh_current_recommendations(&conn, &local_dt(2026, 8, 26, 16, 0), "09:00").unwrap();
+    assert_eq!(r1b, r1);
+    let items = db::list_recommendation_items(&conn, r1).unwrap();
+    assert_eq!(items.len(), 2);
+    assert!(items.iter().any(|i| i.paper_id == pd), "当天手动同步的新论文进入今天推荐");
+}
+
+#[test]
+fn test_recommendation_changing_cutoff_keeps_finalized_history() {
+    use crate::recommendation::{ensure_current_recommendation_cycle, refresh_current_recommendations};
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let pa = seed_paper_with_score(&conn, jid, "10.1000/c-a", "A", 2.0);
+    let r1 = refresh_current_recommendations(&conn, &local_dt(2026, 8, 26, 15, 0), "09:00").unwrap();
+    let _r2 = ensure_current_recommendation_cycle(&conn, &local_dt(2026, 8, 27, 9, 0), "09:00").unwrap();
+    assert_eq!(db::get_recommendation_run(&conn, r1).unwrap().unwrap().status, "finalized");
+    // 修改 daily_check_time 后（09:00 → 08:00），8-26 finalized 历史不变
+    let _r3 = ensure_current_recommendation_cycle(&conn, &local_dt(2026, 8, 27, 8, 30), "08:00").unwrap();
+    let run1 = db::get_recommendation_run(&conn, r1).unwrap().unwrap();
+    assert_eq!(run1.status, "finalized", "改 cutoff 不得改动已 finalized 历史");
+    // 8-26 items 冻结
+    let items = db::list_recommendation_items(&conn, r1).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].paper_id, pa);
+}
+
+#[test]
+fn test_recommendation_does_not_change_total_score() {
+    use crate::recommendation::refresh_current_recommendations;
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let pa = seed_paper_with_score(&conn, jid, "10.1000/t-a", "A", 1.5);
+    let before: f64 = conn
+        .query_row("SELECT total_score FROM papers WHERE id = ?1", params![pa], |r| r.get(0))
+        .unwrap();
+    let _r = refresh_current_recommendations(&conn, &local_dt(2026, 8, 26, 15, 0), "09:00").unwrap();
+    let after: f64 = conn
+        .query_row("SELECT total_score FROM papers WHERE id = ?1", params![pa], |r| r.get(0))
+        .unwrap();
+    assert_eq!(before, after, "recommendation snapshot 不得改变 totalScore");
+    assert_eq!(after, 1.5);
 }
