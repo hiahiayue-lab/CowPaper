@@ -762,3 +762,25 @@ button.full {
   background: var(--panel);
   color: var(--text);
 }
+
+/* ---------- Round 6.1：期刊订阅页（搜索 / 仅未订阅 / 同屏列表） ---------- */
+
+.catalog-tools-bar {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin: 12px 0;
+}
+.catalog-tools-bar input[type="text"] {
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 13px;
+  flex: 0 1 240px;
+  background: var(--panel);
+  color: var(--text);
+}
+.catalog-col.selected {
+  border-color: var(--accent);
+  outline: 2px solid #bfdbfe;
+}

@@ -426,7 +426,7 @@ async function renderCatalogCollections() {
       ${catalogCollections
         .map(
           (c) => `
-        <button class="card catalog-col" data-catalog-code="${escapeHtml(c.code)}">
+        <button class="card catalog-col ${c.code === selectedCatalogCode ? "selected" : ""}" data-catalog-code="${escapeHtml(c.code)}">
           <div class="title">${escapeHtml(c.name)}<span class="muted small"> · ${c.count} 本期刊</span></div>
           <div class="muted small">${escapeHtml(c.version === "current" ? "当前版" : "版本 " + c.version)}${c.effectiveFrom ? " · 更新 " + escapeHtml(c.effectiveFrom) : ""}</div>
           <div class="muted small">${escapeHtml(c.sourceName)}</div>
@@ -436,24 +436,26 @@ async function renderCatalogCollections() {
     </div>`;
 }
 
-/// 集合详情：期刊 checkbox 列表 + 批量操作。
-async function renderCatalogDetail(code: string) {
-  selectedCatalogCode = code;
-  catalogChecked.clear();
+/// 渲染选中集合的期刊列表（受搜索框 / 仅显示未订阅过滤；不重新 invoke）。
+function renderCatalogRows() {
   const box = $("catalog-detail");
-  box.classList.remove("hidden");
-  try {
-    catalogDetail = await invoke<CatalogJournalView[]>("list_catalog_journals", { code });
-  } catch {
-    box.innerHTML = '<div class="empty">期刊列表加载失败</div>';
-    return;
-  }
-  const coll = catalogCollections.find((c) => c.code === code);
+  if (!selectedCatalogCode) return;
+  const q = ($("catalog-search") as HTMLInputElement).value.trim().toLowerCase();
+  const unsubOnly = ($("catalog-unsub-only") as HTMLInputElement).checked;
+  const coll = catalogCollections.find((c) => c.code === selectedCatalogCode);
   const head = coll
     ? `<div class="title">${escapeHtml(coll.name)}<span class="muted small"> · ${catalogDetail.length} 本期刊</span></div>
        <div class="muted small">${escapeHtml(coll.sourceName)}${coll.effectiveFrom ? " · 更新日期 " + escapeHtml(coll.effectiveFrom) : ""}</div>`
     : "";
-  const rows = catalogDetail
+  const filtered = catalogDetail.filter((j) => {
+    if (unsubOnly && j.subscribed) return false;
+    if (q) {
+      const hay = (j.canonicalTitle + " " + (j.printIssn || "") + " " + (j.onlineIssn || "")).toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    return true;
+  });
+  const rows = filtered
     .map((j) => {
       const subscribed = j.subscribed;
       const disabled = subscribed;
@@ -483,17 +485,32 @@ async function renderCatalogDetail(code: string) {
       <button class="ghost small" data-action="catalog-select-unsub">仅选择未订阅</button>
       <button class="ghost small" data-action="catalog-clear">取消全选</button>
     </div>
-    <ul class="list">${rows || '<li class="empty">无期刊</li>'}</ul>
+    <ul class="list">${rows || (filtered.length === 0 && (q || unsubOnly) ? '<li class="empty">没有符合条件的期刊</li>' : '<li class="empty">无期刊</li>')}</ul>
     <div class="catalog-actions"><span id="catalog-selected" class="muted small">已选择 0 本</span>
-      <button class="primary" data-action="catalog-subscribe">添加 N 本</button>
+      <button class="primary" data-action="catalog-subscribe">订阅 0 本</button>
     </div>`;
   updateCatalogSelected();
+}
+
+/// 集合详情：期刊 checkbox 列表 + 批量操作。
+async function renderCatalogDetail(code: string) {
+  selectedCatalogCode = code;
+  catalogChecked.clear();
+  $("catalog-detail").classList.remove("hidden");
+  try {
+    catalogDetail = await invoke<CatalogJournalView[]>("list_catalog_journals", { code });
+  } catch {
+    $("catalog-detail").innerHTML = '<div class="empty">期刊列表加载失败</div>';
+    return;
+  }
+  renderCatalogCollections(); // 刷新集合卡片选中态
+  renderCatalogRows();
 }
 
 function updateCatalogSelected() {
   const n = catalogChecked.size;
   $("catalog-selected").textContent = `已选择 ${n} 本`;
-  ($("catalog-subscribe") as HTMLButtonElement).textContent = `添加 ${n} 本`;
+  ($("catalog-subscribe") as HTMLButtonElement).textContent = `订阅 ${n} 本`;
   ($("catalog-subscribe") as HTMLButtonElement).disabled = n === 0;
 }
 
@@ -1597,6 +1614,10 @@ async function setupListeners() {
     }
     // Catalog 详情操作（统一事件委托；返回按钮不再依赖 render 后绑定）
     if (t.closest("[data-action='catalog-back']")) {
+      selectedCatalogCode = null;
+      catalogChecked.clear();
+      ($("catalog-search") as HTMLInputElement).value = "";
+      ($("catalog-unsub-only") as HTMLInputElement).checked = false;
       $("catalog-detail").classList.add("hidden");
       renderCatalogCollections();
       return;
@@ -1701,6 +1722,15 @@ window.addEventListener("DOMContentLoaded", () => {
     $("rec-tab-history").classList.add("active");
     $("rec-tab-current").classList.remove("active");
     renderRecommend();
+  });
+  $("catalog-search").addEventListener("input", () => {
+    if (selectedCatalogCode) renderCatalogRows();
+  });
+  $("catalog-unsub-only").addEventListener("change", () => {
+    if (selectedCatalogCode) {
+      catalogChecked.clear();
+      renderCatalogRows();
+    }
   });
   $("tab-common").addEventListener("click", () => {
     $("tab-common").classList.add("active");
