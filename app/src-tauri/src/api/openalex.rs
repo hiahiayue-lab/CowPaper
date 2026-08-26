@@ -30,14 +30,30 @@ impl OpenAlex {
         Some(id.replace("https://openalex.org/", ""))
     }
 
-    pub fn works(&self, source_id: &str, from: &str, to: &str) -> Option<Vec<PaperCandidate>> {
+    /// 按 source_id 查询近期 works。
+    /// Ok(Some(v)) = 调用成功（可能为空列表：该窗口无数据，如 OpenAlex 对 HBR 覆盖停止于 2021）；
+    /// Ok(None) = source 不存在/无记录；Err = 网络/服务错误（视为真实失败，不得伪装成 unsupported）。
+    pub fn works(&self, source_id: &str, from: &str, to: &str) -> Result<Option<Vec<PaperCandidate>>, String> {
         let url = format!(
             "https://api.openalex.org/works?filter=primary_location.source.id:{},from_publication_date:{},to_publication_date:{}&sort=publication_date:desc&per-page=200&mailto={}",
             source_id, from, to, self.mailto
         );
-        let v: Value = self.client.get(&url).send().ok()?.json().ok()?;
-        let items = v.get("results")?.as_array()?.clone();
-        Some(items.iter().filter_map(parse_work).collect())
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .map_err(|e| format!("OpenAlex 请求失败: {}", e))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(format!("OpenAlex HTTP {}", resp.status().as_u16()));
+        }
+        let v: Value = resp.json().map_err(|e| format!("OpenAlex 响应解析失败: {}", e))?;
+        let Some(items) = v.get("results").and_then(|a| a.as_array()).cloned() else {
+            return Ok(None);
+        };
+        Ok(Some(items.iter().filter_map(parse_work).collect()))
     }
 }
 

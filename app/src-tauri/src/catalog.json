@@ -766,7 +766,8 @@
       "collections": [
         "FT50"
       ],
-      "metadataNeedsReview": true
+      "metadataNeedsReview": true,
+      "openalexSourceId": "S41416626"
     },
     {
       "catalogId": "journal-of-management",

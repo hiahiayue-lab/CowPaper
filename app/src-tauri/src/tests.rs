@@ -164,7 +164,7 @@ fn live_sync_smoke() {
     if let Ok(Some(w)) = crossref.works("0025-1909", &from, &to) {
         candidates.extend(w.candidates);
     }
-    if let Some(oa) = openalex.works("S33323087", &from, &to) {
+    if let Ok(Some(oa)) = openalex.works("S33323087", &from, &to) {
         candidates.extend(oa);
     }
     assert!(!candidates.is_empty(), "未发现任何候选论文");
@@ -2552,13 +2552,13 @@ fn test_recommendation_ordering_unaffected_by_collections() {
 
 // ================= Round 5C.1：Catalog Identity & Syncability =================
 
-/// 全 catalog 51 本都必须至少一个 discovery identifier（syncable invariant）。
+/// 全 catalog 51 本：identifier_ready = 51/51（至少一个可用的 resolver identifier）。
 #[test]
-fn test_all_catalog_journals_are_syncable() {
+fn test_all_catalog_journals_identifier_ready() {
     use crate::catalog::CatalogFile;
     let data: CatalogFile = serde_json::from_str(crate::catalog::CATALOG_JSON).unwrap();
     assert_eq!(data.journals.len(), 51);
-    let mut non_syncable = Vec::new();
+    let mut not_ready = Vec::new();
     for j in &data.journals {
         let has_id = j
             .print_issn
@@ -2571,10 +2571,93 @@ fn test_all_catalog_journals_are_syncable() {
                 .and_then(crate::util::normalize_issn)
                 .is_some();
         if !has_id {
-            non_syncable.push(j.canonical_title.clone());
+            not_ready.push(j.canonical_title.clone());
         }
     }
-    assert!(non_syncable.is_empty(), "non-syncable: {:?}", non_syncable);
+    assert!(not_ready.is_empty(), "identifier 缺失: {:?}", not_ready);
+}
+
+/// 全 catalog 51 本：discovery_strategy = 51/51（每本至少一个当前 pipeline 可用的
+/// discovery 策略：Crossref ISSN 或 OpenAlex source id）。
+#[test]
+fn test_all_catalog_journals_discovery_strategy() {
+    use crate::catalog::CatalogFile;
+    let data: CatalogFile = serde_json::from_str(crate::catalog::CATALOG_JSON).unwrap();
+    let mut no_strategy = Vec::new();
+    for j in &data.journals {
+        let crossref_id = j
+            .print_issn
+            .as_deref()
+            .and_then(crate::util::normalize_issn)
+            .or(j.online_issn.as_deref().and_then(crate::util::normalize_issn));
+        let openalex_strategy = j
+            .openalex_source_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if crossref_id.is_none() && openalex_strategy.is_none() {
+            no_strategy.push(j.canonical_title.clone());
+        }
+    }
+    assert!(no_strategy.is_empty(), "无 discovery 策略: {:?}", no_strategy);
+}
+
+/// HBR：identifier_ready + OpenAlex source id + discovery strategy（配置层）。
+#[test]
+fn test_hbr_discovery_strategy() {
+    use crate::catalog::{self, CatalogFile};
+    let data: CatalogFile = serde_json::from_str(crate::catalog::CATALOG_JSON).unwrap();
+    let hbr = data
+        .journals
+        .iter()
+        .find(|j| j.canonical_title == "Harvard Business Review")
+        .expect("HBR 在 catalog");
+    // ISSN 0017-8012 校验通过（identifier_ready）
+    assert_eq!(
+        crate::util::normalize_issn("0017-8012").as_deref(),
+        Some("0017-8012")
+    );
+    // OpenAlex source id
+    assert_eq!(hbr.openalex_source_id.as_deref(), Some("S41416626"));
+    // discovery strategy：Crossref ISSN 或 OpenAlex source 至少其一
+    let has_strategy = hbr
+        .print_issn
+        .as_deref()
+        .and_then(crate::util::normalize_issn)
+        .is_some()
+        || hbr
+            .openalex_source_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_some();
+    assert!(has_strategy, "HBR 必须有 discovery strategy");
+    // 导入后：journal 拥有 identifier + openalex_source_id
+    let conn = mem_db();
+    catalog::import_catalog(&conn).unwrap();
+    let h = db::list_journals(&conn)
+        .unwrap()
+        .into_iter()
+        .find(|j| j.name == "Harvard Business Review")
+        .unwrap();
+    assert!(h.identifiers.iter().any(|i| i.value == "0017-8012"));
+    assert_eq!(h.openalex_source_id.as_deref(), Some("S41416626"));
+}
+
+/// OpenAlex 返回的 work 无 DOI 时：按现有规则（title 去重）不产生 duplicate。
+#[test]
+fn test_openalex_no_doi_dedup() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "HBR", Some("0017-8012"), None, None, None).unwrap();
+    // 无 DOI 的候选（OpenAlex HBR 数据现实：无 DOI）
+    let c1 = candidate(None, "A Better Way to Onboard AI", Some("abstract text here"), Some("openalex"));
+    let c2 = candidate(None, "A Better Way to Onboard AI", Some("abstract text here"), Some("openalex"));
+    assert!(matches!(db::upsert_paper(&conn, jid, &c1).unwrap(), UpsertOutcome::New(_)));
+    match db::upsert_paper(&conn, jid, &c2).unwrap() {
+        UpsertOutcome::Existing { .. } => {}
+        _ => panic!("无 DOI 重复候选应按 title 去重"),
+    }
+    assert_eq!(db::list_papers(&conn, Some(jid), 100).unwrap().len(), 1);
 }
 
 /// HBR：identifier 存在（0017-8012，ISSN Portal 核实）→ 订阅成功 → 不再"No ISSN"。
@@ -2664,4 +2747,54 @@ fn test_subscribe_syncable_guard() {
     assert_eq!(r.failed, 1, "无 identifier 的期刊不得订阅");
     assert_eq!(r.subscribed, 0);
     assert!(!db::get_journal(&conn, jid).unwrap().unwrap().enabled);
+}
+
+/// 真实 HBR 同步（ignored，需要网络；临时 DB，不触碰用户数据）：
+/// 验证 Crossref unsupported 被隔离 → OpenAlex fallback 被调用 → sync 不标 failed。
+/// 运行：cargo test test_live_hbr_sync -- --ignored --nocapture
+#[test]
+#[ignore]
+fn test_live_hbr_sync() {
+    use std::sync::{Arc, Mutex};
+    use tauri::Manager;
+
+    use crate::catalog;
+    use crate::sync::run_sync;
+
+    let dir = std::env::temp_dir().join(format!("cowpaper-hbr-live-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("hbr.db");
+    let _ = std::fs::remove_file(&path);
+    let conn = Arc::new(Mutex::new(db::open(&path).unwrap()));
+    {
+        let c = conn.lock().unwrap();
+        db::init(&c).unwrap();
+        catalog::import_catalog(&c).unwrap();
+    }
+    let hbr = {
+        let c = conn.lock().unwrap();
+        let j = db::list_journals(&c)
+            .unwrap()
+            .into_iter()
+            .find(|j| j.name == "Harvard Business Review")
+            .expect("HBR");
+        println!("[live-hbr] journal id={} issns={:?} openalex={:?}", j.id, j.identifiers.iter().map(|i| i.value.clone()).collect::<Vec<_>>(), j.openalex_source_id);
+        db::set_journal_enabled(&c, j.id, true).unwrap();
+        j.id
+    };
+    let app = tauri::test::mock_builder()
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .expect("mock app");
+    let handle = app.handle().clone();
+    let batch_id = {
+        let c = conn.lock().unwrap();
+        db::create_sync_batch(&c, "manual").unwrap()
+    };
+    let report = run_sync(&conn, Some(vec![hbr]), &handle, "dev@cowpaper.local", batch_id, "manual");
+    println!("[live-hbr] checked={} found={} new={} failed_journals={}",
+        report.checked_journals, report.found_records, report.new_papers, report.failed_journals);
+    // 关键断言：HBR 不得被标 failed（Crossref unsupported 被隔离，OpenAlex fallback 成功）
+    assert_eq!(report.failed_journals, 0, "HBR 同步不得标 failed（Crossref unsupported ≠ 期刊 unsupported）");
+    assert_eq!(report.checked_journals, 1);
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -50,6 +50,8 @@ pub struct CatalogJournalDef {
     pub print_issn: Option<String>,
     pub online_issn: Option<String>,
     pub issn_l: Option<String>,
+    /// OpenAlex source id（如 HBR S41416626）；generic 字段，任何 catalog Journal 都可拥有
+    pub openalex_source_id: Option<String>,
     #[allow(dead_code)]
     pub aliases: Vec<String>,
     #[allow(dead_code)]
@@ -184,6 +186,16 @@ pub fn import_catalog(conn: &Connection) -> Result<CatalogImportReport, String> 
             let cur = db::get_journal_issn_l(conn, id).map_err(|e| e.to_string())?;
             if cur.as_deref().is_none() || cur.as_deref() == Some("") {
                 db::set_journal_issn_l(conn, id, Some(il)).map_err(|e| e.to_string())?;
+            }
+        }
+        // OpenAlex source id：仅当为空时补（generic；不覆盖用户已配置值）
+        if let Some(sid) = &j.openalex_source_id {
+            if sid.trim().is_empty() {
+                continue;
+            }
+            let cur = db::get_journal_openalex_source(conn, id).map_err(|e| e.to_string())?;
+            if cur.as_deref().is_none() || cur.as_deref() == Some("") {
+                db::set_journal_openalex_source(conn, id, Some(sid)).map_err(|e| e.to_string())?;
             }
         }
         // metadata_needs_review：仅标记为 true 时写入（不覆盖 false）

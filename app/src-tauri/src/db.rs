@@ -359,6 +359,28 @@ pub fn get_journal_issn_l(conn: &Connection, id: i64) -> Result<Option<String>> 
     Ok(v)
 }
 
+/// 读取 journals.openalex_source_id（仅填空用）。
+pub fn get_journal_openalex_source(conn: &Connection, id: i64) -> Result<Option<String>> {
+    let v: Option<String> = conn
+        .query_row(
+            "SELECT openalex_source_id FROM journals WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(v)
+}
+
+/// 设置 journals.openalex_source_id（仅当调用方判断为空时）。
+pub fn set_journal_openalex_source(conn: &Connection, id: i64, sid: Option<&str>) -> Result<()> {
+    conn.execute(
+        "UPDATE journals SET openalex_source_id = ?1, updated_at = ?2 WHERE id = ?3",
+        params![sid, now_utc(), id],
+    )?;
+    Ok(())
+}
+
 /// 设置 metadata_needs_review（幂等：仅置 true）。
 pub fn set_journal_review_flag(conn: &Connection, id: i64, review: bool) -> Result<()> {
     if review {

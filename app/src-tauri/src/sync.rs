@@ -191,7 +191,8 @@ fn sync_journal(
     };
 
     // 发现：Crossref 为主力（多 ISSN 各自查询，DOI 去重由 upsert 的 normalized_doi 唯一索引保证），
-    // OpenAlex 补漏 + 补摘要。任一 ISSN 成功即继续；全部失败才报错。
+    // OpenAlex 为 fallback/补漏（尤其 Crossref 无记录时，如 HBR）。
+    // "Crossref unsupported ≠ Journal unsupported"：只要任一 configured source 提供数据，sync 即成功。
     let mut candidates: Vec<PaperCandidate> = Vec::new();
     let mut crossref_ok = false;
     let mut crossref_err: Option<String> = None;
@@ -205,32 +206,52 @@ fn sync_journal(
             Err(e) => crossref_err = Some(e),
         }
     }
+    // 网络/服务错误（Err）仍视为真实失败，不得伪装成 unsupported
     if !crossref_ok {
-        // 有 identifier 但 Crossref 全部无记录（无期刊级索引）→ 降级为 unsupported，不刷同步失败。
-        // 网络/服务错误（Err）仍视为失败。
-        if let Some(e) = crossref_err {
+        if let Some(e) = &crossref_err {
             return Err(format!("Crossref 获取失败: {}", e));
         }
-        let c = conn.lock().unwrap();
-        let _ = db::update_journal_sync_state(
-            &c,
-            j.id,
-            &crate::db::now_utc(),
-            None,
-            "unsupported",
-            None,
-        );
-        drop(c);
-        return Ok(JournalSyncResult {
-            inserted: Vec::new(),
-            existing: Vec::new(),
-            abstract_updated: Vec::new(),
-        });
     }
+    // OpenAlex fallback：无论 Crossref 结果如何都尝试补漏
+    let mut openalex_ok = false;
+    let mut openalex_err: Option<String> = None;
     if let Some(sid) = &j.openalex_source_id {
-        if let Some(oa) = openalex.works(sid, &from, to) {
-            candidates.extend(oa);
+        match openalex.works(sid, &from, to) {
+            Ok(Some(oa)) => {
+                openalex_ok = true;
+                candidates.extend(oa);
+            }
+            Ok(None) => {} // source 不存在或无该窗口数据
+            Err(e) => openalex_err = Some(e),
         }
+    }
+    // Overall coverage：所有 configured source 都 unsupported（非网络错误）→ overall unsupported；
+    // 任一 source 成功（即使 0 篇）→ sync 成功。
+    let any_discovery = crossref_ok || openalex_ok;
+    if !any_discovery {
+        if crossref_err.is_none() && openalex_err.is_none() {
+            let c = conn.lock().unwrap();
+            let _ = db::update_journal_sync_state(
+                &c,
+                j.id,
+                &crate::db::now_utc(),
+                None,
+                "unsupported",
+                None,
+            );
+            drop(c);
+            return Ok(JournalSyncResult {
+                inserted: Vec::new(),
+                existing: Vec::new(),
+                abstract_updated: Vec::new(),
+            });
+        }
+        let msg = openalex_err
+            .as_ref()
+            .or(crossref_err.as_ref())
+            .cloned()
+            .unwrap_or_else(|| "所有数据源均不可用".to_string());
+        return Err(format!("同步失败: {}", msg));
     }
     report.found_records += candidates.len() as i64;
 
