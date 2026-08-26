@@ -109,13 +109,29 @@ impl Crossref {
         }
     }
 
-    pub fn works(&self, issn: &str, from: &str, to: &str) -> Option<CrossrefWorks> {
+    /// 按 ISSN 查询期刊 works。
+    /// Ok(Some(w)) = 有记录；Ok(None) = 该 ISSN 在 Crossref 无期刊记录（404 / 无数据，如 HBR）；
+    /// Err = 网络/服务错误（应视为同步失败，而不是"无记录"）。
+    pub fn works(&self, issn: &str, from: &str, to: &str) -> Result<Option<CrossrefWorks>, String> {
         let url = format!(
             "https://api.crossref.org/journals/{}/works?filter=from-pub-date:{},until-pub-date:{}&sort=published&order=desc&rows=200&mailto={}",
             issn, from, to, self.mailto
         );
-        let v: Value = self.client.get(&url).send().ok()?.json().ok()?;
-        let msg = v.get("message")?;
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .map_err(|e| format!("Crossref 请求失败: {}", e))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None); // 无该 ISSN 的期刊记录（HBR 等）
+        }
+        if !resp.status().is_success() {
+            return Err(format!("Crossref HTTP {}", resp.status().as_u16()));
+        }
+        let v: Value = resp.json().map_err(|e| format!("Crossref 响应解析失败: {}", e))?;
+        let Some(msg) = v.get("message") else {
+            return Ok(None);
+        };
         let total = msg.get("total-results").and_then(|t| t.as_i64()).unwrap_or(0);
         let items = msg
             .get("items")
@@ -123,7 +139,7 @@ impl Crossref {
             .cloned()
             .unwrap_or_default();
         let candidates = items.iter().filter_map(parse_work).collect();
-        Some(CrossrefWorks { total, candidates })
+        Ok(Some(CrossrefWorks { total, candidates }))
     }
 }
 

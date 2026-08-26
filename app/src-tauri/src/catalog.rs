@@ -100,7 +100,10 @@ pub fn import_catalog(conn: &Connection) -> Result<CatalogImportReport, String> 
         let online_norm = j.online_issn.as_deref().and_then(crate::util::normalize_issn);
         let issn_l_norm = j.issn_l.as_deref().and_then(crate::util::normalize_issn);
 
-        // resolve：identifier → issn_l → 未命中则创建
+        // resolve 优先级（Round 5C.1）：
+        // 1) exact normalized ISSN（print/online 任一）
+        // 2) ISSN-L
+        // 3) 显式 alias / canonical_title（catalog.json 已验证的别名；带 identifier 冲突检测）
         let mut jid = None;
         for n in [&print_norm, &online_norm].into_iter().flatten() {
             if let Some(id) = db::resolve_journal_by_identifier(conn, n).map_err(|e| e.to_string())? {
@@ -113,9 +116,22 @@ pub fn import_catalog(conn: &Connection) -> Result<CatalogImportReport, String> 
                 jid = db::find_journal_by_issn_l(conn, il).map_err(|e| e.to_string())?;
             }
         }
-        // title alias 辅助匹配（仅当没有 identifier 时）
+        // alias 命中后必须检查 identifier 冲突：冲突 → 不 merge（保留两条并标记 review）
+        let mut alias_conflict = false;
         if jid.is_none() {
-            jid = db::find_journal_by_title_alias(conn, &j.canonical_title).map_err(|e| e.to_string())?;
+            let mut alias_list = j.aliases.clone();
+            alias_list.push(j.canonical_title.clone());
+            if let Some(id) = db::find_journal_by_aliases(conn, &alias_list).map_err(|e| e.to_string())? {
+                if db::journal_has_conflicting_identifiers(conn, id, print_norm.as_deref(), online_norm.as_deref())
+                    .map_err(|e| e.to_string())?
+                {
+                    // identifiers 冲突：不自动 merge；创建 catalog Journal 并标记 review，
+                    // 已有 Journal 的 possible_duplicate 由 list_journals 标题规范化检测。
+                    alias_conflict = true;
+                } else {
+                    jid = Some(id);
+                }
+            }
         }
 
         let id = match jid {
@@ -136,6 +152,12 @@ pub fn import_catalog(conn: &Connection) -> Result<CatalogImportReport, String> 
                 // Catalog ≠ Subscription：新建期刊默认不订阅（enabled=0），用户自行选择
                 db::set_journal_enabled(conn, id, false).map_err(|e| e.to_string())?;
                 report.journals_created += 1;
+                if alias_conflict {
+                    db::set_journal_review_flag(conn, id, true).map_err(|e| e.to_string())?;
+                    if !report.needs_review.contains(&j.canonical_title) {
+                        report.needs_review.push(j.canonical_title.clone());
+                    }
+                }
                 id
             }
         };

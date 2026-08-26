@@ -256,7 +256,9 @@ fn resolve_catalog_journal(conn: &rusqlite::Connection, j: &catalog::CatalogJour
             return Ok(Some(id));
         }
     }
-    db::find_journal_by_title_alias(conn, &j.canonical_title).map_err(|e| e.to_string())
+    let mut alias_list = j.aliases.clone();
+    alias_list.push(j.canonical_title.clone());
+    db::find_journal_by_aliases(conn, &alias_list).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -304,10 +306,21 @@ pub(crate) fn subscribe_journals_logic(
             Some(j) => {
                 if j.enabled {
                     r.already += 1;
-                } else {
-                    db::set_journal_enabled(conn, id, true).map_err(|e| e.to_string())?;
-                    r.subscribed += 1;
+                    continue;
                 }
+                // Syncability 防护（Round 5C.1）：没有任何 discovery identifier 的 Journal
+                // 不得静默 enabled=1（订阅后必然无法同步）。当前 51 本 catalog 全部可同步。
+                let has_identifier = !db::list_journal_identifiers(conn, id)
+                    .map_err(|e| e.to_string())?
+                    .is_empty()
+                    || j.print_issn.is_some()
+                    || j.online_issn.is_some();
+                if !has_identifier {
+                    r.failed += 1;
+                    continue;
+                }
+                db::set_journal_enabled(conn, id, true).map_err(|e| e.to_string())?;
+                r.subscribed += 1;
             }
             None => r.failed += 1,
         }

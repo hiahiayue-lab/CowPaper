@@ -122,7 +122,8 @@
       "onlineIssn": "1465-7368",
       "issnL": null,
       "aliases": [
-        "Review of Financial Studies"
+        "Review of Financial Studies",
+        "The Review of Financial Studies"
       ],
       "metadataSources": [
         "crossref"
@@ -322,7 +323,9 @@
       "printIssn": "1523-4614",
       "onlineIssn": "1526-5498",
       "issnL": null,
-      "aliases": [],
+      "aliases": [
+        "Manufacturing and Service Operations Management"
+      ],
       "metadataSources": [
         "crossref"
       ],
@@ -752,11 +755,13 @@
       "catalogId": "harvard-business-review",
       "canonicalTitle": "Harvard Business Review",
       "publisher": "Harvard Business Publishing",
-      "printIssn": null,
+      "printIssn": "0017-8012",
       "onlineIssn": null,
       "issnL": null,
       "aliases": [],
-      "metadataSources": [],
+      "metadataSources": [
+        "issn-portal"
+      ],
       "lastVerifiedAt": "2026-08-26",
       "collections": [
         "FT50"

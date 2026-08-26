@@ -161,7 +161,7 @@ fn live_sync_smoke() {
         .to_string();
 
     let mut candidates = vec![];
-    if let Some(w) = crossref.works("0025-1909", &from, &to) {
+    if let Ok(Some(w)) = crossref.works("0025-1909", &from, &to) {
         candidates.extend(w.candidates);
     }
     if let Some(oa) = openalex.works("S33323087", &from, &to) {
@@ -2451,6 +2451,12 @@ fn test_catalog_existing_journal_enrichment() {
     db::set_journal_enabled(&conn, jid, true).unwrap();
     let _ = db::insert_identifier(&conn, jid, "print", "0025-1909", Some("manual"));
     let _ = db::insert_identifier(&conn, jid, "online", "1526-5501", Some("manual"));
+    // 用户已有论文（journal_id 必须保留）
+    let cand = candidate(Some("10.1000/ms-fk"), "MS Paper", Some("abstract with full detail here."), Some("crossref"));
+    let pid = match db::upsert_paper(&conn, jid, &cand).unwrap() {
+        UpsertOutcome::New(i) => i,
+        _ => panic!("expected new"),
+    };
     // 导入 catalog → enrichment
     catalog::import_catalog(&conn).unwrap();
     let list = db::list_journals(&conn).unwrap();
@@ -2460,6 +2466,9 @@ fn test_catalog_existing_journal_enrichment() {
     assert!(ms.collections.contains(&"UTD24".to_string()), "获得 UTD24 membership");
     assert!(ms.collections.contains(&"FT50".to_string()), "获得 FT50 membership");
     assert_eq!(ms.identifiers.len(), 2, "identifiers 保持");
+    // papers.journal_id 不变（enrich 不重建/删除 journal）
+    let p = db::list_papers(&conn, None, 100).unwrap().into_iter().find(|x| x.id == pid).expect("论文保留");
+    assert_eq!(p.journal_id, jid, "papers.journal_id 保持原 journal");
     // metadata_needs_review：仅 HBR 标记
     let hbr = list.iter().find(|j| j.name == "Harvard Business Review").expect("HBR 在 catalog 中");
     assert!(hbr.metadata_needs_review, "HBR identifier 未解决应标记 review");
@@ -2539,4 +2548,120 @@ fn test_recommendation_ordering_unaffected_by_collections() {
     let utd = db::create_collection(&conn, "UTD24", "UTD24", None, None, Some("test"), None).unwrap();
     db::add_collection_member(&conn, utd, jid).unwrap();
     assert_eq!(order(), vec![b, a], "collection filter 不改变排序");
+}
+
+// ================= Round 5C.1：Catalog Identity & Syncability =================
+
+/// 全 catalog 51 本都必须至少一个 discovery identifier（syncable invariant）。
+#[test]
+fn test_all_catalog_journals_are_syncable() {
+    use crate::catalog::CatalogFile;
+    let data: CatalogFile = serde_json::from_str(crate::catalog::CATALOG_JSON).unwrap();
+    assert_eq!(data.journals.len(), 51);
+    let mut non_syncable = Vec::new();
+    for j in &data.journals {
+        let has_id = j
+            .print_issn
+            .as_deref()
+            .and_then(crate::util::normalize_issn)
+            .is_some()
+            || j
+                .online_issn
+                .as_deref()
+                .and_then(crate::util::normalize_issn)
+                .is_some();
+        if !has_id {
+            non_syncable.push(j.canonical_title.clone());
+        }
+    }
+    assert!(non_syncable.is_empty(), "non-syncable: {:?}", non_syncable);
+}
+
+/// HBR：identifier 存在（0017-8012，ISSN Portal 核实）→ 订阅成功 → 不再"No ISSN"。
+#[test]
+fn test_hbr_catalog_syncable() {
+    use crate::catalog;
+    // 1) identifier 有效
+    assert_eq!(
+        crate::util::normalize_issn("0017-8012").as_deref(),
+        Some("0017-8012"),
+        "0017-8012 校验通过"
+    );
+    let conn = mem_db();
+    catalog::import_catalog(&conn).unwrap();
+    let list = db::list_journals(&conn).unwrap();
+    let hbr = list.iter().find(|j| j.name == "Harvard Business Review").expect("HBR 在 catalog");
+    // 2) 导入后拥有 identifier
+    assert!(
+        hbr.identifiers.iter().any(|i| i.value == "0017-8012"),
+        "HBR 必须拥有 identifier"
+    );
+    assert!(hbr.metadata_needs_review, "online/ISSN-L 未解决 → 仍标记 review");
+    // 3) subscribe 成功（syncable 防护通过）
+    let r = crate::subscribe_journals_logic(&conn, vec![hbr.id]).unwrap();
+    assert_eq!(r.subscribed, 1, "HBR 可订阅");
+    // 4) sync_journal 的 identifier 列表不再为空（不会 "No ISSN" immediate failure）
+    let hbr2 = db::get_journal(&conn, hbr.id).unwrap().unwrap();
+    assert!(
+        !hbr2.identifiers.is_empty() || hbr2.print_issn.is_some(),
+        "sync 数据流有可用 ISSN"
+    );
+}
+
+/// 已有用户期刊（变体标题）→ catalog alias resolve 到同一 Journal，不产生 duplicate。
+#[test]
+fn test_catalog_alias_matching_no_duplicate() {
+    use crate::catalog;
+    let conn = mem_db();
+    // 用户已有三个变体标题期刊（无 identifier）
+    let rfs = db::insert_journal(&conn, "Review of Financial Studies", None, None, None, None).unwrap();
+    let joc = db::insert_journal(&conn, "Journal on Computing", None, None, None, None).unwrap();
+    let msom = db::insert_journal(&conn, "Manufacturing and Service Operations Management", None, None, None, None).unwrap();
+    db::set_journal_enabled(&conn, rfs, true).unwrap();
+    catalog::import_catalog(&conn).unwrap();
+    let list = db::list_journals(&conn).unwrap();
+    assert_eq!(list.len(), 51, "变体标题不产生 duplicate（3 本被 enrich + 48 新建）");
+    let r = list.iter().find(|j| j.id == rfs).unwrap();
+    assert!(r.enabled, "RFS enabled 保持");
+    assert!(r.collections.iter().any(|c| c == "UTD24") && r.collections.iter().any(|c| c == "FT50"), "RFS 获得 UTD24+FT50");
+    assert!(r.identifiers.iter().any(|i| i.value == "0893-9454"), "RFS 补入 identifier");
+    let j = list.iter().find(|j| j.id == joc).unwrap();
+    assert!(j.collections.contains(&"UTD24".to_string()), "Journal on Computing ∈ UTD24");
+    let m = list.iter().find(|j| j.id == msom).unwrap();
+    assert!(m.collections.iter().any(|c| c == "UTD24") && m.collections.iter().any(|c| c == "FT50"), "M&SOM ∈ UTD24+FT50");
+}
+
+/// title alias 匹配但 identifiers 冲突 → 不自动 merge（保留两条 + review 标记）。
+#[test]
+fn test_catalog_alias_conflict_no_merge() {
+    use crate::catalog;
+    let conn = mem_db();
+    // 用户已有 "Management Science"（同名）但 identifier 是无关的有效 ISSN（2045-2322）
+    let user_id = db::insert_journal(&conn, "Management Science", Some("2045-2322"), None, None, None).unwrap();
+    let _ = db::insert_identifier(&conn, user_id, "print", "2045-2322", Some("manual"));
+    db::set_journal_enabled(&conn, user_id, true).unwrap();
+    catalog::import_catalog(&conn).unwrap();
+    let list = db::list_journals(&conn).unwrap();
+    // 用户 1 + catalog 51 = 52（冲突不 merge）
+    assert_eq!(list.len(), 52, "identifiers 冲突不得自动 merge");
+    let catalog_ms = list
+        .iter()
+        .find(|j| j.id != user_id && j.name == "Management Science")
+        .expect("catalog Management Science 新建");
+    assert!(catalog_ms.metadata_needs_review, "冲突期刊标记 metadataNeedsReview");
+    let user = list.iter().find(|j| j.id == user_id).unwrap();
+    assert!(user.enabled, "用户数据保留");
+    assert_eq!(user.print_issn.as_deref(), Some("2045-2322"), "用户 identifier 不被改写");
+}
+
+/// subscribe_journals syncable 防护：无任何 identifier 的 Journal 订阅 → failed（不静默 enabled）。
+#[test]
+fn test_subscribe_syncable_guard() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "No ID Journal", None, None, None, None).unwrap();
+    db::set_journal_enabled(&conn, jid, false).unwrap();
+    let r = crate::subscribe_journals_logic(&conn, vec![jid]).unwrap();
+    assert_eq!(r.failed, 1, "无 identifier 的期刊不得订阅");
+    assert_eq!(r.subscribed, 0);
+    assert!(!db::get_journal(&conn, jid).unwrap().unwrap().enabled);
 }

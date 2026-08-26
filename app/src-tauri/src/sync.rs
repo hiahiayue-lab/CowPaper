@@ -194,14 +194,38 @@ fn sync_journal(
     // OpenAlex 补漏 + 补摘要。任一 ISSN 成功即继续；全部失败才报错。
     let mut candidates: Vec<PaperCandidate> = Vec::new();
     let mut crossref_ok = false;
+    let mut crossref_err: Option<String> = None;
     for i in &issns {
-        if let Some(w) = crossref.works(i, &from, to) {
-            crossref_ok = true;
-            candidates.extend(w.candidates);
+        match crossref.works(i, &from, to) {
+            Ok(Some(w)) => {
+                crossref_ok = true;
+                candidates.extend(w.candidates);
+            }
+            Ok(None) => {} // 该 ISSN 在 Crossref 无期刊记录（如 HBR）：非错误
+            Err(e) => crossref_err = Some(e),
         }
     }
     if !crossref_ok {
-        return Err("Crossref 获取失败".into());
+        // 有 identifier 但 Crossref 全部无记录（无期刊级索引）→ 降级为 unsupported，不刷同步失败。
+        // 网络/服务错误（Err）仍视为失败。
+        if let Some(e) = crossref_err {
+            return Err(format!("Crossref 获取失败: {}", e));
+        }
+        let c = conn.lock().unwrap();
+        let _ = db::update_journal_sync_state(
+            &c,
+            j.id,
+            &crate::db::now_utc(),
+            None,
+            "unsupported",
+            None,
+        );
+        drop(c);
+        return Ok(JournalSyncResult {
+            inserted: Vec::new(),
+            existing: Vec::new(),
+            abstract_updated: Vec::new(),
+        });
     }
     if let Some(sid) = &j.openalex_source_id {
         if let Some(oa) = openalex.works(sid, &from, to) {

@@ -370,24 +370,63 @@ pub fn set_journal_review_flag(conn: &Connection, id: i64, review: bool) -> Resu
     Ok(())
 }
 
-/// 标题规范化匹配（仅作为 identifier 缺失时的辅助；title alias 不能用于自动合并冲突期刊）。
-pub fn find_journal_by_title_alias(conn: &Connection, title: &str) -> Result<Option<i64>> {
-    let key: String = title
-        .chars()
-        .filter(|c| c.is_alphanumeric())
-        .map(|c| c.to_ascii_lowercase())
+/// 显式别名匹配（Round 5C.1）：只接受 catalog.json 明确列出的 alias（含 canonical_title），
+/// 对 journals.name 做规范化 key 精确比较。禁止模糊字符串（contains/编辑距离）自动合并。
+/// 返回 id 最小的命中期刊。
+pub fn find_journal_by_aliases(conn: &Connection, aliases: &[String]) -> Result<Option<i64>> {
+    let keys: Vec<String> = aliases
+        .iter()
+        .filter_map(|a| {
+            let k: String = a
+                .chars()
+                .filter(|c| c.is_alphanumeric())
+                .map(|c| c.to_ascii_lowercase())
+                .collect();
+            if k.is_empty() {
+                None
+            } else {
+                Some(k)
+            }
+        })
         .collect();
-    if key.is_empty() {
+    if keys.is_empty() {
         return Ok(None);
     }
-    let id = conn
-        .query_row(
-            "SELECT id FROM journals WHERE lower(name) = lower(?1) OR lower(name) = ?2",
-            params![title, key],
-            |r| r.get::<_, i64>(0),
-        )
-        .optional()?;
-    Ok(id)
+    let mut stmt = conn.prepare("SELECT id, name FROM journals ORDER BY id")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+    for row in rows {
+        let (id, name) = row?;
+        let nk: String = name
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .map(|c| c.to_ascii_lowercase())
+            .collect();
+        if keys.contains(&nk) {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
+}
+
+/// 已有 Journal 的 identifiers 是否与 catalog 候选 identifier 冲突：
+/// existing 有 identifier，且没有一个与 catalog 的 print/online 相同 → 冲突（禁止 alias 合并）。
+pub fn journal_has_conflicting_identifiers(
+    conn: &Connection,
+    id: i64,
+    catalog_print: Option<&str>,
+    catalog_online: Option<&str>,
+) -> Result<bool> {
+    let existing = list_journal_identifiers(conn, id)?;
+    if existing.is_empty() {
+        return Ok(false);
+    }
+    let set: std::collections::HashSet<&str> =
+        existing.iter().map(|i| i.value.as_str()).collect();
+    let any_match = [catalog_print, catalog_online]
+        .into_iter()
+        .flatten()
+        .any(|c| set.contains(c));
+    Ok(!any_match)
 }
 
 /// 按 ISSN-L（规范化后）查找 canonical Journal（journals.issn_l 列）。
