@@ -3007,3 +3007,103 @@ fn test_recommendation_does_not_change_total_score() {
     assert_eq!(before, after, "recommendation snapshot 不得改变 totalScore");
     assert_eq!(after, 1.5);
 }
+
+// ================= Round 6.4：User Collections =================
+
+#[test]
+fn test_user_collections_lifecycle() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let cand = candidate(Some("10.1000/uc-p"), "UC Paper", Some("abstract with full detail here."), Some("crossref"));
+    let pid = match db::upsert_paper(&conn, jid, &cand).unwrap() {
+        UpsertOutcome::New(i) => i,
+        _ => panic!(),
+    };
+    // 1) create user collection
+    let cid = db::create_collection(&conn, "USER-x1", "数字平台", None, None, Some("user"), None).unwrap();
+    assert!(db::find_collection_by_code(&conn, "USER-x1").unwrap().is_some());
+    // 3) rename
+    db::rename_collection(&conn, cid, "数字经济").unwrap();
+    assert_eq!(db::list_collections(&conn).unwrap()[0].name, "数字经济");
+    // 4) add member
+    assert!(db::add_collection_member(&conn, cid, jid).unwrap());
+    // 5) duplicate member ignored
+    assert!(!db::add_collection_member(&conn, cid, jid).unwrap(), "重复 member 返回 false");
+    let members = db::list_collection_journals(&conn, "USER-x1").unwrap();
+    assert_eq!(members.len(), 1);
+    // 6) remove member
+    db::remove_collection_member(&conn, cid, jid).unwrap();
+    assert!(db::list_collection_journals(&conn, "USER-x1").unwrap().is_empty());
+    // 8) delete collection：journal/paper 保留
+    db::add_collection_member(&conn, cid, jid).unwrap();
+    db::delete_collection(&conn, cid).unwrap();
+    assert!(db::find_collection_by_code(&conn, "USER-x1").unwrap().is_none());
+    let j = db::get_journal(&conn, jid).unwrap().unwrap();
+    assert_eq!(j.id, jid, "删除集合不得删除 journal");
+    let p = db::list_papers(&conn, Some(jid), 100).unwrap();
+    assert_eq!(p.len(), 1, "删除集合不得删除 paper");
+    assert_eq!(p[0].id, pid);
+    // 10/11) built-in 保护（db 层判定）
+    assert!(db::is_builtin_collection_code("UTD24"));
+    assert!(db::is_builtin_collection_code("FT50"));
+    assert!(!db::is_builtin_collection_code("USER-x1"));
+    // 13) membership 不影响 totalScore
+    db::save_analysis(&conn, pid, "中", "摘要", "句", "[]", 1.5, "m", "v1", "H").unwrap();
+    let c2 = db::create_collection(&conn, "USER-x2", "供应链", None, None, Some("user"), None).unwrap();
+    db::add_collection_member(&conn, c2, jid).unwrap();
+    let score: f64 = conn
+        .query_row("SELECT total_score FROM papers WHERE id = ?1", params![pid], |r| r.get(0))
+        .unwrap();
+    assert_eq!(score, 1.5, "user collection 不得改变 totalScore");
+}
+
+#[test]
+fn test_user_collections_restart_persistence() {
+    let dir = std::env::temp_dir().join(format!("cowpaper_uc_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("uc.db");
+    let _ = std::fs::remove_file(&path);
+    let jid;
+    {
+        let conn = db::open(&path).unwrap();
+        db::init(&conn).unwrap();
+        jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+        let cid = db::create_collection(&conn, "USER-p", "持久集合", None, None, Some("user"), None).unwrap();
+        db::add_collection_member(&conn, cid, jid).unwrap();
+    }
+    {
+        let conn = db::open(&path).unwrap();
+        db::init(&conn).unwrap();
+        let colls = db::list_collections(&conn).unwrap();
+        assert!(colls.iter().any(|c| c.code == "USER-p"));
+        assert_eq!(db::list_collection_journals(&conn, "USER-p").unwrap().len(), 1);
+        let _ = jid;
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_history_run_stats() {
+    use crate::recommendation::refresh_current_recommendations;
+    let conn = mem_db();
+    let jid1 = db::insert_journal(&conn, "J1", Some("0025-1909"), None, None, None).unwrap();
+    let jid2 = db::insert_journal(&conn, "J2", Some("1526-5501"), None, None, None).unwrap();
+    let pa = seed_paper_with_score(&conn, jid1, "10.1000/hs-a", "A", 3.8);
+    let pb = seed_paper_with_score(&conn, jid1, "10.1000/hs-b", "B", 2.0);
+    let pc = seed_paper_with_score(&conn, jid2, "10.1000/hs-c", "C", 3.4);
+    let _r1 = refresh_current_recommendations(&conn, &local_dt(2026, 8, 26, 15, 0), "09:00").unwrap();
+    // 次日 09:00：finalize 8-26
+    let _r2 = refresh_current_recommendations(&conn, &local_dt(2026, 8, 27, 9, 0), "09:00").unwrap();
+    let runs = db::list_recommendation_runs(&conn).unwrap();
+    // 最新在前（cycle_key DESC）
+    assert_eq!(runs[0].cycle_key, "2026-08-27");
+    assert_eq!(runs[1].cycle_key, "2026-08-26");
+    let run26 = &runs[1];
+    assert_eq!(run26.status, "finalized");
+    assert_eq!(run26.item_count, 3);
+    assert_eq!(run26.max_score, Some(3.8), "最高 score_snapshot");
+    assert_eq!(run26.journal_count, 2, "涉及期刊数（去重）");
+    let _ = pa;
+    let _ = pb;
+    let _ = pc;
+}

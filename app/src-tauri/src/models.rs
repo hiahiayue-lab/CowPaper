@@ -103,6 +103,10 @@ pub struct RecommendationRun {
     pub created_at: String,
     pub finalized_at: Option<String>,
     pub item_count: i64,
+    /// 该 run 最高 score_snapshot（历史概览卡片统计）
+    pub max_score: Option<f64>,
+    /// 涉及期刊数（按 paper.journal_id 去重；历史概览卡片统计）
+    pub journal_count: i64,
 }
 
 /// 推荐项（只存 paper_id + rank + score_snapshot，不复制 Paper 内容）。
@@ -191,6 +195,8 @@ pub struct JournalCollection {
     pub last_verified_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// 成员数（list_collections 聚合）
+    pub member_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -17,6 +17,11 @@
   box-sizing: border-box;
 }
 
+/* 通用隐藏（Round 6.4：修复 catalog/manual 面板因无 .hidden 规则而同时显示） */
+.hidden {
+  display: none !important;
+}
+
 body {
   margin: 0;
   font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Segoe UI", sans-serif;
@@ -826,4 +831,46 @@ button.full {
 }
 .catalog-seg-meta {
   margin-top: 6px;
+}
+
+/* ---------- Round 6.4：Modal 输入 / 集合管理 / 历史概览 ---------- */
+
+.modal-input {
+  margin-top: 10px;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 13px;
+  width: 100%;
+  background: var(--panel);
+  color: var(--text);
+}
+.history-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 12px;
+}
+.history-card {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 14px 16px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  cursor: pointer;
+  box-shadow: none;
+}
+.history-card:hover {
+  background: #f5f7fa;
+}
+.history-card .title {
+  font-size: 15px;
+  font-weight: 650;
+}
+.catalog-manage {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 6px 0 4px;
 }

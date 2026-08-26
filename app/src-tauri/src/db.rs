@@ -515,8 +515,9 @@ pub fn add_collection_member(conn: &Connection, collection_id: i64, journal_id: 
 
 pub fn list_collections(conn: &Connection) -> Result<Vec<crate::models::JournalCollection>> {
     let mut stmt = conn.prepare(
-        "SELECT id, code, name, version, effective_from, source_name, source_url, last_verified_at, created_at, updated_at
-         FROM journal_collections ORDER BY code",
+        "SELECT c.id, c.code, c.name, c.version, c.effective_from, c.source_name, c.source_url, c.last_verified_at, c.created_at, c.updated_at,
+            (SELECT COUNT(*) FROM journal_collection_members m WHERE m.collection_id = c.id) AS member_count
+         FROM journal_collections c ORDER BY c.code",
     )?;
     let rows = stmt.query_map([], |r| {
         Ok(crate::models::JournalCollection {
@@ -530,6 +531,7 @@ pub fn list_collections(conn: &Connection) -> Result<Vec<crate::models::JournalC
             last_verified_at: r.get(7)?,
             created_at: r.get(8)?,
             updated_at: r.get(9)?,
+            member_count: r.get(10)?,
         })
     })?;
     rows.collect()
@@ -547,7 +549,8 @@ pub fn count_collection_members(conn: &Connection, code: &str) -> Result<i64> {
 /// Journal 所属集合（Paper → journal → collections 的派生路径）。
 pub fn collections_for_journal(conn: &Connection, journal_id: i64) -> Result<Vec<crate::models::JournalCollection>> {
     let mut stmt = conn.prepare(
-        "SELECT c.id, c.code, c.name, c.version, c.effective_from, c.source_name, c.source_url, c.last_verified_at, c.created_at, c.updated_at
+        "SELECT c.id, c.code, c.name, c.version, c.effective_from, c.source_name, c.source_url, c.last_verified_at, c.created_at, c.updated_at,
+            0 AS member_count
          FROM journal_collection_members m
          JOIN journal_collections c ON c.id = m.collection_id
          WHERE m.journal_id = ?1 ORDER BY c.code",
@@ -564,6 +567,7 @@ pub fn collections_for_journal(conn: &Connection, journal_id: i64) -> Result<Vec
             last_verified_at: r.get(7)?,
             created_at: r.get(8)?,
             updated_at: r.get(9)?,
+            member_count: r.get(10)?,
         })
     })?;
     rows.collect()
@@ -2109,12 +2113,17 @@ fn row_to_recommendation_run(row: &rusqlite::Row) -> Result<RecommendationRun> {
         created_at: row.get("created_at")?,
         finalized_at: row.get("finalized_at")?,
         item_count: row.get("item_count")?,
+        max_score: row.get("max_score")?,
+        journal_count: row.get("journal_count")?,
     })
 }
 
 pub fn get_recommendation_run(conn: &Connection, id: i64) -> Result<Option<RecommendationRun>> {
     conn.query_row(
-        "SELECT r.*, (SELECT COUNT(*) FROM recommendation_items i WHERE i.run_id = r.id) AS item_count
+        "SELECT r.*,
+            (SELECT COUNT(*) FROM recommendation_items i WHERE i.run_id = r.id) AS item_count,
+            (SELECT MAX(score_snapshot) FROM recommendation_items i WHERE i.run_id = r.id) AS max_score,
+            (SELECT COUNT(DISTINCT p.journal_id) FROM recommendation_items i JOIN papers p ON p.id = i.paper_id WHERE i.run_id = r.id) AS journal_count
          FROM recommendation_runs r WHERE r.id = ?1",
         params![id],
         row_to_recommendation_run,
@@ -2124,7 +2133,10 @@ pub fn get_recommendation_run(conn: &Connection, id: i64) -> Result<Option<Recom
 
 pub fn list_recommendation_runs(conn: &Connection) -> Result<Vec<RecommendationRun>> {
     let mut stmt = conn.prepare(
-        "SELECT r.*, (SELECT COUNT(*) FROM recommendation_items i WHERE i.run_id = r.id) AS item_count
+        "SELECT r.*,
+            (SELECT COUNT(*) FROM recommendation_items i WHERE i.run_id = r.id) AS item_count,
+            (SELECT MAX(score_snapshot) FROM recommendation_items i WHERE i.run_id = r.id) AS max_score,
+            (SELECT COUNT(DISTINCT p.journal_id) FROM recommendation_items i JOIN papers p ON p.id = i.paper_id WHERE i.run_id = r.id) AS journal_count
          FROM recommendation_runs r ORDER BY r.cycle_key DESC, r.id DESC",
     )?;
     let rows = stmt.query_map([], row_to_recommendation_run)?;
@@ -2147,4 +2159,55 @@ pub fn list_recommendation_items(conn: &Connection, run_id: i64) -> Result<Vec<R
         })
     })?;
     rows.collect()
+}
+
+// ---------- Round 6.4：User Collections（built-in 保护） ----------
+
+/// built-in 集合（UTD24 / FT50）：membership 由 catalog 管理，用户不可改名/删除/改成员。
+pub fn is_builtin_collection_code(code: &str) -> bool {
+    matches!(code, "UTD24" | "FT50")
+}
+
+pub fn collection_code_by_id(conn: &Connection, id: i64) -> Result<Option<String>> {
+    let v: Option<String> = conn
+        .query_row("SELECT code FROM journal_collections WHERE id = ?1", params![id], |r| r.get(0))
+        .optional()?;
+    Ok(v)
+}
+
+pub fn rename_collection(conn: &Connection, id: i64, name: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE journal_collections SET name = ?1, updated_at = ?2 WHERE id = ?3",
+        params![name, now_utc(), id],
+    )?;
+    Ok(())
+}
+
+pub fn delete_collection(conn: &Connection, id: i64) -> Result<()> {
+    // members 由 FK ON DELETE CASCADE 一并删除；journal/paper/subscription 不受影响
+    conn.execute("DELETE FROM journal_collections WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+pub fn remove_collection_member(conn: &Connection, collection_id: i64, journal_id: i64) -> Result<()> {
+    conn.execute(
+        "DELETE FROM journal_collection_members WHERE collection_id = ?1 AND journal_id = ?2",
+        params![collection_id, journal_id],
+    )?;
+    Ok(())
+}
+
+/// 某集合的 journals（DB 视角，含手动添加期刊；与 catalog 静态列表不同）。
+pub fn list_collection_journals(conn: &Connection, code: &str) -> Result<Vec<Journal>> {
+    let mut stmt = conn.prepare(
+        "SELECT j.*, (SELECT COUNT(*) FROM papers p WHERE p.journal_id = j.id) AS paper_count
+         FROM journal_collection_members m
+         JOIN journal_collections c ON c.id = m.collection_id
+         JOIN journals j ON j.id = m.journal_id
+         WHERE c.code = ?1
+         ORDER BY j.name ASC",
+    )?;
+    let mut journals: Vec<Journal> = stmt.query_map(params![code], row_to_journal)?.collect::<Result<Vec<_>>>()?;
+    enrich_journals(conn, &mut journals)?;
+    Ok(journals)
 }

@@ -18,6 +18,7 @@ interface Journal {
   identifiers: JournalIdentifier[];
   collections: string[];
   possibleDuplicate: boolean;
+  metadataNeedsReview: boolean;
 }
 
 interface JournalIdentifier {
@@ -204,27 +205,22 @@ interface ActivityState {
   waitingForAbstract: number;
 }
 
-interface CatalogCollectionView {
+interface JournalCollection {
+  id: number;
   code: string;
   name: string;
-  version: string;
+  version: string | null;
   effectiveFrom: string | null;
-  sourceName: string;
-  sourceUrl: string;
-  count: number;
+  sourceName: string | null;
+  sourceUrl: string | null;
+  lastVerifiedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  memberCount: number;
 }
 
-interface CatalogJournalView {
-  catalogId: string;
-  canonicalTitle: string;
-  publisher: string | null;
-  printIssn: string | null;
-  onlineIssn: string | null;
-  issnL: string | null;
-  collections: string[];
-  metadataNeedsReview: boolean;
-  journalId: number | null;
-  subscribed: boolean;
+function isBuiltinCollection(code: string): boolean {
+  return code === "UTD24" || code === "FT50";
 }
 
 interface BulkSubscribeResult {
@@ -242,6 +238,8 @@ interface RecommendationRun {
   createdAt: string;
   finalizedAt: string | null;
   itemCount: number;
+  maxScore: number | null;
+  journalCount: number;
 }
 
 interface RecommendationItemView {
@@ -259,6 +257,7 @@ interface RecommendationRunView {
 
 let recHistoryRuns: RecommendationRun[] = [];
 let recSelectedRunId: number | null = null;
+let historyView: "overview" | "detail" = "overview";
 /// 推荐区渲染的 Paper 副本（run 命令返回；供卡片交互查用）
 let recPapers: Paper[] = [];
 
@@ -272,7 +271,9 @@ let aiStatus: AiStatus = emptyAiStatus();
 let activity: ActivityState = emptyActivity();
 let settings: Settings | null = null;
 let abstractLang: "zh" | "en" = "zh";
-const expandedAbstracts = new Set<number>();
+const expandedPaperIds = new Set<number>();
+/// 摘要语言状态（按 paper id，今日/全部/收藏/历史共用）
+const paperLanguageState = new Map<number, "zh" | "en">();
 
 function emptyActivity(): ActivityState {
   return {
@@ -404,39 +405,137 @@ async function loadSettings() {
 
 // ---------- 渲染 ----------
 
-let catalogCollections: CatalogCollectionView[] = [];
-let catalogDetail: CatalogJournalView[] = [];
+let catalogCollections: JournalCollection[] = [];
+let catalogDetail: Journal[] = [];
 let selectedCatalogCode: string | null = null;
 const catalogChecked = new Set<number>(); // 选中的 journal_id
 
-/// 常用期刊页：集合列表。
+/// 重新渲染包含某 paper 的视图（今日推荐 / 历史 / 论文列表按上下文）。
+function rerenderPaperContext(id: number) {
+  if (recPapers.some((x) => x.id === id)) {
+    if (historyView === "detail" && recSelectedRunId != null) renderRecommendHistory();
+    else renderRecommend();
+    return;
+  }
+  renderPapers();
+  renderFavorites();
+}
+
+let journalTab: "catalog" | "manual" = "catalog";
+let addMemberState: { collectionId: number; code: string; query: string; checked: Set<number>; candidates: Journal[] } | null = null;
+
+/// 打开"添加期刊到集合"内嵌面板（搜索所有已知 journals，checkbox 多选）。
+async function openAddMemberPanel(collectionId: number, code: string) {
+  const [all, members] = await Promise.all([
+    invoke<Journal[]>("list_journals"),
+    invoke<Journal[]>("get_collection_journals", { code }),
+  ]);
+  const memberIds = new Set(members.map((m) => m.id));
+  addMemberState = {
+    collectionId,
+    code,
+    query: "",
+    checked: new Set(),
+    candidates: all.filter((j) => !memberIds.has(j.id)),
+  };
+  renderAddMemberPanel();
+}
+
+function renderAddMemberPanel() {
+  const panel = $("add-member-panel");
+  if (!addMemberState) {
+    panel.classList.add("hidden");
+    panel.innerHTML = "";
+    return;
+  }
+  panel.classList.remove("hidden");
+  const q = addMemberState.query.toLowerCase();
+  const shown = addMemberState.candidates.filter((j) => {
+    if (!q) return true;
+    const print = j.identifiers.find((i) => i.identifierType === "print")?.value ?? j.printIssn ?? "";
+    const online = j.identifiers.find((i) => i.identifierType === "online")?.value ?? j.onlineIssn ?? "";
+    return (j.name + " " + print + " " + online).toLowerCase().includes(q);
+  });
+  const rows = shown
+    .map(
+      (j) => `
+        <li class="card catalog-journal">
+          <label class="check grow">
+            <input type="checkbox" data-journal-id="${j.id}" ${addMemberState!.checked.has(j.id) ? "checked" : ""} />
+            <span><span class="title">${escapeHtml(j.name)}</span></span>
+          </label>
+        </li>`,
+    )
+    .join("");
+  panel.innerHTML = `
+    <div class="catalog-detail-head"><span class="title">添加期刊到集合</span></div>
+    <input id="add-member-search" class="modal-input" type="text" placeholder="搜索期刊名 / ISSN" value="${escapeHtml(addMemberState.query)}" />
+    <ul class="list">${rows || '<li class="empty">没有可添加的期刊</li>'}</ul>
+    <div class="catalog-actions">
+      <span id="add-member-count" class="muted small">已选择 ${addMemberState.checked.size} 本</span>
+      <button class="ghost small" data-action="add-member-close">取消</button>
+      <button class="primary" data-action="add-member-submit" ${addMemberState.checked.size === 0 ? "disabled" : ""}>添加 ${addMemberState.checked.size} 本</button>
+    </div>`;
+  const search = $("add-member-search") as HTMLInputElement;
+  search.addEventListener("input", () => {
+    if (addMemberState) addMemberState.query = search.value;
+    renderAddMemberPanel();
+  });
+}
+
+function closeAddMemberPanel() {
+  addMemberState = null;
+  renderAddMemberPanel();
+}
+
+/// 期刊订阅页两 tab 严格互斥（catalog ↔ manual），统一入口，不直接操纵 display。
+function setJournalTab(tab: "catalog" | "manual") {
+  journalTab = tab;
+  const catalogActive = tab === "catalog";
+  $("tab-common").classList.toggle("active", catalogActive);
+  $("tab-manual").classList.toggle("active", !catalogActive);
+  $("catalog-view").classList.toggle("hidden", !catalogActive);
+  $("manual-view").classList.toggle("hidden", catalogActive);
+  if (catalogActive) renderCatalogCollections();
+}
+
+/// 常用期刊页：集合列表（DB 视角 = built-in + 用户集合）。
 async function renderCatalogCollections() {
   const box = $("catalog-collections");
-  if (catalogCollections.length === 0) {
-    try {
-      catalogCollections = await invoke<CatalogCollectionView[]>("list_catalog_collections");
-    } catch {
-      box.innerHTML = '<div class="empty">常用期刊目录加载失败</div>';
-      return;
-    }
+  try {
+    catalogCollections = await invoke<JournalCollection[]>("list_collections");
+  } catch {
+    box.innerHTML = '<div class="empty">期刊集合加载失败</div>';
+    return;
   }
-  // 紧凑集合选择器（segmented buttons）+ 来源说明一行（无 detail/back 层级）
   const seg = catalogCollections
     .map(
       (c) => `
         <button class="catalog-seg ${c.code === selectedCatalogCode ? "selected" : ""}" data-catalog-code="${escapeHtml(c.code)}">
-          ${escapeHtml(c.name)} · ${c.count}
+          ${escapeHtml(c.name)} · ${c.memberCount}
         </button>`,
     )
     .join("");
   const sel = catalogCollections.find((c) => c.code === selectedCatalogCode);
   box.innerHTML = `
-    <div class="catalog-seg-row">${seg}</div>
+    <div class="catalog-seg-row">
+      ${seg}
+      <button class="ghost small" data-action="create-collection">+ 新建集合</button>
+    </div>
     <div class="catalog-seg-meta muted small">${
       sel
-        ? `${escapeHtml(sel.name)}${sel.version !== "current" ? " · " + escapeHtml(sel.version) : ""}${sel.effectiveFrom ? " · 更新 " + escapeHtml(sel.effectiveFrom) : ""} · ${escapeHtml(sel.sourceName)}`
+        ? `${escapeHtml(sel.name)}${sel.version && sel.version !== "current" ? " · " + escapeHtml(sel.version) : ""}${sel.effectiveFrom ? " · 更新 " + escapeHtml(sel.effectiveFrom) : ""} · ${escapeHtml(sel.sourceName || "")}`
         : "选择一个期刊集合查看期刊"
-    }</div>`;
+    }</div>
+    ${
+      sel && !isBuiltinCollection(sel.code)
+        ? `<div class="catalog-manage">
+            <button class="ghost small" data-action="rename-collection" data-collection-id="${sel.id}">重命名</button>
+            <button class="ghost small danger" data-action="delete-collection" data-collection-id="${sel.id}">删除集合</button>
+            <button class="ghost small" data-action="add-member-open" data-collection-id="${sel.id}" data-collection-code="${escapeHtml(sel.code)}">添加期刊到集合</button>
+          </div>`
+        : ""
+    }`;
 }
 
 /// 渲染选中集合的期刊列表（受搜索框 / 仅显示未订阅过滤；不重新 invoke）。
@@ -445,31 +544,41 @@ function renderCatalogRows() {
   if (!selectedCatalogCode) return;
   const q = ($("catalog-search") as HTMLInputElement).value.trim().toLowerCase();
   const unsubOnly = ($("catalog-unsub-only") as HTMLInputElement).checked;
+  const isUser = selectedCatalogCode != null && !isBuiltinCollection(selectedCatalogCode);
+  const coll = catalogCollections.find((c) => c.code === selectedCatalogCode);
   const filtered = catalogDetail.filter((j) => {
-    if (unsubOnly && j.subscribed) return false;
+    if (unsubOnly && j.enabled) return false;
     if (q) {
-      const hay = (j.canonicalTitle + " " + (j.printIssn || "") + " " + (j.onlineIssn || "")).toLowerCase();
+      const print = j.identifiers.find((i) => i.identifierType === "print")?.value ?? j.printIssn ?? "";
+      const online = j.identifiers.find((i) => i.identifierType === "online")?.value ?? j.onlineIssn ?? "";
+      const hay = (j.name + " " + print + " " + online).toLowerCase();
       if (!hay.includes(q)) return false;
     }
     return true;
   });
   const rows = filtered
     .map((j) => {
-      const subscribed = j.subscribed;
+      const subscribed = j.enabled;
       const disabled = subscribed;
       const checked = subscribed ? "checked disabled" : "";
       const badge = j.collections.map((c) => `<span class="coll-badge">${escapeHtml(c)}</span>`).join("");
       const review = j.metadataNeedsReview ? '<span class="muted small">需复核</span>' : "";
+      const print = j.identifiers.find((i) => i.identifierType === "print")?.value ?? j.printIssn ?? "";
+      const online = j.identifiers.find((i) => i.identifierType === "online")?.value ?? j.onlineIssn ?? "";
+      const removeBtn = isUser
+        ? `<button class="ghost small" data-action="remove-collection-member" data-collection-id="${coll?.id ?? ""}" data-journal-id="${j.id}">移出集合</button>`
+        : "";
       return `
         <li class="card catalog-journal">
           <label class="check grow">
-            <input type="checkbox" data-journal-id="${j.journalId ?? ""}" ${checked} ${disabled} />
+            <input type="checkbox" data-journal-id="${j.id}" ${checked} ${disabled} />
             <span>
-              <span class="title">${escapeHtml(j.canonicalTitle)} ${badge} ${review}</span>
-              <span class="muted small">${j.printIssn ? "Print " + escapeHtml(j.printIssn) : ""}${j.onlineIssn ? " · Online " + escapeHtml(j.onlineIssn) : ""}${j.issnL ? " · ISSN-L " + escapeHtml(j.issnL) : ""}</span>
+              <span class="title">${escapeHtml(j.name)} ${badge} ${review}</span>
+              <span class="muted small">${print ? "Print " + escapeHtml(print) : ""}${online ? " · Online " + escapeHtml(online) : ""}</span>
               ${subscribed ? '<span class="chip ok-chip">已订阅</span>' : ""}
             </span>
           </label>
+          ${removeBtn}
         </li>`;
     })
     .join("");
@@ -491,12 +600,13 @@ async function renderCatalogDetail(code: string) {
   catalogChecked.clear();
   $("catalog-detail").classList.remove("hidden");
   try {
-    catalogDetail = await invoke<CatalogJournalView[]>("list_catalog_journals", { code });
+    // DB 视角（built-in 与用户集合统一）：包含 catalog 导入期刊与手动添加期刊
+    catalogDetail = await invoke<Journal[]>("get_collection_journals", { code });
   } catch {
     $("catalog-detail").innerHTML = '<div class="empty">期刊列表加载失败</div>';
     return;
   }
-  renderCatalogCollections(); // 刷新集合卡片选中态
+  renderCatalogCollections(); // 刷新集合选中态与管理按钮
   renderCatalogRows();
 }
 
@@ -531,7 +641,7 @@ async function doCatalogSubscribe() {
       cancelText: "稍后",
     });
     if (goSync) {
-      const idsToSync = catalogDetail.filter((j) => j.journalId != null && res.subscribed > 0).map((j) => j.journalId!) as number[];
+      const idsToSync = catalogDetail.map((j) => j.id);
       await startSync(idsToSync.length ? idsToSync : null);
     }
   }
@@ -636,7 +746,14 @@ function tagChips(matches: TagMatch[]): string {
   );
 }
 
-function paperCard(p: Paper, withAbstract: boolean): string {
+interface RenderPaperOptions {
+  withAbstract: boolean;
+  rank?: number;
+  scoreSnapshot?: number;
+}
+
+/// 统一 Paper Card（今日推荐 / 所有论文 / 收藏 / 历史共用；不维护各自残缺版本）。
+function renderPaperCard(p: Paper, opts: RenderPaperOptions): string {
   const cls = p.isIgnored ? "card paper ignored" : "card paper";
   const status = p.analysisStatus === "analysisSucceeded" ? "" : `<span class="chip muted-chip">${statusLabel(p.analysisStatus)}</span>`;
   const titleZh = p.chineseTitle ? `<div class="paper-title">${escapeHtml(p.chineseTitle)}</div>` : "";
@@ -653,30 +770,36 @@ function paperCard(p: Paper, withAbstract: boolean): string {
     ? `<div class="paper-summary">${escapeHtml(p.oneSentenceSummary)}${partialAiNote}</div>`
     : partialAiNote;
   const score = p.totalScore != null ? `<span class="score-badge">总分 ${p.totalScore.toFixed(1)}</span>` : "";
+  // 历史快照行：固定用当日 rank / 当日 score_snapshot（当前分不显示，避免混乱）
+  const rankLine =
+    opts.rank != null && opts.scoreSnapshot != null
+      ? `<div class="rec-rank muted small">当日排名 #${opts.rank} · 当日总分 ${opts.scoreSnapshot.toFixed(1)}</div>`
+      : "";
   // Collection badge：小、低强调、无 score（与 AI tag 评分视觉分层）
   const collBadges = p.collections.length
     ? `<div class="coll-badges">${p.collections.map((c) => `<span class="coll-badge">${escapeHtml(c)}</span>`).join("")}</div>`
     : "";
 
   let abstractHtml = "";
-  if (withAbstract) {
+  if (opts.withAbstract) {
     const zhAbs = p.chineseAbstract;
     const enAbs = p.abstractText;
-    let lang = p._lang || abstractLang;
+    let lang = paperLanguageState.get(p.id) ?? abstractLang;
     if (lang === "zh" && !zhAbs) lang = "en";
     const text = lang === "zh" ? zhAbs : enAbs;
-    const isExpanded = expandedAbstracts.has(p.id);
+    const isExpanded = expandedPaperIds.has(p.id);
+    const hasZh = !!zhAbs;
     if (text) {
       const trunc = isExpanded ? text : text.slice(0, 400) + (text.length > 400 ? "…" : "");
       abstractHtml = `
         <div class="abstract-wrap">
           <div class="abstract-langs">
-            <button class="abs-lang ${lang === "zh" ? "on" : ""}" data-action="abs-lang" data-id="${p.id}" data-lang="zh">中文</button>
-            <button class="abs-lang ${lang === "en" ? "on" : ""}" data-action="abs-lang" data-id="${p.id}" data-lang="en">English</button>
+            <button class="abs-lang ${lang === "zh" ? "on" : ""}" data-action="toggle-paper-lang" data-paper-id="${p.id}" data-lang="zh" ${hasZh ? "" : "disabled"}>中文</button>
+            <button class="abs-lang ${lang === "en" ? "on" : ""}" data-action="toggle-paper-lang" data-paper-id="${p.id}" data-lang="en">English</button>
           </div>
           ${partialNote}
           <div class="abstract">${escapeHtml(trunc)}</div>
-          ${text.length > 400 ? `<button class="ghost small abs-expand" data-action="abs-expand" data-id="${p.id}">${isExpanded ? "收起" : "展开完整摘要"}</button>` : ""}
+          ${text.length > 400 ? `<button class="ghost small abs-expand" data-action="toggle-paper-abstract" data-paper-id="${p.id}">${isExpanded ? "收起摘要" : "展开摘要"}</button>` : ""}
         </div>`;
     } else if (lang === "zh" && !zhAbs) {
       abstractHtml = `<div class="abstract muted">中文摘要待生成</div>`;
@@ -691,6 +814,7 @@ function paperCard(p: Paper, withAbstract: boolean): string {
       ${status}
       ${titleZh}
       ${titleEn}
+      ${rankLine}
       ${summary}
       <div class="paper-meta">${escapeHtml(authorText(p.authors))} · ${escapeHtml(p.journalName || "")} · ${fmtDate(p.publishedDate)}</div>
       ${collBadges}
@@ -729,16 +853,8 @@ function renderPapers() {
   if (collt) list = list.filter((p) => p.collections.includes(collt));
 
   $("paper-list").innerHTML = list.length
-    ? list.map((p) => paperCard(p, true)).join("")
+    ? list.map((p) => renderPaperCard(p, { withAbstract: true })).join("")
     : '<li class="empty">暂无符合条件的论文</li>';
-}
-
-/// 推荐卡：当前推荐不加排名；历史加"当日排名/当日总分"快照行。
-function recCard(v: RecommendationItemView, withRank: boolean): string {
-  const rankLine = withRank
-    ? `<div class="rec-rank muted small">当日排名 #${v.rank} · 当日总分 ${v.scoreSnapshot.toFixed(1)}</div>`
-    : "";
-  return rankLine + paperCard(v.paper, true);
 }
 
 /// 推荐数据源（Round 6）：当前推荐 = open run；历史 = finalized run。
@@ -756,7 +872,7 @@ async function renderRecommend() {
     const nextLabel = nowHm < dtime ? ` · 下一批 ${dtime} 自动更新` : "";
     status.textContent = `今日推荐 · ${m}月${d}日 · ${view.items.length} 篇${nextLabel}`;
     list.innerHTML = view.items.length
-      ? view.items.map((v) => recCard(v, false)).join("")
+      ? view.items.map((v) => renderPaperCard(v.paper, { withAbstract: true })).join("")
       : '<li class="empty">今天暂无新的推荐论文。同步并完成 AI 分析后，新论文会自动进入今日推荐。</li>';
   } catch (err) {
     console.error("renderRecommend 失败:", err);
@@ -784,48 +900,68 @@ async function refreshRecommendations() {
   await renderRecommend();
 }
 
-/// 历史推荐独立页：日期列表 + 选中 run 快照（rank/score 用 snapshot）。
+/// 历史推荐独立页：overview（每日概览卡片，仅 finalized）→ detail（点击日期进入）。
 async function renderRecommendHistory() {
   const picker = $("rec-history-picker");
   const list = $("recommend-history-list");
   try {
     recHistoryRuns = await invoke<RecommendationRun[]>("list_recommendation_runs");
-    if (!recSelectedRunId || !recHistoryRuns.some((r) => r.id === recSelectedRunId)) {
-      recSelectedRunId = recHistoryRuns.length ? recHistoryRuns[0].id : null;
+    if (historyView === "overview") {
+      // 只显示 finalized；最新在前（后端 cycle_key DESC 已保证）
+      const finalized = recHistoryRuns.filter((r) => r.status === "finalized");
+      picker.innerHTML = '<div class="rec-head"><span class="title">历史推荐</span></div>';
+      list.innerHTML = finalized.length
+        ? `<div class="history-grid">${finalized
+            .map(
+              (r) => `
+            <button class="history-card" data-action="open-history-run" data-run-id="${r.id}">
+              <div class="title">${fmtCycle(r.cycleKey)}</div>
+              <div class="muted small">${r.itemCount} 篇推荐 · 最高 ${(r.maxScore ?? 0).toFixed(1)} · ${r.journalCount} 本期刊</div>
+              <div class="muted small">→</div>
+            </button>`,
+            )
+            .join("")}</div>`
+        : '<li class="empty">暂无历史推荐。每天进入新的推荐周期后，上一周期会自动出现在这里。</li>';
+    } else {
+      // detail：某日快照（rank/score 用 snapshot，Paper 内容用当前）
+      if (recSelectedRunId == null) {
+        historyView = "overview";
+        renderRecommendHistory();
+        return;
+      }
+      const view = await invoke<RecommendationRunView>("get_recommendation_run", { id: recSelectedRunId });
+      recPapers = view.items.map((i) => i.paper);
+      picker.innerHTML = `
+        <div class="rec-head">
+          <button class="ghost small" data-action="history-back">‹ 历史推荐</button>
+          <span class="title">${fmtCycle(view.run.cycleKey)} · ${view.items.length} 篇推荐</span>
+        </div>`;
+      list.innerHTML = view.items.length
+        ? view.items.map((v) => renderPaperCard(v.paper, { withAbstract: true, rank: v.rank, scoreSnapshot: v.scoreSnapshot })).join("")
+        : '<li class="empty">该日暂无推荐</li>';
     }
-    picker.innerHTML = `
-      <div class="rec-head"><span class="title">历史推荐</span></div>
-      <select id="rec-history-select" class="rec-history-select">
-        ${recHistoryRuns
-          .map(
-            (r) =>
-              `<option value="${r.id}" ${r.id === recSelectedRunId ? "selected" : ""}>${fmtCycle(r.cycleKey)} · ${r.itemCount} 篇${r.status === "open" ? "（进行中）" : ""}</option>`,
-          )
-          .join("") || '<option value="">暂无历史</option>'}
-      </select>`;
-    ($("rec-history-select") as HTMLSelectElement).addEventListener("change", (e) => {
-      recSelectedRunId = parseInt((e.target as HTMLSelectElement).value, 10);
-      renderRecommendHistory();
-    });
-    if (recSelectedRunId == null) {
-      list.innerHTML = '<li class="empty">暂无历史推荐</li>';
-      return;
-    }
-    const view = await invoke<RecommendationRunView>("get_recommendation_run", { id: recSelectedRunId });
-    recPapers = view.items.map((i) => i.paper);
-    list.innerHTML = view.items.length
-      ? view.items.map((v) => recCard(v, true)).join("")
-      : '<li class="empty">该日暂无推荐</li>';
   } catch (err) {
     console.error("renderRecommendHistory 失败:", err);
     list.innerHTML = '<li class="empty">暂无历史推荐</li>';
   }
 }
 
+function openHistoryRun(id: number) {
+  recSelectedRunId = id;
+  historyView = "detail";
+  renderRecommendHistory();
+}
+
+function showHistoryOverview() {
+  historyView = "overview";
+  recSelectedRunId = null;
+  renderRecommendHistory();
+}
+
 function renderFavorites() {
   const list = papers.filter((p) => p.isFavorite);
   $("favorites-list").innerHTML = list.length
-    ? list.map((p) => paperCard(p, true)).join("")
+    ? list.map((p) => renderPaperCard(p, { withAbstract: true })).join("")
     : '<li class="empty">暂无收藏。在论文卡片上点 ☆ 收藏。</li>';
 }
 
@@ -1125,10 +1261,13 @@ function switchView(name: string) {
   $("view-title").textContent = titles[name] || name;
   // 进入活动页时渲染 master-detail（数据来自统一 activity + 批次查询）
   if (name === "activity") renderActivityCenter().catch(() => {});
-  // 进入期刊订阅页时加载常用期刊目录
-  if (name === "journals") renderCatalogCollections();
+  // 进入期刊订阅页：保持当前 tab（互斥渲染）
+  if (name === "journals") setJournalTab(journalTab);
   // 进入历史推荐页时渲染快照
-  if (name === "recommend-history") renderRecommendHistory();
+  if (name === "recommend-history") {
+    historyView = "overview";
+    renderRecommendHistory();
+  }
 }
 
 interface SyncStartResult {
@@ -1233,6 +1372,7 @@ function showConfirmModal(opts: ConfirmModalOptions): Promise<boolean> {
       if (done) return;
       done = true;
       overlay.classList.add("hidden");
+      $("confirm-modal-input").classList.add("hidden");
       okBtn.removeEventListener("click", onOk);
       cancelBtn.removeEventListener("click", onCancel);
       overlay.removeEventListener("click", onOverlay);
@@ -1257,6 +1397,30 @@ function showConfirmModal(opts: ConfirmModalOptions): Promise<boolean> {
     window.addEventListener("keydown", onKey);
     overlay.classList.remove("hidden");
     cancelBtn.focus();
+  });
+}
+
+/// 输入型 App Modal（新建/重命名集合等）：返回输入值；取消/Escape/遮罩 → null。
+function showPromptModal(title: string, placeholder: string, defaultValue = ""): Promise<string | null> {
+  const input = $("confirm-modal-input") as HTMLInputElement;
+  input.placeholder = placeholder;
+  input.value = defaultValue;
+  return new Promise((resolve) => {
+    // 复用 showConfirmModal 的 Promise 流程，输入值在确认时读取
+    showConfirmModal({
+      title,
+      message: "",
+      confirmText: "确定",
+      cancelText: "取消",
+    }).then((ok) => {
+      if (!ok) {
+        resolve(null);
+        return;
+      }
+      resolve(input.value.trim() || null);
+    });
+    input.classList.remove("hidden");
+    input.focus();
   });
 }
 
@@ -1495,6 +1659,15 @@ async function setupListeners() {
   // Catalog 详情 checkbox 选择（change 冒泡 → 委托处理）
   document.addEventListener("change", (ev) => {
     const el = ev.target as HTMLInputElement;
+    if (el.matches("#add-member-panel input[type=checkbox]")) {
+      if (!addMemberState) return;
+      const id = parseInt(el.dataset.journalId!, 10);
+      if (isNaN(id)) return;
+      if (el.checked) addMemberState.checked.add(id);
+      else addMemberState.checked.delete(id);
+      renderAddMemberPanel();
+      return;
+    }
     if (!el.matches("#catalog-detail input[type=checkbox]:not(:disabled)")) return;
     const id = parseInt(el.dataset.journalId!, 10);
     if (isNaN(id)) return;
@@ -1576,24 +1749,22 @@ async function setupListeners() {
       }
       return;
     }
-    const absLang = t.closest("[data-action='abs-lang']") as HTMLElement | null;
+    const absLang = t.closest("[data-action='toggle-paper-lang']") as HTMLElement | null;
     if (absLang) {
-      const id = parseInt(absLang.dataset.id!, 10);
+      const id = parseInt(absLang.dataset.paperId!, 10);
+      const lang = absLang.dataset.lang as "zh" | "en";
       const p = papers.find((x) => x.id === id) ?? recPapers.find((x) => x.id === id);
-      if (p) {
-        p._lang = absLang.dataset.lang as "zh" | "en";
-        if (recPapers.some((x) => x.id === id)) renderRecommend();
-        else renderPapers();
-      }
+      if (!p) return;
+      paperLanguageState.set(id, lang);
+      rerenderPaperContext(p.id);
       return;
     }
-    const absExpand = t.closest("[data-action='abs-expand']") as HTMLElement | null;
+    const absExpand = t.closest("[data-action='toggle-paper-abstract']") as HTMLElement | null;
     if (absExpand) {
-      const id = parseInt(absExpand.dataset.id!, 10);
-      if (expandedAbstracts.has(id)) expandedAbstracts.delete(id);
-      else expandedAbstracts.add(id);
-      renderPapers();
-      renderRecommend();
+      const id = parseInt(absExpand.dataset.paperId!, 10);
+      if (expandedPaperIds.has(id)) expandedPaperIds.delete(id);
+      else expandedPaperIds.add(id);
+      rerenderPaperContext(id);
       return;
     }
     const tagToggle = t.closest("[data-action='tag-toggle']") as HTMLElement | null;
@@ -1659,8 +1830,103 @@ async function setupListeners() {
       await doCatalogSubscribe();
       return;
     }
+    if (t.closest("[data-action='create-collection']")) {
+      const name = await showPromptModal("新建期刊集合", "集合名称，如 数字平台");
+      if (!name) return;
+      try {
+        await invoke("create_user_collection", { name });
+      } catch (err) {
+        setStatus(String(err), "error");
+        return;
+      }
+      setStatus(`已创建集合「${name}」`, "done");
+      await renderCatalogCollections();
+      return;
+    }
+    const renameBtn = t.closest("[data-action='rename-collection']") as HTMLElement | null;
+    if (renameBtn) {
+      const id = parseInt(renameBtn.dataset.collectionId!, 10);
+      const coll = catalogCollections.find((c) => c.id === id);
+      const name = await showPromptModal("重命名集合", "新名称", coll?.name || "");
+      if (!name) return;
+      try {
+        await invoke("rename_collection", { id, name });
+      } catch (err) {
+        setStatus(String(err), "error");
+        return;
+      }
+      await renderCatalogCollections();
+      if (selectedCatalogCode) await renderCatalogDetail(selectedCatalogCode);
+      return;
+    }
+    const delColl = t.closest("[data-action='delete-collection']") as HTMLElement | null;
+    if (delColl) {
+      const id = parseInt(delColl.dataset.collectionId!, 10);
+      const ok = await showConfirmModal({
+        title: "删除集合",
+        message: "删除该集合？\n只删除集合与成员关系，不删除期刊、不取消订阅、不删除论文。",
+        confirmText: "删除",
+        cancelText: "取消",
+      });
+      if (!ok) return;
+      try {
+        await invoke("delete_collection", { id });
+      } catch (err) {
+        setStatus(String(err), "error");
+        return;
+      }
+      selectedCatalogCode = null;
+      catalogChecked.clear();
+      $("catalog-detail").classList.add("hidden");
+      closeAddMemberPanel();
+      await renderCatalogCollections();
+      return;
+    }
+    const rmMember = t.closest("[data-action='remove-collection-member']") as HTMLElement | null;
+    if (rmMember) {
+      const collectionId = parseInt(rmMember.dataset.collectionId!, 10);
+      const journalId = parseInt(rmMember.dataset.journalId!, 10);
+      try {
+        await invoke("remove_collection_member", { collectionId, journalId });
+      } catch (err) {
+        setStatus(String(err), "error");
+        return;
+      }
+      await renderCatalogDetail(selectedCatalogCode!);
+      return;
+    }
+    if (t.closest("[data-action='add-member-open']")) {
+      const btn = t.closest("[data-action='add-member-open']") as HTMLElement;
+      await openAddMemberPanel(parseInt(btn.dataset.collectionId!, 10), btn.dataset.collectionCode!);
+      return;
+    }
+    if (t.closest("[data-action='add-member-close']")) {
+      closeAddMemberPanel();
+      return;
+    }
+    if (t.closest("[data-action='add-member-submit']")) {
+      if (!addMemberState) return;
+      const ids = [...addMemberState.checked];
+      for (const jid of ids) {
+        await invoke("add_collection_member", { collectionId: addMemberState.collectionId, journalId: jid });
+      }
+      setStatus(`已添加 ${ids.length} 本期刊到集合`, "done");
+      closeAddMemberPanel();
+      await renderCatalogDetail(selectedCatalogCode!);
+      return;
+    }
+    const historyOpen = t.closest("[data-action='open-history-run']") as HTMLElement | null;
+    if (historyOpen) {
+      openHistoryRun(parseInt(historyOpen.dataset.runId!, 10));
+      return;
+    }
+    if (t.closest("[data-action='history-back']")) {
+      showHistoryOverview();
+      return;
+    }
     const catalogCol = t.closest("[data-catalog-code]") as HTMLElement | null;
     if (catalogCol) {
+      closeAddMemberPanel();
       await renderCatalogDetail(catalogCol.dataset.catalogCode!);
       return;
     }
@@ -1728,19 +1994,8 @@ window.addEventListener("DOMContentLoaded", () => {
       renderCatalogRows();
     }
   });
-  $("tab-common").addEventListener("click", () => {
-    $("tab-common").classList.add("active");
-    $("tab-manual").classList.remove("active");
-    $("catalog-view").classList.remove("hidden");
-    $("manual-view").classList.add("hidden");
-    renderCatalogCollections();
-  });
-  $("tab-manual").addEventListener("click", () => {
-    $("tab-manual").classList.add("active");
-    $("tab-common").classList.remove("active");
-    $("catalog-view").classList.add("hidden");
-    $("manual-view").classList.remove("hidden");
-  });
+  $("tab-common").addEventListener("click", () => setJournalTab("catalog"));
+  $("tab-manual").addEventListener("click", () => setJournalTab("manual"));
 
   // Key 保存在本地 secret 文件，不回填到输入框（输入框仅用于「替换 Key」时输入）
   ($("api-key") as HTMLInputElement).value = "";

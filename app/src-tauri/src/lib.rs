@@ -357,6 +357,87 @@ fn get_current_recommendation_run(state: State<Db>) -> Result<models::Recommenda
     Ok(models::RecommendationRunView { run, items })
 }
 
+// ---------- Round 6.4：User Collections ----------
+
+/// 创建用户集合（code=USER-<unique>，source_name=user）；复用 journal_collections 表。
+#[tauri::command]
+fn create_user_collection(name: String, state: State<Db>) -> Result<i64, String> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("集合名称不能为空".to_string());
+    }
+    if name.chars().count() > 60 {
+        return Err("集合名称过长（最多 60 字）".to_string());
+    }
+    let conn = state.inner().lock().unwrap();
+    // 同名校验（用户集合范围内，source_name='user'）
+    let existing: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM journal_collections WHERE name = ?1 AND source_name = 'user'",
+            rusqlite::params![name],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if existing > 0 {
+        return Err("同名集合已存在".to_string());
+    }
+    let code = format!(
+        "USER-{}-{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+    );
+    db::create_collection(&conn, &code, &name, None, None, Some("user"), None)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn rename_collection(id: i64, name: String, state: State<Db>) -> Result<(), String> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("集合名称不能为空".to_string());
+    }
+    let conn = state.inner().lock().unwrap();
+    let code = db::collection_code_by_id(&conn, id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "集合不存在".to_string())?;
+    if db::is_builtin_collection_code(&code) {
+        return Err("内置集合（UTD24 / FT50）不可重命名".to_string());
+    }
+    db::rename_collection(&conn, id, &name).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn delete_collection(id: i64, state: State<Db>) -> Result<(), String> {
+    let conn = state.inner().lock().unwrap();
+    let code = db::collection_code_by_id(&conn, id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "集合不存在".to_string())?;
+    if db::is_builtin_collection_code(&code) {
+        return Err("内置集合（UTD24 / FT50）不可删除".to_string());
+    }
+    db::delete_collection(&conn, id).map_err(|e| e.to_string())
+}
+
+/// 从集合移除期刊（只删 membership，不取消订阅、不删 journal/paper）。
+#[tauri::command]
+fn remove_collection_member(collection_id: i64, journal_id: i64, state: State<Db>) -> Result<(), String> {
+    let conn = state.inner().lock().unwrap();
+    let code = db::collection_code_by_id(&conn, collection_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "集合不存在".to_string())?;
+    if db::is_builtin_collection_code(&code) {
+        return Err("内置集合（UTD24 / FT50）成员不可修改".to_string());
+    }
+    db::remove_collection_member(&conn, collection_id, journal_id).map_err(|e| e.to_string())
+}
+
+/// 某集合的 journals（DB 视角，支持用户集合；含手动添加期刊）。
+#[tauri::command]
+fn get_collection_journals(code: String, state: State<Db>) -> Result<Vec<models::Journal>, String> {
+    let conn = state.inner().lock().unwrap();
+    db::list_collection_journals(&conn, &code).map_err(|e| e.to_string())
+}
+
 /// 重算当前 open run（幂等；finalized 冻结不动）。
 #[tauri::command]
 fn refresh_current_recommendations(state: State<Db>) -> Result<i64, String> {
@@ -1050,7 +1131,12 @@ pub fn run() {
             get_current_recommendation_run,
             refresh_current_recommendations,
             list_recommendation_runs,
-            get_recommendation_run
+            get_recommendation_run,
+            create_user_collection,
+            rename_collection,
+            delete_collection,
+            remove_collection_member,
+            get_collection_journals
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
