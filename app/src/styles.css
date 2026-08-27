@@ -84,8 +84,6 @@ body {
   color: var(--accent);
   font-weight: 600;
 }
-/* The nav's 2px gap remains the baseline; this is the only extra group spacing. */
-.nav-item[data-view="journals"] { margin-top: 6px; }
 .segmented { display: inline-flex; gap: 2px; padding: 3px; background: #eef1f4; border-radius: 8px; margin: 4px 0 10px; }
 .seg { border: 0; background: transparent; padding: 5px 10px; border-radius: 6px; color: var(--muted); cursor: pointer; }
 .seg.on { background: var(--panel); color: var(--text); box-shadow: 0 1px 2px #00000012; }
