@@ -998,7 +998,7 @@ function renderPaperCard(p: Paper, opts: RenderPaperOptions): string {
       abstractHtml = `<div class="abstract muted">中文摘要待生成</div>`;
     } else {
       // missing：明确显示"暂无摘要"，不空白
-      abstractHtml = `<div class="abstract muted">暂无摘要</div>`;
+      abstractHtml = `<div class="abstract muted">暂无摘要</div>${p.analysisStatus === "waitingForAbstract" ? `<button class="ghost small" data-action="recover-paper-abstract" data-paper-id="${p.id}">重新获取摘要</button>` : ""}`;
     }
   }
 
@@ -1319,7 +1319,8 @@ function renderActivityPending() {
         ${pending > 0 ? `<button class="ghost small" data-action="manual-analyze">开始分析</button>` : ""}</div>
       <div class="pending-row"><span>AI 分析失败</span><strong>${failed} 篇</strong>
         ${failed > 0 ? `<button class="ghost small" data-action="retry-failed">重新分析</button>` : ""}</div>
-      <div class="pending-row"><span>等待摘要</span><strong>${waiting} 篇</strong></div>
+      <div class="pending-row"><span>等待摘要</span><strong>${waiting} 篇</strong>
+        ${waiting > 0 ? `<button class="ghost small" data-action="recover-due-abstracts">补全缺失摘要</button>` : ""}</div>
     </div>`;
 }
 
@@ -2002,6 +2003,24 @@ async function setupListeners() {
       if (expandedPaperIds.has(id)) expandedPaperIds.delete(id);
       else expandedPaperIds.add(id);
       rerenderPaperContext(id);
+      return;
+    }
+    const recoverAbstract = t.closest("[data-action='recover-paper-abstract']") as HTMLElement | null;
+    if (recoverAbstract) {
+      const id = parseInt(recoverAbstract.dataset.paperId!, 10);
+      try {
+        const r = await invoke<{ recovered: number; remaining: number }>("recover_paper_abstract", { paperId: id });
+        setStatus(r.recovered ? "摘要已更新" : "暂无公开摘要", r.recovered ? "done" : "idle");
+        await loadPapers(); await refreshWorkState();
+      } catch (err) { setStatus(`摘要恢复失败：${String(err)}`, "error"); }
+      return;
+    }
+    if (t.closest("[data-action='recover-due-abstracts']")) {
+      try {
+        const r = await invoke<{ checked: number; recovered: number; remaining: number }>("recover_due_abstracts");
+        setStatus(`摘要补全：检查 ${r.checked} · 更新 ${r.recovered} · 暂无 ${r.remaining}`, "done");
+        await loadPapers(); await refreshWorkState();
+      } catch (err) { setStatus(`摘要补全失败：${String(err)}`, "error"); }
       return;
     }
     // Tag Draft Editor 操作（Round 6.5：只改 draft，不写 DB）

@@ -2054,6 +2054,21 @@ fn test_abstract_normalize_html_jats() {
     assert_eq!(assess_abstract_quality(&snippet).0, crate::models::ABQ_PARTIAL);
 }
 
+#[test]
+fn test_abstract_recovery_retry_cadence_and_public_metadata_parser() {
+    use chrono::{Duration, Utc};
+    use crate::abstract_recovery::{retry_due, retry_delay};
+    let now = Utc::now();
+    assert_eq!(retry_delay(0), Duration::days(1));
+    assert_eq!(retry_delay(1), Duration::days(3));
+    assert_eq!(retry_delay(2), Duration::days(7));
+    assert_eq!(retry_delay(3), Duration::days(30));
+    assert!(!retry_due(Some(&(now - Duration::hours(23)).to_rfc3339()), 0, now));
+    assert!(retry_due(Some(&(now - Duration::days(3)).to_rfc3339()), 1, now));
+    let html = r#"<meta name="citation_abstract" content="A public abstract with methods and results.">"#;
+    assert_eq!(crate::api::publisher::extract_public_abstract(html).as_deref(), Some("A public abstract with methods and results."));
+}
+
 fn mk_candidate(src: &str, text: &str) -> crate::abstract_quality::AbstractCandidate {
     use crate::abstract_quality::assess_abstract_quality;
     let (q, r) = assess_abstract_quality(text);

@@ -71,6 +71,16 @@ impl OpenAlex {
         };
         Ok(Some(items.iter().filter_map(parse_work).collect()))
     }
+
+    /// Re-check one DOI for a later OpenAlex abstract without a journal-wide query.
+    pub fn work_by_doi(&self, doi: &str) -> Result<Option<PaperCandidate>, String> {
+        let resp = self.client.get("https://api.openalex.org/works")
+            .query(&[("filter", format!("doi:https://doi.org/{}", doi)), ("per-page", "1".to_string()), ("mailto", self.mailto.clone())])
+            .send().map_err(|e| format!("OpenAlex DOI 请求失败: {}", e))?;
+        if !resp.status().is_success() { return Err(format!("OpenAlex DOI HTTP {}", resp.status().as_u16())); }
+        let v: Value = resp.json().map_err(|e| format!("OpenAlex DOI 响应解析失败: {}", e))?;
+        Ok(v.get("results").and_then(|x| x.as_array()).and_then(|x| x.first()).and_then(parse_work))
+    }
 }
 
 fn parse_work(item: &Value) -> Option<PaperCandidate> {

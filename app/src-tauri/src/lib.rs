@@ -1,4 +1,5 @@
 mod abstract_quality;
+mod abstract_recovery;
 mod catalog;
 mod recommendation;
 mod tag_config;
@@ -756,6 +757,18 @@ fn sync_task<R: Runtime>(app: &AppHandle<R>, db: &Db, ids: Option<Vec<i64>>, tri
     let mut batch_finalizer = SyncBatchFinalizer::new(db.clone(), batch_id);
     let _ = app.emit("sync://start", ());
     let mut report = sync::run_sync(db, ids, app, MAILTO, batch_id, trigger);
+    // Reuse normal sync triggers for bounded missing/partial recovery. This is
+    // deliberately not a background daemon and does not invoke DeepSeek.
+    let recovery = {
+        let c = db.lock().unwrap();
+        abstract_recovery::recover_due(&c, MAILTO, 20).unwrap_or_default()
+    };
+    report.abstracts_added += recovery.recovered;
+    report.abstracts_upgraded += recovery.upgraded;
+    report.abstract_upgraded_ids.extend(recovery.recovered_ids);
+    report.abstract_upgraded_ids.extend(recovery.upgraded_ids);
+    report.abstract_upgraded_ids.sort_unstable();
+    report.abstract_upgraded_ids.dedup();
     report.batch_id = batch_id;
     report.trigger = trigger.to_string();
     // finalize：部分期刊失败 → completedWithErrors；否则 completed
@@ -1113,6 +1126,18 @@ fn get_waiting_abstract_count(state: State<Db>) -> Result<i64, String> {
     db::count_waiting_for_abstract(&conn).map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn recover_paper_abstract(paper_id: i64, state: State<Db>) -> Result<abstract_recovery::RecoveryReport, String> {
+    let conn = state.inner().lock().unwrap();
+    abstract_recovery::recover_paper(&conn, MAILTO, paper_id)
+}
+
+#[tauri::command]
+fn recover_due_abstracts(state: State<Db>) -> Result<abstract_recovery::RecoveryReport, String> {
+    let conn = state.inner().lock().unwrap();
+    abstract_recovery::recover_due(&conn, MAILTO, 50)
+}
+
 /// 测试 DeepSeek 连接：Key 由 Rust 从 Keychain 读取，前端不传 Key。
 #[tauri::command]
 fn test_api_connection(model: String, store: State<Secure>) -> Result<models::ConnectionTestResult, String> {
@@ -1408,6 +1433,8 @@ pub fn run() {
             get_pending_ai_count,
             get_failed_ai_count,
             get_waiting_abstract_count,
+            recover_paper_abstract,
+            recover_due_abstracts,
             test_api_connection,
             get_settings,
             set_settings,

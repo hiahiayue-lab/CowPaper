@@ -808,6 +808,35 @@ fn merge_abstract(conn: &Connection, paper_id: i64, c: &PaperCandidate) -> Resul
     Ok((filled, upgraded))
 }
 
+/// Feed a public recovery result back through the same source ledger and
+/// canonical selector used by normal sync; never creates a second abstract
+/// field or bypasses quality/upgraded semantics.
+pub fn merge_recovered_abstract(
+    conn: &Connection,
+    paper_id: i64,
+    source: &str,
+    abstract_text: &str,
+) -> Result<(bool, bool)> {
+    merge_abstract(conn, paper_id, &PaperCandidate {
+        normalized_doi: None, original_doi: None, title: None, authors: Vec::new(),
+        published_date: None, year: None, abstract_text: Some(abstract_text.to_string()),
+        abstract_source: Some(source.to_string()), url: None, publisher_article_id: None,
+        openalex_work_id: None, discovery_source: source.to_string(), source_id: None, raw_json: None,
+    })
+}
+
+/// A recovery attempt is recorded even when public sources have no abstract.
+/// This timestamp/count drives the bounded retry cadence and is never applied
+/// to complete papers.
+pub fn mark_abstract_recovery_attempt(conn: &Connection, paper_id: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE papers SET abstract_last_checked_at=?1, abstract_retry_count=abstract_retry_count+1, updated_at=?1
+         WHERE id=?2 AND abstract_quality != 'complete'",
+        params![now_utc(), paper_id],
+    )?;
+    Ok(())
+}
+
 /// 填充非摘要缺失字段（从 fill_missing_fields 拆出，保持原有 §8.3 行为）。
 fn fill_other_fields(conn: &Connection, id: i64, c: &PaperCandidate) -> Result<()> {
     let authors_json = serde_json::to_string(&c.authors).unwrap_or_else(|_| "[]".to_string());

@@ -145,6 +145,16 @@ impl Crossref {
         let candidates = items.iter().filter_map(parse_work).collect();
         Ok(Some(CrossrefWorks { total, candidates }))
     }
+
+    /// Re-check one already discovered work without widening a journal sync.
+    pub fn work_by_doi(&self, doi: &str) -> Result<Option<PaperCandidate>, String> {
+        let url = format!("https://api.crossref.org/works/{}", doi);
+        let resp = self.client.get(&url).send().map_err(|e| format!("Crossref DOI 请求失败: {}", e))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND { return Ok(None); }
+        if !resp.status().is_success() { return Err(format!("Crossref DOI HTTP {}", resp.status().as_u16())); }
+        let v: Value = resp.json().map_err(|e| format!("Crossref DOI 响应解析失败: {}", e))?;
+        Ok(v.get("message").and_then(parse_work))
+    }
 }
 
 fn parse_work(item: &Value) -> Option<PaperCandidate> {
