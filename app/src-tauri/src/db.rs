@@ -88,7 +88,7 @@ pub fn open(path: &Path) -> Result<Connection> {
 /// 当前 schema 版本（Round 5B：abstract_quality / paper_abstract_sources 为 v4）。
 /// 生产构建中仅由迁移系统隐式使用；测试中直接断言。
 #[allow(dead_code)]
-pub const SCHEMA_VERSION: i64 = 11;
+pub const SCHEMA_VERSION: i64 = 12;
 
 pub fn init(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
@@ -1044,10 +1044,20 @@ pub fn list_current_missing_papers_for_cycle(conn: &Connection, cycle_key: &str)
 
 pub fn list_daily_paper_summaries(conn: &Connection) -> Result<Vec<crate::models::DailyPaperSummary>> {
     let mut stmt = conn.prepare(
-        "SELECT p.first_seen_cycle,COUNT(*),SUM(p.first_seen_abstract_missing),r.id,COUNT(ri.id)
-         FROM papers p LEFT JOIN recommendation_runs r ON r.cycle_key=p.first_seen_cycle
-         LEFT JOIN recommendation_items ri ON ri.run_id=r.id
-         WHERE p.first_seen_cycle IS NOT NULL GROUP BY p.first_seen_cycle,r.id ORDER BY p.first_seen_cycle DESC"
+        "WITH days AS (
+             SELECT first_seen_cycle AS cycle_key FROM papers WHERE first_seen_cycle IS NOT NULL
+             UNION SELECT cycle_key FROM recommendation_runs
+         ), paper_counts AS (
+             SELECT first_seen_cycle AS cycle_key, COUNT(DISTINCT id) AS paper_count,
+                    COUNT(DISTINCT CASE WHEN first_seen_abstract_missing=1 THEN id END) AS missing_count
+             FROM papers WHERE first_seen_cycle IS NOT NULL GROUP BY first_seen_cycle
+         ), recommendation_counts AS (
+             SELECT r.cycle_key, r.id AS run_id, COUNT(DISTINCT ri.paper_id) AS recommendation_count
+             FROM recommendation_runs r LEFT JOIN recommendation_items ri ON ri.run_id=r.id GROUP BY r.id,r.cycle_key
+         )
+         SELECT d.cycle_key,COALESCE(p.paper_count,0),COALESCE(p.missing_count,0),rc.run_id,COALESCE(rc.recommendation_count,0)
+         FROM days d LEFT JOIN paper_counts p ON p.cycle_key=d.cycle_key
+         LEFT JOIN recommendation_counts rc ON rc.cycle_key=d.cycle_key ORDER BY d.cycle_key DESC"
     )?;
     let rows = stmt.query_map([], |r| Ok(crate::models::DailyPaperSummary { cycle_key:r.get(0)?, paper_count:r.get(1)?, missing_count:r.get(2)?, recommendation_run_id:r.get(3)?, recommendation_count:r.get(4)? }))?;
     rows.collect()
@@ -1190,7 +1200,24 @@ fn migrations() -> Vec<(i64, &'static str, fn(&Connection) -> Result<()>)> {
         (9, "full-ai-tag-identity-repair", migrate_to_v9),
         (10, "abstract-recovery-batches", migrate_to_v10),
         (11, "daily-paper-first-seen-cycle", migrate_to_v11),
+        (12, "backfill-first-seen-missing-from-recovery", migrate_to_v12),
     ]
+}
+
+/// v12 data-only repair: v11 could initialise a recovered paper as non-missing
+/// because recovery had already completed. A persisted successful v10 recovery
+/// after the paper was created is reliable evidence that it was originally
+/// lacking an abstract. No network/AI/snapshot data is touched.
+fn migrate_to_v12(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE papers SET first_seen_abstract_missing=1
+         WHERE first_seen_abstract_missing=0 AND EXISTS (
+           SELECT 1 FROM abstract_recovery_items i
+           WHERE i.paper_id=papers.id AND i.outcome='recovered'
+             AND i.started_at IS NOT NULL AND i.started_at >= papers.created_at
+         )", []
+    )?;
+    Ok(())
 }
 
 /// Immutable local calendar-day membership. Existing records retain their

@@ -260,7 +260,7 @@ interface DailyPaperSummary { cycleKey: string; paperCount: number; missingCount
 
 let todayView: "recommend" | "missing" = "recommend";
 let historyCycleKey: string | null = null;
-let historyTab: "all" | "recommend" | "missing" = "all";
+let historyTab: "recommend" | "missing" = "recommend";
 /// 推荐区渲染的 Paper 副本（run 命令返回；供卡片交互查用）
 let recPapers: Paper[] = [];
 
@@ -1125,12 +1125,12 @@ async function renderRecommendHistory() {
     if (!historyCycleKey) {
       const days = await invoke<DailyPaperSummary[]>("list_daily_paper_summaries");
       picker.innerHTML = '<div class="rec-head"><span class="title">历史</span></div>';
-      list.innerHTML = days.length ? `<div class="history-grid">${days.map((d) => `<button class="history-card" data-action="open-history-day" data-cycle-key="${d.cycleKey}"><div class="title">${fmtCycle(d.cycleKey)}</div><div class="muted small">收录 ${d.paperCount} 篇 · 推荐 ${d.recommendationCount} 篇 · 缺摘要 ${d.missingCount} 篇</div><div class="muted small">→</div></button>`).join("")}</div>` : '<li class="empty">暂无历史收录。</li>';
+      list.innerHTML = days.length ? `<div class="history-grid">${days.map((d) => `<button class="history-card" data-action="open-history-day" data-cycle-key="${d.cycleKey}"><div class="title">${fmtCycle(d.cycleKey)}</div><div class="muted small">推荐 ${d.recommendationCount} 篇 · 缺摘要 ${d.missingCount} 篇</div><div class="muted small">›</div></button>`).join("")}</div>` : '<li class="empty">暂无历史收录。</li>';
     } else {
       picker.innerHTML = `
         <div class="rec-head">
           <button class="ghost small" data-action="history-back">‹ 历史</button><span class="title">${fmtCycle(historyCycleKey)}</span>
-          <span class="segmented"><button class="seg ${historyTab === "all" ? "on" : ""}" data-action="history-tab" data-tab="all">全部</button><button class="seg ${historyTab === "recommend" ? "on" : ""}" data-action="history-tab" data-tab="recommend">推荐</button><button class="seg ${historyTab === "missing" ? "on" : ""}" data-action="history-tab" data-tab="missing">缺摘要</button></span></div>`;
+          <span class="segmented"><button class="seg ${historyTab === "recommend" ? "on" : ""}" data-action="history-tab" data-tab="recommend">推荐</button><button class="seg ${historyTab === "missing" ? "on" : ""}" data-action="history-tab" data-tab="missing">缺摘要</button></span></div>`;
       if (historyTab === "recommend") {
         const view = await invoke<RecommendationRunView | null>("get_daily_recommendation_run", { cycleKey: historyCycleKey });
         list.innerHTML = view?.items.length ? view.items.map((v) => renderPaperCard(v.paper, { withAbstract: true, rank: v.rank, scoreSnapshot: v.scoreSnapshot, scoreOverride: v.scoreSnapshot })).join("") : '<li class="empty">该日暂无推荐</li>';
@@ -2203,13 +2203,13 @@ async function setupListeners() {
     const historyDay = t.closest("[data-action='open-history-day']") as HTMLElement | null;
     if (historyDay) {
       historyCycleKey = historyDay.dataset.cycleKey!;
-      historyTab = "all";
+      historyTab = "recommend";
       await renderRecommendHistory();
       return;
     }
     const historyTabEl = t.closest("[data-action='history-tab']") as HTMLElement | null;
     if (historyTabEl) {
-      historyTab = historyTabEl.dataset.tab as "all" | "recommend" | "missing";
+      historyTab = historyTabEl.dataset.tab as "recommend" | "missing";
       await renderRecommendHistory();
       return;
     }

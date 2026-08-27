@@ -1528,6 +1528,77 @@ fn test_daily_first_seen_membership_is_stable() {
     assert!(db::list_papers_for_first_seen_cycle(&conn, "2026-08-28", false).unwrap().is_empty());
 }
 
+#[test]
+fn test_daily_summary_aggregates_papers_and_recommendations_independently() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let now = db::now_utc();
+    let mut day_27 = Vec::new();
+    let mut day_26 = Vec::new();
+    for (day, total, missing, ids) in [
+        ("2026-08-27", 372, 83, &mut day_27),
+        ("2026-08-26", 34, 20, &mut day_26),
+    ] {
+        for n in 0..total {
+            conn.execute(
+                "INSERT INTO papers (journal_id,normalized_doi,original_doi,title,title_norm,authors_json,analysis_status,created_at,updated_at,first_seen_cycle,first_seen_abstract_missing)
+                 VALUES (?1,?2,?2,?3,?3,'[]','pendingAnalysis',?4,?4,?5,?6)",
+                params![jid, format!("10.1000/{day}-{n}"), format!("Paper {day}-{n}"), now, day, if n < missing { 1 } else { 0 }],
+            ).unwrap();
+            ids.push(conn.last_insert_rowid());
+        }
+    }
+    // A recommendation run may include papers first seen before that date.
+    // Add 77 older papers so the 8/26 run has 111 distinct snapshot items
+    // while that day itself still has only 34 first-seen papers.
+    let mut day_26_recommendations = day_26.clone();
+    for n in 0..77 {
+        conn.execute(
+            "INSERT INTO papers (journal_id,normalized_doi,original_doi,title,title_norm,authors_json,analysis_status,created_at,updated_at,first_seen_cycle,first_seen_abstract_missing)
+             VALUES (?1,?2,?2,?3,?3,'[]','pendingAnalysis',?4,?4,'2026-08-01',0)",
+            params![jid, format!("10.1000/older-{n}"), format!("Older {n}"), now],
+        ).unwrap();
+        day_26_recommendations.push(conn.last_insert_rowid());
+    }
+    for (day, ids, count) in [("2026-08-27", &day_27, 221usize), ("2026-08-26", &day_26_recommendations, 111usize)] {
+        let run = db::create_recommendation_run(&conn, day, "finalized").unwrap();
+        for (rank, paper_id) in ids.iter().take(count).enumerate() {
+            conn.execute(
+                "INSERT INTO recommendation_items (run_id,paper_id,rank,score_snapshot,added_at) VALUES (?1,?2,?3,1.0,?4)",
+                params![run, paper_id, rank as i64 + 1, now],
+            ).unwrap();
+        }
+    }
+
+    let summaries = db::list_daily_paper_summaries(&conn).unwrap();
+    let day_27 = summaries.iter().find(|s| s.cycle_key == "2026-08-27").unwrap();
+    assert_eq!((day_27.paper_count, day_27.recommendation_count, day_27.missing_count), (372, 221, 83));
+    let day_26 = summaries.iter().find(|s| s.cycle_key == "2026-08-26").unwrap();
+    assert_eq!((day_26.paper_count, day_26.recommendation_count, day_26.missing_count), (34, 111, 20));
+}
+
+#[test]
+fn test_v12_backfills_ledger_proven_legacy_missing_idempotently() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let paper_id = match db::upsert_paper(&conn, jid, &candidate(Some("10.1000/v12"), "Recovered", None, None)).unwrap() {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new paper"),
+    };
+    conn.execute("UPDATE papers SET created_at='2026-08-27T00:00:00Z', first_seen_abstract_missing=0 WHERE id=?1", params![paper_id]).unwrap();
+    let batch = db::create_abstract_recovery_batch(&conn, &[paper_id]).unwrap();
+    let item = db::list_abstract_recovery_items(&conn, batch).unwrap().remove(0);
+    conn.execute("UPDATE abstract_recovery_items SET started_at='2026-08-27T01:00:00Z', outcome='recovered' WHERE id=?1", params![item.id]).unwrap();
+    conn.pragma_update(None, "user_version", 11).unwrap();
+
+    db::init(&conn).unwrap();
+    let missing: i64 = conn.query_row("SELECT first_seen_abstract_missing FROM papers WHERE id=?1", params![paper_id], |r| r.get(0)).unwrap();
+    assert_eq!(missing, 1, "v12 must restore first-seen missing membership from recovery evidence");
+    db::init(&conn).unwrap();
+    let after_restart: i64 = conn.query_row("SELECT first_seen_abstract_missing FROM papers WHERE id=?1", params![paper_id], |r| r.get(0)).unwrap();
+    assert_eq!(after_restart, 1, "v12 repair must be idempotent");
+}
+
 /// AnalysisBatch DB 生命周期：创建+items → 状态流转 → aggregate 重算。
 #[test]
 fn test_analysis_batch_db_lifecycle() {
@@ -1877,7 +1948,7 @@ fn test_migration_v2_to_v3_preserves_data() {
 
     // 迁移到 v3
     db::init(&conn).unwrap();
-    assert_eq!(db::SCHEMA_VERSION, 11);
+    assert_eq!(db::SCHEMA_VERSION, 12);
 
     // 8) 旧 issn 迁移进 journal_identifiers（类型按列，不猜）
     let ids = db::list_journal_identifiers(&conn, jid).unwrap();
@@ -1918,7 +1989,7 @@ fn test_database_restart_persistence() {
     {
         let conn = db::open(&path).unwrap();
         db::init(&conn).unwrap(); // 幂等：user_version=3 不重复迁移
-        assert_eq!(db::SCHEMA_VERSION, 11);
+        assert_eq!(db::SCHEMA_VERSION, 12);
         let j = db::get_journal(&conn, 1).unwrap().expect("期刊持久化");
         assert_eq!(j.print_issn.as_deref(), Some("0025-1909"));
         assert_eq!(j.identifiers.len(), 1);
@@ -2343,7 +2414,7 @@ fn test_migration_v4_abstract_quality_init() {
     .unwrap();
 
     db::init(&conn).unwrap();
-    assert_eq!(db::SCHEMA_VERSION, 11);
+    assert_eq!(db::SCHEMA_VERSION, 12);
 
     let papers = db::list_papers(&conn, Some(jid), 100).unwrap();
     assert_eq!(papers.len(), 3, "迁移不得丢论文");
