@@ -35,6 +35,15 @@ pub fn recover_paper(conn: &Connection, mailto: &str, paper_id: i64) -> Result<R
     recover_many(conn, mailto, vec![paper])
 }
 
+/// Explicit user action: retry every non-complete paper now, ignoring the
+/// automatic cadence. It still uses the same bounded source sequence and never
+/// starts AI work.
+pub fn recover_all(conn: &Connection, mailto: &str) -> Result<RecoveryReport, String> {
+    let papers = db::list_papers(conn, None, 10_000).map_err(|e| e.to_string())?
+        .into_iter().filter(|p| p.abstract_quality != "complete").collect();
+    recover_many(conn, mailto, papers)
+}
+
 fn recover_many(conn: &Connection, mailto: &str, papers: Vec<Paper>) -> Result<RecoveryReport, String> {
     let crossref = Crossref::new(mailto);
     let openalex = OpenAlex::new(mailto);

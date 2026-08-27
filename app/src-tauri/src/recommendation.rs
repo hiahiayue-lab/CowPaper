@@ -58,7 +58,7 @@ pub fn ensure_current_recommendation_cycle(
 
 /// 重算当前 open run 的推荐项：
 /// - 删除本 run 现有 items（open 允许重建）后重算；
-/// - 候选 = 现有推荐规则（totalScore 非空且未忽略）+ NOT EXISTS(recommendation_items)
+/// - 候选 = 当前有效的 Full AI 成功结果（score 可以合法为 0）且未忽略；
 ///   （从未在任何周期推荐过；paper_id 全局唯一约束兜底）；
 /// - 按 totalScore DESC、published_date DESC、id DESC 排序，rank 重排。
 pub fn refresh_current_recommendations(
@@ -83,7 +83,12 @@ pub fn refresh_current_recommendations(
     let mut stmt = tx
         .prepare(
             "SELECT p.id, COALESCE(p.total_score, 0) FROM papers p
-             WHERE p.total_score IS NOT NULL AND p.is_ignored = 0
+             WHERE p.analysis_status = 'analysisSucceeded'
+               AND p.total_score IS NOT NULL AND p.is_ignored = 0
+               AND COALESCE(TRIM(p.chinese_title), '') != ''
+               AND COALESCE(TRIM(p.chinese_abstract), '') != ''
+               AND COALESCE(TRIM(p.one_sentence_summary), '') != ''
+               AND p.evidence_hash IS NOT NULL
                AND NOT EXISTS (SELECT 1 FROM recommendation_items ri WHERE ri.paper_id = p.id)
              ORDER BY p.total_score DESC, p.published_date DESC, p.id DESC",
         )

@@ -1014,7 +1014,7 @@ function renderPaperCard(p: Paper, opts: RenderPaperOptions): string {
       ${scoreRow}
       ${abstractHtml}
       <div class="paper-actions">
-        ${p.isFavorite || !opts.lightActions ? `<button class="ghost small" data-action="fav" data-id="${p.id}">${p.isFavorite ? "★" : "☆"}</button>` : ""}
+        <button class="ghost small" data-action="toggle-favorite" data-paper-id="${p.id}">${p.isFavorite ? "★" : "☆"}</button>
         ${!opts.lightActions ? `<button class="ghost small" data-action="read" data-id="${p.id}">${p.isRead ? "已读" : "未读"}</button>` : ""}
         ${!opts.lightActions ? `<button class="ghost small" data-action="ignore" data-id="${p.id}">${p.isIgnored ? "取消忽略" : "忽略"}</button>` : ""}
         ${p.url ? `<a href="#" class="ghost small" data-action="open" data-url="${escapeHtml(p.url)}">原文 ↗</a>` : ""}
@@ -1319,8 +1319,8 @@ function renderActivityPending() {
         ${pending > 0 ? `<button class="ghost small" data-action="manual-analyze">开始分析</button>` : ""}</div>
       <div class="pending-row"><span>AI 分析失败</span><strong>${failed} 篇</strong>
         ${failed > 0 ? `<button class="ghost small" data-action="retry-failed">重新分析</button>` : ""}</div>
-      <div class="pending-row"><span>等待摘要</span><strong>${waiting} 篇</strong>
-        ${waiting > 0 ? `<button class="ghost small" data-action="recover-due-abstracts">补全缺失摘要</button>` : ""}</div>
+      <div class="pending-row"><span>缺失摘要</span><strong>${waiting} 篇</strong>
+        ${waiting > 0 ? `<button class="ghost small" data-action="recover-all-abstracts">重新获取全部摘要</button>` : ""}</div>
     </div>`;
 }
 
@@ -1957,9 +1957,9 @@ async function setupListeners() {
       await refreshWorkState();
       return;
     }
-    const fav = t.closest("[data-action='fav']") as HTMLElement | null;
+    const fav = t.closest("[data-action='fav'], [data-action='toggle-favorite']") as HTMLElement | null;
     if (fav) {
-      const id = parseInt(fav.dataset.id!, 10);
+      const id = parseInt(fav.dataset.paperId || fav.dataset.id!, 10);
       const p = papers.find((x) => x.id === id) ?? recPapers.find((x) => x.id === id);
       if (p) {
         await setFlag(id, "favorite", !p.isFavorite);
@@ -2020,6 +2020,19 @@ async function setupListeners() {
         const r = await invoke<{ checked: number; recovered: number; remaining: number }>("recover_due_abstracts");
         setStatus(`摘要补全：检查 ${r.checked} · 更新 ${r.recovered} · 暂无 ${r.remaining}`, "done");
         await loadPapers(); await refreshWorkState();
+      } catch (err) { setStatus(`摘要补全失败：${String(err)}`, "error"); }
+      return;
+    }
+    if (t.closest("[data-action='recover-all-abstracts']")) {
+      const ok = await showConfirmModal({ title: "重新获取全部摘要", message: "将从 Crossref、OpenAlex 和官方 publisher 页面重新尝试获取公开摘要，不会调用 AI。", confirmText: "开始获取", cancelText: "取消" });
+      if (!ok) return;
+      try {
+        setStatus("正在获取摘要…", "running");
+        const r = await invoke<{ recovered: number; remaining: number; recoveredIds: number[] }>("recover_all_abstracts");
+        await loadPapers(); await refreshWorkState();
+        const analyze = r.recoveredIds.length > 0 && await showConfirmModal({ title: "摘要补全完成", message: `补回 ${r.recovered} 篇 · 仍缺失 ${r.remaining} 篇`, confirmText: `分析本次补回的 ${r.recoveredIds.length} 篇`, cancelText: "完成" });
+        if (analyze) await startAnalyze(r.recoveredIds, "manual");
+        setStatus(`补回 ${r.recovered} 篇 · 仍缺失 ${r.remaining} 篇`, "done");
       } catch (err) { setStatus(`摘要补全失败：${String(err)}`, "error"); }
       return;
     }
