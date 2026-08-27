@@ -10,9 +10,10 @@ use crate::util::hash64;
 pub const PROMPT_VERSION: &str = "v1";
 
 /// 标签上下文：入队时快照一次，整批复用（仅包含当前启用标签 = canonical set）。
+/// 每项 (tag_id, name, description)——Full AI 保存时必须写 tag identity（Round small fix）。
 #[derive(Debug, Clone)]
 pub struct AnalyzeContext {
-    pub tag_pairs: Vec<(String, String)>,
+    pub tag_pairs: Vec<(i64, String, String)>,
 }
 
 pub fn build_context(conn: &Arc<Mutex<Connection>>) -> Option<AnalyzeContext> {
@@ -22,9 +23,9 @@ pub fn build_context(conn: &Arc<Mutex<Connection>>) -> Option<AnalyzeContext> {
     if tags.is_empty() {
         return None;
     }
-    let tag_pairs: Vec<(String, String)> = tags
+    let tag_pairs: Vec<(i64, String, String)> = tags
         .iter()
-        .map(|t| (t.name.clone(), t.description.clone().unwrap_or_default()))
+        .map(|t| (t.id, t.name.clone(), t.description.clone().unwrap_or_default()))
         .collect();
     Some(AnalyzeContext { tag_pairs })
 }
@@ -37,11 +38,11 @@ pub fn build_context(conn: &Arc<Mutex<Connection>>) -> Option<AnalyzeContext> {
 /// totalScore 必须由 Rust 基于该规范化结果求和。
 pub fn normalize_tag_matches(
     ai_matches: Vec<TagMatch>,
-    tag_pairs: &[(String, String)],
+    tag_pairs: &[(i64, String, String)],
 ) -> Vec<TagMatch> {
     tag_pairs
         .iter()
-        .map(|(name, _)| {
+        .map(|(id, name, desc)| {
             let score = ai_matches
                 .iter()
                 .filter(|m| m.tag == *name)
@@ -50,8 +51,8 @@ pub fn normalize_tag_matches(
             TagMatch {
                 tag: name.clone(),
                 score,
-                tag_id: None,
-                semantic_hash: None,
+                tag_id: Some(*id),
+                semantic_hash: Some(crate::tag_config::tag_semantic_hash(*id, name, desc)),
             }
         })
         .collect()
@@ -77,7 +78,7 @@ pub fn analyze_paper_once(
     let tag_names: String = ctx
         .tag_pairs
         .iter()
-        .map(|(n, _)| n.as_str())
+        .map(|(_, n, _)| n.as_str())
         .collect::<Vec<_>>()
         .join(",");
     let evidence_hash = hash64(&format!(
@@ -95,7 +96,12 @@ pub fn analyze_paper_once(
         }
     }
 
-    let out = ds.analyze(api_key, model, title, abstract_text, abstract_quality, &ctx.tag_pairs)?;
+    let prompt_tags: Vec<(String, String)> = ctx
+        .tag_pairs
+        .iter()
+        .map(|(_, n, d)| (n.clone(), d.clone()))
+        .collect();
+    let out = ds.analyze(api_key, model, title, abstract_text, abstract_quality, &prompt_tags)?;
 
     // 规范化：canonical 唯一标签集 + 最高合法分（重复 tag 不求和）。
     let tag_matches = normalize_tag_matches(out.tag_matches, &ctx.tag_pairs);
@@ -117,6 +123,10 @@ pub fn analyze_paper_once(
             &evidence_hash,
         )
         .map_err(|e| AiError::Paper(e.to_string()))?;
+        // totalScore 必须与当前有效（active+hash 匹配）评分一致：以统一规则本地重算
+        if let Ok(active) = crate::tag_config::active_tags(&c) {
+            let _ = crate::tag_config::recompute_paper_total_score(&c, paper_id, &active);
+        }
     }
     Ok(true)
 }

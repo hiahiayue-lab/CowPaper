@@ -976,10 +976,10 @@ fn test_sync_coordinator_no_reentry() {
 fn test_duplicate_tag_normalization() {
     use crate::analyze::normalize_tag_matches;
     use crate::models::TagMatch;
-    let pairs: Vec<(String, String)> = vec![
-        ("平台经济".into(), "".into()),
-        ("博弈论".into(), "".into()),
-        ("定价".into(), "".into()),
+    let pairs: Vec<(i64, String, String)> = vec![
+        (1, "平台经济".into(), "".into()),
+        (2, "博弈论".into(), "".into()),
+        (3, "定价".into(), "".into()),
     ];
     let t = |tag: &str, s: f64| TagMatch {
         tag: tag.into(),
@@ -1810,7 +1810,7 @@ fn test_migration_v2_to_v3_preserves_data() {
 
     // 迁移到 v3
     db::init(&conn).unwrap();
-    assert_eq!(db::SCHEMA_VERSION, 8);
+    assert_eq!(db::SCHEMA_VERSION, 9);
 
     // 8) 旧 issn 迁移进 journal_identifiers（类型按列，不猜）
     let ids = db::list_journal_identifiers(&conn, jid).unwrap();
@@ -1851,7 +1851,7 @@ fn test_database_restart_persistence() {
     {
         let conn = db::open(&path).unwrap();
         db::init(&conn).unwrap(); // 幂等：user_version=3 不重复迁移
-        assert_eq!(db::SCHEMA_VERSION, 8);
+        assert_eq!(db::SCHEMA_VERSION, 9);
         let j = db::get_journal(&conn, 1).unwrap().expect("期刊持久化");
         assert_eq!(j.print_issn.as_deref(), Some("0025-1909"));
         assert_eq!(j.identifiers.len(), 1);
@@ -2241,7 +2241,7 @@ fn test_migration_v4_abstract_quality_init() {
     .unwrap();
 
     db::init(&conn).unwrap();
-    assert_eq!(db::SCHEMA_VERSION, 8);
+    assert_eq!(db::SCHEMA_VERSION, 9);
 
     let papers = db::list_papers(&conn, Some(jid), 100).unwrap();
     assert_eq!(papers.len(), 3, "迁移不得丢论文");
@@ -3295,7 +3295,7 @@ fn test_full_ai_prompt_uses_description() {
     let conn = mem_db();
     db::add_tag(&conn, "新标签Y", Some("关注双边平台")).unwrap();
     let ctx = crate::analyze::build_context(&std::sync::Arc::new(std::sync::Mutex::new(conn))).unwrap();
-    assert!(ctx.tag_pairs.iter().any(|(n, d)| n == "新标签Y" && d == "关注双边平台"), "description 必须进入 prompt 上下文");
+    assert!(ctx.tag_pairs.iter().any(|(_id, n, d)| n == "新标签Y" && d == "关注双边平台"), "description 必须进入 prompt 上下文");
 }
 
 // ================= Round 6.5.2：Decouple Save from Rerank =================
@@ -3806,4 +3806,61 @@ fn test_recommend_dto_carries_tag_matches() {
     let _ = ta;
     let _ = tb;
     let _ = tc;
+}
+
+// ================= Full AI Tag Identity Persistence =================
+
+/// 1) Full AI 新结果带 tag_id/hash；totalScore = visible matches sum。
+#[test]
+fn test_full_ai_writes_tag_identity() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let pa = seed_paper_with_score(&conn, jid, "10.1000/fa-a", "A", 0.0);
+    let ta = db::add_tag(&conn, "FA-A", Some("a")).unwrap();
+    let tb = db::add_tag(&conn, "FA-B", Some("b")).unwrap();
+    let tc = db::add_tag(&conn, "FA-C", Some("c")).unwrap();
+    // Full AI 返回（name + score）
+    let ai = vec![
+        crate::models::TagMatch { tag: "FA-A".into(), score: 0.8, tag_id: None, semantic_hash: None },
+        crate::models::TagMatch { tag: "FA-B".into(), score: 0.6, tag_id: None, semantic_hash: None },
+        crate::models::TagMatch { tag: "FA-C".into(), score: 1.0, tag_id: None, semantic_hash: None },
+    ];
+    // 用当前连接的 active tags 构造 canonical 集（含 seed 6 + FA 3）
+    let active: Vec<(i64, String, String)> = db::list_tags(&conn)
+        .unwrap()
+        .into_iter()
+        .filter(|t| t.enabled)
+        .map(|t| (t.id, t.name, t.description.unwrap_or_default()))
+        .collect();
+    let normalized = crate::analyze::normalize_tag_matches(ai, &active);
+    assert_eq!(normalized.len(), 6 + 3, "包含 seed tags + FA 的完整 canonical 集");
+    for m in normalized.iter().filter(|m| m.tag == "FA-A" || m.tag == "FA-B" || m.tag == "FA-C") {
+        assert!(m.tag_id.is_some(), "Full AI 结果必须带 tag_id: {}", m.tag);
+        assert!(m.semantic_hash.is_some(), "Full AI 结果必须带 semantic_hash: {}", m.tag);
+    }
+    let c = &conn;
+    let _ = ta;
+    let _ = tb;
+    let _ = tc;
+    let _ = pa;
+    let _ = c;
+}
+
+/// 3) legacy name-only repair → DTO 恢复 tagMatches、totalScore 重算。
+#[test]
+fn test_legacy_name_only_repair() {
+    let (conn, pa, _ta, _tb, _tc) = seed_abc_scores();
+    // 破坏：清空 tag_id/hash（模拟 Full AI 旧写入）
+    conn.execute(
+        "UPDATE papers SET tag_matches_json=?1 WHERE id=?2",
+        params![serde_json::json!([{"tag":"VIS-A","score":0.8},{"tag":"VIS-B","score":0.6},{"tag":"VIS-C","score":1.0}]).to_string(), pa],
+    )
+    .unwrap();
+    // repair（migration v9 逻辑）
+    db::repair_paper_tag_matches(&conn).unwrap();
+    let p = db::get_paper(&conn, pa).unwrap().unwrap();
+    assert_eq!(p.tag_matches.len(), 3, "repair 后 DTO 恢复 3 个 tagMatches: {:?}", p.tag_matches.iter().map(|m| m.tag.clone()).collect::<Vec<_>>());
+    assert!(p.tag_matches.iter().all(|m| m.tag_id.is_some() && m.semantic_hash.is_some()));
+    let s: f64 = conn.query_row("SELECT total_score FROM papers WHERE id=?1", params![pa], |r| r.get(0)).unwrap();
+    assert!((s - 2.4).abs() < 1e-9, "repair 后 totalScore=2.4，实际 {}", s);
 }

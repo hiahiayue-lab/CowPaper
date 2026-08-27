@@ -87,7 +87,7 @@ pub fn open(path: &Path) -> Result<Connection> {
 /// 当前 schema 版本（Round 5B：abstract_quality / paper_abstract_sources 为 v4）。
 /// 生产构建中仅由迁移系统隐式使用；测试中直接断言。
 #[allow(dead_code)]
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 pub fn init(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
@@ -1120,7 +1120,16 @@ fn migrations() -> Vec<(i64, &'static str, fn(&Connection) -> Result<()>)> {
         (6, "round6-recommendation-history", migrate_to_v6),
         (7, "round6.5-tag-config-versions", migrate_to_v7),
         (8, "round6.5.4-tag-score-repair", migrate_to_v8),
+        (9, "full-ai-tag-identity-repair", migrate_to_v9),
     ]
+}
+
+/// v9：修复 Full AI 历史 name-only tagMatches（无 tag_id/hash）。
+/// repair_paper_tag_matches 幂等：按 name 匹配 tags 表补 tag_id + 当前 semantic hash，
+/// 按 tag_id 去重并重算 total_score；不调用 DeepSeek、不删除 Paper。
+fn migrate_to_v9(conn: &Connection) -> Result<()> {
+    repair_paper_tag_matches(conn)?;
+    Ok(())
 }
 
 /// v8：修复历史 tag score 数据——为无 tag_id 的记录补 identity + 当前 semantic hash，
