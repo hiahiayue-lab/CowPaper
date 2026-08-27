@@ -77,6 +77,7 @@ pub fn run_sync<R: Runtime>(
     };
 
     for j in &journals {
+        let journal_started = std::time::Instant::now();
         let _ = app.emit("sync://journal-start", j.name.clone());
         emit_progress(
             Some(&j.name),
@@ -100,20 +101,38 @@ pub fn run_sync<R: Runtime>(
                         &res.existing,
                         &res.abstract_updated,
                     );
-                    let _ = db::update_sync_batch_journal_progress(
-                        &c,
-                        batch_id,
-                        journal_completed,
-                        journal_failed,
-                    );
                 }
+                eprintln!(
+                    "sync journal completed journal={:?} elapsed_ms={} papers={}",
+                    j.name,
+                    journal_started.elapsed().as_millis(),
+                    res.inserted.len() + res.existing.len()
+                );
                 let _ = app.emit("sync://journal-done", j.name.clone());
             }
             Err(e) => {
                 journal_failed += 1;
                 report.failed_journals += 1;
+                eprintln!(
+                    "sync journal failed journal={:?} elapsed_ms={} error={}",
+                    j.name,
+                    journal_started.elapsed().as_millis(),
+                    e
+                );
                 let _ = app.emit("sync://journal-error", format!("{}: {}", j.name, e));
             }
+        }
+        // Persist progress after *every* terminal journal result. Otherwise a
+        // failed journal leaves Activity showing stale counts while the worker
+        // correctly proceeds to the next journal.
+        {
+            let c = conn.lock().unwrap();
+            let _ = db::update_sync_batch_journal_progress(
+                &c,
+                batch_id,
+                journal_completed,
+                journal_failed,
+            );
         }
         emit_progress(
             None,
@@ -206,16 +225,29 @@ fn sync_journal(
             Err(e) => crossref_err = Some(e),
         }
     }
-    // 网络/服务错误（Err）仍视为真实失败，不得伪装成 unsupported
-    if !crossref_ok {
-        if let Some(e) = &crossref_err {
-            return Err(format!("Crossref 获取失败: {}", e));
-        }
-    }
     // OpenAlex fallback：无论 Crossref 结果如何都尝试补漏
+    // Catalog imports may not yet have a cached OpenAlex source id. Resolve it
+    // once from the first configured ISSN and persist it; later syncs reuse the
+    // stored id and therefore avoid this metadata request.
     let mut openalex_ok = false;
     let mut openalex_err: Option<String> = None;
-    if let Some(sid) = &j.openalex_source_id {
+    let openalex_source_id = match &j.openalex_source_id {
+        Some(sid) => Some(sid.clone()),
+        None => match openalex.source_by_issn(&issns[0]) {
+            Ok(Some(sid)) => {
+                if let Ok(c) = conn.lock() {
+                    let _ = db::set_journal_openalex_source(&c, j.id, Some(&sid));
+                }
+                Some(sid)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                openalex_err = Some(e);
+                None
+            }
+        },
+    };
+    if let Some(sid) = &openalex_source_id {
         match openalex.works(sid, &from, to) {
             Ok(Some(oa)) => {
                 openalex_ok = true;
@@ -227,7 +259,7 @@ fn sync_journal(
     }
     // Overall coverage：所有 configured source 都 unsupported（非网络错误）→ overall unsupported；
     // 任一 source 成功（即使 0 篇）→ sync 成功。
-    let any_discovery = crossref_ok || openalex_ok;
+    let any_discovery = source_discovery_succeeded(crossref_ok, openalex_ok);
     if !any_discovery {
         if crossref_err.is_none() && openalex_err.is_none() {
             let c = conn.lock().unwrap();
@@ -324,6 +356,13 @@ fn sync_journal(
     tx.commit().map_err(|e| e.to_string())?;
 
     Ok(res)
+}
+
+/// A working fallback makes the journal sync successful even if the primary
+/// source had a transient failure. Only fail the journal when no configured
+/// source completed a request.
+pub(crate) fn source_discovery_succeeded(crossref_ok: bool, openalex_ok: bool) -> bool {
+    crossref_ok || openalex_ok
 }
 
 fn thirty_days_ago() -> String {

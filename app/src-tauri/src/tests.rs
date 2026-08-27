@@ -1604,6 +1604,23 @@ fn test_sync_batch_journal_counters() {
     assert_eq!(sb.journal_completed + sb.journal_failed, sb.journal_total, "正常结束应相等");
 }
 
+/// Crossref may be temporarily unavailable while OpenAlex still covers the
+/// journal. That fallback must keep the journal successful instead of
+/// preventing every later journal in the sequential batch from running.
+#[test]
+fn test_openalex_fallback_is_successful_after_crossref_error() {
+    assert!(crate::sync::source_discovery_succeeded(false, true));
+    assert!(!crate::sync::source_discovery_succeeded(false, false));
+}
+
+#[test]
+fn test_daily_sync_time_validation() {
+    assert!(crate::valid_daily_sync_time("09:00"));
+    assert!(crate::valid_daily_sync_time("23:59"));
+    assert!(!crate::valid_daily_sync_time("9:00"));
+    assert!(!crate::valid_daily_sync_time("25:00"));
+}
+
 #[test]
 fn test_work_state_consistency() {
     // ===== Scenario A：7 篇 pendingAnalysis（有摘要）→ Work State pending_analysis=7 =====

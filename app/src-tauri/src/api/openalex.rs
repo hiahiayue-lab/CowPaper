@@ -13,7 +13,8 @@ impl OpenAlex {
     pub fn new(mailto: &str) -> Self {
         let client = Client::builder()
             .user_agent(format!("CowPaper/0.1 (mailto:{})", mailto))
-            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(20))
             .build()
             .expect("build openalex http client");
         OpenAlex {
@@ -23,11 +24,26 @@ impl OpenAlex {
     }
 
     /// 通过 ISSN 查找期刊 Source ID（去掉 https://openalex.org/ 前缀）。
-    pub fn source_by_issn(&self, issn: &str) -> Option<String> {
+    pub fn source_by_issn(&self, issn: &str) -> Result<Option<String>, String> {
         let url = format!("https://api.openalex.org/sources?filter=issn:{}&mailto={}", issn, self.mailto);
-        let v: Value = self.client.get(&url).send().ok()?.json().ok()?;
-        let id = v.get("results")?.as_array()?.first()?.get("id")?.as_str()?;
-        Some(id.replace("https://openalex.org/", ""))
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .map_err(|e| format!("OpenAlex source 查询失败: {}", e))?;
+        if !resp.status().is_success() {
+            return Err(format!("OpenAlex source HTTP {}", resp.status().as_u16()));
+        }
+        let v: Value = resp
+            .json()
+            .map_err(|e| format!("OpenAlex source 响应解析失败: {}", e))?;
+        Ok(v
+            .get("results")
+            .and_then(|r| r.as_array())
+            .and_then(|r| r.first())
+            .and_then(|r| r.get("id"))
+            .and_then(|id| id.as_str())
+            .map(|id| id.replace("https://openalex.org/", "")))
     }
 
     /// 按 source_id 查询近期 works。

@@ -1781,13 +1781,18 @@ async function saveSettings() {
     autoAnalyzeNew: ($("set-auto-analyze") as HTMLInputElement).checked,
     defaultAbstractLang: ($("set-abstract-lang") as HTMLSelectElement).value,
   };
-  await invoke("set_settings", { s });
-  settings = s;
-  abstractLang = s.defaultAbstractLang === "en" ? "en" : "zh";
-  renderPapers();
-  renderNextCheck();
-  $("settings-msg").textContent = "设置已保存（每日时间修改后，运行中的调度器将在 30s 内采用）";
-  $("settings-msg").className = "ok small";
+  try {
+    await invoke("set_settings", { s });
+    settings = s;
+    abstractLang = s.defaultAbstractLang === "en" ? "en" : "zh";
+    renderPapers();
+    renderNextCheck();
+    $("settings-msg").textContent = "设置已保存（每日时间修改后，运行中的调度器将在 30s 内采用）";
+    $("settings-msg").className = "ok small";
+  } catch (err) {
+    $("settings-msg").textContent = `设置未保存：${String(err)}`;
+    $("settings-msg").className = "error small";
+  }
 }
 
 // ---------- 事件监听 ----------
@@ -1804,7 +1809,13 @@ async function setupListeners() {
     const p = e.payload as SyncProgress;
     const el = $("work-status");
     el.className = "work-status running";
-    el.innerHTML = `正在检查新论文 · ${p.journalCompleted}/${p.journalTotal} 本期刊`;
+    const checked = p.journalCompleted + p.journalFailed;
+    el.innerHTML = `正在检查新论文 · ${checked}/${p.journalTotal} 本期刊${p.journalFailed ? ` · 失败 ${p.journalFailed}` : ""}`;
+    if (p.currentJournal) {
+      setStatus(`正在同步 ${p.currentJournal} · ${checked}/${p.journalTotal}`, "running");
+    } else {
+      setStatus(`已检查 ${checked}/${p.journalTotal} 本期刊${p.journalFailed ? ` · 失败 ${p.journalFailed}` : ""}`, p.journalFailed ? "error" : "running");
+    }
   });
   await listen("sync://done", async (e) => {
     const r = e.payload as any;

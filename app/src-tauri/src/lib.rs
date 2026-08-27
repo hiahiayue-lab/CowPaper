@@ -99,7 +99,9 @@ fn add_journal(
     let meta = crossref
         .journal_meta(&norm)
         .ok_or_else(|| "Crossref 未收录该 ISSN".to_string())?;
-    let oa_id = openalex.source_by_issn(&norm);
+    // Failure to enrich with OpenAlex must not prevent a valid Crossref-backed
+    // manual subscription; the sync path will retry and cache it later.
+    let oa_id = openalex.source_by_issn(&norm).ok().flatten();
 
     // 2) ISSN-L 归并：meta 的 ISSN-L 若命中已有期刊（issn_l 列或既有 identifier），
     //    把输入 ISSN 归入该 canonical Journal，不创建新 Journal。
@@ -1124,25 +1126,34 @@ fn get_settings(state: State<Db>) -> Result<models::Settings, String> {
 
 #[tauri::command]
 fn set_settings(s: models::Settings, state: State<Db>) -> Result<(), String> {
+    if !valid_daily_sync_time(&s.daily_sync_time) {
+        return Err("每日检查时间必须为 HH:MM".to_string());
+    }
     let conn = state.inner().lock().unwrap();
-    let _ = db::set_setting(
+    db::set_setting(
         &conn,
         "settings.startup_auto_sync",
         if s.startup_auto_sync { "1" } else { "0" },
-    );
-    let _ = db::set_setting(
+    ).map_err(|e| e.to_string())?;
+    db::set_setting(
         &conn,
         "settings.daily_auto_sync",
         if s.daily_auto_sync { "1" } else { "0" },
-    );
-    let _ = db::set_setting(&conn, "settings.daily_sync_time", &s.daily_sync_time);
-    let _ = db::set_setting(
+    ).map_err(|e| e.to_string())?;
+    db::set_setting(&conn, "settings.daily_sync_time", &s.daily_sync_time)
+        .map_err(|e| e.to_string())?;
+    db::set_setting(
         &conn,
         "settings.auto_analyze_new",
         if s.auto_analyze_new { "1" } else { "0" },
-    );
-    let _ = db::set_setting(&conn, "settings.default_abstract_lang", &s.default_abstract_lang);
+    ).map_err(|e| e.to_string())?;
+    db::set_setting(&conn, "settings.default_abstract_lang", &s.default_abstract_lang)
+        .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+fn valid_daily_sync_time(value: &str) -> bool {
+    chrono::NaiveTime::parse_from_str(value, "%H:%M").is_ok()
 }
 
 // ---------- Round 4：Activity 查询 ----------

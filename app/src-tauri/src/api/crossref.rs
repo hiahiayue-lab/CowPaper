@@ -28,7 +28,11 @@ impl Crossref {
     pub fn new(mailto: &str) -> Self {
         let client = Client::builder()
             .user_agent(format!("CowPaper/0.1 (mailto:{})", mailto))
-            .timeout(std::time::Duration::from_secs(30))
+            // A source outage must not hold the whole (sequential) journal batch
+            // indefinitely. `timeout` covers the complete request/response body;
+            // `connect_timeout` makes a broken route fail promptly.
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(20))
             .build()
             .expect("build crossref http client");
         Crossref {
