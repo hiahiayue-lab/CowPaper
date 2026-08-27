@@ -925,3 +925,22 @@ button.full {
 .tag-action-bar .muted {
   margin-right: auto;
 }
+
+/* ---------- Round 6.5.7：推荐卡 score row ---------- */
+
+.score-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 4px 0;
+}
+.tag-chip {
+  background: #eef1f4;
+  color: #3f4750;
+  border: 1px solid #e2e6ea;
+  font-weight: 400;
+}
+.score-badge {
+  margin-left: auto;
+}

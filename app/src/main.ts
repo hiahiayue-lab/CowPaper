@@ -929,18 +929,17 @@ function tagChips(matches: TagMatch[]): string {
     if (!prev || m.score > prev.score) seen.set(key, m);
   }
   const shown = [...seen.values()];
-  if (!shown.length) return "";
-  return (
-    `<div class="tags-line">` +
-    shown.map((m) => `<span class="tag-chip">${escapeHtml(m.tag)} ${m.score.toFixed(1)}</span>`).join("") +
-    `</div>`
-  );
+  return shown.map((m) => `<span class="tag-chip">${escapeHtml(m.tag)} ${m.score.toFixed(1)}</span>`).join("");
 }
 
 interface RenderPaperOptions {
   withAbstract: boolean;
   rank?: number;
   scoreSnapshot?: number;
+  /// 精简操作（推荐/历史：只保留收藏 + 原文；已读/忽略归"所有论文"）
+  lightActions?: boolean;
+  /// 历史总分覆盖（用 score_snapshot，避免显示当前分造成混淆）
+  scoreOverride?: number;
 }
 
 /// 统一 Paper Card（今日推荐 / 所有论文 / 收藏 / 历史共用；不维护各自残缺版本）。
@@ -960,7 +959,10 @@ function renderPaperCard(p: Paper, opts: RenderPaperOptions): string {
   const summary = p.oneSentenceSummary
     ? `<div class="paper-summary">${escapeHtml(p.oneSentenceSummary)}${partialAiNote}</div>`
     : partialAiNote;
-  const score = p.totalScore != null ? `<span class="score-badge">总分 ${p.totalScore.toFixed(1)}</span>` : "";
+  const displayScore = opts.scoreOverride ?? p.totalScore;
+  const scoreBadge = displayScore != null ? `<span class="score-badge">总分 ${displayScore.toFixed(1)}</span>` : "";
+  // 研究标签评分 + 总分同一 score row（标签在前、总分最后）
+  const scoreRow = `<div class="score-row">${tagChips(p.tagMatches)}${scoreBadge}</div>`;
   // 历史快照行：固定用当日 rank / 当日 score_snapshot（当前分不显示，避免混乱）
   const rankLine =
     opts.rank != null && opts.scoreSnapshot != null
@@ -1009,12 +1011,12 @@ function renderPaperCard(p: Paper, opts: RenderPaperOptions): string {
       ${summary}
       <div class="paper-meta">${escapeHtml(authorText(p.authors))} · ${escapeHtml(p.journalName || "")} · ${fmtDate(p.publishedDate)}</div>
       ${collBadges}
-      ${tagChips(p.tagMatches)} ${score}
+      ${scoreRow}
       ${abstractHtml}
       <div class="paper-actions">
-        <button class="ghost small" data-action="fav" data-id="${p.id}">${p.isFavorite ? "★" : "☆"}</button>
-        <button class="ghost small" data-action="read" data-id="${p.id}">${p.isRead ? "已读" : "未读"}</button>
-        <button class="ghost small" data-action="ignore" data-id="${p.id}">${p.isIgnored ? "取消忽略" : "忽略"}</button>
+        ${p.isFavorite || !opts.lightActions ? `<button class="ghost small" data-action="fav" data-id="${p.id}">${p.isFavorite ? "★" : "☆"}</button>` : ""}
+        ${!opts.lightActions ? `<button class="ghost small" data-action="read" data-id="${p.id}">${p.isRead ? "已读" : "未读"}</button>` : ""}
+        ${!opts.lightActions ? `<button class="ghost small" data-action="ignore" data-id="${p.id}">${p.isIgnored ? "取消忽略" : "忽略"}</button>` : ""}
         ${p.url ? `<a href="#" class="ghost small" data-action="open" data-url="${escapeHtml(p.url)}">原文 ↗</a>` : ""}
         <span class="muted small detail">${escapeHtml(p.normalizedDoi || "")} · 来源 ${escapeHtml(p.discoverySource || "—")} · ${p.abstractSource ? "摘要 " + escapeHtml(p.abstractSource) : ""}</span>
       </div>
@@ -1128,7 +1130,7 @@ async function renderRecommendHistory() {
           <span class="title">${fmtCycle(view.run.cycleKey)} · ${view.items.length} 篇推荐</span>
         </div>`;
       list.innerHTML = view.items.length
-        ? view.items.map((v) => renderPaperCard(v.paper, { withAbstract: true, rank: v.rank, scoreSnapshot: v.scoreSnapshot })).join("")
+        ? view.items.map((v) => renderPaperCard(v.paper, { withAbstract: true, rank: v.rank, scoreSnapshot: v.scoreSnapshot, scoreOverride: v.scoreSnapshot, lightActions: true })).join("")
         : '<li class="empty">该日暂无推荐</li>';
     }
   } catch (err) {
