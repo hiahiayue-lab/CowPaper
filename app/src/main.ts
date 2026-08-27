@@ -578,7 +578,7 @@ function renderCatalogRows() {
     <ul class="list">${rows || (filtered.length === 0 && (q || unsubOnly) ? '<li class="empty">没有符合条件的期刊</li>' : '<li class="empty">无期刊</li>')}</ul>
     <div class="catalog-actions"><span id="catalog-selected" class="muted small">已选择 0 本</span>
       <button class="ghost small" data-action="catalog-clear">清除</button>
-      <button class="primary" data-action="catalog-subscribe">订阅 0 本</button>
+      <button id="catalog-subscribe" class="primary" data-action="catalog-subscribe">订阅 0 本</button>
     </div>`;
   updateCatalogSelected();
 }
@@ -1065,7 +1065,7 @@ async function renderRecommend() {
     const nextLabel = nowHm < dtime ? ` · 下一批 ${dtime} 自动更新` : "";
     status.textContent = `今日推荐 · ${m}月${d}日 · ${view.items.length} 篇${nextLabel}`;
     list.innerHTML = view.items.length
-      ? view.items.map((v) => renderPaperCard(v.paper, { withAbstract: true })).join("")
+      ? view.items.map((v) => renderPaperCard(v.paper, { withAbstract: true, lightActions: true })).join("")
       : '<li class="empty">今天暂无新的推荐论文。同步并完成 AI 分析后，新论文会自动进入今日推荐。</li>';
   } catch (err) {
     console.error("renderRecommend 失败:", err);

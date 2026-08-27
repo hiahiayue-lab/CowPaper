@@ -3790,3 +3790,20 @@ fn test_history_frozen_by_dto_filter() {
     let items = db::list_recommendation_items(&conn, r1).unwrap();
     assert_eq!(items[0].score_snapshot, snapshot, "历史 rank/score 冻结");
 }
+
+/// 推荐命令 DTO 端到端：3 个有效 tagMatches 的论文进入推荐后，items.paper.tag_matches 非空且含全部 3 个。
+#[test]
+fn test_recommend_dto_carries_tag_matches() {
+    let (conn, pa, ta, tb, tc) = seed_abc_scores();
+    let _r = crate::recommendation::refresh_current_recommendations(&conn, &local_dt(2026, 8, 26, 15, 0), "09:00").unwrap();
+    let runs = db::list_recommendation_runs(&conn).unwrap();
+    let run_id = runs.iter().find(|r| r.status == "open").map(|r| r.id).or_else(|| runs.first().map(|r| r.id)).unwrap();
+    let views = crate::recommendation::run_items_with_papers(&conn, run_id).unwrap();
+    let v = views.iter().find(|v| v.paper_id == pa).expect("论文在推荐中");
+    assert_eq!(v.paper.tag_matches.len(), 3, "推荐 DTO 必须携带 3 个有效 tagMatches: {:?}", v.paper.tag_matches.iter().map(|m| m.tag.clone()).collect::<Vec<_>>());
+    let names: Vec<&str> = v.paper.tag_matches.iter().map(|m| m.tag.as_str()).collect();
+    assert!(names.contains(&"VIS-A") && names.contains(&"VIS-B") && names.contains(&"VIS-C"));
+    let _ = ta;
+    let _ = tb;
+    let _ = tc;
+}
