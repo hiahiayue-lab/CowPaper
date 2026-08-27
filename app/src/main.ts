@@ -256,10 +256,11 @@ interface RecommendationRunView {
   run: RecommendationRun;
   items: RecommendationItemView[];
 }
+interface DailyPaperSummary { cycleKey: string; paperCount: number; missingCount: number; recommendationRunId: number | null; recommendationCount: number; }
 
-let recHistoryRuns: RecommendationRun[] = [];
-let recSelectedRunId: number | null = null;
-let historyView: "overview" | "detail" = "overview";
+let todayView: "recommend" | "missing" = "recommend";
+let historyCycleKey: string | null = null;
+let historyTab: "all" | "recommend" | "missing" = "all";
 /// 推荐区渲染的 Paper 副本（run 命令返回；供卡片交互查用）
 let recPapers: Paper[] = [];
 
@@ -419,7 +420,7 @@ const catalogChecked = new Set<number>(); // 选中的 journal_id
 /// 重新渲染包含某 paper 的视图（今日推荐 / 历史 / 论文列表按上下文）。
 function rerenderPaperContext(id: number) {
   if (recPapers.some((x) => x.id === id)) {
-    if (historyView === "detail" && recSelectedRunId != null) renderRecommendHistory();
+    if (historyCycleKey != null) renderRecommendHistory();
     else renderRecommend();
     return;
   }
@@ -953,8 +954,6 @@ interface RenderPaperOptions {
   withAbstract: boolean;
   rank?: number;
   scoreSnapshot?: number;
-  /// 精简操作（推荐/历史：只保留收藏 + 原文；已读/忽略归"所有论文"）
-  lightActions?: boolean;
   /// 历史总分覆盖（用 score_snapshot，避免显示当前分造成混淆）
   scoreOverride?: number;
 }
@@ -1015,7 +1014,7 @@ function renderPaperCard(p: Paper, opts: RenderPaperOptions): string {
       abstractHtml = `<div class="abstract muted">中文摘要待生成</div>`;
     } else {
       // missing：明确显示"暂无摘要"，不空白
-      abstractHtml = `<div class="abstract muted">暂无摘要</div>${p.analysisStatus === "waitingForAbstract" ? `<button class="ghost small" data-action="recover-paper-abstract" data-paper-id="${p.id}">重新获取摘要</button>` : ""}`;
+      abstractHtml = `<div class="abstract muted">未找到公开摘要</div>${p.analysisStatus === "waitingForAbstract" ? `<div class="muted small">可检查 Crossref · OpenAlex · Publisher</div><button class="ghost small" data-action="recover-paper-abstract" data-paper-id="${p.id}">重新获取摘要</button>` : ""}`;
     }
   }
 
@@ -1031,9 +1030,8 @@ function renderPaperCard(p: Paper, opts: RenderPaperOptions): string {
       ${scoreRow}
       ${abstractHtml}
       <div class="paper-actions">
-        <button class="ghost small" data-action="toggle-favorite" data-paper-id="${p.id}">${opts.lightActions ? (p.isFavorite ? "★ 已收藏" : "☆ 收藏") : (p.isFavorite ? "★" : "☆")}</button>
-        ${!opts.lightActions ? `<button class="ghost small" data-action="read" data-id="${p.id}">${p.isRead ? "已读" : "未读"}</button>` : ""}
-        ${!opts.lightActions ? `<button class="ghost small" data-action="ignore" data-id="${p.id}">${p.isIgnored ? "取消忽略" : "忽略"}</button>` : ""}
+        <button class="ghost small" data-action="toggle-favorite" data-paper-id="${p.id}">${p.isFavorite ? "★ 收藏" : "☆ 收藏"}</button>
+        <button class="ghost small" data-action="ignore" data-id="${p.id}">${p.isIgnored ? "取消忽略" : "忽略"}</button>
         ${p.url ? `<a href="#" class="ghost small" data-action="open" data-url="${escapeHtml(p.url)}">原文 ↗</a>` : ""}
         <span class="muted small detail">${escapeHtml(p.normalizedDoi || "")} · 来源 ${escapeHtml(p.discoverySource || "—")} · ${p.abstractSource ? "摘要 " + escapeHtml(p.abstractSource) : ""}</span>
       </div>
@@ -1080,17 +1078,19 @@ async function renderRecommend() {
   const list = $("recommend-list");
   const status = $("rec-status");
   try {
-    const view = await invoke<RecommendationRunView>("get_current_recommendation_run");
+    const [view, missing] = await Promise.all([invoke<RecommendationRunView>("get_current_recommendation_run"), invoke<Paper[]>("list_today_missing_papers")]);
     recPapers = view.items.map((i) => i.paper);
     const [, m, d] = view.run.cycleKey.split("-").map(Number);
     const dtime = getDailyCheckTime();
     const now = new Date();
     const nowHm = now.getHours().toString().padStart(2, "0") + ":" + now.getMinutes().toString().padStart(2, "0");
     const nextLabel = nowHm < dtime ? ` · 下一批 ${dtime} 自动更新` : "";
-    status.textContent = `今日推荐 · ${m}月${d}日 · ${view.items.length} 篇${nextLabel}`;
-    list.innerHTML = view.items.length
-      ? view.items.map((v) => renderPaperCard(v.paper, { withAbstract: true, lightActions: true })).join("")
-      : '<li class="empty">今天暂无新的推荐论文。同步并完成 AI 分析后，新论文会自动进入今日推荐。</li>';
+    status.textContent = `今日推荐 · ${m}月${d}日${nextLabel}`;
+    $("today-segments").innerHTML = `<button class="seg ${todayView === "recommend" ? "on" : ""}" data-action="today-tab" data-tab="recommend">推荐 ${view.items.length}</button><button class="seg ${todayView === "missing" ? "on" : ""}" data-action="today-tab" data-tab="missing">缺摘要 ${missing.length}</button>`;
+    $("today-missing-actions").innerHTML = todayView === "missing" ? `<div class="rec-head"><span class="muted small">今日缺失摘要 ${missing.length} 篇</span>${missing.length ? '<button class="ghost small" data-action="recover-all-abstracts">重新获取全部摘要</button>' : ""}</div>` : "";
+    list.innerHTML = todayView === "recommend"
+      ? (view.items.length ? view.items.map((v) => renderPaperCard(v.paper, { withAbstract: true })).join("") : '<li class="empty">今天暂无新的推荐论文。</li>')
+      : (missing.length ? missing.map((p) => renderPaperCard(p, { withAbstract: true })).join("") : '<li class="empty">今天没有缺失摘要的新增论文。</li>');
   } catch (err) {
     console.error("renderRecommend 失败:", err);
     list.innerHTML = '<li class="empty">暂无推荐。保存 API Key 后点「AI 分析」，或同步新论文后自动分析。</li>';
@@ -1117,45 +1117,27 @@ async function refreshRecommendations() {
   await renderRecommend();
 }
 
-/// 历史推荐独立页：overview（每日概览卡片，仅 finalized）→ detail（点击日期进入）。
+/// Daily Papers and the recommendation snapshot are separate dimensions.
 async function renderRecommendHistory() {
   const picker = $("rec-history-picker");
   const list = $("recommend-history-list");
   try {
-    recHistoryRuns = await invoke<RecommendationRun[]>("list_recommendation_runs");
-    if (historyView === "overview") {
-      // 只显示 finalized；最新在前（后端 cycle_key DESC 已保证）
-      const finalized = recHistoryRuns.filter((r) => r.status === "finalized");
-      picker.innerHTML = '<div class="rec-head"><span class="title">历史推荐</span></div>';
-      list.innerHTML = finalized.length
-        ? `<div class="history-grid">${finalized
-            .map(
-              (r) => `
-            <button class="history-card" data-action="open-history-run" data-run-id="${r.id}">
-              <div class="title">${fmtCycle(r.cycleKey)}</div>
-              <div class="muted small">${r.itemCount} 篇推荐 · 最高 ${(r.maxScore ?? 0).toFixed(1)} · ${r.journalCount} 本期刊</div>
-              <div class="muted small">→</div>
-            </button>`,
-            )
-            .join("")}</div>`
-        : '<li class="empty">暂无历史推荐。每天进入新的推荐周期后，上一周期会自动出现在这里。</li>';
+    if (!historyCycleKey) {
+      const days = await invoke<DailyPaperSummary[]>("list_daily_paper_summaries");
+      picker.innerHTML = '<div class="rec-head"><span class="title">历史</span></div>';
+      list.innerHTML = days.length ? `<div class="history-grid">${days.map((d) => `<button class="history-card" data-action="open-history-day" data-cycle-key="${d.cycleKey}"><div class="title">${fmtCycle(d.cycleKey)}</div><div class="muted small">收录 ${d.paperCount} 篇 · 推荐 ${d.recommendationCount} 篇 · 缺摘要 ${d.missingCount} 篇</div><div class="muted small">→</div></button>`).join("")}</div>` : '<li class="empty">暂无历史收录。</li>';
     } else {
-      // detail：某日快照（rank/score 用 snapshot，Paper 内容用当前）
-      if (recSelectedRunId == null) {
-        historyView = "overview";
-        renderRecommendHistory();
-        return;
-      }
-      const view = await invoke<RecommendationRunView>("get_recommendation_run", { id: recSelectedRunId });
-      recPapers = view.items.map((i) => i.paper);
       picker.innerHTML = `
         <div class="rec-head">
-          <button class="ghost small" data-action="history-back">‹ 历史推荐</button>
-          <span class="title">${fmtCycle(view.run.cycleKey)} · ${view.items.length} 篇推荐</span>
-        </div>`;
-      list.innerHTML = view.items.length
-        ? view.items.map((v) => renderPaperCard(v.paper, { withAbstract: true, rank: v.rank, scoreSnapshot: v.scoreSnapshot, scoreOverride: v.scoreSnapshot, lightActions: true })).join("")
-        : '<li class="empty">该日暂无推荐</li>';
+          <button class="ghost small" data-action="history-back">‹ 历史</button><span class="title">${fmtCycle(historyCycleKey)}</span>
+          <span class="segmented"><button class="seg ${historyTab === "all" ? "on" : ""}" data-action="history-tab" data-tab="all">全部</button><button class="seg ${historyTab === "recommend" ? "on" : ""}" data-action="history-tab" data-tab="recommend">推荐</button><button class="seg ${historyTab === "missing" ? "on" : ""}" data-action="history-tab" data-tab="missing">缺摘要</button></span></div>`;
+      if (historyTab === "recommend") {
+        const view = await invoke<RecommendationRunView | null>("get_daily_recommendation_run", { cycleKey: historyCycleKey });
+        list.innerHTML = view?.items.length ? view.items.map((v) => renderPaperCard(v.paper, { withAbstract: true, rank: v.rank, scoreSnapshot: v.scoreSnapshot, scoreOverride: v.scoreSnapshot })).join("") : '<li class="empty">该日暂无推荐</li>';
+      } else {
+        const ps = await invoke<Paper[]>("list_daily_papers", { cycleKey: historyCycleKey, missingOnly: historyTab === "missing" });
+        list.innerHTML = ps.length ? ps.map((p) => renderPaperCard(p, { withAbstract: true })).join("") : '<li class="empty">该日暂无论文</li>';
+      }
     }
   } catch (err) {
     console.error("renderRecommendHistory 失败:", err);
@@ -1163,15 +1145,8 @@ async function renderRecommendHistory() {
   }
 }
 
-function openHistoryRun(id: number) {
-  recSelectedRunId = id;
-  historyView = "detail";
-  renderRecommendHistory();
-}
-
 function showHistoryOverview() {
-  historyView = "overview";
-  recSelectedRunId = null;
+  historyCycleKey = null;
   renderRecommendHistory();
 }
 
@@ -1502,7 +1477,7 @@ function doSwitch(name: string) {
   document.querySelectorAll(".nav-item").forEach((t) => t.classList.toggle("active", (t as HTMLElement).dataset.view === name));
   document.querySelectorAll(".view").forEach((v) => v.classList.toggle("active", v.id === `view-${name}`));
   const titles: Record<string, string> = {
-    recommend: "今日推荐", "recommend-history": "历史推荐", papers: "所有论文", favorites: "收藏", journals: "期刊订阅", tags: "标签", settings: "设置", activity: "活动",
+    recommend: "今日推荐", "recommend-history": "历史", papers: "所有论文", favorites: "收藏", journals: "期刊订阅", tags: "研究标签", settings: "设置", activity: "活动",
   };
   $("view-title").textContent = titles[name] || name;
   // 进入活动页时渲染 master-detail（数据来自统一 activity + 批次查询）
@@ -1511,7 +1486,7 @@ function doSwitch(name: string) {
   if (name === "journals") setJournalTab(journalTab);
   // 进入历史推荐页时渲染快照
   if (name === "recommend-history") {
-    historyView = "overview";
+    historyCycleKey = null;
     renderRecommendHistory();
   }
   // 进入标签页时加载 Draft Editor
@@ -2219,9 +2194,23 @@ async function setupListeners() {
       await renderCatalogDetail(selectedCatalogCode!);
       return;
     }
-    const historyOpen = t.closest("[data-action='open-history-run']") as HTMLElement | null;
-    if (historyOpen) {
-      openHistoryRun(parseInt(historyOpen.dataset.runId!, 10));
+    const todayTab = t.closest("[data-action='today-tab']") as HTMLElement | null;
+    if (todayTab) {
+      todayView = todayTab.dataset.tab as "recommend" | "missing";
+      await renderRecommend();
+      return;
+    }
+    const historyDay = t.closest("[data-action='open-history-day']") as HTMLElement | null;
+    if (historyDay) {
+      historyCycleKey = historyDay.dataset.cycleKey!;
+      historyTab = "all";
+      await renderRecommendHistory();
+      return;
+    }
+    const historyTabEl = t.closest("[data-action='history-tab']") as HTMLElement | null;
+    if (historyTabEl) {
+      historyTab = historyTabEl.dataset.tab as "all" | "recommend" | "missing";
+      await renderRecommendHistory();
       return;
     }
     if (t.closest("[data-action='history-back']")) {

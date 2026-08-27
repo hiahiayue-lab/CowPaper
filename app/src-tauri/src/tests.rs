@@ -1515,6 +1515,19 @@ fn test_abstract_recovery_batch_ledger_and_restart_recovery() {
     assert_eq!(db::get_abstract_recovery_batch(&conn, running).unwrap().unwrap().status, "interrupted");
 }
 
+#[test]
+fn test_daily_first_seen_membership_is_stable() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let id = match db::upsert_paper(&conn, jid, &candidate(Some("10.1000/daily"), "Daily", None, None)).unwrap() { UpsertOutcome::New(id) => id, _ => panic!() };
+    conn.execute("UPDATE papers SET first_seen_cycle='2026-08-27' WHERE id=?1", params![id]).unwrap();
+    assert_eq!(db::list_papers_for_first_seen_cycle(&conn, "2026-08-27", true).unwrap().len(), 1);
+    db::merge_recovered_abstract(&conn, id, "crossref", "A complete abstract with sufficient research detail and results.").unwrap();
+    assert_eq!(db::list_papers_for_first_seen_cycle(&conn, "2026-08-27", false).unwrap().len(), 1);
+    assert_eq!(db::list_papers_for_first_seen_cycle(&conn, "2026-08-27", true).unwrap().len(), 1, "history missing membership must survive later recovery");
+    assert!(db::list_papers_for_first_seen_cycle(&conn, "2026-08-28", false).unwrap().is_empty());
+}
+
 /// AnalysisBatch DB 生命周期：创建+items → 状态流转 → aggregate 重算。
 #[test]
 fn test_analysis_batch_db_lifecycle() {
@@ -1864,7 +1877,7 @@ fn test_migration_v2_to_v3_preserves_data() {
 
     // 迁移到 v3
     db::init(&conn).unwrap();
-    assert_eq!(db::SCHEMA_VERSION, 10);
+    assert_eq!(db::SCHEMA_VERSION, 11);
 
     // 8) 旧 issn 迁移进 journal_identifiers（类型按列，不猜）
     let ids = db::list_journal_identifiers(&conn, jid).unwrap();
@@ -1905,7 +1918,7 @@ fn test_database_restart_persistence() {
     {
         let conn = db::open(&path).unwrap();
         db::init(&conn).unwrap(); // 幂等：user_version=3 不重复迁移
-        assert_eq!(db::SCHEMA_VERSION, 10);
+        assert_eq!(db::SCHEMA_VERSION, 11);
         let j = db::get_journal(&conn, 1).unwrap().expect("期刊持久化");
         assert_eq!(j.print_issn.as_deref(), Some("0025-1909"));
         assert_eq!(j.identifiers.len(), 1);
@@ -2330,7 +2343,7 @@ fn test_migration_v4_abstract_quality_init() {
     .unwrap();
 
     db::init(&conn).unwrap();
-    assert_eq!(db::SCHEMA_VERSION, 10);
+    assert_eq!(db::SCHEMA_VERSION, 11);
 
     let papers = db::list_papers(&conn, Some(jid), 100).unwrap();
     assert_eq!(papers.len(), 3, "迁移不得丢论文");

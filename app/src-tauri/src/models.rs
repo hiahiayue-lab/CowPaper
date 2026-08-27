@@ -206,6 +206,16 @@ pub struct RecommendationRunView {
     pub items: Vec<RecommendationItemView>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DailyPaperSummary {
+    pub cycle_key: String,
+    pub paper_count: i64,
+    pub missing_count: i64,
+    pub recommendation_run_id: Option<i64>,
+    pub recommendation_count: i64,
+}
+
 /// 集合视图（前端常用期刊页）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

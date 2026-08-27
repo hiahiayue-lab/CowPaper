@@ -740,6 +740,32 @@ fn list_papers(journal_id: Option<i64>, state: State<Db>) -> Result<Vec<models::
 }
 
 #[tauri::command]
+fn list_today_missing_papers(state: State<Db>) -> Result<Vec<models::Paper>, String> {
+    let c = state.inner().lock().unwrap();
+    db::list_current_missing_papers_for_cycle(&c, &chrono::Local::now().format("%Y-%m-%d").to_string()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn list_daily_paper_summaries(state: State<Db>) -> Result<Vec<models::DailyPaperSummary>, String> {
+    let c = state.inner().lock().unwrap();
+    db::list_daily_paper_summaries(&c).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn list_daily_papers(cycle_key: String, missing_only: Option<bool>, state: State<Db>) -> Result<Vec<models::Paper>, String> {
+    let c = state.inner().lock().unwrap();
+    db::list_papers_for_first_seen_cycle(&c, &cycle_key, missing_only.unwrap_or(false)).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_daily_recommendation_run(cycle_key: String, state: State<Db>) -> Result<Option<models::RecommendationRunView>, String> {
+    let c = state.inner().lock().unwrap();
+    let Some(id) = db::find_recommendation_run_by_cycle_key(&c, &cycle_key).map_err(|e| e.to_string())? else { return Ok(None) };
+    let run = db::get_recommendation_run(&c, id).map_err(|e| e.to_string())?.ok_or_else(|| "推荐周期不存在".to_string())?;
+    Ok(Some(models::RecommendationRunView { run, items: recommendation::run_items_with_papers(&c, id)? }))
+}
+
+#[tauri::command]
 fn set_paper_flag(id: i64, flag: String, value: bool, state: State<Db>) -> Result<(), String> {
     let conn = state.inner().lock().unwrap();
     db::set_paper_flag(&conn, id, &flag, value).map_err(|e| e.to_string())
@@ -1443,6 +1469,10 @@ pub fn run() {
             set_journal_enabled,
             delete_journal,
             list_papers,
+            list_today_missing_papers,
+            list_daily_paper_summaries,
+            list_daily_papers,
+            get_daily_recommendation_run,
             set_paper_flag,
             sync_journals,
             maybe_auto_sync,

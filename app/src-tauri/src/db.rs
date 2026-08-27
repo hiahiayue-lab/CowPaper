@@ -88,7 +88,7 @@ pub fn open(path: &Path) -> Result<Connection> {
 /// 当前 schema 版本（Round 5B：abstract_quality / paper_abstract_sources 为 v4）。
 /// 生产构建中仅由迁移系统隐式使用；测试中直接断言。
 #[allow(dead_code)]
-pub const SCHEMA_VERSION: i64 = 10;
+pub const SCHEMA_VERSION: i64 = 11;
 
 pub fn init(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
@@ -894,14 +894,15 @@ pub fn upsert_paper(conn: &Connection, journal_id: i64, c: &PaperCandidate) -> R
         ST_PENDING
     };
     let now = now_utc();
+    let first_seen_cycle = chrono::Local::now().format("%Y-%m-%d").to_string();
 
     conn.execute(
         "INSERT INTO papers (
             journal_id, normalized_doi, original_doi, title, title_norm, authors_json,
             published_date, year, abstract, abstract_source, abstract_retrieved_at,
             url, publisher_article_id, openalex_work_id, discovery_source,
-            analysis_status, abstract_quality, abstract_last_checked_at, created_at, updated_at
-         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?19)",
+            analysis_status, abstract_quality, abstract_last_checked_at, first_seen_cycle, first_seen_abstract_missing, created_at, updated_at
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?21)",
         params![
             journal_id,
             c.normalized_doi,
@@ -921,6 +922,8 @@ pub fn upsert_paper(conn: &Connection, journal_id: i64, c: &PaperCandidate) -> R
             analysis_status,
             abs_quality,
             now.clone(),
+            first_seen_cycle,
+            if abs_quality == crate::models::ABQ_MISSING { 1 } else { 0 },
             now
         ],
     )?;
@@ -1014,6 +1017,40 @@ pub fn list_papers(conn: &Connection, journal_id: Option<i64>, limit: i64) -> Re
     enrich_papers_collections(conn, &mut papers)?;
     filter_current_tag_matches(conn, &mut papers)?;
     Ok(papers)
+}
+
+pub fn list_papers_for_first_seen_cycle(conn: &Connection, cycle_key: &str, missing_only: bool) -> Result<Vec<Paper>> {
+    let sql = if missing_only {
+        "SELECT p.*,j.name AS journal_name FROM papers p JOIN journals j ON j.id=p.journal_id WHERE p.first_seen_cycle=?1 AND p.first_seen_abstract_missing=1 ORDER BY p.id DESC"
+    } else {
+        "SELECT p.*,j.name AS journal_name FROM papers p JOIN journals j ON j.id=p.journal_id WHERE p.first_seen_cycle=?1 ORDER BY p.id DESC"
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(params![cycle_key], row_to_paper)?;
+    let mut papers: Vec<Paper> = rows.collect::<Result<Vec<_>>>()?;
+    enrich_papers_collections(conn, &mut papers)?;
+    filter_current_tag_matches(conn, &mut papers)?;
+    Ok(papers)
+}
+
+pub fn list_current_missing_papers_for_cycle(conn: &Connection, cycle_key: &str) -> Result<Vec<Paper>> {
+    let mut stmt = conn.prepare("SELECT p.*,j.name AS journal_name FROM papers p JOIN journals j ON j.id=p.journal_id WHERE p.first_seen_cycle=?1 AND p.abstract_quality='missing' ORDER BY p.id DESC")?;
+    let rows = stmt.query_map(params![cycle_key], row_to_paper)?;
+    let mut papers: Vec<Paper> = rows.collect::<Result<Vec<_>>>()?;
+    enrich_papers_collections(conn, &mut papers)?;
+    filter_current_tag_matches(conn, &mut papers)?;
+    Ok(papers)
+}
+
+pub fn list_daily_paper_summaries(conn: &Connection) -> Result<Vec<crate::models::DailyPaperSummary>> {
+    let mut stmt = conn.prepare(
+        "SELECT p.first_seen_cycle,COUNT(*),SUM(p.first_seen_abstract_missing),r.id,COUNT(ri.id)
+         FROM papers p LEFT JOIN recommendation_runs r ON r.cycle_key=p.first_seen_cycle
+         LEFT JOIN recommendation_items ri ON ri.run_id=r.id
+         WHERE p.first_seen_cycle IS NOT NULL GROUP BY p.first_seen_cycle,r.id ORDER BY p.first_seen_cycle DESC"
+    )?;
+    let rows = stmt.query_map([], |r| Ok(crate::models::DailyPaperSummary { cycle_key:r.get(0)?, paper_count:r.get(1)?, missing_count:r.get(2)?, recommendation_run_id:r.get(3)?, recommendation_count:r.get(4)? }))?;
+    rows.collect()
 }
 
 /// Paper DTO 过滤：只保留当前有效 tag score（active + enabled + tag_id 精确匹配 + hash 一致）。
@@ -1152,7 +1189,23 @@ fn migrations() -> Vec<(i64, &'static str, fn(&Connection) -> Result<()>)> {
         (8, "round6.5.4-tag-score-repair", migrate_to_v8),
         (9, "full-ai-tag-identity-repair", migrate_to_v9),
         (10, "abstract-recovery-batches", migrate_to_v10),
+        (11, "daily-paper-first-seen-cycle", migrate_to_v11),
     ]
+}
+
+/// Immutable local calendar-day membership. Existing records retain their
+/// original created date; new papers are assigned only at first insertion.
+fn migrate_to_v11(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "papers", "first_seen_cycle") {
+        conn.execute("ALTER TABLE papers ADD COLUMN first_seen_cycle TEXT", [])?;
+        conn.execute("UPDATE papers SET first_seen_cycle=substr(created_at,1,10) WHERE first_seen_cycle IS NULL", [])?;
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_papers_first_seen_cycle ON papers(first_seen_cycle)", [])?;
+    }
+    if !column_exists(conn, "papers", "first_seen_abstract_missing") {
+        conn.execute("ALTER TABLE papers ADD COLUMN first_seen_abstract_missing INTEGER NOT NULL DEFAULT 0", [])?;
+        conn.execute("UPDATE papers SET first_seen_abstract_missing=CASE WHEN abstract_quality='missing' THEN 1 ELSE 0 END", [])?;
+    }
+    Ok(())
 }
 
 /// v10: durable, inspectable abstract-recovery attempt ledger.

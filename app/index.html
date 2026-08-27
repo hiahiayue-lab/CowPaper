@@ -13,9 +13,10 @@
         <div class="brand">CowPaper<span class="muted">论文工作台</span></div>
         <nav class="nav">
           <button class="nav-item active" data-view="recommend">今日推荐</button>
-          <button class="nav-item" data-view="recommend-history">历史推荐</button>
-          <button class="nav-item" data-view="papers">所有论文</button>
+          <button class="nav-item" data-view="recommend-history">历史</button>
           <button class="nav-item" data-view="favorites">收藏</button>
+          <button class="nav-item" data-view="papers">所有论文</button>
+          <div class="nav-divider"></div>
           <button class="nav-item" data-view="journals">期刊订阅</button>
           <button class="nav-item" data-view="tags">标签</button>
           <button class="nav-item" data-view="activity">活动</button>
@@ -45,6 +46,8 @@
           <div class="rec-head">
             <span id="rec-status" class="muted small"></span>
           </div>
+          <div id="today-segments" class="segmented"></div>
+          <div id="today-missing-actions"></div>
           <ul id="recommend-list" class="list"></ul>
         </section>
         <section id="view-recommend-history" class="view">
