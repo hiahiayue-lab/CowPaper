@@ -2069,6 +2069,26 @@ fn test_abstract_recovery_retry_cadence_and_public_metadata_parser() {
     assert_eq!(crate::api::publisher::extract_public_abstract(html).as_deref(), Some("A public abstract with methods and results."));
 }
 
+#[test]
+fn test_non_research_sync_filter_is_strict() {
+    use crate::sync::is_non_research_record;
+
+    let mut issue = candidate(Some("10.1000/issue"), "Issue Information: Volume 12, Issue 3", None, None);
+    assert_eq!(is_non_research_record(&issue), Some("issue-information"));
+    issue.title = Some("Table of Contents".into());
+    assert_eq!(is_non_research_record(&issue), Some("table-of-contents"));
+    issue.title = Some("Front Matter".into());
+    assert_eq!(is_non_research_record(&issue), Some("front-matter"));
+    issue.title = Some("Correction to: Platform Pricing".into());
+    assert_eq!(is_non_research_record(&issue), Some("publication-notice"));
+    issue.title = Some("A normal-looking title".into());
+    issue.raw_json = Some(r#"{"type":"journal-issue"}"#.into());
+    assert_eq!(is_non_research_record(&issue), Some("source-metadata-type"));
+
+    let research = candidate(Some("10.1000/research"), "An Editorial Perspective on Platform Strategy", None, None);
+    assert_eq!(is_non_research_record(&research), None, "ambiguous scholarly titles must remain eligible");
+}
+
 fn mk_candidate(src: &str, text: &str) -> crate::abstract_quality::AbstractCandidate {
     use crate::abstract_quality::assess_abstract_quality;
     let (q, r) = assess_abstract_quality(text);

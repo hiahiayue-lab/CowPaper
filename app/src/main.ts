@@ -1014,7 +1014,7 @@ function renderPaperCard(p: Paper, opts: RenderPaperOptions): string {
       ${scoreRow}
       ${abstractHtml}
       <div class="paper-actions">
-        <button class="ghost small" data-action="toggle-favorite" data-paper-id="${p.id}">${p.isFavorite ? "★" : "☆"}</button>
+        <button class="ghost small" data-action="toggle-favorite" data-paper-id="${p.id}">${opts.lightActions ? (p.isFavorite ? "★ 已收藏" : "☆ 收藏") : (p.isFavorite ? "★" : "☆")}</button>
         ${!opts.lightActions ? `<button class="ghost small" data-action="read" data-id="${p.id}">${p.isRead ? "已读" : "未读"}</button>` : ""}
         ${!opts.lightActions ? `<button class="ghost small" data-action="ignore" data-id="${p.id}">${p.isIgnored ? "取消忽略" : "忽略"}</button>` : ""}
         ${p.url ? `<a href="#" class="ghost small" data-action="open" data-url="${escapeHtml(p.url)}">原文 ↗</a>` : ""}
@@ -1035,6 +1035,13 @@ function renderPapers() {
   const aist = asel.value;
   const abst = absel.value;
   const collt = csel.value;
+
+  // Keep recovery reachable from All Papers rather than a hidden filter or
+  // Activity-only panel.
+  const missingAbstracts = papers.filter((p) => p.abstractQuality !== "complete").length;
+  $("abstract-recovery-banner").innerHTML = missingAbstracts > 0
+    ? `<div class="pending-row abstract-recovery-banner"><span>缺失摘要 <strong>${missingAbstracts} 篇</strong></span><button class="ghost small" data-action="recover-all-abstracts">重新获取全部摘要</button></div>`
+    : "";
 
   let list = papers;
   if (jid != null) list = list.filter((p) => p.journalId === jid);
@@ -1799,6 +1806,10 @@ async function saveSettings() {
 // ---------- 事件监听 ----------
 
 async function setupListeners() {
+  await listen("abstract://progress", (e) => {
+    const p = e.payload as { completed: number; total: number };
+    setStatus(`正在获取摘要 · ${p.completed}/${p.total}`, "running");
+  });
   await listen("sync://start", async () => {
     setStatus("同步中…", "running");
     await refreshWorkState();
@@ -2009,8 +2020,10 @@ async function setupListeners() {
     if (recoverAbstract) {
       const id = parseInt(recoverAbstract.dataset.paperId!, 10);
       try {
-        const r = await invoke<{ recovered: number; remaining: number }>("recover_paper_abstract", { paperId: id });
-        setStatus(r.recovered ? "摘要已更新" : "暂无公开摘要", r.recovered ? "done" : "idle");
+        setStatus("正在重新获取摘要…", "running");
+        const r = await invoke<{ recovered: number; remaining: number; failed: number }>("recover_paper_abstract", { paperId: id });
+        if (r.failed) setStatus("获取失败：公开数据源暂时不可用", "error");
+        else setStatus(r.recovered ? "已补充摘要" : "暂未找到公开摘要", r.recovered ? "done" : "idle");
         await loadPapers(); await refreshWorkState();
       } catch (err) { setStatus(`摘要恢复失败：${String(err)}`, "error"); }
       return;
@@ -2027,12 +2040,14 @@ async function setupListeners() {
       const ok = await showConfirmModal({ title: "重新获取全部摘要", message: "将从 Crossref、OpenAlex 和官方 publisher 页面重新尝试获取公开摘要，不会调用 AI。", confirmText: "开始获取", cancelText: "取消" });
       if (!ok) return;
       try {
-        setStatus("正在获取摘要…", "running");
-        const r = await invoke<{ recovered: number; remaining: number; recoveredIds: number[] }>("recover_all_abstracts");
+        const total = papers.filter((p) => p.abstractQuality !== "complete").length;
+        setStatus(`正在获取摘要 · 0/${total}`, "running");
+        const r = await invoke<{ recovered: number; remaining: number; failed: number; recoveredIds: number[] }>("recover_all_abstracts");
         await loadPapers(); await refreshWorkState();
-        const analyze = r.recoveredIds.length > 0 && await showConfirmModal({ title: "摘要补全完成", message: `补回 ${r.recovered} 篇 · 仍缺失 ${r.remaining} 篇`, confirmText: `分析本次补回的 ${r.recoveredIds.length} 篇`, cancelText: "完成" });
+        const summary = `补回 ${r.recovered} 篇 · 仍缺失 ${r.remaining} 篇 · 失败 ${r.failed} 篇`;
+        const analyze = r.recoveredIds.length > 0 && await showConfirmModal({ title: "摘要补全完成", message: summary, confirmText: `分析本次补回的 ${r.recoveredIds.length} 篇`, cancelText: "完成" });
         if (analyze) await startAnalyze(r.recoveredIds, "manual");
-        setStatus(`补回 ${r.recovered} 篇 · 仍缺失 ${r.remaining} 篇`, "done");
+        setStatus(summary, r.failed ? "error" : "done");
       } catch (err) { setStatus(`摘要补全失败：${String(err)}`, "error"); }
       return;
     }

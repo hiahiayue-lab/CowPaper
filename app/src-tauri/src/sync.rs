@@ -9,6 +9,50 @@ use crate::models::{
     Journal, PaperCandidate, SyncProgress, SyncReport, UpsertOutcome,
 };
 
+/// Only exclude records whose metadata or title explicitly identifies a
+/// journal artifact rather than a research paper. This deliberately avoids
+/// broad terms such as "introduction" or "editorial", which can be valid
+/// scholarly article titles.
+pub(crate) fn is_non_research_record(candidate: &PaperCandidate) -> Option<&'static str> {
+    if let Some(raw) = candidate.raw_json.as_deref() {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) {
+            if let Some(kind) = value.get("type").and_then(|v| v.as_str()) {
+                match kind.to_ascii_lowercase().as_str() {
+                    "journal-issue" | "journal-volume" => return Some("source-metadata-type"),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let title = candidate.title.as_deref()?.trim().to_ascii_lowercase();
+    let exact = [
+        ("issue information", "issue-information"),
+        ("table of contents", "table-of-contents"),
+        ("contents", "table-of-contents"),
+        ("front matter", "front-matter"),
+        ("back matter", "back-matter"),
+        ("editorial board", "editorial-board"),
+        ("masthead", "masthead"),
+        ("cover", "cover"),
+        ("index", "index"),
+        ("author index", "author-index"),
+        ("subject index", "subject-index"),
+        ("call for papers", "call-for-papers"),
+        ("announcement", "announcement"),
+        ("publication information", "publication-information"),
+    ];
+    if let Some((_, reason)) = exact.iter().find(|(pattern, _)| title == *pattern || title.starts_with(&format!("{}:", pattern))) {
+        return Some(reason);
+    }
+    if ["correction", "erratum", "retraction notice"].iter().any(|prefix| {
+        title == *prefix || title.starts_with(&format!("{}:", prefix)) || title.starts_with(&format!("{} to:", prefix))
+    }) {
+        return Some("publication-notice");
+    }
+    None
+}
+
 /// 单期刊同步结果：本次涉及论文及其结果（用于 SyncBatch 关联）。
 pub struct JournalSyncResult {
     pub inserted: Vec<i64>,
@@ -317,6 +361,10 @@ fn sync_journal(
         abstract_updated: Vec::new(),
     };
     for cand in &candidates {
+        if let Some(reason) = is_non_research_record(cand) {
+            eprintln!("skipped non-research record title={:?} reason={}", cand.title, reason);
+            continue;
+        }
         match db::upsert_paper(&tx, j.id, cand) {
             Ok(UpsertOutcome::New(id)) => {
                 report.new_papers += 1;

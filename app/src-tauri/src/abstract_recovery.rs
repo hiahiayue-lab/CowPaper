@@ -8,7 +8,7 @@ use crate::{api::{crossref::Crossref, openalex::OpenAlex, publisher::PublisherMe
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RecoveryReport { pub checked: i64, pub recovered: i64, pub upgraded: i64, pub remaining: i64, pub recovered_ids: Vec<i64>, pub upgraded_ids: Vec<i64> }
+pub struct RecoveryReport { pub checked: i64, pub recovered: i64, pub upgraded: i64, pub remaining: i64, pub failed: i64, pub recovered_ids: Vec<i64>, pub upgraded_ids: Vec<i64> }
 
 /// 24h → 3d → 7d → 30d; later attempts stay at a 30-day cadence rather than
 /// issuing daily publisher requests forever.
@@ -27,44 +27,56 @@ pub fn recover_due(conn: &Connection, mailto: &str, limit: usize) -> Result<Reco
     let papers = db::list_papers(conn, None, 10_000).map_err(|e| e.to_string())?;
     let now = Utc::now();
     let due = papers.into_iter().filter(|p| p.abstract_quality != "complete" && retry_due(p.abstract_last_checked_at.as_deref(), p.abstract_retry_count, now)).take(limit);
-    recover_many(conn, mailto, due.collect())
+    recover_many(conn, mailto, due.collect(), |_| {})
 }
 
 pub fn recover_paper(conn: &Connection, mailto: &str, paper_id: i64) -> Result<RecoveryReport, String> {
     let paper = db::get_paper(conn, paper_id).map_err(|e| e.to_string())?.ok_or_else(|| "论文不存在".to_string())?;
-    recover_many(conn, mailto, vec![paper])
+    recover_many(conn, mailto, vec![paper], |_| {})
 }
 
 /// Explicit user action: retry every non-complete paper now, ignoring the
 /// automatic cadence. It still uses the same bounded source sequence and never
 /// starts AI work.
-pub fn recover_all(conn: &Connection, mailto: &str) -> Result<RecoveryReport, String> {
+pub fn recover_all_with_progress<F>(conn: &Connection, mailto: &str, progress: F) -> Result<RecoveryReport, String>
+where F: FnMut(RecoveryProgress) {
     let papers = db::list_papers(conn, None, 10_000).map_err(|e| e.to_string())?
         .into_iter().filter(|p| p.abstract_quality != "complete").collect();
-    recover_many(conn, mailto, papers)
+    recover_many(conn, mailto, papers, progress)
 }
 
-fn recover_many(conn: &Connection, mailto: &str, papers: Vec<Paper>) -> Result<RecoveryReport, String> {
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryProgress { pub completed: i64, pub total: i64 }
+
+fn recover_many<F>(conn: &Connection, mailto: &str, papers: Vec<Paper>, mut progress: F) -> Result<RecoveryReport, String>
+where F: FnMut(RecoveryProgress) {
     let crossref = Crossref::new(mailto);
     let openalex = OpenAlex::new(mailto);
     let publisher = PublisherMetadata::new();
     let mut report = RecoveryReport::default();
+    let total = papers.iter().filter(|p| p.abstract_quality != "complete").count() as i64;
+    progress(RecoveryProgress { completed: 0, total });
     for paper in papers {
         if paper.abstract_quality == "complete" { continue; }
         report.checked += 1;
         db::mark_abstract_recovery_attempt(conn, paper.id).map_err(|e| e.to_string())?;
         let before = paper.abstract_quality.clone();
+        let mut source_failed = false;
         if let Some(doi) = paper.normalized_doi.as_deref() {
-            if let Ok(Some(c)) = crossref.work_by_doi(doi) {
-                if let Some(text) = c.abstract_text { let _ = db::merge_recovered_abstract(conn, paper.id, "crossref", &text); }
+            match crossref.work_by_doi(doi) {
+                Ok(Some(c)) => if let Some(text) = c.abstract_text { let _ = db::merge_recovered_abstract(conn, paper.id, "crossref", &text); },
+                Ok(None) => {}, Err(_) => source_failed = true,
             }
-            if let Ok(Some(c)) = openalex.work_by_doi(doi) {
-                if let Some(text) = c.abstract_text { let _ = db::merge_recovered_abstract(conn, paper.id, "openalex", &text); }
+            match openalex.work_by_doi(doi) {
+                Ok(Some(c)) => if let Some(text) = c.abstract_text { let _ = db::merge_recovered_abstract(conn, paper.id, "openalex", &text); },
+                Ok(None) => {}, Err(_) => source_failed = true,
             }
             let current = db::get_paper(conn, paper.id).map_err(|e| e.to_string())?.ok_or_else(|| "论文不存在".to_string())?;
             if current.abstract_quality != "complete" {
-                if let Ok(Some(text)) = publisher.abstract_by_doi(doi) {
-                    let _ = db::merge_recovered_abstract(conn, paper.id, "publisher", &text);
+                match publisher.abstract_by_doi(doi) {
+                    Ok(Some(text)) => { let _ = db::merge_recovered_abstract(conn, paper.id, "publisher", &text); },
+                    Ok(None) => {}, Err(_) => source_failed = true,
                 }
             }
         }
@@ -72,6 +84,8 @@ fn recover_many(conn: &Connection, mailto: &str, papers: Vec<Paper>) -> Result<R
         if after.abstract_quality != before { report.recovered += 1; report.recovered_ids.push(paper.id); }
         if before == "partial" && after.abstract_quality == "complete" { report.upgraded += 1; report.upgraded_ids.push(paper.id); }
         if after.abstract_quality != "complete" { report.remaining += 1; }
+        if after.abstract_quality != "complete" && source_failed { report.failed += 1; }
+        progress(RecoveryProgress { completed: report.checked, total });
     }
     Ok(report)
 }

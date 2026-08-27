@@ -1127,9 +1127,11 @@ fn recover_due_abstracts(state: State<Db>) -> Result<abstract_recovery::Recovery
 }
 
 #[tauri::command]
-fn recover_all_abstracts(state: State<Db>) -> Result<abstract_recovery::RecoveryReport, String> {
+fn recover_all_abstracts(app: AppHandle, state: State<Db>) -> Result<abstract_recovery::RecoveryReport, String> {
     let conn = state.inner().lock().unwrap();
-    abstract_recovery::recover_all(&conn, MAILTO)
+    abstract_recovery::recover_all_with_progress(&conn, MAILTO, |progress| {
+        let _ = app.emit("abstract://progress", &progress);
+    })
 }
 
 /// 测试 DeepSeek 连接：Key 由 Rust 从 Keychain 读取，前端不传 Key。
