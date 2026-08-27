@@ -1478,6 +1478,24 @@ fn test_sync_batch_db_lifecycle() {
     assert_eq!(p2[0].paper_id, paper_ids[1]);
 }
 
+/// An old process cannot finish a persisted running SyncBatch. Startup recovery
+/// must make it terminal so it cannot permanently drive the Work Center.
+#[test]
+fn test_interrupted_sync_batch_is_recovered() {
+    let conn = mem_db();
+    let batch_id = db::create_sync_batch(&conn, "startup").unwrap();
+    db::set_sync_batch_journal_total(&conn, batch_id, 51).unwrap();
+    db::update_sync_batch_journal_progress(&conn, batch_id, 31, 0).unwrap();
+
+    assert_eq!(db::recover_interrupted_sync_batches(&conn).unwrap(), 1);
+    let batch = db::get_sync_batch(&conn, batch_id).unwrap().unwrap();
+    assert_eq!(batch.status, "failed");
+    assert!(batch.finished_at.is_some());
+    assert_eq!(batch.journal_completed, 31);
+    assert!(batch.error_summary.unwrap_or_default().contains("中断"));
+    assert_eq!(db::recover_interrupted_sync_batches(&conn).unwrap(), 0);
+}
+
 /// AnalysisBatch DB 生命周期：创建+items → 状态流转 → aggregate 重算。
 #[test]
 fn test_analysis_batch_db_lifecycle() {

@@ -4,7 +4,8 @@ use std::path::Path;
 use crate::models::{
     AnalysisBatch, AnalysisBatchItem, Author, Journal, Paper, PaperCandidate,
     RecommendationItem, RecommendationRun, SyncBatch, SyncBatchPaper, Tag, TagMatch,
-    UpsertOutcome, IDT_ONLINE, IDT_PRINT, ST_PENDING, ST_SUCCEEDED, ST_WAITING_ABSTRACT,
+    UpsertOutcome, IDT_ONLINE, IDT_PRINT, SBC_FAILED, ST_PENDING, ST_SUCCEEDED,
+    ST_WAITING_ABSTRACT,
 };
 
 const SCHEMA: &str = r#"
@@ -1900,6 +1901,20 @@ pub fn finalize_sync_batch(
         params![status, now_utc(), error_summary, id],
     )?;
     Ok(())
+}
+
+/// A sync batch cannot survive a process exit: there is no worker after the
+/// next launch that could legitimately complete it.  Mark such persisted
+/// `running` rows terminal before Activity state is exposed again.
+pub fn recover_interrupted_sync_batches(conn: &Connection) -> Result<usize> {
+    let changed = conn.execute(
+        "UPDATE sync_batches
+         SET status=?1, finished_at=?2,
+             error_summary=COALESCE(error_summary, '应用在同步完成前中断')
+         WHERE status='running'",
+        params![SBC_FAILED, now_utc()],
+    )?;
+    Ok(changed)
 }
 
 fn row_to_sync_batch(row: &rusqlite::Row) -> Result<SyncBatch> {

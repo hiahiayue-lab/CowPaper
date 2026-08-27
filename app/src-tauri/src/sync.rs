@@ -216,13 +216,19 @@ fn sync_journal(
     let mut crossref_ok = false;
     let mut crossref_err: Option<String> = None;
     for i in &issns {
+        let source_started = std::time::Instant::now();
+        eprintln!("sync source start journal={:?} source=crossref issn={}", j.name, i);
         match crossref.works(i, &from, to) {
             Ok(Some(w)) => {
                 crossref_ok = true;
+                eprintln!("sync source end journal={:?} source=crossref elapsed_ms={} result=ok candidates={}", j.name, source_started.elapsed().as_millis(), w.candidates.len());
                 candidates.extend(w.candidates);
             }
-            Ok(None) => {} // 该 ISSN 在 Crossref 无期刊记录（如 HBR）：非错误
-            Err(e) => crossref_err = Some(e),
+            Ok(None) => eprintln!("sync source end journal={:?} source=crossref elapsed_ms={} result=unsupported", j.name, source_started.elapsed().as_millis()),
+            Err(e) => {
+                eprintln!("sync source end journal={:?} source=crossref elapsed_ms={} result=error error={}", j.name, source_started.elapsed().as_millis(), e);
+                crossref_err = Some(e);
+            }
         }
     }
     // OpenAlex fallback：无论 Crossref 结果如何都尝试补漏
@@ -231,30 +237,45 @@ fn sync_journal(
     // stored id and therefore avoid this metadata request.
     let mut openalex_ok = false;
     let mut openalex_err: Option<String> = None;
+    let source_resolve_started = std::time::Instant::now();
     let openalex_source_id = match &j.openalex_source_id {
-        Some(sid) => Some(sid.clone()),
+        Some(sid) => {
+            eprintln!("sync source end journal={:?} source=openalex-resolve elapsed_ms=0 result=cached", j.name);
+            Some(sid.clone())
+        }
         None => match openalex.source_by_issn(&issns[0]) {
             Ok(Some(sid)) => {
+                eprintln!("sync source end journal={:?} source=openalex-resolve elapsed_ms={} result=ok", j.name, source_resolve_started.elapsed().as_millis());
                 if let Ok(c) = conn.lock() {
                     let _ = db::set_journal_openalex_source(&c, j.id, Some(&sid));
                 }
                 Some(sid)
             }
-            Ok(None) => None,
+            Ok(None) => {
+                eprintln!("sync source end journal={:?} source=openalex-resolve elapsed_ms={} result=unsupported", j.name, source_resolve_started.elapsed().as_millis());
+                None
+            }
             Err(e) => {
+                eprintln!("sync source end journal={:?} source=openalex-resolve elapsed_ms={} result=error error={}", j.name, source_resolve_started.elapsed().as_millis(), e);
                 openalex_err = Some(e);
                 None
             }
         },
     };
     if let Some(sid) = &openalex_source_id {
+        let source_started = std::time::Instant::now();
+        eprintln!("sync source start journal={:?} source=openalex", j.name);
         match openalex.works(sid, &from, to) {
             Ok(Some(oa)) => {
                 openalex_ok = true;
+                eprintln!("sync source end journal={:?} source=openalex elapsed_ms={} result=ok candidates={}", j.name, source_started.elapsed().as_millis(), oa.len());
                 candidates.extend(oa);
             }
-            Ok(None) => {} // source 不存在或无该窗口数据
-            Err(e) => openalex_err = Some(e),
+            Ok(None) => eprintln!("sync source end journal={:?} source=openalex elapsed_ms={} result=unsupported", j.name, source_started.elapsed().as_millis()),
+            Err(e) => {
+                eprintln!("sync source end journal={:?} source=openalex elapsed_ms={} result=error error={}", j.name, source_started.elapsed().as_millis(), e);
+                openalex_err = Some(e);
+            }
         }
     }
     // Overall coverage：所有 configured source 都 unsupported（非网络错误）→ overall unsupported；

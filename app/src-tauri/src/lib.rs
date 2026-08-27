@@ -37,6 +37,39 @@ const AUTO_SYNC_MIN_INTERVAL: chrono::Duration = chrono::Duration::minutes(30);
 type Db = Arc<Mutex<Connection>>;
 type Secure = Arc<dyn SecureStore>;
 
+/// Ensures a persisted SyncBatch cannot remain `running` when its worker
+/// unwinds. Process-exit recovery below covers the case where Drop cannot run.
+struct SyncBatchFinalizer {
+    db: Db,
+    batch_id: i64,
+    finalized: bool,
+}
+
+impl SyncBatchFinalizer {
+    fn new(db: Db, batch_id: i64) -> Self {
+        Self { db, batch_id, finalized: false }
+    }
+
+    fn mark_finalized(&mut self) {
+        self.finalized = true;
+    }
+}
+
+impl Drop for SyncBatchFinalizer {
+    fn drop(&mut self) {
+        if !self.finalized && self.batch_id != 0 {
+            if let Ok(conn) = self.db.lock() {
+                let _ = db::finalize_sync_batch(
+                    &conn,
+                    self.batch_id,
+                    crate::models::SBC_FAILED,
+                    Some("同步任务异常终止"),
+                );
+            }
+        }
+    }
+}
+
 // ---------- 期刊 ----------
 
 /// Post-Sync 自动分析目标合并（Round 5B.1）：一次 sync 最多一个自动 AnalysisBatch。
@@ -720,6 +753,7 @@ fn sync_task<R: Runtime>(app: &AppHandle<R>, db: &Db, ids: Option<Vec<i64>>, tri
         let c = db.lock().unwrap();
         db::create_sync_batch(&c, trigger).unwrap_or(0)
     };
+    let mut batch_finalizer = SyncBatchFinalizer::new(db.clone(), batch_id);
     let _ = app.emit("sync://start", ());
     let mut report = sync::run_sync(db, ids, app, MAILTO, batch_id, trigger);
     report.batch_id = batch_id;
@@ -740,6 +774,7 @@ fn sync_task<R: Runtime>(app: &AppHandle<R>, db: &Db, ids: Option<Vec<i64>>, tri
         let _ = db::finalize_sync_batch(&c, batch_id, status, err.as_deref());
         let _ = db::set_setting(&c, "sync.last_auto_sync_at", &db::now_utc());
     }
+    batch_finalizer.mark_finalized();
     if report.new_papers > 0 {
         let _ = app
             .notification()
@@ -1225,6 +1260,9 @@ pub fn run() {
             let db_path = data_dir.join("cowpaper.db");
             let conn = db::open(&db_path)?;
             db::init(&conn)?;
+            // 上次进程若在同步期间退出，持久化的 running batch 已不可能继续；
+            // 先收尾，避免它永久遮蔽随后完成的同步进度。
+            let _ = db::recover_interrupted_sync_batches(&conn);
             // 启动恢复：中断的 analyzing 论文退回 queued（可作为剩余任务继续）
             let _ = db::recover_analyzing_to_queued(&conn);
             // 有剩余任务 → 队列显示为「已暂停」，可继续
