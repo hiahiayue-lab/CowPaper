@@ -1016,18 +1016,6 @@ pub fn list_papers(conn: &Connection, journal_id: Option<i64>, limit: i64) -> Re
     Ok(papers)
 }
 
-/// Daily reading membership is the persisted ingest date of the active local
-/// cycle, not a recommendation/AI result. Historical cycles use the same
-/// query, so papers are never copied into a second snapshot table.
-pub fn list_papers_for_cycle(conn: &Connection, cycle_key: &str) -> Result<Vec<Paper>> {
-    let mut stmt = conn.prepare("SELECT p.*, j.name AS journal_name FROM papers p JOIN journals j ON j.id=p.journal_id WHERE substr(p.created_at,1,10)=?1 ORDER BY p.published_date DESC,p.id DESC")?;
-    let rows = stmt.query_map(params![cycle_key], row_to_paper)?;
-    let mut papers: Vec<Paper> = rows.collect::<Result<Vec<_>>>()?;
-    enrich_papers_collections(conn, &mut papers)?;
-    filter_current_tag_matches(conn, &mut papers)?;
-    Ok(papers)
-}
-
 /// Paper DTO 过滤：只保留当前有效 tag score（active + enabled + tag_id 精确匹配 + hash 一致）。
 /// 不修改 tag_matches_json（cache 完整保留）。
 fn filter_current_tag_matches(conn: &Connection, papers: &mut [Paper]) -> Result<()> {

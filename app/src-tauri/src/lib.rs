@@ -740,16 +740,6 @@ fn list_papers(journal_id: Option<i64>, state: State<Db>) -> Result<Vec<models::
 }
 
 #[tauri::command]
-fn list_cycle_papers(cycle_key: Option<String>, state: State<Db>) -> Result<Vec<models::Paper>, String> {
-    let c = state.inner().lock().unwrap();
-    let key = cycle_key.unwrap_or_else(|| {
-        let time = db::get_setting(&c, "settings.daily_sync_time").unwrap_or_else(|| "09:00".into());
-        recommendation::cycle_key_for(&chrono::Local::now(), &time)
-    });
-    db::list_papers_for_cycle(&c, &key).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
 fn set_paper_flag(id: i64, flag: String, value: bool, state: State<Db>) -> Result<(), String> {
     let conn = state.inner().lock().unwrap();
     db::set_paper_flag(&conn, id, &flag, value).map_err(|e| e.to_string())
@@ -1453,7 +1443,6 @@ pub fn run() {
             set_journal_enabled,
             delete_journal,
             list_papers,
-            list_cycle_papers,
             set_paper_flag,
             sync_journals,
             maybe_auto_sync,

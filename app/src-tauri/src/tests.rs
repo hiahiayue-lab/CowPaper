@@ -1515,16 +1515,6 @@ fn test_abstract_recovery_batch_ledger_and_restart_recovery() {
     assert_eq!(db::get_abstract_recovery_batch(&conn, running).unwrap().unwrap().status, "interrupted");
 }
 
-#[test]
-fn test_cycle_papers_are_not_recommendation_membership() {
-    let conn = mem_db();
-    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
-    let id = match db::upsert_paper(&conn, jid, &candidate(Some("10.1000/cycle"), "Cycle paper", None, None)).unwrap() { UpsertOutcome::New(id) => id, _ => panic!() };
-    conn.execute("UPDATE papers SET created_at='2026-08-27T12:00:00Z' WHERE id=?1", params![id]).unwrap();
-    assert_eq!(db::list_papers_for_cycle(&conn, "2026-08-27").unwrap().len(), 1);
-    assert!(db::list_papers_for_cycle(&conn, "2026-08-26").unwrap().is_empty());
-}
-
 /// AnalysisBatch DB 生命周期：创建+items → 状态流转 → aggregate 重算。
 #[test]
 fn test_analysis_batch_db_lifecycle() {

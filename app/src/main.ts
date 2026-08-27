@@ -275,7 +275,6 @@ let abstractLang: "zh" | "en" = "zh";
 const expandedPaperIds = new Set<number>();
 /// 摘要语言状态（按 paper id，今日/全部/收藏/历史共用）
 const paperLanguageState = new Map<number, "zh" | "en">();
-let todayCycleKey: string | null = null;
 
 async function finishRecoveryBatch(batchId: number) {
   const [batch, items] = await invoke<[AbstractRecoveryBatch, AbstractRecoveryItem[]]>("get_abstract_recovery_batch", { id: batchId });
@@ -382,26 +381,8 @@ async function loadJournals() {
 async function loadPapers() {
   papers = await invoke<Paper[]>("list_papers", { journalId: null });
   renderPapers();
-  await renderTodayPapers();
-  renderPendingPapers();
   renderRecommend();
   renderFavorites();
-}
-
-async function renderTodayPapers() {
-  const list = await invoke<Paper[]>("list_cycle_papers", { cycleKey: todayCycleKey });
-  const label = todayCycleKey || "当前周期";
-  $("today-papers-status").innerHTML = `<span class="muted small">${escapeHtml(label)} · 收录 ${list.length} 篇</span>`;
-  $("today-papers-list").innerHTML = list.length ? list.map((p) => renderPaperCard(p, { withAbstract: true, lightActions: true })).join("") : '<li class="empty">当前周期暂无收录论文。</li>';
-}
-
-function renderPendingPapers() {
-  const groups: Array<[string, Paper[]]> = [
-    ["等待摘要", papers.filter((p) => p.analysisStatus === "waitingForAbstract")],
-    ["待 AI 分析", papers.filter((p) => p.analysisStatus === "pendingAnalysis")],
-    ["AI 分析失败", papers.filter((p) => p.analysisStatus === "analysisFailed")],
-  ];
-  $("pending-paper-groups").innerHTML = groups.map(([label, ps]) => `<section class="pending-group"><div class="rec-head"><span class="title">${label} · ${ps.length} 篇</span>${label === "等待摘要" && ps.length ? '<button class="ghost small" data-action="recover-all-abstracts">重新获取全部摘要</button>' : ""}${label === "待 AI 分析" && ps.length ? '<button class="ghost small" data-action="manual-analyze">开始分析</button>' : ""}${label === "AI 分析失败" && ps.length ? '<button class="ghost small" data-action="retry-failed">重新分析</button>' : ""}</div><ul class="list">${ps.length ? ps.map((p) => renderPaperCard(p, { withAbstract: true, lightActions: true })).join("") : '<li class="empty">暂无</li>'}</ul></section>`).join("");
 }
 
 async function loadAiStatus() {
@@ -1153,7 +1134,6 @@ async function renderRecommendHistory() {
             <button class="history-card" data-action="open-history-run" data-run-id="${r.id}">
               <div class="title">${fmtCycle(r.cycleKey)}</div>
               <div class="muted small">${r.itemCount} 篇推荐 · 最高 ${(r.maxScore ?? 0).toFixed(1)} · ${r.journalCount} 本期刊</div>
-              <span class="ghost small" data-action="open-cycle-papers" data-cycle-key="${r.cycleKey}">查看当日收录</span>
               <div class="muted small">→</div>
             </button>`,
             )
@@ -1522,7 +1502,7 @@ function doSwitch(name: string) {
   document.querySelectorAll(".nav-item").forEach((t) => t.classList.toggle("active", (t as HTMLElement).dataset.view === name));
   document.querySelectorAll(".view").forEach((v) => v.classList.toggle("active", v.id === `view-${name}`));
   const titles: Record<string, string> = {
-    recommend: "今日推荐", "today-papers": "今日论文", pending: "待处理", "recommend-history": "推荐历史", favorites: "收藏", journals: "期刊订阅", tags: "研究标签", settings: "设置", activity: "活动",
+    recommend: "今日推荐", "recommend-history": "历史推荐", papers: "所有论文", favorites: "收藏", journals: "期刊订阅", tags: "标签", settings: "设置", activity: "活动",
   };
   $("view-title").textContent = titles[name] || name;
   // 进入活动页时渲染 master-detail（数据来自统一 activity + 批次查询）
@@ -1534,8 +1514,6 @@ function doSwitch(name: string) {
     historyView = "overview";
     renderRecommendHistory();
   }
-  if (name === "today-papers") renderTodayPapers().catch(() => {});
-  if (name === "pending") renderPendingPapers();
   // 进入标签页时加载 Draft Editor
   if (name === "tags") loadTagEditor();
 }
@@ -1979,7 +1957,6 @@ async function setupListeners() {
     const t = ev.target as HTMLElement;
     const nav = t.closest(".nav-item") as HTMLElement | null;
     if (nav) {
-      if (nav.dataset.view === "today-papers") todayCycleKey = null;
       switchView(nav.dataset.view!);
       return;
     }
@@ -2240,12 +2217,6 @@ async function setupListeners() {
       setStatus(`已添加 ${ids.length} 本期刊到集合`, "done");
       closeAddMemberPanel();
       await renderCatalogDetail(selectedCatalogCode!);
-      return;
-    }
-    const cyclePapers = t.closest("[data-action='open-cycle-papers']") as HTMLElement | null;
-    if (cyclePapers) {
-      todayCycleKey = cyclePapers.dataset.cycleKey || null;
-      switchView("today-papers");
       return;
     }
     const historyOpen = t.closest("[data-action='open-history-run']") as HTMLElement | null;
