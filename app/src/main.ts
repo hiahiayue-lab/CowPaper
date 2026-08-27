@@ -186,6 +186,13 @@ interface AnalysisBatchItem {
   title: string | null;
 }
 
+interface AbstractRecoveryBatch {
+  id: number; status: string; total: number; completed: number; recovered: number; notFound: number; failed: number; remaining: number;
+  createdAt: string; startedAt: string | null; finishedAt: string | null; errorSummary: string | null;
+}
+interface AbstractRecoveryItem { paperId: number; outcome: string | null; currentSource: string | null; title: string | null; nextRetryAt: string | null; errorSummary: string | null; }
+interface AbstractRecoveryProgress { batchId: number; completed: number; total: number; currentPaperTitle: string | null; currentSource: string | null; phase: string; recovered: number; notFound: number; failed: number; remaining: number; }
+
 interface ActivityState {
   syncBatch: SyncBatch | null;
   analysisBatch: AnalysisBatch | null;
@@ -268,6 +275,17 @@ let abstractLang: "zh" | "en" = "zh";
 const expandedPaperIds = new Set<number>();
 /// 摘要语言状态（按 paper id，今日/全部/收藏/历史共用）
 const paperLanguageState = new Map<number, "zh" | "en">();
+let todayCycleKey: string | null = null;
+
+async function finishRecoveryBatch(batchId: number) {
+  const [batch, items] = await invoke<[AbstractRecoveryBatch, AbstractRecoveryItem[]]>("get_abstract_recovery_batch", { id: batchId });
+  await loadPapers(); await refreshWorkState();
+  const summary = `补回 ${batch.recovered} 篇 · 未找到 ${batch.notFound} 篇 · 来源失败 ${batch.failed} 篇`;
+  const recoveredIds = items.filter((i) => i.outcome === "recovered").map((i) => i.paperId);
+  const analyze = recoveredIds.length > 0 && await showConfirmModal({ title: "摘要补全完成", message: summary, confirmText: `分析本次补回的 ${recoveredIds.length} 篇`, cancelText: "完成" });
+  if (analyze) await startAnalyze(recoveredIds, "manual");
+  setStatus(summary, batch.failed ? "error" : "done");
+}
 
 function emptyActivity(): ActivityState {
   return {
@@ -364,8 +382,26 @@ async function loadJournals() {
 async function loadPapers() {
   papers = await invoke<Paper[]>("list_papers", { journalId: null });
   renderPapers();
+  await renderTodayPapers();
+  renderPendingPapers();
   renderRecommend();
   renderFavorites();
+}
+
+async function renderTodayPapers() {
+  const list = await invoke<Paper[]>("list_cycle_papers", { cycleKey: todayCycleKey });
+  const label = todayCycleKey || "当前周期";
+  $("today-papers-status").innerHTML = `<span class="muted small">${escapeHtml(label)} · 收录 ${list.length} 篇</span>`;
+  $("today-papers-list").innerHTML = list.length ? list.map((p) => renderPaperCard(p, { withAbstract: true, lightActions: true })).join("") : '<li class="empty">当前周期暂无收录论文。</li>';
+}
+
+function renderPendingPapers() {
+  const groups: Array<[string, Paper[]]> = [
+    ["等待摘要", papers.filter((p) => p.analysisStatus === "waitingForAbstract")],
+    ["待 AI 分析", papers.filter((p) => p.analysisStatus === "pendingAnalysis")],
+    ["AI 分析失败", papers.filter((p) => p.analysisStatus === "analysisFailed")],
+  ];
+  $("pending-paper-groups").innerHTML = groups.map(([label, ps]) => `<section class="pending-group"><div class="rec-head"><span class="title">${label} · ${ps.length} 篇</span>${label === "等待摘要" && ps.length ? '<button class="ghost small" data-action="recover-all-abstracts">重新获取全部摘要</button>' : ""}${label === "待 AI 分析" && ps.length ? '<button class="ghost small" data-action="manual-analyze">开始分析</button>' : ""}${label === "AI 分析失败" && ps.length ? '<button class="ghost small" data-action="retry-failed">重新分析</button>' : ""}</div><ul class="list">${ps.length ? ps.map((p) => renderPaperCard(p, { withAbstract: true, lightActions: true })).join("") : '<li class="empty">暂无</li>'}</ul></section>`).join("");
 }
 
 async function loadAiStatus() {
@@ -1117,6 +1153,7 @@ async function renderRecommendHistory() {
             <button class="history-card" data-action="open-history-run" data-run-id="${r.id}">
               <div class="title">${fmtCycle(r.cycleKey)}</div>
               <div class="muted small">${r.itemCount} 篇推荐 · 最高 ${(r.maxScore ?? 0).toFixed(1)} · ${r.journalCount} 本期刊</div>
+              <span class="ghost small" data-action="open-cycle-papers" data-cycle-key="${r.cycleKey}">查看当日收录</span>
               <div class="muted small">→</div>
             </button>`,
             )
@@ -1349,9 +1386,10 @@ let recentActivityItems: Array<{ time: string; kind: string; line: string; statu
 
 async function renderActivityHistory() {
   const ul = $("activity-history");
-  const [sbs, abs] = await Promise.all([
+  const [sbs, abs, recovers] = await Promise.all([
     invoke<SyncBatch[]>("list_sync_batches", { limit: 25 }).catch(() => []),
     invoke<AnalysisBatch[]>("list_analysis_batches", { limit: 25 }).catch(() => []),
+    invoke<AbstractRecoveryBatch[]>("list_abstract_recovery_batches", { limit: 25 }).catch(() => []),
   ]);
   const items: typeof recentActivityItems = [];
   for (const b of sbs) {
@@ -1364,6 +1402,10 @@ async function renderActivityHistory() {
     const line = `${TRIGGER_ZH[b.trigger] || b.trigger} · ${b.total} 篇 · 成功 ${b.succeeded}${b.failed ? " · 失败 " + b.failed : ""}`;
     items.push({ time: t, kind: "ai", type: "analysis", id: b.id, status: b.status, line });
   }
+  for (const b of recovers) {
+    const t = b.finishedAt || b.startedAt || b.createdAt;
+    items.push({ time: t, kind: "recovery", type: "recovery", id: b.id, status: b.status, line: `摘要补全 · 已处理 ${b.completed}/${b.total} · 补回 ${b.recovered} · 未找到 ${b.notFound} · 失败 ${b.failed}` });
+  }
   items.sort((x, y) => (y.time || "").localeCompare(x.time || ""));
   recentActivityItems = items.slice(0, 50);
   ul.innerHTML = recentActivityItems
@@ -1372,7 +1414,7 @@ async function renderActivityHistory() {
       <li class="card activity-item ${selectedActivity && selectedActivity.type === i.type && selectedActivity.id === i.id ? "selected" : ""}" data-activity-type="${i.type}" data-activity-id="${i.id}">
         <div class="row">
           <div class="grow">
-            <div class="title">${i.kind === "sync" ? "检查新论文" : "AI 分析"} #${i.id} <span class="chip muted-chip">${STATUS_ZH[i.status] || i.status}</span></div>
+            <div class="title">${i.kind === "sync" ? "检查新论文" : i.kind === "recovery" ? "摘要补全" : "AI 分析"} #${i.id} <span class="chip muted-chip">${STATUS_ZH[i.status] || i.status}</span></div>
             <div class="muted small">${i.line}</div>
           </div>
           <span class="muted small">${i.time ? new Date(i.time).toLocaleTimeString() : "—"}</span>
@@ -1402,6 +1444,9 @@ async function renderActivityDetail() {
         <div class="paper-meta">记录：发现 ${b.recordsFound} · 新增 ${b.papersInserted} · 已有 ${b.papersExisting} · 补摘要 ${b.abstractsAdded}</div>
         <div class="paper-meta muted small">本次涉及论文 ${papers.length} 篇（${Object.entries(groups).map(([k, v]) => `${k} ${v}`).join(" · ")}）</div>
       </div>`;
+  } else if (type === "recovery") {
+    const [b, items] = await invoke<[AbstractRecoveryBatch, AbstractRecoveryItem[]]>("get_abstract_recovery_batch", { id });
+    box.innerHTML = `<div class="card"><div class="title">摘要补全 #${b.id} <span class="chip muted-chip">${STATUS_ZH[b.status] || b.status}</span></div><div class="paper-meta">已处理 ${b.completed}/${b.total} · 补回 ${b.recovered} · 未找到 ${b.notFound} · 来源失败 ${b.failed}</div><div class="abstract muted small">${items.filter((i) => i.outcome && i.outcome !== "recovered").slice(0, 8).map((i) => `${escapeHtml(i.title || "未命名")}：${i.outcome}${i.nextRetryAt ? `（下次 ${fmtDate(i.nextRetryAt)}）` : ""}`).join("；") || "所有论文已补回摘要"}</div></div>`;
   } else {
     const [b, items] = await invoke<[AnalysisBatch, AnalysisBatchItem[]]>("get_analysis_batch", { id });
     const failed = items.filter((i) => i.status === "failed");
@@ -1477,7 +1522,7 @@ function doSwitch(name: string) {
   document.querySelectorAll(".nav-item").forEach((t) => t.classList.toggle("active", (t as HTMLElement).dataset.view === name));
   document.querySelectorAll(".view").forEach((v) => v.classList.toggle("active", v.id === `view-${name}`));
   const titles: Record<string, string> = {
-    recommend: "今日推荐", "recommend-history": "历史推荐", papers: "所有论文", favorites: "收藏", journals: "期刊订阅", tags: "标签", settings: "设置", activity: "活动",
+    recommend: "今日推荐", "today-papers": "今日论文", pending: "待处理", "recommend-history": "推荐历史", favorites: "收藏", journals: "期刊订阅", tags: "研究标签", settings: "设置", activity: "活动",
   };
   $("view-title").textContent = titles[name] || name;
   // 进入活动页时渲染 master-detail（数据来自统一 activity + 批次查询）
@@ -1489,6 +1534,8 @@ function doSwitch(name: string) {
     historyView = "overview";
     renderRecommendHistory();
   }
+  if (name === "today-papers") renderTodayPapers().catch(() => {});
+  if (name === "pending") renderPendingPapers();
   // 进入标签页时加载 Draft Editor
   if (name === "tags") loadTagEditor();
 }
@@ -1807,9 +1854,12 @@ async function saveSettings() {
 
 async function setupListeners() {
   await listen("abstract://progress", (e) => {
-    const p = e.payload as { completed: number; total: number };
-    setStatus(`正在获取摘要 · ${p.completed}/${p.total}`, "running");
+    const p = e.payload as AbstractRecoveryProgress;
+    const source = p.currentSource ? ` · ${p.currentSource}` : "";
+    setStatus(`正在补全摘要 · ${p.completed}/${p.total}${source}`, "running");
   });
+  await listen("abstract://done", async (e) => { await finishRecoveryBatch(e.payload as number); });
+  await listen("abstract://error", (e) => { setStatus(`摘要补全失败：${String(e.payload)}`, "error"); });
   await listen("sync://start", async () => {
     setStatus("同步中…", "running");
     await refreshWorkState();
@@ -1929,6 +1979,7 @@ async function setupListeners() {
     const t = ev.target as HTMLElement;
     const nav = t.closest(".nav-item") as HTMLElement | null;
     if (nav) {
+      if (nav.dataset.view === "today-papers") todayCycleKey = null;
       switchView(nav.dataset.view!);
       return;
     }
@@ -2021,10 +2072,8 @@ async function setupListeners() {
       const id = parseInt(recoverAbstract.dataset.paperId!, 10);
       try {
         setStatus("正在重新获取摘要…", "running");
-        const r = await invoke<{ recovered: number; remaining: number; failed: number }>("recover_paper_abstract", { paperId: id });
-        if (r.failed) setStatus("获取失败：公开数据源暂时不可用", "error");
-        else setStatus(r.recovered ? "已补充摘要" : "暂未找到公开摘要", r.recovered ? "done" : "idle");
-        await loadPapers(); await refreshWorkState();
+        const b = await invoke<AbstractRecoveryBatch>("recover_paper_abstract", { paperId: id });
+        setStatus(`正在补全摘要 · 0/${b.total}`, "running");
       } catch (err) { setStatus(`摘要恢复失败：${String(err)}`, "error"); }
       return;
     }
@@ -2042,12 +2091,8 @@ async function setupListeners() {
       try {
         const total = papers.filter((p) => p.abstractQuality !== "complete").length;
         setStatus(`正在获取摘要 · 0/${total}`, "running");
-        const r = await invoke<{ recovered: number; remaining: number; failed: number; recoveredIds: number[] }>("recover_all_abstracts");
-        await loadPapers(); await refreshWorkState();
-        const summary = `补回 ${r.recovered} 篇 · 仍缺失 ${r.remaining} 篇 · 失败 ${r.failed} 篇`;
-        const analyze = r.recoveredIds.length > 0 && await showConfirmModal({ title: "摘要补全完成", message: summary, confirmText: `分析本次补回的 ${r.recoveredIds.length} 篇`, cancelText: "完成" });
-        if (analyze) await startAnalyze(r.recoveredIds, "manual");
-        setStatus(summary, r.failed ? "error" : "done");
+        const b = await invoke<AbstractRecoveryBatch>("recover_all_abstracts");
+        setStatus(`正在补全摘要 · 0/${b.total}`, "running");
       } catch (err) { setStatus(`摘要补全失败：${String(err)}`, "error"); }
       return;
     }
@@ -2195,6 +2240,12 @@ async function setupListeners() {
       setStatus(`已添加 ${ids.length} 本期刊到集合`, "done");
       closeAddMemberPanel();
       await renderCatalogDetail(selectedCatalogCode!);
+      return;
+    }
+    const cyclePapers = t.closest("[data-action='open-cycle-papers']") as HTMLElement | null;
+    if (cyclePapers) {
+      todayCycleKey = cyclePapers.dataset.cycleKey || null;
+      switchView("today-papers");
       return;
     }
     const historyOpen = t.closest("[data-action='open-history-run']") as HTMLElement | null;

@@ -570,6 +570,30 @@ pub struct AnalysisBatchItem {
     pub title: Option<String>,
 }
 
+/// Public, persisted abstract recovery work. Unlike a sync batch, this runs
+/// one paper/source at a time and can safely survive an app restart.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AbstractRecoveryBatch {
+    pub id: i64, pub status: String, pub created_at: String, pub started_at: Option<String>, pub finished_at: Option<String>,
+    pub total: i64, pub completed: i64, pub recovered: i64, pub not_found: i64, pub failed: i64, pub remaining: i64, pub error_summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AbstractRecoveryItem {
+    pub id: i64, pub batch_id: i64, pub paper_id: i64, pub title: Option<String>, pub status: String,
+    pub current_source: Option<String>, pub outcome: Option<String>, pub started_at: Option<String>, pub completed_at: Option<String>,
+    pub next_retry_at: Option<String>, pub error_summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AbstractRecoveryProgress {
+    pub batch_id: i64, pub completed: i64, pub total: i64, pub current_paper_title: Option<String>, pub current_source: Option<String>,
+    pub phase: String, pub recovered: i64, pub not_found: i64, pub failed: i64, pub remaining: i64,
+}
+
 /// 同步进度事件负载（Activity Bar 渲染来源之一）。
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]

@@ -1496,6 +1496,35 @@ fn test_interrupted_sync_batch_is_recovered() {
     assert_eq!(db::recover_interrupted_sync_batches(&conn).unwrap(), 0);
 }
 
+#[test]
+fn test_abstract_recovery_batch_ledger_and_restart_recovery() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let id = match db::upsert_paper(&conn, jid, &candidate(Some("10.1000/recovery"), "Recovery", None, None)).unwrap() { UpsertOutcome::New(id) => id, _ => panic!() };
+    let batch = db::create_abstract_recovery_batch(&conn, &[id]).unwrap();
+    let item = db::list_abstract_recovery_items(&conn, batch).unwrap().remove(0);
+    db::start_abstract_recovery_item(&conn, item.id, "Crossref").unwrap();
+    db::finish_abstract_recovery_attempt(&conn, item.id, "Crossref", "notFound", None).unwrap();
+    db::finish_abstract_recovery_item(&conn, item.id, "notFound", None, Some("2030-01-01T00:00:00Z")).unwrap();
+    db::update_abstract_recovery_batch_counts(&conn, batch).unwrap();
+    db::finalize_abstract_recovery_batch(&conn, batch, "completed", None).unwrap();
+    let b = db::get_abstract_recovery_batch(&conn, batch).unwrap().unwrap();
+    assert_eq!((b.completed, b.not_found, b.remaining), (1, 1, 0));
+    let running = db::create_abstract_recovery_batch(&conn, &[id]).unwrap();
+    assert_eq!(db::recover_interrupted_abstract_recovery_batches(&conn).unwrap(), 1);
+    assert_eq!(db::get_abstract_recovery_batch(&conn, running).unwrap().unwrap().status, "interrupted");
+}
+
+#[test]
+fn test_cycle_papers_are_not_recommendation_membership() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let id = match db::upsert_paper(&conn, jid, &candidate(Some("10.1000/cycle"), "Cycle paper", None, None)).unwrap() { UpsertOutcome::New(id) => id, _ => panic!() };
+    conn.execute("UPDATE papers SET created_at='2026-08-27T12:00:00Z' WHERE id=?1", params![id]).unwrap();
+    assert_eq!(db::list_papers_for_cycle(&conn, "2026-08-27").unwrap().len(), 1);
+    assert!(db::list_papers_for_cycle(&conn, "2026-08-26").unwrap().is_empty());
+}
+
 /// AnalysisBatch DB 生命周期：创建+items → 状态流转 → aggregate 重算。
 #[test]
 fn test_analysis_batch_db_lifecycle() {
@@ -1845,7 +1874,7 @@ fn test_migration_v2_to_v3_preserves_data() {
 
     // 迁移到 v3
     db::init(&conn).unwrap();
-    assert_eq!(db::SCHEMA_VERSION, 9);
+    assert_eq!(db::SCHEMA_VERSION, 10);
 
     // 8) 旧 issn 迁移进 journal_identifiers（类型按列，不猜）
     let ids = db::list_journal_identifiers(&conn, jid).unwrap();
@@ -1886,7 +1915,7 @@ fn test_database_restart_persistence() {
     {
         let conn = db::open(&path).unwrap();
         db::init(&conn).unwrap(); // 幂等：user_version=3 不重复迁移
-        assert_eq!(db::SCHEMA_VERSION, 9);
+        assert_eq!(db::SCHEMA_VERSION, 10);
         let j = db::get_journal(&conn, 1).unwrap().expect("期刊持久化");
         assert_eq!(j.print_issn.as_deref(), Some("0025-1909"));
         assert_eq!(j.identifiers.len(), 1);
@@ -2311,7 +2340,7 @@ fn test_migration_v4_abstract_quality_init() {
     .unwrap();
 
     db::init(&conn).unwrap();
-    assert_eq!(db::SCHEMA_VERSION, 9);
+    assert_eq!(db::SCHEMA_VERSION, 10);
 
     let papers = db::list_papers(&conn, Some(jid), 100).unwrap();
     assert_eq!(papers.len(), 3, "迁移不得丢论文");

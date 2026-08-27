@@ -740,6 +740,16 @@ fn list_papers(journal_id: Option<i64>, state: State<Db>) -> Result<Vec<models::
 }
 
 #[tauri::command]
+fn list_cycle_papers(cycle_key: Option<String>, state: State<Db>) -> Result<Vec<models::Paper>, String> {
+    let c = state.inner().lock().unwrap();
+    let key = cycle_key.unwrap_or_else(|| {
+        let time = db::get_setting(&c, "settings.daily_sync_time").unwrap_or_else(|| "09:00".into());
+        recommendation::cycle_key_for(&chrono::Local::now(), &time)
+    });
+    db::list_papers_for_cycle(&c, &key).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn set_paper_flag(id: i64, flag: String, value: bool, state: State<Db>) -> Result<(), String> {
     let conn = state.inner().lock().unwrap();
     db::set_paper_flag(&conn, id, &flag, value).map_err(|e| e.to_string())
@@ -1114,24 +1124,56 @@ fn get_waiting_abstract_count(state: State<Db>) -> Result<i64, String> {
     db::count_waiting_for_abstract(&conn).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-fn recover_paper_abstract(paper_id: i64, state: State<Db>) -> Result<abstract_recovery::RecoveryReport, String> {
-    let conn = state.inner().lock().unwrap();
-    abstract_recovery::recover_paper(&conn, MAILTO, paper_id)
+fn start_abstract_recovery(app: AppHandle, db_arc: Db, paper_ids: Vec<i64>) -> Result<models::AbstractRecoveryBatch, String> {
+    if paper_ids.is_empty() { return Err("没有需要补全摘要的论文".into()); }
+    let batch = {
+        let c = db_arc.lock().unwrap();
+        if let Some(running) = db::latest_abstract_recovery_batch(&c).map_err(|e| e.to_string())? {
+            if running.status == "running" { return Err("摘要补全正在进行中".into()); }
+        }
+        let id = db::create_abstract_recovery_batch(&c, &paper_ids).map_err(|e| e.to_string())?;
+        db::get_abstract_recovery_batch(&c, id).map_err(|e| e.to_string())?.ok_or_else(|| "无法创建摘要补全批次".to_string())?
+    };
+    let worker_db = db_arc.clone();
+    std::thread::spawn(move || {
+        let result = abstract_recovery::run_batch(worker_db.clone(), batch.id, MAILTO, |progress| { let _ = app.emit("abstract://progress", &progress); });
+        if let Err(err) = result {
+            if let Ok(c) = worker_db.lock() { let _ = db::finalize_abstract_recovery_batch(&c, batch.id, "failed", Some(&err)); }
+            let _ = app.emit("abstract://error", err);
+        } else { let _ = app.emit("abstract://done", batch.id); }
+    });
+    Ok(batch)
 }
 
 #[tauri::command]
-fn recover_due_abstracts(state: State<Db>) -> Result<abstract_recovery::RecoveryReport, String> {
-    let conn = state.inner().lock().unwrap();
-    abstract_recovery::recover_due(&conn, MAILTO, 50)
+fn recover_paper_abstract(app: AppHandle, paper_id: i64, state: State<Db>) -> Result<models::AbstractRecoveryBatch, String> {
+    start_abstract_recovery(app, state.inner().clone(), vec![paper_id])
 }
 
 #[tauri::command]
-fn recover_all_abstracts(app: AppHandle, state: State<Db>) -> Result<abstract_recovery::RecoveryReport, String> {
-    let conn = state.inner().lock().unwrap();
-    abstract_recovery::recover_all_with_progress(&conn, MAILTO, |progress| {
-        let _ = app.emit("abstract://progress", &progress);
-    })
+fn recover_due_abstracts(app: AppHandle, state: State<Db>) -> Result<models::AbstractRecoveryBatch, String> {
+    let ids = { let c = state.inner().lock().unwrap(); let now = chrono::Utc::now(); db::list_papers(&c, None, 10_000).map_err(|e| e.to_string())?.into_iter().filter(|p| p.abstract_quality != "complete" && abstract_recovery::retry_due(p.abstract_last_checked_at.as_deref(), p.abstract_retry_count, now)).take(50).map(|p| p.id).collect() };
+    start_abstract_recovery(app, state.inner().clone(), ids)
+}
+
+#[tauri::command]
+fn recover_all_abstracts(app: AppHandle, state: State<Db>) -> Result<models::AbstractRecoveryBatch, String> {
+    let ids = { let c = state.inner().lock().unwrap(); db::list_papers(&c, None, 10_000).map_err(|e| e.to_string())?.into_iter().filter(|p| p.abstract_quality != "complete").map(|p| p.id).collect() };
+    start_abstract_recovery(app, state.inner().clone(), ids)
+}
+
+#[tauri::command]
+fn get_abstract_recovery_batch(id: i64, state: State<Db>) -> Result<(models::AbstractRecoveryBatch, Vec<models::AbstractRecoveryItem>), String> {
+    let c = state.inner().lock().unwrap();
+    let batch = db::get_abstract_recovery_batch(&c, id).map_err(|e| e.to_string())?.ok_or_else(|| "摘要补全批次不存在".to_string())?;
+    let items = db::list_abstract_recovery_items(&c, id).map_err(|e| e.to_string())?;
+    Ok((batch, items))
+}
+
+#[tauri::command]
+fn list_abstract_recovery_batches(limit: Option<i64>, state: State<Db>) -> Result<Vec<models::AbstractRecoveryBatch>, String> {
+    let c = state.inner().lock().unwrap();
+    db::list_abstract_recovery_batches(&c, limit.unwrap_or(25)).map_err(|e| e.to_string())
 }
 
 /// 测试 DeepSeek 连接：Key 由 Rust 从 Keychain 读取，前端不传 Key。
@@ -1288,6 +1330,7 @@ pub fn run() {
             // 上次进程若在同步期间退出，持久化的 running batch 已不可能继续；
             // 先收尾，避免它永久遮蔽随后完成的同步进度。
             let _ = db::recover_interrupted_sync_batches(&conn);
+            let _ = db::recover_interrupted_abstract_recovery_batches(&conn);
             // 启动恢复：中断的 analyzing 论文退回 queued（可作为剩余任务继续）
             let _ = db::recover_analyzing_to_queued(&conn);
             // 有剩余任务 → 队列显示为「已暂停」，可继续
@@ -1410,6 +1453,7 @@ pub fn run() {
             set_journal_enabled,
             delete_journal,
             list_papers,
+            list_cycle_papers,
             set_paper_flag,
             sync_journals,
             maybe_auto_sync,
@@ -1432,6 +1476,8 @@ pub fn run() {
             recover_paper_abstract,
             recover_due_abstracts,
             recover_all_abstracts,
+            get_abstract_recovery_batch,
+            list_abstract_recovery_batches,
             test_api_connection,
             get_settings,
             set_settings,

@@ -13,13 +13,14 @@
         <div class="brand">CowPaper<span class="muted">论文工作台</span></div>
         <nav class="nav">
           <button class="nav-item active" data-view="recommend">今日推荐</button>
-          <button class="nav-item" data-view="recommend-history">历史推荐</button>
-          <button class="nav-item" data-view="papers">所有论文</button>
+          <button class="nav-item" data-view="today-papers">今日论文</button>
+          <button class="nav-item" data-view="pending">待处理</button>
           <button class="nav-item" data-view="favorites">收藏</button>
+          <button class="nav-item" data-view="recommend-history">推荐历史</button>
           <button class="nav-item" data-view="journals">期刊订阅</button>
-          <button class="nav-item" data-view="tags">标签</button>
-          <button class="nav-item" data-view="settings">设置</button>
+          <button class="nav-item" data-view="tags">研究标签</button>
           <button class="nav-item" data-view="activity">活动</button>
+          <button class="nav-item" data-view="settings">设置</button>
         </nav>
       </aside>
 
@@ -52,8 +53,10 @@
           <ul id="recommend-history-list" class="list"></ul>
         </section>
 
-        <section id="view-papers" class="view">
-          <div class="filter">
+        <section id="view-today-papers" class="view">
+          <div id="today-papers-status" class="rec-head"></div>
+          <ul id="today-papers-list" class="list"></ul>
+          <div class="hidden" aria-hidden="true"><div class="filter">
             <select id="journal-filter"><option value="">全部期刊</option></select>
             <select id="ai-filter">
               <option value="">全部状态</option>
@@ -83,7 +86,10 @@
           </div>
           <div id="abstract-recovery-banner"></div>
           <ul id="paper-list" class="list"></ul>
+          </div></div>
         </section>
+
+        <section id="view-pending" class="view"><div id="pending-paper-groups"></div></section>
 
         <section id="view-favorites" class="view">
           <ul id="favorites-list" class="list"></ul>

@@ -3,7 +3,7 @@ use std::path::Path;
 
 use crate::models::{
     AnalysisBatch, AnalysisBatchItem, Author, Journal, Paper, PaperCandidate,
-    RecommendationItem, RecommendationRun, SyncBatch, SyncBatchPaper, Tag, TagMatch,
+    AbstractRecoveryBatch, AbstractRecoveryItem, RecommendationItem, RecommendationRun, SyncBatch, SyncBatchPaper, Tag, TagMatch,
     UpsertOutcome, IDT_ONLINE, IDT_PRINT, SBC_FAILED, ST_PENDING, ST_SUCCEEDED,
     ST_WAITING_ABSTRACT,
 };
@@ -88,7 +88,7 @@ pub fn open(path: &Path) -> Result<Connection> {
 /// 当前 schema 版本（Round 5B：abstract_quality / paper_abstract_sources 为 v4）。
 /// 生产构建中仅由迁移系统隐式使用；测试中直接断言。
 #[allow(dead_code)]
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 10;
 
 pub fn init(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
@@ -1016,6 +1016,18 @@ pub fn list_papers(conn: &Connection, journal_id: Option<i64>, limit: i64) -> Re
     Ok(papers)
 }
 
+/// Daily reading membership is the persisted ingest date of the active local
+/// cycle, not a recommendation/AI result. Historical cycles use the same
+/// query, so papers are never copied into a second snapshot table.
+pub fn list_papers_for_cycle(conn: &Connection, cycle_key: &str) -> Result<Vec<Paper>> {
+    let mut stmt = conn.prepare("SELECT p.*, j.name AS journal_name FROM papers p JOIN journals j ON j.id=p.journal_id WHERE substr(p.created_at,1,10)=?1 ORDER BY p.published_date DESC,p.id DESC")?;
+    let rows = stmt.query_map(params![cycle_key], row_to_paper)?;
+    let mut papers: Vec<Paper> = rows.collect::<Result<Vec<_>>>()?;
+    enrich_papers_collections(conn, &mut papers)?;
+    filter_current_tag_matches(conn, &mut papers)?;
+    Ok(papers)
+}
+
 /// Paper DTO 过滤：只保留当前有效 tag score（active + enabled + tag_id 精确匹配 + hash 一致）。
 /// 不修改 tag_matches_json（cache 完整保留）。
 fn filter_current_tag_matches(conn: &Connection, papers: &mut [Paper]) -> Result<()> {
@@ -1151,7 +1163,34 @@ fn migrations() -> Vec<(i64, &'static str, fn(&Connection) -> Result<()>)> {
         (7, "round6.5-tag-config-versions", migrate_to_v7),
         (8, "round6.5.4-tag-score-repair", migrate_to_v8),
         (9, "full-ai-tag-identity-repair", migrate_to_v9),
+        (10, "abstract-recovery-batches", migrate_to_v10),
     ]
+}
+
+/// v10: durable, inspectable abstract-recovery attempt ledger.
+fn migrate_to_v10(conn: &Connection) -> Result<()> {
+    conn.execute_batch(r#"
+        CREATE TABLE IF NOT EXISTS abstract_recovery_batches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, status TEXT NOT NULL, created_at TEXT NOT NULL,
+            started_at TEXT, finished_at TEXT, total INTEGER NOT NULL DEFAULT 0, completed INTEGER NOT NULL DEFAULT 0,
+            recovered INTEGER NOT NULL DEFAULT 0, not_found INTEGER NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0,
+            remaining INTEGER NOT NULL DEFAULT 0, error_summary TEXT
+        );
+        CREATE TABLE IF NOT EXISTS abstract_recovery_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, batch_id INTEGER NOT NULL REFERENCES abstract_recovery_batches(id) ON DELETE CASCADE,
+            paper_id INTEGER NOT NULL REFERENCES papers(id) ON DELETE CASCADE, status TEXT NOT NULL DEFAULT 'pending',
+            current_source TEXT, outcome TEXT, started_at TEXT, completed_at TEXT, next_retry_at TEXT, error_summary TEXT,
+            UNIQUE(batch_id, paper_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_arb_started ON abstract_recovery_batches(started_at);
+        CREATE INDEX IF NOT EXISTS idx_ari_batch ON abstract_recovery_items(batch_id, status);
+        CREATE TABLE IF NOT EXISTS abstract_recovery_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, item_id INTEGER NOT NULL REFERENCES abstract_recovery_items(id) ON DELETE CASCADE,
+            source TEXT NOT NULL, outcome TEXT, started_at TEXT NOT NULL, completed_at TEXT, error_summary TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_ara_item ON abstract_recovery_attempts(item_id);
+    "#)?;
+    Ok(())
 }
 
 /// v9：修复 Full AI 历史 name-only tagMatches（无 tag_id/hash）。
@@ -1993,6 +2032,65 @@ pub fn last_finished_sync_batch(conn: &Connection) -> Result<Option<SyncBatch>> 
         row_to_sync_batch,
     )
     .optional()
+}
+
+// ---------- AbstractRecoveryBatch ----------
+
+pub fn create_abstract_recovery_batch(conn: &Connection, paper_ids: &[i64]) -> Result<i64> {
+    let now = now_utc();
+    conn.execute("INSERT INTO abstract_recovery_batches (status, created_at, started_at, total, remaining) VALUES ('running', ?1, ?1, ?2, ?2)", params![now, paper_ids.len() as i64])?;
+    let id = conn.last_insert_rowid();
+    for paper_id in paper_ids {
+        conn.execute("INSERT INTO abstract_recovery_items (batch_id, paper_id, status) VALUES (?1, ?2, 'pending')", params![id, paper_id])?;
+    }
+    Ok(id)
+}
+
+fn row_to_abstract_recovery_batch(row: &rusqlite::Row) -> Result<AbstractRecoveryBatch> {
+    Ok(AbstractRecoveryBatch { id: row.get(0)?, status: row.get(1)?, created_at: row.get(2)?, started_at: row.get(3)?, finished_at: row.get(4)?, total: row.get(5)?, completed: row.get(6)?, recovered: row.get(7)?, not_found: row.get(8)?, failed: row.get(9)?, remaining: row.get(10)?, error_summary: row.get(11)? })
+}
+pub fn get_abstract_recovery_batch(conn: &Connection, id: i64) -> Result<Option<AbstractRecoveryBatch>> {
+    conn.query_row("SELECT id,status,created_at,started_at,finished_at,total,completed,recovered,not_found,failed,remaining,error_summary FROM abstract_recovery_batches WHERE id=?1", params![id], row_to_abstract_recovery_batch).optional()
+}
+pub fn latest_abstract_recovery_batch(conn: &Connection) -> Result<Option<AbstractRecoveryBatch>> {
+    conn.query_row("SELECT id,status,created_at,started_at,finished_at,total,completed,recovered,not_found,failed,remaining,error_summary FROM abstract_recovery_batches ORDER BY id DESC LIMIT 1", [], row_to_abstract_recovery_batch).optional()
+}
+pub fn list_abstract_recovery_batches(conn: &Connection, limit: i64) -> Result<Vec<AbstractRecoveryBatch>> {
+    let mut stmt = conn.prepare("SELECT id,status,created_at,started_at,finished_at,total,completed,recovered,not_found,failed,remaining,error_summary FROM abstract_recovery_batches ORDER BY id DESC LIMIT ?1")?;
+    let rows = stmt.query_map(params![limit], row_to_abstract_recovery_batch)?;
+    rows.collect()
+}
+pub fn list_abstract_recovery_items(conn: &Connection, batch_id: i64) -> Result<Vec<AbstractRecoveryItem>> {
+    let mut stmt = conn.prepare("SELECT i.id,i.batch_id,i.paper_id,p.title,i.status,i.current_source,i.outcome,i.started_at,i.completed_at,i.next_retry_at,i.error_summary FROM abstract_recovery_items i LEFT JOIN papers p ON p.id=i.paper_id WHERE i.batch_id=?1 ORDER BY i.id")?;
+    let rows = stmt.query_map(params![batch_id], |r| Ok(AbstractRecoveryItem { id:r.get(0)?, batch_id:r.get(1)?, paper_id:r.get(2)?, title:r.get(3)?, status:r.get(4)?, current_source:r.get(5)?, outcome:r.get(6)?, started_at:r.get(7)?, completed_at:r.get(8)?, next_retry_at:r.get(9)?, error_summary:r.get(10)? }))?;
+    rows.collect()
+}
+pub fn start_abstract_recovery_item(conn: &Connection, item_id: i64, source: &str) -> Result<()> {
+    let now = now_utc();
+    conn.execute("UPDATE abstract_recovery_items SET status='running', current_source=?1, started_at=COALESCE(started_at,?2) WHERE id=?3", params![source,now,item_id])?;
+    conn.execute("INSERT INTO abstract_recovery_attempts (item_id,source,started_at) VALUES (?1,?2,?3)", params![item_id,source,now])?;
+    Ok(())
+}
+pub fn finish_abstract_recovery_attempt(conn: &Connection, item_id: i64, source: &str, outcome: &str, error: Option<&str>) -> Result<()> {
+    let now = now_utc();
+    conn.execute("UPDATE abstract_recovery_attempts SET outcome=?1,completed_at=?2,error_summary=?3 WHERE id=(SELECT id FROM abstract_recovery_attempts WHERE item_id=?4 AND source=?5 AND completed_at IS NULL ORDER BY id DESC LIMIT 1)", params![outcome,now,error,item_id,source])?;
+    Ok(())
+}
+pub fn finish_abstract_recovery_item(conn: &Connection, item_id: i64, outcome: &str, error: Option<&str>, next_retry_at: Option<&str>) -> Result<()> {
+    let now = now_utc();
+    conn.execute("UPDATE abstract_recovery_items SET status='completed',outcome=?1,error_summary=?2,next_retry_at=?3,completed_at=?4 WHERE id=?5", params![outcome,error,next_retry_at,now,item_id])?;
+    Ok(())
+}
+pub fn update_abstract_recovery_batch_counts(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute("UPDATE abstract_recovery_batches SET completed=(SELECT COUNT(*) FROM abstract_recovery_items WHERE batch_id=?1 AND status='completed'), recovered=(SELECT COUNT(*) FROM abstract_recovery_items WHERE batch_id=?1 AND outcome='recovered'), not_found=(SELECT COUNT(*) FROM abstract_recovery_items WHERE batch_id=?1 AND outcome='notFound'), failed=(SELECT COUNT(*) FROM abstract_recovery_items WHERE batch_id=?1 AND outcome='networkFailure'), remaining=(SELECT COUNT(*) FROM abstract_recovery_items WHERE batch_id=?1 AND status!='completed') WHERE id=?1", params![id])?;
+    Ok(())
+}
+pub fn finalize_abstract_recovery_batch(conn: &Connection, id: i64, status: &str, error: Option<&str>) -> Result<()> {
+    conn.execute("UPDATE abstract_recovery_batches SET status=?1,finished_at=?2,error_summary=?3 WHERE id=?4", params![status,now_utc(),error,id])?;
+    Ok(())
+}
+pub fn recover_interrupted_abstract_recovery_batches(conn: &Connection) -> Result<usize> {
+    conn.execute("UPDATE abstract_recovery_batches SET status='interrupted',finished_at=?1,error_summary=COALESCE(error_summary,'App restarted; remaining papers can be retried.') WHERE status='running'", params![now_utc()])
 }
 
 pub fn list_sync_batch_papers(conn: &Connection, batch_id: i64) -> Result<Vec<SyncBatchPaper>> {
