@@ -1188,7 +1188,11 @@ fn set_settings(s: models::Settings, state: State<Db>) -> Result<(), String> {
 }
 
 fn valid_daily_sync_time(value: &str) -> bool {
-    chrono::NaiveTime::parse_from_str(value, "%H:%M").is_ok()
+    value.len() == 5
+        && value.as_bytes()[2] == b':'
+        && value.as_bytes()[..2].iter().all(u8::is_ascii_digit)
+        && value.as_bytes()[3..].iter().all(u8::is_ascii_digit)
+        && chrono::NaiveTime::parse_from_str(value, "%H:%M").is_ok()
 }
 
 // ---------- Round 4：Activity 查询 ----------
