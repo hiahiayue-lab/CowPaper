@@ -9,6 +9,16 @@ pub struct OpenAlex {
     mailto: String,
 }
 
+/// Stable journal identity returned by OpenAlex for an ISSN lookup.  The ISSN
+/// family is intentionally retained: a source can represent both print and
+/// online editions even when Crossref only exposes one of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenAlexSourceIdentity {
+    pub source_id: String,
+    pub issn_l: Option<String>,
+    pub issns: Vec<String>,
+}
+
 impl OpenAlex {
     pub fn new(mailto: &str) -> Self {
         let client = Client::builder()
@@ -25,6 +35,13 @@ impl OpenAlex {
 
     /// 通过 ISSN 查找期刊 Source ID（去掉 https://openalex.org/ 前缀）。
     pub fn source_by_issn(&self, issn: &str) -> Result<Option<String>, String> {
+        Ok(self.source_identity_by_issn(issn)?.map(|identity| identity.source_id))
+    }
+
+    /// Resolve the complete OpenAlex journal identity for one ISSN.  `Ok(None)`
+    /// means no matching source; transport and service failures stay errors so
+    /// callers never mistake an unavailable source for an identity conflict.
+    pub fn source_identity_by_issn(&self, issn: &str) -> Result<Option<OpenAlexSourceIdentity>, String> {
         let url = format!("https://api.openalex.org/sources?filter=issn:{}&mailto={}", issn, self.mailto);
         let resp = self
             .client
@@ -37,13 +54,32 @@ impl OpenAlex {
         let v: Value = resp
             .json()
             .map_err(|e| format!("OpenAlex source 响应解析失败: {}", e))?;
-        Ok(v
+        let Some(source) = v
             .get("results")
             .and_then(|r| r.as_array())
-            .and_then(|r| r.first())
-            .and_then(|r| r.get("id"))
+            .and_then(|r| r.first()) else {
+            return Ok(None);
+        };
+        let Some(source_id) = source
+            .get("id")
             .and_then(|id| id.as_str())
-            .map(|id| id.replace("https://openalex.org/", "")))
+            .map(|id| id.replace("https://openalex.org/", "")) else {
+            return Ok(None);
+        };
+        let mut issns = source
+            .get("issn")
+            .and_then(|values| values.as_array())
+            .map(|values| values.iter().filter_map(|value| value.as_str())
+                .filter_map(crate::util::normalize_issn).collect::<Vec<_>>())
+            .unwrap_or_default();
+        issns.sort();
+        issns.dedup();
+        Ok(Some(OpenAlexSourceIdentity {
+            source_id,
+            issn_l: source.get("issn_l").and_then(|value| value.as_str())
+                .and_then(crate::util::normalize_issn),
+            issns,
+        }))
     }
 
     /// 按 source_id 查询近期 works。

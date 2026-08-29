@@ -1730,6 +1730,25 @@ async function addJournalHandler(e: Event) {
     ($("add-online-issn") as HTMLInputElement).value = "";
     await loadJournals();
   } catch (err) {
+    if (String(err).includes("ISSN_PAIR_UNKNOWN_CONFIRMATION")) {
+      const confirmed = await showConfirmModal({
+        title: "无法确认 ISSN 关联",
+        message: "暂未能从公开元数据确认两个 ISSN 的关联。\n如果你确认它们属于同一期刊，可以继续添加。",
+        confirmText: "仍然添加",
+        cancelText: "取消",
+      });
+      if (!confirmed) return;
+      try {
+        await invoke("add_journal", { name: name || null, printIssn: printIssn || null, onlineIssn: onlineIssn || null, confirmUnknown: true });
+        ($("add-name") as HTMLInputElement).value = "";
+        ($("add-print-issn") as HTMLInputElement).value = "";
+        ($("add-online-issn") as HTMLInputElement).value = "";
+        await loadJournals();
+      } catch (confirmationErr) {
+        $("add-error").textContent = String(confirmationErr);
+      }
+      return;
+    }
     $("add-error").textContent = String(err);
   }
 }

@@ -1887,12 +1887,65 @@ fn test_manual_print_online_validation_and_confirmation() {
         title: "Management Science".into(), publisher: None,
         print_issn: Some("0025-1909".into()), online_issn: Some("1526-5501".into()), issn_l: Some("0025-1909".into()),
     };
-    let different = crate::api::crossref::JournalMeta {
-        title: "Another Journal".into(), publisher: None,
-        print_issn: Some("0306-4573".into()), online_issn: None, issn_l: Some("0306-4573".into()),
+    let evidence = crate::IssnIdentityEvidence { print_crossref: Some(same), ..Default::default() };
+    assert_eq!(crate::resolve_paired_issn_identity("0025-1909", "1526-5501", &evidence), crate::IssnIdentityRelation::Same);
+    assert!(crate::requires_unknown_pair_confirmation(true, crate::IssnIdentityRelation::Unknown, false));
+    assert!(!crate::requires_unknown_pair_confirmation(true, crate::IssnIdentityRelation::Unknown, true));
+}
+
+fn openalex_identity(source_id: &str, issn_l: Option<&str>, issns: &[&str]) -> crate::api::openalex::OpenAlexSourceIdentity {
+    crate::api::openalex::OpenAlexSourceIdentity {
+        source_id: source_id.to_string(),
+        issn_l: issn_l.map(str::to_string),
+        issns: issns.iter().map(|value| value.to_string()).collect(),
+    }
+}
+
+#[test]
+fn test_paired_issn_identity_resolver_is_three_state() {
+    use crate::{IssnIdentityEvidence, IssnIdentityRelation};
+    use crate::api::crossref::JournalMeta;
+
+    // Energy Economics: Crossref only resolves the print endpoint; OpenAlex's
+    // source family proves that 0140-9883 and 1873-6181 are one journal.
+    let energy_crossref = JournalMeta {
+        title: "Energy Economics".into(), publisher: Some("Elsevier".into()),
+        print_issn: Some("0140-9883".into()), online_issn: None, issn_l: Some("0140-9883".into()),
     };
-    assert!(crate::crossref_confirms_same_journal("0025-1909", "1526-5501", &[same]));
-    assert!(!crate::crossref_confirms_same_journal("0025-1909", "0306-4573", &[different]));
+    let energy = IssnIdentityEvidence {
+        print_crossref: Some(energy_crossref),
+        online_crossref: None, // Crossref online lookup 404
+        print_openalex: Some(openalex_identity("S94499970", Some("0140-9883"), &["0140-9883", "1873-6181"])),
+        online_openalex: Some(openalex_identity("S94499970", Some("0140-9883"), &["0140-9883", "1873-6181"])),
+    };
+    assert_eq!(crate::resolve_paired_issn_identity("0140-9883", "1873-6181", &energy), IssnIdentityRelation::Same);
+
+    // Crossref can be absent for both lookups while a shared OpenAlex source
+    // remains sufficient positive evidence.
+    let openalex_only = IssnIdentityEvidence {
+        print_openalex: Some(openalex_identity("S1", Some("0025-1909"), &["0025-1909", "1526-5501"])),
+        online_openalex: Some(openalex_identity("S1", Some("0025-1909"), &["0025-1909", "1526-5501"])),
+        ..Default::default()
+    };
+    assert_eq!(crate::resolve_paired_issn_identity("0025-1909", "1526-5501", &openalex_only), IssnIdentityRelation::Same);
+
+    // A timeout or any other unavailable lookup supplies no positive conflict
+    // evidence, so the UI must request confirmation rather than reject it.
+    assert_eq!(crate::resolve_paired_issn_identity("0025-1909", "1526-5501", &IssnIdentityEvidence::default()), IssnIdentityRelation::Unknown);
+    assert!(crate::requires_unknown_pair_confirmation(true, IssnIdentityRelation::Unknown, false));
+    let conn = mem_db();
+    let confirmed_id = db::insert_journal(&conn, "Confirmed unknown pair", Some("0025-1909"), Some("1526-5501"), None, None).unwrap();
+    db::bind_journal_identifier(&conn, confirmed_id, crate::models::IDT_PRINT, "0025-1909", Some("manual")).unwrap();
+    db::bind_journal_identifier(&conn, confirmed_id, crate::models::IDT_ONLINE, "1526-5501", Some("manual")).unwrap();
+    assert_eq!(db::list_journals(&conn).unwrap().len(), 1, "confirmed unknown pair remains one canonical Journal");
+    assert_eq!(db::list_journal_identifiers(&conn, confirmed_id).unwrap().len(), 2);
+
+    let conflict = IssnIdentityEvidence {
+        print_openalex: Some(openalex_identity("S-print", Some("0025-1909"), &["0025-1909"])),
+        online_openalex: Some(openalex_identity("S-online", Some("0306-4573"), &["0306-4573"])),
+        ..Default::default()
+    };
+    assert_eq!(crate::resolve_paired_issn_identity("0025-1909", "0306-4573", &conflict), IssnIdentityRelation::Conflict);
 }
 
 #[test]

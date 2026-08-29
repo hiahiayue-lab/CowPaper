@@ -99,6 +99,7 @@ fn add_journal(
     name: Option<String>,
     print_issn: Option<String>,
     online_issn: Option<String>,
+    confirm_unknown: Option<bool>,
     state: State<Db>,
 ) -> Result<models::AddJournalResult, String> {
     let crossref = api::crossref::Crossref::new(MAILTO);
@@ -114,11 +115,20 @@ fn add_journal(
     for issn in [&print, &online].into_iter().flatten() {
         if !supplied.contains(issn) { supplied.push(issn.clone()); }
     }
-    let metas: Vec<api::crossref::JournalMeta> = supplied
-        .iter()
-        .filter_map(|issn| crossref.journal_meta(issn))
-        .collect();
-    let oa_id = supplied.first().and_then(|issn| openalex.source_by_issn(issn).ok().flatten());
+    let mut evidence = IssnIdentityEvidence::default();
+    for issn in &supplied {
+        let crossref_meta = crossref.journal_meta(issn);
+        let openalex_identity = openalex.source_identity_by_issn(issn).ok().flatten();
+        if print.as_deref() == Some(issn) {
+            evidence.print_crossref = crossref_meta;
+            evidence.print_openalex = openalex_identity;
+        } else {
+            evidence.online_crossref = crossref_meta;
+            evidence.online_openalex = openalex_identity;
+        }
+    }
+    let metas = evidence.crossref_metas();
+    let oa_id = evidence.openalex_id();
 
     let conn = state.inner().lock().unwrap();
     let direct_ids: Vec<i64> = [&print, &online]
@@ -152,9 +162,22 @@ fn add_journal(
         return Err("Print ISSN 与 Online ISSN 对应的期刊不一致，请检查后重试。".to_string());
     }
     let direct_same_journal = direct_ids.len() == 2 && direct_ids[0] == direct_ids[1];
-    if print.is_some() && online.is_some() && !direct_same_journal
-        && !crossref_confirms_same_journal(print.as_deref().unwrap(), online.as_deref().unwrap(), &metas) {
+    let remote_relation = match (print.as_deref(), online.as_deref()) {
+        (Some(print), Some(online)) => resolve_paired_issn_identity(print, online, &evidence),
+        _ => IssnIdentityRelation::Unknown,
+    };
+    let relation = if targets.len() > 1 {
+        IssnIdentityRelation::Conflict
+    } else if direct_same_journal {
+        IssnIdentityRelation::Same
+    } else {
+        remote_relation
+    };
+    if relation == IssnIdentityRelation::Conflict {
         return Err("Print ISSN 与 Online ISSN 对应的期刊不一致，请检查后重试。".to_string());
+    }
+    if requires_unknown_pair_confirmation(print.is_some() && online.is_some(), relation, confirm_unknown.unwrap_or(false)) {
+        return Err(UNKNOWN_ISSN_PAIR_CONFIRMATION.to_string());
     }
 
     let meta_print = metas.iter().find_map(|m| m.print_issn.as_deref().and_then(crate::util::normalize_issn));
@@ -176,12 +199,27 @@ fn add_journal(
         ).map_err(|e| e.to_string())?
     };
 
-    // Crossref provides authoritative extra identifiers; explicit user inputs
+    // Crossref and OpenAlex provide reliable extra identifiers; explicit user inputs
     // are then bound with their declared print/online type.
     if let Some(value) = meta_print.as_deref() { db::bind_journal_identifier(&conn, id, models::IDT_PRINT, value, Some("crossref")).map_err(|e| e.to_string())?; }
     if let Some(value) = meta_online.as_deref() { db::bind_journal_identifier(&conn, id, models::IDT_ONLINE, value, Some("crossref")).map_err(|e| e.to_string())?; }
     if let Some(value) = print.as_deref() { db::bind_journal_identifier(&conn, id, models::IDT_PRINT, value, Some("manual")).map_err(|e| e.to_string())?; }
     if let Some(value) = online.as_deref() { db::bind_journal_identifier(&conn, id, models::IDT_ONLINE, value, Some("manual")).map_err(|e| e.to_string())?; }
+    for value in evidence.openalex_family() {
+        // Inputs retain their print/online type.  A supplemental OpenAlex
+        // family identifier may only be added when it is not already owned by
+        // another canonical Journal; never turn it into an implicit merge.
+        if print.as_deref() == Some(value.as_str()) || online.as_deref() == Some(value.as_str()) {
+            continue;
+        }
+        match db::resolve_journal_by_identifier(&conn, &value).map_err(|e| e.to_string())? {
+            Some(owner) if owner != id => {
+                return Err("Print ISSN 与 Online ISSN 对应的期刊不一致，请检查后重试。".to_string());
+            }
+            Some(_) => {}
+            None => db::insert_identifier(&conn, id, models::IDT_OTHER, &value, Some("openalex")).map_err(|e| e.to_string())?,
+        }
+    }
     db::fill_journal_issn_columns(&conn, id, print.as_deref().or(meta_print.as_deref()), online.as_deref().or(meta_online.as_deref())).map_err(|e| e.to_string())?;
     if db::get_journal_issn_l(&conn, id).map_err(|e| e.to_string())?.is_none() {
         if let Some(value) = meta_issn_l.as_deref() { db::set_journal_issn_l(&conn, id, Some(value)).map_err(|e| e.to_string())?; }
@@ -192,7 +230,14 @@ fn add_journal(
     let journal = db::get_journal(&conn, id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "写入后读取失败".to_string())?;
-    Ok(models::AddJournalResult { journal, note: if targets.is_empty() { None } else { Some("已补充到已有期刊，未创建重复".to_string()) } })
+    let note = if targets.is_empty() {
+        if relation == IssnIdentityRelation::Unknown && print.is_some() && online.is_some() {
+            Some("已按确认添加；公开元数据尚未确认两个 ISSN 的关联".to_string())
+        } else { None }
+    } else {
+        Some("已补充到已有期刊，未创建重复".to_string())
+    };
+    Ok(models::AddJournalResult { journal, note })
 }
 
 fn normalize_manual_issn(input: Option<&str>, label: &str) -> Result<Option<String>, String> {
@@ -202,19 +247,88 @@ fn normalize_manual_issn(input: Option<&str>, label: &str) -> Result<Option<Stri
     }
 }
 
-fn crossref_confirms_same_journal(print: &str, online: &str, metas: &[api::crossref::JournalMeta]) -> bool {
-    let contains_both = metas.iter().any(|meta| {
-        let ids = [meta.print_issn.as_deref(), meta.online_issn.as_deref()]
+const UNKNOWN_ISSN_PAIR_CONFIRMATION: &str = "ISSN_PAIR_UNKNOWN_CONFIRMATION";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IssnIdentityRelation { Same, Conflict, Unknown }
+
+#[derive(Default)]
+pub(crate) struct IssnIdentityEvidence {
+    pub print_crossref: Option<api::crossref::JournalMeta>,
+    pub online_crossref: Option<api::crossref::JournalMeta>,
+    pub print_openalex: Option<api::openalex::OpenAlexSourceIdentity>,
+    pub online_openalex: Option<api::openalex::OpenAlexSourceIdentity>,
+}
+
+impl IssnIdentityEvidence {
+    fn crossref_metas(&self) -> Vec<api::crossref::JournalMeta> {
+        [self.print_crossref.clone(), self.online_crossref.clone()].into_iter().flatten().collect()
+    }
+
+    fn openalex_id(&self) -> Option<String> {
+        self.print_openalex.as_ref().or(self.online_openalex.as_ref()).map(|identity| identity.source_id.clone())
+    }
+
+    fn openalex_family(&self) -> Vec<String> {
+        let mut family = self.print_openalex.iter().chain(self.online_openalex.iter())
+            .flat_map(|identity| identity.issns.iter().cloned()).collect::<Vec<_>>();
+        family.sort();
+        family.dedup();
+        family
+    }
+}
+
+/// Resolve a supplied print/online pair without treating absent or incomplete
+/// public metadata as evidence of a different journal.
+pub(crate) fn resolve_paired_issn_identity(
+    print: &str,
+    online: &str,
+    evidence: &IssnIdentityEvidence,
+) -> IssnIdentityRelation {
+    let meta_contains_pair = |meta: &api::crossref::JournalMeta| {
+        let identifiers = [meta.print_issn.as_deref(), meta.online_issn.as_deref()]
             .into_iter().flatten().filter_map(crate::util::normalize_issn).collect::<Vec<_>>();
-        ids.contains(&print.to_string()) && ids.contains(&online.to_string())
-    });
-    if contains_both { return true; }
-    let mut issn_l: Vec<String> = metas.iter()
-        .filter_map(|meta| meta.issn_l.as_deref().and_then(crate::util::normalize_issn))
-        .collect();
-    issn_l.sort();
-    issn_l.dedup();
-    issn_l.len() == 1 && metas.len() >= 2
+        identifiers.contains(&print.to_string()) && identifiers.contains(&online.to_string())
+    };
+    if evidence.print_crossref.iter().chain(evidence.online_crossref.iter()).any(meta_contains_pair) {
+        return IssnIdentityRelation::Same;
+    }
+    let same_crossref_issn_l = match (&evidence.print_crossref, &evidence.online_crossref) {
+        (Some(left), Some(right)) => left.issn_l.as_deref().and_then(crate::util::normalize_issn)
+            .zip(right.issn_l.as_deref().and_then(crate::util::normalize_issn))
+            .is_some_and(|(left, right)| left == right),
+        _ => false,
+    };
+    if same_crossref_issn_l { return IssnIdentityRelation::Same; }
+
+    let source_has_pair = |identity: &api::openalex::OpenAlexSourceIdentity| {
+        identity.issns.iter().any(|value| value == print) && identity.issns.iter().any(|value| value == online)
+    };
+    if evidence.print_openalex.iter().chain(evidence.online_openalex.iter()).any(source_has_pair) {
+        return IssnIdentityRelation::Same;
+    }
+    let (Some(left), Some(right)) = (&evidence.print_openalex, &evidence.online_openalex) else {
+        return IssnIdentityRelation::Unknown;
+    };
+    if left.source_id == right.source_id {
+        return IssnIdentityRelation::Same;
+    }
+    if left.issn_l.is_some() && left.issn_l == right.issn_l {
+        return IssnIdentityRelation::Same;
+    }
+    let has_shared_family = left.issns.iter().any(|value| right.issns.contains(value));
+    if has_shared_family { return IssnIdentityRelation::Same; }
+    // Both source records resolve successfully and declare distinct canonical
+    // identities without a shared family: this is positive conflict evidence.
+    IssnIdentityRelation::Conflict
+}
+
+pub(crate) fn requires_unknown_pair_confirmation(
+    has_pair: bool,
+    relation: IssnIdentityRelation,
+    confirmed: bool,
+) -> bool {
+    has_pair && relation == IssnIdentityRelation::Unknown && !confirmed
 }
 
 #[tauri::command]

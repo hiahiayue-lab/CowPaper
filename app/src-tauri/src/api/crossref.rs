@@ -4,6 +4,7 @@ use serde_json::Value;
 use crate::models::{Author, PaperCandidate};
 use crate::util::{extract_year, normalize_doi, strip_html};
 
+#[derive(Debug, Clone)]
 pub struct JournalMeta {
     pub title: String,
     pub publisher: Option<String>,
