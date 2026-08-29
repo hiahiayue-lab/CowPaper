@@ -1716,16 +1716,18 @@ async function manualAnalyze(): Promise<boolean> {
 async function addJournalHandler(e: Event) {
   e.preventDefault();
   const name = ($("add-name") as HTMLInputElement).value.trim();
-  const issn = ($("add-issn") as HTMLInputElement).value.trim();
-  if (!name && !issn) {
-    $("add-error").textContent = "请输入期刊名称或 ISSN";
+  const printIssn = ($("add-print-issn") as HTMLInputElement).value.trim();
+  const onlineIssn = ($("add-online-issn") as HTMLInputElement).value.trim();
+  if (!printIssn && !onlineIssn) {
+    $("add-error").textContent = "至少填写一个 ISSN";
     return;
   }
   $("add-error").textContent = "";
   try {
-    await invoke("add_journal", { name: name || null, issn: issn || null });
+    await invoke("add_journal", { name: name || null, printIssn: printIssn || null, onlineIssn: onlineIssn || null });
     ($("add-name") as HTMLInputElement).value = "";
-    ($("add-issn") as HTMLInputElement).value = "";
+    ($("add-print-issn") as HTMLInputElement).value = "";
+    ($("add-online-issn") as HTMLInputElement).value = "";
     await loadJournals();
   } catch (err) {
     $("add-error").textContent = String(err);

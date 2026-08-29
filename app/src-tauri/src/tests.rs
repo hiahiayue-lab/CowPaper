@@ -1878,6 +1878,46 @@ fn test_identifier_resolution_same_journal() {
 }
 
 #[test]
+fn test_manual_print_online_validation_and_confirmation() {
+    assert_eq!(crate::normalize_manual_issn(Some("00251909"), "Print ISSN").unwrap().as_deref(), Some("0025-1909"));
+    assert!(crate::normalize_manual_issn(Some("0025-1900"), "Print ISSN").is_err());
+    assert_eq!(crate::normalize_manual_issn(None, "Online ISSN").unwrap(), None);
+
+    let same = crate::api::crossref::JournalMeta {
+        title: "Management Science".into(), publisher: None,
+        print_issn: Some("0025-1909".into()), online_issn: Some("1526-5501".into()), issn_l: Some("0025-1909".into()),
+    };
+    let different = crate::api::crossref::JournalMeta {
+        title: "Another Journal".into(), publisher: None,
+        print_issn: Some("0306-4573".into()), online_issn: None, issn_l: Some("0306-4573".into()),
+    };
+    assert!(crate::crossref_confirms_same_journal("0025-1909", "1526-5501", &[same]));
+    assert!(!crate::crossref_confirms_same_journal("0025-1909", "0306-4573", &[different]));
+}
+
+#[test]
+fn test_manual_identifier_enriches_existing_journal_without_duplicates() {
+    let conn = mem_db();
+    let print_first = db::insert_journal(&conn, "Print first", Some("0025-1909"), None, None, None).unwrap();
+    db::bind_journal_identifier(&conn, print_first, crate::models::IDT_PRINT, "0025-1909", Some("manual")).unwrap();
+    db::bind_journal_identifier(&conn, print_first, crate::models::IDT_ONLINE, "1526-5501", Some("manual")).unwrap();
+    db::fill_journal_issn_columns(&conn, print_first, Some("0025-1909"), Some("1526-5501")).unwrap();
+    assert_eq!(db::resolve_journal_by_identifier(&conn, "1526-5501").unwrap(), Some(print_first));
+    assert_eq!(db::list_journals(&conn).unwrap().len(), 1);
+
+    let online_first = db::insert_journal(&conn, "Online first", None, Some("0306-4573"), None, None).unwrap();
+    db::bind_journal_identifier(&conn, online_first, crate::models::IDT_ONLINE, "0306-4573", Some("manual")).unwrap();
+    db::bind_journal_identifier(&conn, online_first, crate::models::IDT_PRINT, "0743-7463", Some("manual")).unwrap();
+    db::fill_journal_issn_columns(&conn, online_first, Some("0743-7463"), Some("0306-4573")).unwrap();
+    assert_eq!(db::resolve_journal_by_identifier(&conn, "0743-7463").unwrap(), Some(online_first));
+    assert_eq!(db::list_journals(&conn).unwrap().len(), 2);
+
+    let other = db::insert_journal(&conn, "Other", Some("1932-6203"), None, None, None).unwrap();
+    db::bind_journal_identifier(&conn, other, crate::models::IDT_PRINT, "1932-6203", Some("manual")).unwrap();
+    assert!(db::bind_journal_identifier(&conn, print_first, crate::models::IDT_ONLINE, "1932-6203", Some("manual")).is_err(), "different canonical Journal must not be merged");
+}
+
+#[test]
 fn test_duplicate_identifier_rejected() {
     let conn = mem_db();
     let a = db::insert_journal(&conn, "Journal A", Some("0025-1909"), None, None, None).unwrap();

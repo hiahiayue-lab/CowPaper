@@ -348,6 +348,13 @@ button.full {
   gap: 8px;
   margin-bottom: 10px;
 }
+.add-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 13px;
+}
 .add-form input,
 .settings input,
 .settings select {

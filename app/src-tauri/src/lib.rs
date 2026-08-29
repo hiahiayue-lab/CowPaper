@@ -97,104 +97,124 @@ fn list_journals(state: State<Db>) -> Result<Vec<models::Journal>, String> {
 #[tauri::command]
 fn add_journal(
     name: Option<String>,
-    issn: Option<String>,
+    print_issn: Option<String>,
+    online_issn: Option<String>,
     state: State<Db>,
 ) -> Result<models::AddJournalResult, String> {
     let crossref = api::crossref::Crossref::new(MAILTO);
     let openalex = api::openalex::OpenAlex::new(MAILTO);
+    let print = normalize_manual_issn(print_issn.as_deref(), "Print ISSN")?;
+    let online = normalize_manual_issn(online_issn.as_deref(), "Online ISSN")?;
+    if print.is_none() && online.is_none() {
+        return Err("至少填写一个 ISSN".to_string());
+    }
 
-    let issn_str = match issn.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        Some(i) => i.to_string(),
-        None => {
-            let cands = crossref
-                .search_issns(name.as_deref().unwrap_or(""))
-                .ok_or_else(|| "按名称检索期刊失败，请改用 ISSN".to_string())?;
-            cands
-                .first()
-                .cloned()
-                .ok_or_else(|| "未找到匹配期刊，请改用 ISSN".to_string())?
-        }
-    };
-    // 统一 normalize + checksum；非法 ISSN 不得进入 canonical identifiers
-    let norm = crate::util::normalize_issn(&issn_str).ok_or_else(|| "ISSN 格式无效".to_string())?;
+    // Network calls deliberately happen before taking the SQLite mutex.
+    let mut supplied = Vec::new();
+    for issn in [&print, &online].into_iter().flatten() {
+        if !supplied.contains(issn) { supplied.push(issn.clone()); }
+    }
+    let metas: Vec<api::crossref::JournalMeta> = supplied
+        .iter()
+        .filter_map(|issn| crossref.journal_meta(issn))
+        .collect();
+    let oa_id = supplied.first().and_then(|issn| openalex.source_by_issn(issn).ok().flatten());
 
     let conn = state.inner().lock().unwrap();
-    // 1) 已存在的 identifier 映射 → 返回已有 Journal，不创建重复
-    if let Some(jid) = db::resolve_journal_by_identifier(&conn, &norm).map_err(|e| e.to_string())? {
-        let journal = db::get_journal(&conn, jid)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "期刊不存在".to_string())?;
-        return Ok(models::AddJournalResult {
-            journal,
-            note: Some("该 ISSN 已对应已有期刊，未创建重复".to_string()),
-        });
-    }
-
-    let meta = crossref
-        .journal_meta(&norm)
-        .ok_or_else(|| "Crossref 未收录该 ISSN".to_string())?;
-    // Failure to enrich with OpenAlex must not prevent a valid Crossref-backed
-    // manual subscription; the sync path will retry and cache it later.
-    let oa_id = openalex.source_by_issn(&norm).ok().flatten();
-
-    // 2) ISSN-L 归并：meta 的 ISSN-L 若命中已有期刊（issn_l 列或既有 identifier），
-    //    把输入 ISSN 归入该 canonical Journal，不创建新 Journal。
-    let issn_l_norm = meta.issn_l.as_deref().and_then(crate::util::normalize_issn);
-    if let Some(il) = &issn_l_norm {
-        let merged = db::find_journal_by_issn_l(&conn, il)
-            .map_err(|e| e.to_string())?
-            .or(db::resolve_journal_by_identifier(&conn, il).map_err(|e| e.to_string())?);
-        if let Some(jid) = merged {
-            let _ = db::insert_identifier(&conn, jid, models::IDT_OTHER, &norm, Some("manual"));
-            let journal = db::get_journal(&conn, jid)
+    let direct_ids: Vec<i64> = [&print, &online]
+        .into_iter()
+        .flatten()
+        .map(|issn| db::resolve_journal_by_identifier(&conn, issn))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .flatten()
+        .collect();
+    let mut targets = direct_ids.clone();
+    for meta in &metas {
+        for value in [meta.print_issn.as_deref(), meta.online_issn.as_deref()]
+            .into_iter().flatten().filter_map(crate::util::normalize_issn) {
+            if let Some(id) = db::resolve_journal_by_identifier(&conn, &value).map_err(|e| e.to_string())? {
+                targets.push(id);
+            }
+        }
+        if let Some(issn_l) = meta.issn_l.as_deref().and_then(crate::util::normalize_issn) {
+            if let Some(id) = db::find_journal_by_issn_l(&conn, &issn_l)
                 .map_err(|e| e.to_string())?
-                .ok_or_else(|| "期刊不存在".to_string())?;
-            return Ok(models::AddJournalResult {
-                journal,
-                note: Some("通过 ISSN-L 归并到已有期刊，未创建重复".to_string()),
-            });
+                .or(db::resolve_journal_by_identifier(&conn, &issn_l).map_err(|e| e.to_string())?) {
+                targets.push(id);
+            }
         }
     }
+    targets.sort_unstable();
+    targets.dedup();
+    if targets.len() > 1 {
+        return Err("Print ISSN 与 Online ISSN 对应的期刊不一致，请检查后重试。".to_string());
+    }
+    let direct_same_journal = direct_ids.len() == 2 && direct_ids[0] == direct_ids[1];
+    if print.is_some() && online.is_some() && !direct_same_journal
+        && !crossref_confirms_same_journal(print.as_deref().unwrap(), online.as_deref().unwrap(), &metas) {
+        return Err("Print ISSN 与 Online ISSN 对应的期刊不一致，请检查后重试。".to_string());
+    }
 
-    // 3) 创建新 Journal + identifiers（保守合并：Crossref 明确给出的 print/online 才入库）
-    let id = db::insert_journal(
-        &conn,
-        &meta.title,
-        meta.print_issn.as_deref(),
-        meta.online_issn.as_deref(),
-        meta.publisher.as_deref(),
-        oa_id.as_deref(),
-    )
-    .map_err(|e| e.to_string())?;
-    if let Some(p) = meta.print_issn.as_deref().and_then(crate::util::normalize_issn) {
-        let _ = db::insert_identifier(&conn, id, models::IDT_PRINT, &p, Some("crossref"));
+    let meta_print = metas.iter().find_map(|m| m.print_issn.as_deref().and_then(crate::util::normalize_issn));
+    let meta_online = metas.iter().find_map(|m| m.online_issn.as_deref().and_then(crate::util::normalize_issn));
+    let meta_issn_l = metas.iter().find_map(|m| m.issn_l.as_deref().and_then(crate::util::normalize_issn));
+    let id = if let Some(id) = targets.first().copied() {
+        id
+    } else {
+        let title = metas.first().map(|m| m.title.as_str())
+            .or_else(|| name.as_deref().map(str::trim).filter(|s| !s.is_empty()))
+            .ok_or_else(|| "无法解析期刊名称，请填写期刊名称后重试。".to_string())?;
+        db::insert_journal(
+            &conn,
+            title,
+            print.as_deref().or(meta_print.as_deref()),
+            online.as_deref().or(meta_online.as_deref()),
+            metas.first().and_then(|m| m.publisher.as_deref()),
+            oa_id.as_deref(),
+        ).map_err(|e| e.to_string())?
+    };
+
+    // Crossref provides authoritative extra identifiers; explicit user inputs
+    // are then bound with their declared print/online type.
+    if let Some(value) = meta_print.as_deref() { db::bind_journal_identifier(&conn, id, models::IDT_PRINT, value, Some("crossref")).map_err(|e| e.to_string())?; }
+    if let Some(value) = meta_online.as_deref() { db::bind_journal_identifier(&conn, id, models::IDT_ONLINE, value, Some("crossref")).map_err(|e| e.to_string())?; }
+    if let Some(value) = print.as_deref() { db::bind_journal_identifier(&conn, id, models::IDT_PRINT, value, Some("manual")).map_err(|e| e.to_string())?; }
+    if let Some(value) = online.as_deref() { db::bind_journal_identifier(&conn, id, models::IDT_ONLINE, value, Some("manual")).map_err(|e| e.to_string())?; }
+    db::fill_journal_issn_columns(&conn, id, print.as_deref().or(meta_print.as_deref()), online.as_deref().or(meta_online.as_deref())).map_err(|e| e.to_string())?;
+    if db::get_journal_issn_l(&conn, id).map_err(|e| e.to_string())?.is_none() {
+        if let Some(value) = meta_issn_l.as_deref() { db::set_journal_issn_l(&conn, id, Some(value)).map_err(|e| e.to_string())?; }
     }
-    if let Some(o) = meta.online_issn.as_deref().and_then(crate::util::normalize_issn) {
-        let _ = db::insert_identifier(&conn, id, models::IDT_ONLINE, &o, Some("crossref"));
-    }
-    // 输入 ISSN 若不在 print/online 中，以 other 补充（用户明确给出的 identifier）
-    let covered = meta
-        .print_issn
-        .as_deref()
-        .and_then(crate::util::normalize_issn)
-        .map(|x| x == norm)
-        .unwrap_or(false)
-        || meta
-            .online_issn
-            .as_deref()
-            .and_then(crate::util::normalize_issn)
-            .map(|x| x == norm)
-            .unwrap_or(false);
-    if !covered {
-        let _ = db::insert_identifier(&conn, id, models::IDT_OTHER, &norm, Some("manual"));
-    }
-    if let Some(il) = &issn_l_norm {
-        let _ = db::set_journal_issn_l(&conn, id, Some(il));
+    if db::get_journal_openalex_source(&conn, id).map_err(|e| e.to_string())?.is_none() {
+        if let Some(value) = oa_id.as_deref() { db::set_journal_openalex_source(&conn, id, Some(value)).map_err(|e| e.to_string())?; }
     }
     let journal = db::get_journal(&conn, id)
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| "插入后读取失败".to_string())?;
-    Ok(models::AddJournalResult { journal, note: None })
+        .ok_or_else(|| "写入后读取失败".to_string())?;
+    Ok(models::AddJournalResult { journal, note: if targets.is_empty() { None } else { Some("已补充到已有期刊，未创建重复".to_string()) } })
+}
+
+fn normalize_manual_issn(input: Option<&str>, label: &str) -> Result<Option<String>, String> {
+    match input.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(value) => crate::util::normalize_issn(value).map(Some).ok_or_else(|| format!("{} 格式无效", label)),
+        None => Ok(None),
+    }
+}
+
+fn crossref_confirms_same_journal(print: &str, online: &str, metas: &[api::crossref::JournalMeta]) -> bool {
+    let contains_both = metas.iter().any(|meta| {
+        let ids = [meta.print_issn.as_deref(), meta.online_issn.as_deref()]
+            .into_iter().flatten().filter_map(crate::util::normalize_issn).collect::<Vec<_>>();
+        ids.contains(&print.to_string()) && ids.contains(&online.to_string())
+    });
+    if contains_both { return true; }
+    let mut issn_l: Vec<String> = metas.iter()
+        .filter_map(|meta| meta.issn_l.as_deref().and_then(crate::util::normalize_issn))
+        .collect();
+    issn_l.sort();
+    issn_l.dedup();
+    issn_l.len() == 1 && metas.len() >= 2
 }
 
 #[tauri::command]

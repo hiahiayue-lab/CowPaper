@@ -107,8 +107,10 @@
           </div>
           <div id="manual-view" class="manual-view hidden">
             <form id="add-form" class="add-form">
-              <input id="add-name" type="text" placeholder="期刊名称" />
-              <input id="add-issn" type="text" placeholder="ISSN，如 0025-1909" />
+              <label>期刊名称（可选）<input id="add-name" type="text" placeholder="例如 Management Science" /></label>
+              <label>Print ISSN（可选）<input id="add-print-issn" type="text" placeholder="例如 0025-1909" /></label>
+              <label>Online ISSN（可选）<input id="add-online-issn" type="text" placeholder="例如 1526-5501" /></label>
+              <span class="muted small">至少填写一个 ISSN</span>
               <button type="submit" class="primary">添加期刊</button>
             </form>
             <p id="add-error" class="error"></p>

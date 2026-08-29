@@ -327,6 +327,48 @@ pub fn insert_identifier(
     Ok(())
 }
 
+/// Bind a known normalized identifier to its canonical Journal. Unlike the
+/// migration-oriented `insert_identifier`, this checks ownership first and
+/// updates the identifier type when a user explicitly supplies print/online.
+/// It never silently moves an identifier between journals.
+pub fn bind_journal_identifier(
+    conn: &Connection,
+    journal_id: i64,
+    identifier_type: &str,
+    value: &str,
+    source: Option<&str>,
+) -> Result<()> {
+    if let Some(owner) = resolve_journal_by_identifier(conn, value)? {
+        if owner != journal_id {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        conn.execute(
+            "UPDATE journal_identifiers SET identifier_type=?1, source=COALESCE(source,?2), updated_at=?3 WHERE value=?4",
+            params![identifier_type, source, now_utc(), value],
+        )?;
+        return Ok(());
+    }
+    insert_identifier(conn, journal_id, identifier_type, value, source)
+}
+
+/// Enrich only empty legacy display columns. Canonical identity remains in
+/// journal_identifiers; this keeps existing rows backward-compatible without
+/// overwriting known values.
+pub fn fill_journal_issn_columns(
+    conn: &Connection,
+    journal_id: i64,
+    print_issn: Option<&str>,
+    online_issn: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE journals
+         SET print_issn=COALESCE(print_issn,?1), online_issn=COALESCE(online_issn,?2), updated_at=?3
+         WHERE id=?4",
+        params![print_issn, online_issn, now_utc(), journal_id],
+    )?;
+    Ok(())
+}
+
 /// 输入任意已知 ISSN（规范化后），返回其映射的 canonical Journal id（如有）。
 pub fn resolve_journal_by_identifier(conn: &Connection, value: &str) -> Result<Option<i64>> {
     let id = conn
