@@ -1,0 +1,96 @@
+name: macOS arm64 Beta
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/macos-arm64-beta.yml"
+      - "app/**"
+
+permissions:
+  contents: read
+
+jobs:
+  build-macos-arm64:
+    runs-on: macos-14
+    defaults:
+      run:
+        working-directory: app
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Set up Rust stable arm64
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Type check frontend
+        run: npx tsc --noEmit
+
+      - name: Build frontend
+        run: npx vite build
+
+      - name: Check Rust application
+        working-directory: app/src-tauri
+        run: cargo check --target aarch64-apple-darwin
+
+      - name: Test Rust application
+        working-directory: app/src-tauri
+        run: cargo test --target aarch64-apple-darwin
+
+      - name: Build macOS DMG
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle_dir="src-tauri/target/aarch64-apple-darwin/release/bundle"
+          app_path="$bundle_dir/macos/CowPaper.app"
+          dmg_path="$bundle_dir/dmg/CowPaper_0.1.1_aarch64.dmg"
+
+          set +e
+          npx tauri build --target aarch64-apple-darwin
+          tauri_status=$?
+          set -e
+
+          if [[ $tauri_status -ne 0 ]]; then
+            if [[ ! -d "$app_path" ]]; then
+              exit $tauri_status
+            fi
+            echo "Tauri's Finder-based DMG step failed; creating a fresh headless DMG from this build's app bundle."
+            rm -f "$dmg_path"
+            mkdir -p "$(dirname "$dmg_path")"
+            hdiutil create -volname CowPaper -srcfolder "$app_path" -ov -format UDZO "$dmg_path"
+          fi
+
+          test -d "$app_path"
+          test -f "$dmg_path"
+
+      - name: Verify app signature and architecture
+        run: |
+          app_path="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/CowPaper.app"
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+          file "$app_path/Contents/MacOS/app" | grep -q "arm64"
+
+      - name: Verify DMG and print SHA-256
+        run: |
+          dmg_path="src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/CowPaper_0.1.1_aarch64.dmg"
+          test -f "$dmg_path"
+          shasum -a 256 "$dmg_path"
+
+      - name: Upload macOS DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: CowPaper_0.1.1_aarch64
+          path: app/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/CowPaper_0.1.1_aarch64.dmg
+          if-no-files-found: error
