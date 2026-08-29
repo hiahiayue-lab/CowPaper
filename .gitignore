@@ -7,4 +7,10 @@ app/src-tauri/target/
 app/dist/
 .env
 .env.*
+target/
+*.log
+*.db
+*.sqlite
+*.sqlite3
+secrets.json
 .DS_Store
