@@ -2,7 +2,7 @@
 
 Test each installer on a clean Windows 10 or Windows 11 x64 user profile or VM.
 
-1. Download the `CowPaper_0.1.0_x64-setup.exe` Actions artifact and verify its name.
+1. Download the `CowPaper_0.1.1_x64-setup.exe` Actions artifact and verify its name.
 2. Start the unsigned installer. A Microsoft Defender SmartScreen warning is expected for this beta; do not treat it as a signing failure.
 3. Install CowPaper, then confirm the Start Menu, desktop shortcut (if selected), and app window use the CowPaper icon.
 4. Launch CowPaper and confirm it creates a fresh local SQLite database for the new Windows user.
