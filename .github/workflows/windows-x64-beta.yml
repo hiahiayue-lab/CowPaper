@@ -1,0 +1,69 @@
+name: Windows x64 Beta
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/windows-x64-beta.yml"
+      - "app/**"
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-x64:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: app
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Set up Rust stable MSVC
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Type check frontend
+        run: npx tsc --noEmit
+
+      - name: Build frontend
+        run: npx vite build
+
+      - name: Check Rust application
+        working-directory: app/src-tauri
+        run: cargo check --target x86_64-pc-windows-msvc
+
+      - name: Test Rust application
+        working-directory: app/src-tauri
+        run: cargo test
+
+      - name: Build NSIS installer
+        run: npx tauri build --config src-tauri/tauri.windows.conf.json --target x86_64-pc-windows-msvc
+
+      - name: Verify installer name
+        shell: pwsh
+        run: |
+          $installer = "src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/CowPaper_0.1.0_x64-setup.exe"
+          if (-not (Test-Path $installer)) {
+            throw "Expected Windows installer was not produced: $installer"
+          }
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: CowPaper_0.1.0_x64-setup
+          path: app/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/CowPaper_0.1.0_x64-setup.exe
+          if-no-files-found: error
