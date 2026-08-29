@@ -74,6 +74,15 @@ jobs:
           fi
 
           test -d "$app_path"
+          # The beta channel deliberately uses an ad-hoc signature. Re-sign the
+          # just-built bundle before packaging so CodeResources is current.
+          codesign --force --deep --sign - "$app_path"
+
+          # Package the verified bundle, never a stale DMG produced before the
+          # ad-hoc signature was refreshed.
+          rm -f "$dmg_path"
+          mkdir -p "$(dirname "$dmg_path")"
+          hdiutil create -volname CowPaper -srcfolder "$app_path" -ov -format UDZO "$dmg_path"
           test -f "$dmg_path"
 
       - name: Verify app signature and architecture
