@@ -1068,7 +1068,7 @@ function renderPapers() {
   // Activity-only panel.
   const missingAbstracts = papers.filter((p) => p.abstractQuality !== "complete").length;
   $("abstract-recovery-banner").innerHTML = missingAbstracts > 0
-    ? `<div class="pending-row abstract-recovery-banner"><span>缺失摘要 <strong>${missingAbstracts} 篇</strong></span><button class="ghost small" data-action="recover-all-abstracts">重新获取全部摘要</button></div>`
+    ? `<div class="pending-row abstract-recovery-banner"><span>缺失摘要 <strong>${missingAbstracts} 篇</strong></span><button class="ghost small" data-action="translate-missing-titles">翻译缺摘要标题</button><button class="ghost small" data-action="recover-all-abstracts">重新获取全部摘要</button></div>`
     : "";
 
   let list = papers;
@@ -1892,6 +1892,20 @@ async function setupListeners() {
       });
       await refreshWorkState();
     }
+    // Missing abstracts never enter full analysis, but title translation is
+    // safe and useful without an abstract. It remains a separate, title-only
+    // operation and therefore cannot affect recommendation eligibility.
+    if (settings?.autoAnalyzeNew && Array.isArray(r.newPaperIds) && (await hasKey())) {
+      await invoke("translate_missing_titles", { paperIds: r.newPaperIds as number[], model: getModel() });
+    }
+  });
+
+  await listen("title-translation://done", async (e) => {
+    const r = e.payload as { translated: number; failed: number };
+    await loadPapers();
+    if (r.translated || r.failed) {
+      setStatus(`标题翻译完成：${r.translated}${r.failed ? ` · 失败 ${r.failed}` : ""}`, r.failed ? "error" : "done");
+    }
   });
 
   await listen("ai://progress", (e) => {
@@ -2063,6 +2077,14 @@ async function setupListeners() {
         const b = await invoke<AbstractRecoveryBatch>("recover_paper_abstract", { paperId: id });
         setStatus(`正在补全摘要 · 0/${b.total}`, "running");
       } catch (err) { setStatus(`摘要恢复失败：${String(err)}`, "error"); }
+      return;
+    }
+    if (t.closest("[data-action='translate-missing-titles']")) {
+      if (!(await requireKey())) return;
+      try {
+        const scheduled = await invoke<number>("translate_missing_titles", { paperIds: null, model: getModel() });
+        setStatus(scheduled ? `正在翻译 ${scheduled} 篇缺摘要论文标题…` : "没有需要翻译的缺摘要论文标题", "running");
+      } catch (err) { setStatus(`标题翻译启动失败：${safeError(err)}`, "error"); }
       return;
     }
     if (t.closest("[data-action='recover-due-abstracts']")) {

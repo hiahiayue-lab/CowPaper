@@ -2374,6 +2374,57 @@ fn test_missing_abstract_flow() {
 }
 
 #[test]
+fn test_title_only_translation_preserves_missing_abstract_semantics() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let id = match db::upsert_paper(&conn, jid, &candidate(Some("10.1000/title-only"), "English-only title", None, None)).unwrap() {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new paper"),
+    };
+
+    // This is the exact input set a title-only request may use: missing
+    // abstract, source title, and no existing Chinese title.
+    assert_eq!(db::list_missing_title_translation_candidates(&conn, None).unwrap(), vec![(id, "English-only title".into())]);
+    assert!(db::save_title_translation(&conn, id, "仅标题翻译").unwrap());
+
+    let p = db::get_paper(&conn, id).unwrap().unwrap();
+    assert_eq!(p.chinese_title.as_deref(), Some("仅标题翻译"));
+    assert_eq!(p.abstract_quality, "missing");
+    assert_eq!(p.analysis_status, "waitingForAbstract");
+    assert!(p.evidence_hash.is_none());
+    assert!(p.chinese_abstract.is_none());
+    assert!(p.one_sentence_summary.is_none());
+    assert!(p.total_score.is_none());
+    assert!(db::list_pending_papers(&conn, None).unwrap().is_empty(), "title-only must not become a full-analysis job");
+    let run_id = crate::recommendation::refresh_current_recommendations(&conn, &chrono::Local::now(), "09:00").unwrap();
+    assert!(
+        !db::list_recommendation_items(&conn, run_id).unwrap().iter().any(|item| item.paper_id == id),
+        "a translated title alone must not enter recommendations"
+    );
+
+    // Existing translated title excludes repeat requests; no API key path
+    // simply leaves the original English title stored by upsert untouched.
+    assert!(db::list_missing_title_translation_candidates(&conn, None).unwrap().is_empty());
+}
+
+#[test]
+fn test_recovered_abstract_after_title_only_translation_remains_full_analysis_eligible() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let id = match db::upsert_paper(&conn, jid, &candidate(Some("10.1000/title-recovery"), "Title before recovery", None, None)).unwrap() {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new paper"),
+    };
+    db::save_title_translation(&conn, id, "恢复前标题翻译").unwrap();
+    let full = "A complete abstract with methods, results, and implications. ".repeat(8);
+    db::merge_recovered_abstract(&conn, id, "crossref", &full).unwrap();
+    let p = db::get_paper(&conn, id).unwrap().unwrap();
+    assert_ne!(p.abstract_quality, "missing");
+    assert_eq!(p.analysis_status, "pendingAnalysis", "title-only must not cause full analysis to be skipped");
+    assert!(db::list_pending_papers(&conn, Some(&[id])).unwrap().iter().any(|p| p.id == id));
+}
+
+#[test]
 fn test_abstract_upgrade_flow() {
     let conn = mem_db();
     let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();

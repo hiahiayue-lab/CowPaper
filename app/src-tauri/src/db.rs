@@ -1780,6 +1780,40 @@ pub fn list_pending_papers(conn: &Connection, paper_ids: Option<&[i64]>) -> Resu
     rows.collect()
 }
 
+/// Missing-abstract papers may receive a title-only translation. This query
+/// intentionally excludes papers with an abstract or an existing Chinese
+/// title, and does not use or alter full-analysis state.
+pub fn list_missing_title_translation_candidates(
+    conn: &Connection,
+    paper_ids: Option<&[i64]>,
+) -> Result<Vec<(i64, String)>> {
+    let mut sql = String::from(
+        "SELECT id, title FROM papers WHERE abstract_quality = 'missing' \
+         AND title IS NOT NULL AND TRIM(title) != '' \
+         AND (chinese_title IS NULL OR TRIM(chinese_title) = '')",
+    );
+    if let Some(ids) = paper_ids {
+        if ids.is_empty() { return Ok(vec![]); }
+        sql.push_str(" AND id IN (");
+        sql.push_str(&ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(","));
+        sql.push(')');
+    }
+    let mut stmt = conn.prepare(&sql)?;
+    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect()
+}
+
+/// Persist only a translated title. In particular, this must never create
+/// evidence, scores, summaries, or a completed-analysis status.
+pub fn save_title_translation(conn: &Connection, id: i64, chinese_title: &str) -> Result<bool> {
+    let changed = conn.execute(
+        "UPDATE papers SET chinese_title = ?1, updated_at = ?2
+         WHERE id = ?3 AND abstract_quality = 'missing'
+           AND (chinese_title IS NULL OR TRIM(chinese_title) = '')",
+        params![chinese_title, now_utc(), id],
+    )?;
+    Ok(changed == 1)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn save_analysis(
     conn: &Connection,

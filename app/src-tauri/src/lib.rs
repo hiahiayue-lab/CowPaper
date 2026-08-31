@@ -1213,6 +1213,52 @@ fn start_ai(
         .map_err(|e| e.to_string())
 }
 
+/// Schedule title-only translations for missing-abstract papers. This is kept
+/// outside the full AnalysisBatch state machine because those papers must stay
+/// waitingForAbstract and ineligible for recommendation.
+#[tauri::command]
+fn translate_missing_titles(
+    app: AppHandle,
+    paper_ids: Option<Vec<i64>>,
+    model: String,
+    state: State<Db>,
+    store: State<Secure>,
+) -> Result<i64, String> {
+    let api_key = store.get().map_err(|e| e.to_string())?
+        .filter(|key| !key.is_empty())
+        .ok_or_else(|| "未保存 API Key，请先在设置中保存".to_string())?;
+    let candidates = {
+        let conn = state.inner().lock().unwrap();
+        db::list_missing_title_translation_candidates(&conn, paper_ids.as_deref())
+            .map_err(|e| e.to_string())?
+    };
+    let scheduled = candidates.len() as i64;
+    if candidates.is_empty() { return Ok(0); }
+    let worker_db = state.inner().clone();
+    std::thread::spawn(move || {
+        let client = api::deepseek::DeepSeek::new();
+        let mut translated = 0_i64;
+        let mut failed = 0_i64;
+        for (id, title) in candidates {
+            match client.translate_title(&api_key, &model, &title) {
+                Ok(chinese_title) => match worker_db.lock()
+                    .map_err(|_| "数据库锁定".to_string())
+                    .and_then(|conn| db::save_title_translation(&conn, id, &chinese_title).map_err(|e| e.to_string())) {
+                    Ok(true) => translated += 1,
+                    Ok(false) => {},
+                    Err(_) => failed += 1,
+                },
+                Err(_) => failed += 1,
+            }
+        }
+        let _ = app.emit("title-translation://done", serde_json::json!({
+            "translated": translated,
+            "failed": failed,
+        }));
+    });
+    Ok(scheduled)
+}
+
 #[tauri::command]
 fn pause_ai(queue: State<AiQueue>) -> Result<(), String> {
     queue.cmd_tx.send(QueueCommand::Pause).map_err(|e| e.to_string())
@@ -1618,6 +1664,7 @@ pub fn run() {
             has_api_key,
             delete_api_key,
             start_ai,
+            translate_missing_titles,
             pause_ai,
             resume_ai,
             stop_ai,
