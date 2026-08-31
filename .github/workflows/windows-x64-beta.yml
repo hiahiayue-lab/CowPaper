@@ -124,7 +124,7 @@ jobs:
         shell: pwsh
         run: |
           $bundleDir = "src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis"
-          $installers = @(Get-ChildItem -Path $bundleDir -Filter "CowPaper_*-x64-setup.exe" -File -ErrorAction SilentlyContinue)
+          $installers = @(Get-ChildItem -Path $bundleDir -Filter "CowPaper_*_x64-setup.exe" -File -ErrorAction SilentlyContinue)
 
           if ($installers.Count -ne 1) {
             $found = if ($installers.Count) { $installers.FullName -join ", " } else { "none" }
