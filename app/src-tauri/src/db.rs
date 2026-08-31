@@ -1782,7 +1782,11 @@ pub fn list_pending_papers(conn: &Connection, paper_ids: Option<&[i64]>) -> Resu
 
 /// Missing-abstract papers may receive a title-only translation. This query
 /// intentionally excludes papers with an abstract or an existing Chinese
-/// title, and does not use or alter full-analysis state.
+/// title, and does not use or alter full-analysis state.  It deliberately
+/// has no sync-batch or first-seen predicate: historical papers are backlog
+/// candidates too.  A bounded, oldest-first batch keeps automatic catch-up
+/// from turning one launch or sync into an unbounded API run.
+pub const TITLE_TRANSLATION_BATCH_LIMIT: usize = 25;
 pub fn list_missing_title_translation_candidates(
     conn: &Connection,
     paper_ids: Option<&[i64]>,
@@ -1798,6 +1802,8 @@ pub fn list_missing_title_translation_candidates(
         sql.push_str(&ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(","));
         sql.push(')');
     }
+    sql.push_str(" ORDER BY created_at ASC, id ASC LIMIT ");
+    sql.push_str(&TITLE_TRANSLATION_BATCH_LIMIT.to_string());
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
     let candidates = rows.collect::<Result<Vec<_>>>()?;

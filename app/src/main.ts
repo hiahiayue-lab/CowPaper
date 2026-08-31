@@ -1530,6 +1530,16 @@ async function requireKey(): Promise<boolean> {
   return false;
 }
 
+/**
+ * Run one bounded title-only backlog batch.  The backend selects both newly
+ * discovered and historical missing-abstract papers, so callers must not
+ * restrict this to the current sync result.
+ */
+async function scheduleMissingTitleBacklog(): Promise<number> {
+  if (!settings?.autoAnalyzeNew || !(await hasKey())) return 0;
+  return invoke<number>("translate_missing_titles", { paperIds: null, model: getModel() });
+}
+
 /// 统一的 start_ai 调用（所有入口必须走这里）：带 trigger + 错误捕获 + 即时反馈。
 async function startAnalyze(paperIds: number[] | null, trigger: string, sourceSyncBatchId: number | null = null): Promise<boolean> {
   if (!(await requireKey())) return false;
@@ -1895,9 +1905,7 @@ async function setupListeners() {
     // Missing abstracts never enter full analysis, but title translation is
     // safe and useful without an abstract. It remains a separate, title-only
     // operation and therefore cannot affect recommendation eligibility.
-    if (settings?.autoAnalyzeNew && Array.isArray(r.newPaperIds) && (await hasKey())) {
-      await invoke("translate_missing_titles", { paperIds: r.newPaperIds as number[], model: getModel() });
-    }
+    await scheduleMissingTitleBacklog();
   });
 
   await listen("title-translation://done", async (e) => {
@@ -2361,6 +2369,10 @@ window.addEventListener("DOMContentLoaded", () => {
     await refreshRecommendations();
     renderNextCheck();
     await refreshKeyStatus();
+    // Title-only translations use the same automatic-AI preference as
+    // post-sync analysis. This starts one rate-limited historical backlog
+    // batch even when no new papers are discovered this session.
+    await scheduleMissingTitleBacklog();
     // 启动自动同步（阈值判断在 Rust 端）
     await invoke("maybe_auto_sync").catch(() => {});
   })();

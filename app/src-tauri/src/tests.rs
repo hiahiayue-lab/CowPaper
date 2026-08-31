@@ -2408,6 +2408,41 @@ fn test_title_only_translation_preserves_missing_abstract_semantics() {
 }
 
 #[test]
+fn test_historical_missing_title_backlog_candidate_is_translated_once() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let id = match db::upsert_paper(&conn, jid, &candidate(Some("10.1000/historical-title"), "Historical English title", None, None)).unwrap() {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new paper"),
+    };
+    // Simulate a paper that already existed before this sync/app session.
+    conn.execute(
+        "UPDATE papers SET created_at='2026-08-06T00:00:00Z', updated_at='2026-08-06T00:00:00Z', first_seen_cycle='2026-08-06' WHERE id=?1",
+        params![id],
+    ).unwrap();
+
+    assert_eq!(
+        db::list_missing_title_translation_candidates(&conn, None).unwrap(),
+        vec![(id, "Historical English title".into())],
+        "historical missing papers must be selected without a current sync batch"
+    );
+    assert!(db::save_title_translation(&conn, id, "历史中文标题").unwrap());
+
+    let p = db::get_paper(&conn, id).unwrap().unwrap();
+    assert_eq!(p.chinese_title.as_deref(), Some("历史中文标题"));
+    assert_eq!(p.abstract_quality, "missing");
+    assert_eq!(p.analysis_status, "waitingForAbstract");
+    assert!(p.evidence_hash.is_none());
+    assert!(p.total_score.is_none());
+    assert!(db::list_pending_papers(&conn, None).unwrap().is_empty());
+    let run_id = crate::recommendation::refresh_current_recommendations(&conn, &chrono::Local::now(), "09:00").unwrap();
+    assert!(!db::list_recommendation_items(&conn, run_id).unwrap().iter().any(|item| item.paper_id == id));
+
+    // The next backlog run cannot make another DeepSeek request for this row.
+    assert!(db::list_missing_title_translation_candidates(&conn, None).unwrap().is_empty());
+}
+
+#[test]
 fn test_recovered_abstract_after_title_only_translation_remains_full_analysis_eligible() {
     let conn = mem_db();
     let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
