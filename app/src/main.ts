@@ -1912,6 +1912,11 @@ async function setupListeners() {
   await listen("title-translation://done", async (e) => {
     const r = e.payload as { translated: number; failed: number; errors?: string[] };
     await loadPapers();
+    // The title-only worker may finish while Today or a historical missing
+    // list is visible. Rebuild that visible source immediately so users do
+    // not have to switch tabs, sync again, or restart to see chineseTitle.
+    await refreshRecommendations();
+    if (historyCycleKey && historyTab === "missing") await renderRecommendHistory();
     if (r.translated || r.failed) {
       const firstError = r.errors?.[0];
       setStatus(`标题翻译完成：${r.translated}${r.failed ? ` · 失败 ${r.failed}${firstError ? `：${firstError}` : ""}` : ""}`, r.failed ? "error" : "done");
