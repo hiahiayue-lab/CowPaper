@@ -56,7 +56,8 @@ jobs:
           set -euo pipefail
           bundle_dir="src-tauri/target/aarch64-apple-darwin/release/bundle"
           app_path="$bundle_dir/macos/CowPaper.app"
-          dmg_path="$bundle_dir/dmg/CowPaper_0.1.1_aarch64.dmg"
+          version="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          dmg_path="$bundle_dir/dmg/CowPaper_${version}_aarch64.dmg"
 
           set +e
           npx tauri build --target aarch64-apple-darwin
@@ -93,10 +94,41 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "$app_path"
           file "$app_path/Contents/MacOS/app" | grep -q "arm64"
 
-      - name: Verify DMG layout and print SHA-256
+      - name: Discover and normalize macOS DMG
+        id: dmg
+        shell: bash
         run: |
           set -euo pipefail
-          dmg_path="src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/CowPaper_0.1.1_aarch64.dmg"
+          bundle_dir="src-tauri/target/aarch64-apple-darwin/release/bundle"
+          dmg_dir="$bundle_dir/dmg"
+          dmg_paths=()
+          while IFS= read -r dmg_path; do
+            dmg_paths+=("$dmg_path")
+          done < <(find "$dmg_dir" -maxdepth 1 -type f -name 'CowPaper_*.dmg' -print)
+
+          if [[ ${#dmg_paths[@]} -ne 1 ]]; then
+            found="none"
+            if [[ ${#dmg_paths[@]} -gt 0 ]]; then found="${dmg_paths[*]}"; fi
+            echo "Expected exactly one CowPaper DMG in $dmg_dir; found ${#dmg_paths[@]}: $found" >&2
+            exit 1
+          fi
+
+          version="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          release_name="CowPaper_${version}_aarch64.dmg"
+          release_dmg="$dmg_dir/$release_name"
+          if [[ "${dmg_paths[0]}" != "$release_dmg" ]]; then
+            mv "${dmg_paths[0]}" "$release_dmg"
+          fi
+
+          printf 'dmg_path=%s\n' "$release_dmg" >> "$GITHUB_OUTPUT"
+          printf 'artifact_name=%s\n' "${release_name%.dmg}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify DMG layout and print SHA-256
+        env:
+          DMG_PATH: ${{ steps.dmg.outputs.dmg_path }}
+        run: |
+          set -euo pipefail
+          dmg_path="$DMG_PATH"
           test -f "$dmg_path"
           mount_dir="$(mktemp -d)"
           attached=0
@@ -115,6 +147,6 @@ jobs:
       - name: Upload macOS DMG
         uses: actions/upload-artifact@v4
         with:
-          name: CowPaper_0.1.1_aarch64
-          path: app/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/CowPaper_0.1.1_aarch64.dmg
+          name: ${{ steps.dmg.outputs.artifact_name }}
+          path: app/${{ steps.dmg.outputs.dmg_path }}
           if-no-files-found: error
