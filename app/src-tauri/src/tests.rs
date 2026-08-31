@@ -2483,6 +2483,42 @@ fn test_historical_missing_title_backlog_candidate_is_translated_once() {
 }
 
 #[test]
+fn test_title_only_backlog_drains_bounded_batches_without_reselecting_translated_rows() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    for n in 0..61 {
+        let outcome = db::upsert_paper(
+            &conn,
+            jid,
+            &candidate(Some(&format!("10.1000/title-batch-{}", n)), &format!("English title {}", n), None, None),
+        ).unwrap();
+        assert!(matches!(outcome, UpsertOutcome::New(_)));
+    }
+
+    let mut batch_sizes = Vec::new();
+    loop {
+        let candidates = db::list_missing_title_translation_candidates(&conn, None).unwrap();
+        batch_sizes.push(candidates.len());
+        if candidates.is_empty() { break; }
+        assert!(candidates.len() <= db::TITLE_TRANSLATION_BATCH_LIMIT);
+        for (id, _) in candidates {
+            assert!(db::save_title_translation(&conn, id, "中文标题").unwrap());
+        }
+    }
+
+    assert_eq!(batch_sizes, vec![25, 25, 11, 0]);
+}
+
+#[test]
+fn test_title_translation_gate_is_exclusive_and_releases_after_worker_exit() {
+    let gate = crate::TitleTranslationGate::default();
+    let permit = gate.acquire().unwrap();
+    assert!(gate.acquire().is_err(), "manual and automatic workers must not overlap");
+    drop(permit);
+    assert!(gate.acquire().is_ok(), "worker completion/error must release the gate");
+}
+
+#[test]
 fn test_scoped_abstract_recovery_only_accepts_current_view_ids() {
     let conn = mem_db();
     let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
@@ -2499,6 +2535,20 @@ fn test_scoped_abstract_recovery_only_accepts_current_view_ids() {
 
     db::merge_recovered_abstract(&conn, ids[0], "crossref", &"complete abstract ".repeat(30)).unwrap();
     assert!(db::list_recoverable_paper_ids(&conn, &[ids[0]]).unwrap().is_empty());
+}
+
+#[test]
+fn test_scoped_abstract_recovery_dedupes_and_caps_to_fifty_ids() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let ids: Vec<i64> = (0..61).map(|n| match db::upsert_paper(
+        &conn, jid, &candidate(Some(&format!("10.1000/scoped-{}", n)), &format!("P{}", n), None, None),
+    ).unwrap() { UpsertOutcome::New(id) => id, _ => unreachable!() }).collect();
+    let mut requested = ids.clone();
+    requested.extend_from_slice(&ids[..3]);
+    let recoverable = db::list_recoverable_paper_ids(&conn, &requested).unwrap();
+    assert_eq!(recoverable.len(), db::ABSTRACT_RECOVERY_BATCH_LIMIT);
+    assert_eq!(recoverable, ids[..db::ABSTRACT_RECOVERY_BATCH_LIMIT]);
 }
 
 #[test]

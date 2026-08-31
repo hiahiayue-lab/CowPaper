@@ -1537,19 +1537,40 @@ async function requireKey(): Promise<boolean> {
  * restrict this to the current sync result.
  */
 let missingTitleBacklogInFlight = false;
-async function scheduleMissingTitleBacklog(): Promise<number> {
-  if (missingTitleBacklogInFlight || !settings?.autoAnalyzeNew || !(await hasKey())) return 0;
+let missingTitleBacklogDraining = false;
+
+async function startMissingTitleTranslation(drainBacklog: boolean): Promise<number> {
+  if (missingTitleBacklogInFlight) {
+    setStatus("标题翻译正在进行中…", "running");
+    return 0;
+  }
+  if (!(await hasKey())) return 0;
+
   missingTitleBacklogInFlight = true;
+  if (drainBacklog) missingTitleBacklogDraining = true;
   try {
     const scheduled = await invoke<number>("translate_missing_titles", { paperIds: null, model: getModel() });
-    if (scheduled) setStatus(`正在翻译 ${scheduled} 篇缺摘要论文标题…`, "running");
+    if (scheduled) {
+      setStatus(`正在翻译 ${scheduled} 篇缺摘要论文标题…`, "running");
+    } else {
+      // The command does not emit a completion event when there is no work.
+      // Always release the UI gate on this path so a future sync/launch can retry.
+      missingTitleBacklogInFlight = false;
+      missingTitleBacklogDraining = false;
+    }
     return scheduled;
   } catch (err) {
     missingTitleBacklogInFlight = false;
+    missingTitleBacklogDraining = false;
     setStatus(`标题翻译启动失败：${safeError(err)}`, "error");
     console.error("translate_missing_titles invoke failed", err);
     return 0;
   }
+}
+
+async function scheduleMissingTitleBacklog(): Promise<number> {
+  if (!settings?.autoAnalyzeNew) return 0;
+  return startMissingTitleTranslation(true);
 }
 
 /// 统一的 start_ai 调用（所有入口必须走这里）：带 trigger + 错误捕获 + 即时反馈。
@@ -1921,17 +1942,27 @@ async function setupListeners() {
   });
 
   await listen("title-translation://done", async (e) => {
-    missingTitleBacklogInFlight = false;
     const r = e.payload as { translated: number; failed: number; translatedIds?: number[]; errors?: string[] };
-    await loadPapers();
-    // The title-only worker may finish while Today or a historical missing
-    // list is visible. Rebuild that visible source immediately so users do
-    // not have to switch tabs, sync again, or restart to see chineseTitle.
-    await refreshRecommendations();
-    if (historyCycleKey && historyTab === "missing") await renderRecommendHistory();
-    if (r.translated || r.failed) {
-      const firstError = r.errors?.[0];
-      setStatus(`标题翻译完成：${r.translated}${r.failed ? ` · 失败 ${r.failed}${firstError ? `：${firstError}` : ""}` : ""}`, r.failed ? "error" : "done");
+    const continueDraining = missingTitleBacklogDraining && r.translated > 0 && r.failed === 0;
+    // Release before any rendering work: a listener/rendering failure must
+    // never leave the automatic backlog permanently suppressed.
+    missingTitleBacklogInFlight = false;
+    missingTitleBacklogDraining = false;
+    try {
+      await loadPapers();
+      // The title-only worker may finish while Today or a historical missing
+      // list is visible. Rebuild that visible source immediately so users do
+      // not have to switch tabs, sync again, or restart to see chineseTitle.
+      await refreshRecommendations();
+      if (historyCycleKey && historyTab === "missing") await renderRecommendHistory();
+      if (r.translated || r.failed) {
+        const firstError = r.errors?.[0];
+        setStatus(`标题翻译完成：${r.translated}${r.failed ? ` · 失败 ${r.failed}${firstError ? `：${firstError}` : ""}` : ""}`, r.failed ? "error" : "done");
+      }
+    } finally {
+      // Only a fully successful batch drains further. A failure stops this
+      // run and leaves failed papers eligible for a later launch/sync/manual retry.
+      if (continueDraining) window.setTimeout(() => { void scheduleMissingTitleBacklog(); }, 0);
     }
   });
   await listen("title-translation://started", (e) => {
@@ -2112,19 +2143,8 @@ async function setupListeners() {
       return;
     }
     if (t.closest("[data-action='translate-missing-titles']")) {
-      if (!(await requireKey())) return;
-      try {
-        const scheduled = await invoke<number>("translate_missing_titles", { paperIds: null, model: getModel() });
-        setStatus(scheduled ? `正在翻译 ${scheduled} 篇缺摘要论文标题…` : "没有需要翻译的缺摘要论文标题", "running");
-      } catch (err) { setStatus(`标题翻译启动失败：${safeError(err)}`, "error"); }
-      return;
-    }
-    if (t.closest("[data-action='recover-due-abstracts']")) {
-      try {
-        const r = await invoke<{ checked: number; recovered: number; remaining: number }>("recover_due_abstracts");
-        setStatus(`摘要补全：检查 ${r.checked} · 更新 ${r.recovered} · 暂无 ${r.remaining}`, "done");
-        await loadPapers(); await refreshWorkState();
-      } catch (err) { setStatus(`摘要补全失败：${String(err)}`, "error"); }
+      const scheduled = await startMissingTitleTranslation(false);
+      if (!scheduled && !missingTitleBacklogInFlight) setStatus("没有需要翻译的缺摘要论文标题", "done");
       return;
     }
     const scopedRecovery = t.closest("[data-action='recover-scoped-abstracts']") as HTMLElement | null;

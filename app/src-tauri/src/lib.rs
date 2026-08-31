@@ -38,6 +38,33 @@ const AUTO_SYNC_MIN_INTERVAL: chrono::Duration = chrono::Duration::minutes(30);
 type Db = Arc<Mutex<Connection>>;
 type Secure = Arc<dyn SecureStore>;
 
+/// One process-wide permit for title-only translation. Both automatic backlog
+/// draining and the manual UI command use this guard, so the same paper can
+/// never be sent to DeepSeek by two workers at once.
+#[derive(Clone, Default)]
+struct TitleTranslationGate(Arc<Mutex<bool>>);
+
+struct TitleTranslationPermit(TitleTranslationGate);
+
+impl TitleTranslationGate {
+    fn acquire(&self) -> Result<TitleTranslationPermit, String> {
+        let mut running = self.0.lock().map_err(|_| "标题翻译状态锁定".to_string())?;
+        if *running {
+            return Err("标题翻译正在进行中".to_string());
+        }
+        *running = true;
+        Ok(TitleTranslationPermit(self.clone()))
+    }
+}
+
+impl Drop for TitleTranslationPermit {
+    fn drop(&mut self) {
+        if let Ok(mut running) = self.0.0.lock() {
+            *running = false;
+        }
+    }
+}
+
 /// Ensures a persisted SyncBatch cannot remain `running` when its worker
 /// unwinds. Process-exit recovery below covers the case where Drop cannot run.
 struct SyncBatchFinalizer {
@@ -1223,7 +1250,11 @@ fn translate_missing_titles(
     model: String,
     state: State<Db>,
     store: State<Secure>,
+    gate: State<TitleTranslationGate>,
 ) -> Result<i64, String> {
+    // Acquire before selecting candidates so a manual click cannot race an
+    // automatic drain between selection and worker startup.
+    let permit = gate.acquire()?;
     let api_key = store.get().map_err(|e| e.to_string())?
         .filter(|key| !key.is_empty())
         .ok_or_else(|| "未保存 API Key，请先在设置中保存".to_string())?;
@@ -1241,6 +1272,7 @@ fn translate_missing_titles(
     })).map_err(|e| e.to_string())?;
     let worker_db = state.inner().clone();
     std::thread::spawn(move || {
+        let _permit = permit;
         let client = api::deepseek::DeepSeek::new();
         let mut translated = 0_i64;
         let mut failed = 0_i64;
@@ -1361,12 +1393,6 @@ fn start_abstract_recovery(app: AppHandle, db_arc: Db, paper_ids: Vec<i64>) -> R
 #[tauri::command]
 fn recover_paper_abstract(app: AppHandle, paper_id: i64, state: State<Db>) -> Result<models::AbstractRecoveryBatch, String> {
     start_abstract_recovery(app, state.inner().clone(), vec![paper_id])
-}
-
-#[tauri::command]
-fn recover_due_abstracts(app: AppHandle, state: State<Db>) -> Result<models::AbstractRecoveryBatch, String> {
-    let ids = { let c = state.inner().lock().unwrap(); let now = chrono::Utc::now(); db::list_papers(&c, None, 10_000).map_err(|e| e.to_string())?.into_iter().filter(|p| p.abstract_quality != "complete" && abstract_recovery::retry_due(p.abstract_last_checked_at.as_deref(), p.abstract_retry_count, now)).take(50).map(|p| p.id).collect() };
-    start_abstract_recovery(app, state.inner().clone(), ids)
 }
 
 #[tauri::command]
@@ -1554,6 +1580,7 @@ pub fn run() {
             );
             let db_arc = Arc::new(Mutex::new(conn));
             app.manage(db_arc.clone());
+            app.manage(TitleTranslationGate::default());
 
             // 全局同步协调器（禁止重入）
             let sync_arc = Arc::new(SyncCoordinator::new());
@@ -1690,7 +1717,6 @@ pub fn run() {
             get_failed_ai_count,
             get_waiting_abstract_count,
             recover_paper_abstract,
-            recover_due_abstracts,
             recover_scoped_abstracts,
             get_abstract_recovery_batch,
             list_abstract_recovery_batches,
