@@ -1,4 +1,7 @@
 use rusqlite::{params, Connection, OptionalExtension};
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::thread;
 
 use crate::db;
 use crate::models::{Author, PaperCandidate, UpsertOutcome};
@@ -36,6 +39,23 @@ fn candidate(
         source_id: doi.map(str::to_string),
         raw_json: None,
     }
+}
+
+fn title_mock_server(body: &str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let body = body.to_string();
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 8192];
+        let _ = stream.read(&mut request).unwrap();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(), body
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+    format!("http://{address}/chat/completions")
 }
 
 #[test]
@@ -2405,6 +2425,26 @@ fn test_title_only_translation_preserves_missing_abstract_semantics() {
     // Existing translated title excludes repeat requests; no API key path
     // simply leaves the original English title stored by upsert untouched.
     assert!(db::list_missing_title_translation_candidates(&conn, None).unwrap().is_empty());
+}
+
+#[test]
+fn test_title_only_http_success_writes_one_row_without_changing_missing_semantics() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let id = match db::upsert_paper(&conn, jid, &candidate(Some("10.1000/http-title"), "English-only title", None, None)).unwrap() {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new paper"),
+    };
+    let endpoint = title_mock_server(r#"{"choices":[{"message":{"content":"HTTP 模拟中文标题"}}]}"#);
+    let translated = crate::api::deepseek::DeepSeek::with_endpoint(endpoint)
+        .translate_title("valid-test-key", "test-model", "English-only title")
+        .unwrap();
+    assert!(db::save_title_translation(&conn, id, &translated).unwrap(), "UPDATE must affect one candidate row");
+    let paper = db::get_paper(&conn, id).unwrap().unwrap();
+    assert_eq!(paper.chinese_title.as_deref(), Some("HTTP 模拟中文标题"));
+    assert_eq!(paper.abstract_quality, "missing");
+    assert_eq!(paper.analysis_status, "waitingForAbstract");
+    assert!(paper.total_score.is_none());
 }
 
 #[test]

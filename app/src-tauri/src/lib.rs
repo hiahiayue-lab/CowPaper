@@ -1234,18 +1234,24 @@ fn translate_missing_titles(
     };
     let scheduled = candidates.len() as i64;
     if candidates.is_empty() { return Ok(0); }
+    let candidate_ids: Vec<i64> = candidates.iter().map(|(id, _)| *id).collect();
+    app.emit("title-translation://started", serde_json::json!({
+        "scheduled": scheduled,
+        "paperIds": candidate_ids,
+    })).map_err(|e| e.to_string())?;
     let worker_db = state.inner().clone();
     std::thread::spawn(move || {
         let client = api::deepseek::DeepSeek::new();
         let mut translated = 0_i64;
         let mut failed = 0_i64;
+        let mut translated_ids: Vec<i64> = Vec::new();
         let mut errors: Vec<String> = Vec::new();
         for (id, title) in candidates {
             match client.translate_title(&api_key, &model, &title) {
                 Ok(chinese_title) => match worker_db.lock()
                     .map_err(|_| "数据库锁定".to_string())
                     .and_then(|conn| db::save_title_translation(&conn, id, &chinese_title).map_err(|e| e.to_string())) {
-                    Ok(true) => translated += 1,
+                    Ok(true) => { translated += 1; translated_ids.push(id); },
                     Ok(false) => {},
                     Err(err) => {
                         failed += 1;
@@ -1261,6 +1267,7 @@ fn translate_missing_titles(
         let _ = app.emit("title-translation://done", serde_json::json!({
             "translated": translated,
             "failed": failed,
+            "translatedIds": translated_ids,
             "errors": errors,
         }));
     });

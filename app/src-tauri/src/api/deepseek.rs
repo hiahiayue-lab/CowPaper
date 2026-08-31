@@ -70,6 +70,7 @@ pub struct AnalysisOutput {
 
 pub struct DeepSeek {
     client: Client,
+    endpoint: String,
 }
 
 impl DeepSeek {
@@ -78,7 +79,16 @@ impl DeepSeek {
             .timeout(std::time::Duration::from_secs(180))
             .build()
             .expect("build deepseek client");
-        DeepSeek { client }
+        DeepSeek { client, endpoint: ENDPOINT.to_string() }
+    }
+
+    #[cfg(test)]
+    pub fn with_endpoint(endpoint: String) -> Self {
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("build test deepseek client");
+        DeepSeek { client, endpoint }
     }
 
     pub fn analyze(
@@ -103,7 +113,7 @@ impl DeepSeek {
 
         let resp = self
             .client
-            .post(ENDPOINT)
+            .post(&self.endpoint)
             .header("Authorization", format!("Bearer {}", api_key))
             .json(&body)
             .send()
@@ -202,7 +212,7 @@ impl DeepSeek {
             "max_tokens": 128,
             "stream": false
         });
-        let resp = self.client.post(ENDPOINT)
+        let resp = self.client.post(&self.endpoint)
             .header("Authorization", format!("Bearer {}", api_key))
             .json(&body).send().map_err(|e| AiError::Network(e.to_string()))?;
         if !resp.status().is_success() {
@@ -220,13 +230,7 @@ impl DeepSeek {
         let v: Value = resp.json().map_err(|e| AiError::Paper(e.to_string()))?;
         let content = v["choices"][0]["message"]["content"].as_str()
             .ok_or_else(|| AiError::Paper("响应缺少 content 字段".to_string()))?;
-        let parsed: Value = serde_json::from_str(&strip_code_fences(content))
-            .map_err(|e| AiError::Paper(format!("标题翻译响应解析失败：{}", e)))?;
-        let translated = parsed["chineseTitle"].as_str().unwrap_or("").trim().to_string();
-        if translated.is_empty() {
-            return Err(AiError::Paper("标题翻译响应缺少 chineseTitle".to_string()));
-        }
-        Ok(translated)
+        parse_title_translation_response(content)
     }
 
     pub fn test_connection(&self, api_key: &str, model: &str) -> Result<String, AiError> {
@@ -238,7 +242,7 @@ impl DeepSeek {
         });
         let resp = self
             .client
-            .post(ENDPOINT)
+            .post(&self.endpoint)
             .header("Authorization", format!("Bearer {}", api_key))
             .json(&body)
             .send()
@@ -303,7 +307,7 @@ impl DeepSeek {
         });
         let resp = self
             .client
-            .post(ENDPOINT)
+            .post(&self.endpoint)
             .header("Authorization", format!("Bearer {}", api_key))
             .json(&body)
             .send()
@@ -329,6 +333,40 @@ impl DeepSeek {
         }
         Ok(out)
     }
+}
+
+/// Title-only replies are deliberately accepted as either the requested small
+/// JSON object or one plain title.  Some compatible OpenAI endpoints ignore
+/// `response_format` for short responses; rejecting that otherwise valid
+/// Chinese title stranded the whole missing-title backlog.
+pub(crate) fn parse_title_translation_response(content: &str) -> Result<String, AiError> {
+    let normalized = strip_code_fences(content);
+    if let Ok(parsed) = serde_json::from_str::<Value>(&normalized) {
+        if let Some(translated) = parsed.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+            return Ok(translated.to_string());
+        }
+        let translated = parsed["chineseTitle"]
+            .as_str()
+            .or_else(|| parsed["title"].as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if !translated.is_empty() {
+            return Ok(translated);
+        }
+        return Err(AiError::Paper("标题翻译响应缺少 chineseTitle".to_string()));
+    }
+
+    // Plain text is a valid minimal protocol for a title-only request.  Do
+    // not accept an empty reply or accidental prose-sized output.
+    let translated = normalized.trim().trim_matches('"').trim().to_string();
+    if translated.is_empty() {
+        return Err(AiError::Paper("标题翻译响应为空".to_string()));
+    }
+    if translated.chars().count() > 300 {
+        return Err(AiError::Paper("标题翻译响应过长，疑似非标题内容".to_string()));
+    }
+    Ok(translated)
 }
 
 fn system_tag_only_prompt() -> String {
@@ -377,5 +415,60 @@ fn truncate(s: &str, n: usize) -> String {
         s.to_string()
     } else {
         s.chars().take(n).collect::<String>() + "…"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    fn one_response_server(status: &str, body: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let status = status.to_string();
+        let body = body.to_string();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 8192];
+            let _ = stream.read(&mut request).unwrap();
+            let response = format!(
+                "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                status, body.len(), body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        format!("http://{address}/chat/completions")
+    }
+
+    #[test]
+    fn title_translation_accepts_json_and_plain_text() {
+        assert_eq!(parse_title_translation_response(r#"{"chineseTitle":"中文标题"}"#).unwrap(), "中文标题");
+        assert_eq!(parse_title_translation_response("```json\n{\"title\":\"备用字段\"}\n```").unwrap(), "备用字段");
+        assert_eq!(parse_title_translation_response("纯文本中文标题").unwrap(), "纯文本中文标题");
+        assert!(parse_title_translation_response(" ").is_err());
+    }
+
+    #[test]
+    fn title_translation_http_success_extracts_title() {
+        let endpoint = one_response_server(
+            "200 OK",
+            r#"{"choices":[{"message":{"content":"中文标题"}}]}"#,
+        );
+        let client = DeepSeek::with_endpoint(endpoint);
+        assert_eq!(client.translate_title("test-key", "test-model", "English title").unwrap(), "中文标题");
+    }
+
+    #[test]
+    fn title_translation_http_error_is_not_silent() {
+        let endpoint = one_response_server(
+            "401 Unauthorized",
+            r#"{"error":{"message":"invalid key","code":"invalid_api_key"}}"#,
+        );
+        let client = DeepSeek::with_endpoint(endpoint);
+        let error = client.translate_title("bad-key", "test-model", "English title").unwrap_err();
+        assert!(error.to_string().contains("invalid key"));
     }
 }

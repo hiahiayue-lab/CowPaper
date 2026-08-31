@@ -1536,9 +1536,20 @@ async function requireKey(): Promise<boolean> {
  * discovered and historical missing-abstract papers, so callers must not
  * restrict this to the current sync result.
  */
+let missingTitleBacklogInFlight = false;
 async function scheduleMissingTitleBacklog(): Promise<number> {
-  if (!settings?.autoAnalyzeNew || !(await hasKey())) return 0;
-  return invoke<number>("translate_missing_titles", { paperIds: null, model: getModel() });
+  if (missingTitleBacklogInFlight || !settings?.autoAnalyzeNew || !(await hasKey())) return 0;
+  missingTitleBacklogInFlight = true;
+  try {
+    const scheduled = await invoke<number>("translate_missing_titles", { paperIds: null, model: getModel() });
+    if (scheduled) setStatus(`正在翻译 ${scheduled} 篇缺摘要论文标题…`, "running");
+    return scheduled;
+  } catch (err) {
+    missingTitleBacklogInFlight = false;
+    setStatus(`标题翻译启动失败：${safeError(err)}`, "error");
+    console.error("translate_missing_titles invoke failed", err);
+    return 0;
+  }
 }
 
 /// 统一的 start_ai 调用（所有入口必须走这里）：带 trigger + 错误捕获 + 即时反馈。
@@ -1910,7 +1921,8 @@ async function setupListeners() {
   });
 
   await listen("title-translation://done", async (e) => {
-    const r = e.payload as { translated: number; failed: number; errors?: string[] };
+    missingTitleBacklogInFlight = false;
+    const r = e.payload as { translated: number; failed: number; translatedIds?: number[]; errors?: string[] };
     await loadPapers();
     // The title-only worker may finish while Today or a historical missing
     // list is visible. Rebuild that visible source immediately so users do
@@ -1921,6 +1933,11 @@ async function setupListeners() {
       const firstError = r.errors?.[0];
       setStatus(`标题翻译完成：${r.translated}${r.failed ? ` · 失败 ${r.failed}${firstError ? `：${firstError}` : ""}` : ""}`, r.failed ? "error" : "done");
     }
+  });
+  await listen("title-translation://started", (e) => {
+    const r = e.payload as { scheduled: number; paperIds: number[] };
+    console.info("title-only translation started", r);
+    setStatus(`正在翻译 ${r.scheduled} 篇缺摘要论文标题…`, "running");
   });
 
   await listen("ai://progress", (e) => {
