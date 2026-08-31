@@ -1799,7 +1799,9 @@ pub fn list_missing_title_translation_candidates(
         sql.push(')');
     }
     let mut stmt = conn.prepare(&sql)?;
-    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect()
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    let candidates = rows.collect::<Result<Vec<_>>>()?;
+    Ok(candidates)
 }
 
 /// Persist only a translated title. In particular, this must never create
