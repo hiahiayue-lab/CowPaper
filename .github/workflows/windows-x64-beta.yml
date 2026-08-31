@@ -1,5 +1,5 @@
 name: Windows x64 Beta
-run-name: ${{ github.workflow }} · ${{ github.sha }}
+run-name: ${{ github.workflow }} artifact verification · ${{ github.sha }}
 
 on:
   workflow_dispatch:
@@ -134,7 +134,7 @@ jobs:
           $version = (Get-Content "src-tauri/tauri.conf.json" -Raw | ConvertFrom-Json).version
           $releaseName = "CowPaper_$version`_x64-setup.exe"
           $releaseInstaller = Join-Path $bundleDir $releaseName
-          if ($installers[0].FullName -ne [System.IO.Path]::GetFullPath($releaseInstaller)) {
+          if ($installers[0].Name -ne $releaseName) {
             Move-Item -Path $installers[0].FullName -Destination $releaseInstaller -Force
           }
 
