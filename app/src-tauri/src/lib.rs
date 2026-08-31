@@ -1239,6 +1239,7 @@ fn translate_missing_titles(
         let client = api::deepseek::DeepSeek::new();
         let mut translated = 0_i64;
         let mut failed = 0_i64;
+        let mut errors: Vec<String> = Vec::new();
         for (id, title) in candidates {
             match client.translate_title(&api_key, &model, &title) {
                 Ok(chinese_title) => match worker_db.lock()
@@ -1246,14 +1247,21 @@ fn translate_missing_titles(
                     .and_then(|conn| db::save_title_translation(&conn, id, &chinese_title).map_err(|e| e.to_string())) {
                     Ok(true) => translated += 1,
                     Ok(false) => {},
-                    Err(_) => failed += 1,
+                    Err(err) => {
+                        failed += 1;
+                        errors.push(format!("论文 {} 保存标题失败：{}", id, err));
+                    },
                 },
-                Err(_) => failed += 1,
+                Err(err) => {
+                    failed += 1;
+                    errors.push(format!("论文 {} 标题翻译失败：{}", id, err));
+                },
             }
         }
         let _ = app.emit("title-translation://done", serde_json::json!({
             "translated": translated,
             "failed": failed,
+            "errors": errors,
         }));
     });
     Ok(scheduled)
@@ -1324,6 +1332,8 @@ fn start_abstract_recovery(app: AppHandle, db_arc: Db, paper_ids: Vec<i64>) -> R
     if paper_ids.is_empty() { return Err("没有需要补全摘要的论文".into()); }
     let batch = {
         let c = db_arc.lock().unwrap();
+        let paper_ids = db::list_recoverable_paper_ids(&c, &paper_ids).map_err(|e| e.to_string())?;
+        if paper_ids.is_empty() { return Err("当前范围内没有需要补全摘要的论文".into()); }
         if let Some(running) = db::latest_abstract_recovery_batch(&c).map_err(|e| e.to_string())? {
             if running.status == "running" { return Err("摘要补全正在进行中".into()); }
         }
@@ -1353,9 +1363,8 @@ fn recover_due_abstracts(app: AppHandle, state: State<Db>) -> Result<models::Abs
 }
 
 #[tauri::command]
-fn recover_all_abstracts(app: AppHandle, state: State<Db>) -> Result<models::AbstractRecoveryBatch, String> {
-    let ids = { let c = state.inner().lock().unwrap(); db::list_papers(&c, None, 10_000).map_err(|e| e.to_string())?.into_iter().filter(|p| p.abstract_quality != "complete").map(|p| p.id).collect() };
-    start_abstract_recovery(app, state.inner().clone(), ids)
+fn recover_scoped_abstracts(app: AppHandle, paper_ids: Vec<i64>, state: State<Db>) -> Result<models::AbstractRecoveryBatch, String> {
+    start_abstract_recovery(app, state.inner().clone(), paper_ids)
 }
 
 #[tauri::command]
@@ -1675,7 +1684,7 @@ pub fn run() {
             get_waiting_abstract_count,
             recover_paper_abstract,
             recover_due_abstracts,
-            recover_all_abstracts,
+            recover_scoped_abstracts,
             get_abstract_recovery_batch,
             list_abstract_recovery_batches,
             test_api_connection,

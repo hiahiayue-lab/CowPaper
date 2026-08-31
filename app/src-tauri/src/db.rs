@@ -1784,8 +1784,9 @@ pub fn list_pending_papers(conn: &Connection, paper_ids: Option<&[i64]>) -> Resu
 /// intentionally excludes papers with an abstract or an existing Chinese
 /// title, and does not use or alter full-analysis state.  It deliberately
 /// has no sync-batch or first-seen predicate: historical papers are backlog
-/// candidates too.  A bounded, oldest-first batch keeps automatic catch-up
-/// from turning one launch or sync into an unbounded API run.
+/// candidates too. A bounded, newest-first batch lets the missing papers
+/// currently visible after a sync get their titles in this session, without
+/// turning one launch or sync into an unbounded API run.
 pub const TITLE_TRANSLATION_BATCH_LIMIT: usize = 25;
 pub fn list_missing_title_translation_candidates(
     conn: &Connection,
@@ -1802,12 +1803,33 @@ pub fn list_missing_title_translation_candidates(
         sql.push_str(&ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(","));
         sql.push(')');
     }
-    sql.push_str(" ORDER BY created_at ASC, id ASC LIMIT ");
+    sql.push_str(" ORDER BY created_at DESC, id DESC LIMIT ");
     sql.push_str(&TITLE_TRANSLATION_BATCH_LIMIT.to_string());
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
     let candidates = rows.collect::<Result<Vec<_>>>()?;
     Ok(candidates)
+}
+
+/// Validate a caller-provided recovery scope.  Recovery is deliberately never
+/// allowed to discover its own database-wide target set: the current UI view
+/// owns the scope, while this query protects against stale, duplicate, or
+/// already-complete IDs.
+pub const ABSTRACT_RECOVERY_BATCH_LIMIT: usize = 50;
+pub fn list_recoverable_paper_ids(conn: &Connection, paper_ids: &[i64]) -> Result<Vec<i64>> {
+    if paper_ids.is_empty() { return Ok(vec![]); }
+    let mut ids = paper_ids.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    let mut sql = String::from(
+        "SELECT id FROM papers WHERE id IN (",
+    );
+    sql.push_str(&ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(","));
+    sql.push_str(") AND abstract_quality != 'complete' ORDER BY id ASC LIMIT ");
+    sql.push_str(&ABSTRACT_RECOVERY_BATCH_LIMIT.to_string());
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], |r| r.get(0))?;
+    rows.collect()
 }
 
 /// Persist only a translated title. In particular, this must never create

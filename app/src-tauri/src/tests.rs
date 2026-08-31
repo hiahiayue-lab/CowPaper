@@ -2443,6 +2443,25 @@ fn test_historical_missing_title_backlog_candidate_is_translated_once() {
 }
 
 #[test]
+fn test_scoped_abstract_recovery_only_accepts_current_view_ids() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let ids: Vec<i64> = (1..=6).map(|n| match db::upsert_paper(
+        &conn, jid, &candidate(Some(&format!("10.1000/recovery-{}", n)), &format!("P{}", n), None, None),
+    ).unwrap() { UpsertOutcome::New(id) => id, _ => unreachable!() }).collect();
+
+    // The page decides membership (today/day A/day B); the backend only
+    // validates those submitted IDs and cannot expand the scope to all rows.
+    assert_eq!(db::list_recoverable_paper_ids(&conn, &ids[4..6]).unwrap(), ids[4..6]);
+    assert_eq!(db::list_recoverable_paper_ids(&conn, &ids[0..2]).unwrap(), ids[0..2]);
+    assert_eq!(db::list_recoverable_paper_ids(&conn, &ids[2..4]).unwrap(), ids[2..4]);
+    assert_eq!(db::list_recoverable_paper_ids(&conn, &[ids[3], ids[3]]).unwrap(), vec![ids[3]]);
+
+    db::merge_recovered_abstract(&conn, ids[0], "crossref", &"complete abstract ".repeat(30)).unwrap();
+    assert!(db::list_recoverable_paper_ids(&conn, &[ids[0]]).unwrap().is_empty());
+}
+
+#[test]
 fn test_recovered_abstract_after_title_only_translation_remains_full_analysis_eligible() {
     let conn = mem_db();
     let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();

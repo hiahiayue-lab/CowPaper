@@ -1068,7 +1068,7 @@ function renderPapers() {
   // Activity-only panel.
   const missingAbstracts = papers.filter((p) => p.abstractQuality !== "complete").length;
   $("abstract-recovery-banner").innerHTML = missingAbstracts > 0
-    ? `<div class="pending-row abstract-recovery-banner"><span>缺失摘要 <strong>${missingAbstracts} 篇</strong></span><button class="ghost small" data-action="translate-missing-titles">翻译缺摘要标题</button><button class="ghost small" data-action="recover-all-abstracts">重新获取全部摘要</button></div>`
+    ? `<div class="pending-row abstract-recovery-banner"><span>缺失摘要 <strong>${missingAbstracts} 篇</strong></span><button class="ghost small" data-action="translate-missing-titles">翻译缺摘要标题</button></div>`
     : "";
 
   let list = papers;
@@ -1100,7 +1100,8 @@ async function renderRecommend() {
     const nextLabel = nowHm < dtime ? ` · 下一批 ${dtime} 自动更新` : "";
     status.textContent = `今日推荐 · ${m}月${d}日${nextLabel}`;
     $("today-segments").innerHTML = `<button class="seg ${todayView === "recommend" ? "on" : ""}" data-action="today-tab" data-tab="recommend">推荐 ${view.items.length}</button><button class="seg ${todayView === "missing" ? "on" : ""}" data-action="today-tab" data-tab="missing">缺摘要 ${missing.length}</button>`;
-    $("today-missing-actions").innerHTML = todayView === "missing" ? `<div class="rec-head"><span class="muted small">今日缺失摘要 ${missing.length} 篇</span>${missing.length ? '<button class="ghost small" data-action="recover-all-abstracts">重新获取全部摘要</button>' : ""}</div>` : "";
+    const missingIds = missing.map((p) => p.id).join(",");
+    $("today-missing-actions").innerHTML = todayView === "missing" ? `<div class="rec-head"><span class="muted small">今日缺失摘要 ${missing.length} 篇</span>${missing.length ? `<button class="ghost small" data-action="recover-scoped-abstracts" data-paper-ids="${missingIds}" data-recovery-label="今日">重新获取今日摘要</button>` : ""}</div>` : "";
     list.innerHTML = todayView === "recommend"
       ? (view.items.length ? view.items.map((v) => renderPaperCard(v.paper, { withAbstract: true, context: `today:recommend:${view.run.id}` })).join("") : '<li class="empty">今天暂无新的推荐论文。</li>')
       : (missing.length ? missing.map((p) => renderPaperCard(p, { withAbstract: true, context: `today:missing:${view.run.id}` })).join("") : '<li class="empty">今天没有缺失摘要的新增论文。</li>');
@@ -1149,7 +1150,8 @@ async function renderRecommendHistory() {
         list.innerHTML = view?.items.length ? view.items.map((v) => renderPaperCard(v.paper, { withAbstract: true, context: `history:${historyCycleKey}:recommend:${view.run.id}`, rank: v.rank, scoreSnapshot: v.scoreSnapshot, scoreOverride: v.scoreSnapshot })).join("") : '<li class="empty">该日暂无推荐</li>';
       } else {
         const ps = await invoke<Paper[]>("list_daily_papers", { cycleKey: historyCycleKey, missingOnly: historyTab === "missing" });
-        list.innerHTML = ps.length ? ps.map((p) => renderPaperCard(p, { withAbstract: true, context: `history:${historyCycleKey}:missing` })).join("") : '<li class="empty">该日暂无论文</li>';
+        const missingIds = ps.map((p) => p.id).join(",");
+        list.innerHTML = `${ps.length ? `<div class="rec-head"><span class="muted small">当日缺失摘要 ${ps.length} 篇</span><button class="ghost small" data-action="recover-scoped-abstracts" data-paper-ids="${missingIds}" data-recovery-label="当日">重新获取当日摘要</button></div>${ps.map((p) => renderPaperCard(p, { withAbstract: true, context: `history:${historyCycleKey}:missing` })).join("")}` : '<li class="empty">该日暂无论文</li>'}`;
       }
     }
   } catch (err) {
@@ -1331,8 +1333,7 @@ function renderActivityPending() {
         ${pending > 0 ? `<button class="ghost small" data-action="manual-analyze">开始分析</button>` : ""}</div>
       <div class="pending-row"><span>AI 分析失败</span><strong>${failed} 篇</strong>
         ${failed > 0 ? `<button class="ghost small" data-action="retry-failed">重新分析</button>` : ""}</div>
-      <div class="pending-row"><span>缺失摘要</span><strong>${waiting} 篇</strong>
-        ${waiting > 0 ? `<button class="ghost small" data-action="recover-all-abstracts">重新获取全部摘要</button>` : ""}</div>
+      <div class="pending-row"><span>缺失摘要</span><strong>${waiting} 篇</strong></div>
     </div>`;
 }
 
@@ -1909,10 +1910,11 @@ async function setupListeners() {
   });
 
   await listen("title-translation://done", async (e) => {
-    const r = e.payload as { translated: number; failed: number };
+    const r = e.payload as { translated: number; failed: number; errors?: string[] };
     await loadPapers();
     if (r.translated || r.failed) {
-      setStatus(`标题翻译完成：${r.translated}${r.failed ? ` · 失败 ${r.failed}` : ""}`, r.failed ? "error" : "done");
+      const firstError = r.errors?.[0];
+      setStatus(`标题翻译完成：${r.translated}${r.failed ? ` · 失败 ${r.failed}${firstError ? `：${firstError}` : ""}` : ""}`, r.failed ? "error" : "done");
     }
   });
 
@@ -2103,13 +2105,15 @@ async function setupListeners() {
       } catch (err) { setStatus(`摘要补全失败：${String(err)}`, "error"); }
       return;
     }
-    if (t.closest("[data-action='recover-all-abstracts']")) {
-      const ok = await showConfirmModal({ title: "重新获取全部摘要", message: "将从 Crossref、OpenAlex 和官方 publisher 页面重新尝试获取公开摘要，不会调用 AI。", confirmText: "开始获取", cancelText: "取消" });
+    const scopedRecovery = t.closest("[data-action='recover-scoped-abstracts']") as HTMLElement | null;
+    if (scopedRecovery) {
+      const ids = (scopedRecovery.dataset.paperIds || "").split(",").map(Number).filter(Number.isInteger);
+      const label = scopedRecovery.dataset.recoveryLabel || "当前列表";
+      const ok = await showConfirmModal({ title: `重新获取${label}摘要`, message: "仅检查当前页面显示的缺摘要论文；将从 Crossref、OpenAlex 和官方 publisher 页面重新尝试获取公开摘要，不会调用 AI。", confirmText: "开始获取", cancelText: "取消" });
       if (!ok) return;
       try {
-        const total = papers.filter((p) => p.abstractQuality !== "complete").length;
-        setStatus(`正在获取摘要 · 0/${total}`, "running");
-        const b = await invoke<AbstractRecoveryBatch>("recover_all_abstracts");
+        setStatus(`正在获取摘要 · 0/${ids.length}`, "running");
+        const b = await invoke<AbstractRecoveryBatch>("recover_scoped_abstracts", { paperIds: ids });
         setStatus(`正在补全摘要 · 0/${b.total}`, "running");
       } catch (err) { setStatus(`摘要补全失败：${String(err)}`, "error"); }
       return;
