@@ -118,17 +118,31 @@ jobs:
       - name: Build NSIS installer
         run: npx tauri build --config src-tauri/tauri.windows.conf.json --target x86_64-pc-windows-msvc
 
-      - name: Verify installer name
+      - name: Discover and normalize NSIS installer
+        id: installer
         shell: pwsh
         run: |
-          $installer = "src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/CowPaper_0.1.1_x64-setup.exe"
-          if (-not (Test-Path $installer)) {
-            throw "Expected Windows installer was not produced: $installer"
+          $bundleDir = "src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis"
+          $installers = @(Get-ChildItem -Path $bundleDir -Filter "CowPaper_*-x64-setup.exe" -File -ErrorAction SilentlyContinue)
+
+          if ($installers.Count -ne 1) {
+            $found = if ($installers.Count) { $installers.FullName -join ", " } else { "none" }
+            throw "Expected exactly one CowPaper NSIS installer in $bundleDir; found $($installers.Count): $found"
           }
+
+          $version = (Get-Content "src-tauri/tauri.conf.json" -Raw | ConvertFrom-Json).version
+          $releaseName = "CowPaper_$version`_x64-setup.exe"
+          $releaseInstaller = Join-Path $bundleDir $releaseName
+          if ($installers[0].FullName -ne [System.IO.Path]::GetFullPath($releaseInstaller)) {
+            Move-Item -Path $installers[0].FullName -Destination $releaseInstaller -Force
+          }
+
+          "installer=$releaseInstaller" >> $env:GITHUB_OUTPUT
+          "artifact_name=$([System.IO.Path]::GetFileNameWithoutExtension($releaseName))" >> $env:GITHUB_OUTPUT
 
       - name: Upload Windows installer
         uses: actions/upload-artifact@v4
         with:
-          name: CowPaper_0.1.1_x64-setup
-          path: app/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/CowPaper_0.1.1_x64-setup.exe
+          name: ${{ steps.installer.outputs.artifact_name }}
+          path: app/${{ steps.installer.outputs.installer }}
           if-no-files-found: error
