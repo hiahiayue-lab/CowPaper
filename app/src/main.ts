@@ -273,9 +273,10 @@ let aiStatus: AiStatus = emptyAiStatus();
 let activity: ActivityState = emptyActivity();
 let settings: Settings | null = null;
 let abstractLang: "zh" | "en" = "zh";
-const expandedPaperIds = new Set<number>();
-/// 摘要语言状态（按 paper id，今日/全部/收藏/历史共用）
-const paperLanguageState = new Map<number, "zh" | "en">();
+/// 纯卡片 UI 状态必须按实例隔离；favorite/ignore 等持久业务状态仍按 paper id。
+const expandedCardInstanceIds = new Set<string>();
+const cardLanguageState = new Map<string, "zh" | "en">();
+const cardPaperState = new Map<string, Paper>();
 
 async function finishRecoveryBatch(batchId: number) {
   const [batch, items] = await invoke<[AbstractRecoveryBatch, AbstractRecoveryItem[]]>("get_abstract_recovery_batch", { id: batchId });
@@ -416,17 +417,6 @@ let catalogCollections: JournalCollection[] = [];
 let catalogDetail: Journal[] = [];
 let selectedCatalogCode: string | null = null;
 const catalogChecked = new Set<number>(); // 选中的 journal_id
-
-/// 重新渲染包含某 paper 的视图（今日推荐 / 历史 / 论文列表按上下文）。
-function rerenderPaperContext(id: number) {
-  if (recPapers.some((x) => x.id === id)) {
-    if (historyCycleKey != null) renderRecommendHistory();
-    else renderRecommend();
-    return;
-  }
-  renderPapers();
-  renderFavorites();
-}
 
 let journalTab: "catalog" | "manual" = "catalog";
 let addMemberState: { collectionId: number; code: string; query: string; checked: Set<number>; candidates: Journal[] } | null = null;
@@ -952,6 +942,8 @@ function tagChips(matches: TagMatch[]): string {
 
 interface RenderPaperOptions {
   withAbstract: boolean;
+  /** Stable identity for this rendered card, separate from the paper's business identity. */
+  context: string;
   rank?: number;
   scoreSnapshot?: number;
   /// 历史总分覆盖（用 score_snapshot，避免显示当前分造成混淆）
@@ -960,6 +952,8 @@ interface RenderPaperOptions {
 
 /// 统一 Paper Card（今日推荐 / 所有论文 / 收藏 / 历史共用；不维护各自残缺版本）。
 function renderPaperCard(p: Paper, opts: RenderPaperOptions): string {
+  const cardInstanceId = `${opts.context}:paper:${p.id}`;
+  cardPaperState.set(cardInstanceId, p);
   const cls = p.isIgnored ? "card paper ignored" : "card paper";
   const status = p.analysisStatus === "analysisSucceeded" ? "" : `<span class="chip muted-chip">${statusLabel(p.analysisStatus)}</span>`;
   const titleZh = p.chineseTitle ? `<div class="paper-title">${escapeHtml(p.chineseTitle)}</div>` : "";
@@ -993,10 +987,10 @@ function renderPaperCard(p: Paper, opts: RenderPaperOptions): string {
   if (opts.withAbstract) {
     const zhAbs = p.chineseAbstract;
     const enAbs = p.abstractText;
-    let lang = paperLanguageState.get(p.id) ?? abstractLang;
+    let lang = cardLanguageState.get(cardInstanceId) ?? abstractLang;
     if (lang === "zh" && !zhAbs) lang = "en";
     const text = lang === "zh" ? zhAbs : enAbs;
-    const isExpanded = expandedPaperIds.has(p.id);
+    const isExpanded = expandedCardInstanceIds.has(cardInstanceId);
     const hasZh = !!zhAbs;
     if (text) {
       const trunc = isExpanded ? text : text.slice(0, 400) + (text.length > 400 ? "…" : "");
@@ -1019,7 +1013,7 @@ function renderPaperCard(p: Paper, opts: RenderPaperOptions): string {
   }
 
   return `
-    <li class="${cls}">
+    <li class="${cls} paper-card" data-card-instance-id="${escapeHtml(cardInstanceId)}" data-card-context="${escapeHtml(opts.context)}" data-paper-id="${p.id}"${opts.rank != null ? ` data-card-rank="${opts.rank}"` : ""}${opts.scoreSnapshot != null ? ` data-card-score-snapshot="${opts.scoreSnapshot}"` : ""}${opts.scoreOverride != null ? ` data-card-score-override="${opts.scoreOverride}"` : ""}>
       ${status}
       ${titleZh}
       ${titleEn}
@@ -1037,6 +1031,25 @@ function renderPaperCard(p: Paper, opts: RenderPaperOptions): string {
       </div>
     </li>
   `;
+}
+
+/** Rebuild exactly the card that received a local UI interaction. */
+function renderCardInstance(card: HTMLElement): string {
+  const id = Number(card.dataset.paperId);
+  const context = card.dataset.cardContext;
+  const cardInstanceId = card.dataset.cardInstanceId;
+  const p = (cardInstanceId ? cardPaperState.get(cardInstanceId) : undefined)
+    ?? papers.find((x) => x.id === id)
+    ?? recPapers.find((x) => x.id === id);
+  if (!p || !context) return card.outerHTML;
+  const num = (value: string | undefined) => value == null ? undefined : Number(value);
+  return renderPaperCard(p, {
+    withAbstract: true,
+    context,
+    rank: num(card.dataset.cardRank),
+    scoreSnapshot: num(card.dataset.cardScoreSnapshot),
+    scoreOverride: num(card.dataset.cardScoreOverride),
+  });
 }
 
 function renderPapers() {
@@ -1068,7 +1081,7 @@ function renderPapers() {
   if (collt) list = list.filter((p) => p.collections.includes(collt));
 
   $("paper-list").innerHTML = list.length
-    ? list.map((p) => renderPaperCard(p, { withAbstract: true })).join("")
+    ? list.map((p) => renderPaperCard(p, { withAbstract: true, context: "all-papers" })).join("")
     : '<li class="empty">暂无符合条件的论文</li>';
 }
 
@@ -1089,8 +1102,8 @@ async function renderRecommend() {
     $("today-segments").innerHTML = `<button class="seg ${todayView === "recommend" ? "on" : ""}" data-action="today-tab" data-tab="recommend">推荐 ${view.items.length}</button><button class="seg ${todayView === "missing" ? "on" : ""}" data-action="today-tab" data-tab="missing">缺摘要 ${missing.length}</button>`;
     $("today-missing-actions").innerHTML = todayView === "missing" ? `<div class="rec-head"><span class="muted small">今日缺失摘要 ${missing.length} 篇</span>${missing.length ? '<button class="ghost small" data-action="recover-all-abstracts">重新获取全部摘要</button>' : ""}</div>` : "";
     list.innerHTML = todayView === "recommend"
-      ? (view.items.length ? view.items.map((v) => renderPaperCard(v.paper, { withAbstract: true })).join("") : '<li class="empty">今天暂无新的推荐论文。</li>')
-      : (missing.length ? missing.map((p) => renderPaperCard(p, { withAbstract: true })).join("") : '<li class="empty">今天没有缺失摘要的新增论文。</li>');
+      ? (view.items.length ? view.items.map((v) => renderPaperCard(v.paper, { withAbstract: true, context: `today:recommend:${view.run.id}` })).join("") : '<li class="empty">今天暂无新的推荐论文。</li>')
+      : (missing.length ? missing.map((p) => renderPaperCard(p, { withAbstract: true, context: `today:missing:${view.run.id}` })).join("") : '<li class="empty">今天没有缺失摘要的新增论文。</li>');
   } catch (err) {
     console.error("renderRecommend 失败:", err);
     list.innerHTML = '<li class="empty">暂无推荐。保存 API Key 后点「AI 分析」，或同步新论文后自动分析。</li>';
@@ -1133,10 +1146,10 @@ async function renderRecommendHistory() {
           <span class="segmented"><button class="seg ${historyTab === "recommend" ? "on" : ""}" data-action="history-tab" data-tab="recommend">推荐</button><button class="seg ${historyTab === "missing" ? "on" : ""}" data-action="history-tab" data-tab="missing">缺摘要</button></span></div>`;
       if (historyTab === "recommend") {
         const view = await invoke<RecommendationRunView | null>("get_daily_recommendation_run", { cycleKey: historyCycleKey });
-        list.innerHTML = view?.items.length ? view.items.map((v) => renderPaperCard(v.paper, { withAbstract: true, rank: v.rank, scoreSnapshot: v.scoreSnapshot, scoreOverride: v.scoreSnapshot })).join("") : '<li class="empty">该日暂无推荐</li>';
+        list.innerHTML = view?.items.length ? view.items.map((v) => renderPaperCard(v.paper, { withAbstract: true, context: `history:${historyCycleKey}:recommend:${view.run.id}`, rank: v.rank, scoreSnapshot: v.scoreSnapshot, scoreOverride: v.scoreSnapshot })).join("") : '<li class="empty">该日暂无推荐</li>';
       } else {
         const ps = await invoke<Paper[]>("list_daily_papers", { cycleKey: historyCycleKey, missingOnly: historyTab === "missing" });
-        list.innerHTML = ps.length ? ps.map((p) => renderPaperCard(p, { withAbstract: true })).join("") : '<li class="empty">该日暂无论文</li>';
+        list.innerHTML = ps.length ? ps.map((p) => renderPaperCard(p, { withAbstract: true, context: `history:${historyCycleKey}:missing` })).join("") : '<li class="empty">该日暂无论文</li>';
       }
     }
   } catch (err) {
@@ -1153,7 +1166,7 @@ function showHistoryOverview() {
 function renderFavorites() {
   const list = papers.filter((p) => p.isFavorite);
   $("favorites-list").innerHTML = list.length
-    ? list.map((p) => renderPaperCard(p, { withAbstract: true })).join("")
+    ? list.map((p) => renderPaperCard(p, { withAbstract: true, context: "favorites" })).join("")
     : '<li class="empty">暂无收藏。在论文卡片上点 ☆ 收藏。</li>';
 }
 
@@ -2024,20 +2037,22 @@ async function setupListeners() {
     }
     const absLang = t.closest("[data-action='toggle-paper-lang']") as HTMLElement | null;
     if (absLang) {
-      const id = parseInt(absLang.dataset.paperId!, 10);
       const lang = absLang.dataset.lang as "zh" | "en";
-      const p = papers.find((x) => x.id === id) ?? recPapers.find((x) => x.id === id);
-      if (!p) return;
-      paperLanguageState.set(id, lang);
-      rerenderPaperContext(p.id);
+      const card = absLang.closest(".paper-card") as HTMLElement | null;
+      const cardInstanceId = card?.dataset.cardInstanceId;
+      if (!cardInstanceId) return;
+      cardLanguageState.set(cardInstanceId, lang);
+      card.outerHTML = renderCardInstance(card);
       return;
     }
     const absExpand = t.closest("[data-action='toggle-paper-abstract']") as HTMLElement | null;
     if (absExpand) {
-      const id = parseInt(absExpand.dataset.paperId!, 10);
-      if (expandedPaperIds.has(id)) expandedPaperIds.delete(id);
-      else expandedPaperIds.add(id);
-      rerenderPaperContext(id);
+      const card = absExpand.closest(".paper-card") as HTMLElement | null;
+      const cardInstanceId = card?.dataset.cardInstanceId;
+      if (!cardInstanceId) return;
+      if (expandedCardInstanceIds.has(cardInstanceId)) expandedCardInstanceIds.delete(cardInstanceId);
+      else expandedCardInstanceIds.add(cardInstanceId);
+      card.outerHTML = renderCardInstance(card);
       return;
     }
     const recoverAbstract = t.closest("[data-action='recover-paper-abstract']") as HTMLElement | null;

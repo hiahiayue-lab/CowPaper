@@ -3078,6 +3078,24 @@ fn local_dt(y: i32, m: u32, d: u32, h: u32, min: u32) -> chrono::DateTime<chrono
 }
 
 #[test]
+fn test_new_journal_sync_uses_two_day_local_safe_window() {
+    let now = local_dt(2026, 8, 31, 0, 5);
+    assert_eq!(crate::sync::initial_safe_window(now), ("2026-08-30".into(), "2026-08-31".into()));
+    assert_eq!(crate::sync::sync_window_start(None, now), "2026-08-30");
+}
+
+#[test]
+fn test_existing_journal_sync_keeps_24_hour_overlap() {
+    let now = local_dt(2026, 8, 31, 12, 0);
+    assert_eq!(
+        crate::sync::sync_window_start(Some("2026-08-31T01:30:00+00:00"), now),
+        "2026-08-30"
+    );
+    // A malformed legacy timestamp must not reopen a 30-day initial fetch.
+    assert_eq!(crate::sync::sync_window_start(Some("invalid"), now), "2026-08-30");
+}
+
+#[test]
 fn test_recommendation_cycle_key() {
     use crate::recommendation::cycle_key_for;
     // cutoff 09:00：当天 15:00 → 当天；次日 08:59 → 仍前一天；09:00 → 当天

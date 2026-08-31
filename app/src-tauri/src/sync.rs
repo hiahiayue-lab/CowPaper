@@ -92,7 +92,10 @@ pub fn run_sync<R: Runtime>(
 
     let crossref = Crossref::new(mailto);
     let openalex = OpenAlex::new(mailto);
-    let to = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    // Discovery APIs accept date-only bounds. Product "today" follows the
+    // device's local calendar day, not UTC.
+    let sync_now = chrono::Local::now();
+    let to = sync_now.format("%Y-%m-%d").to_string();
 
     let mut journal_completed: i64 = 0;
     let mut journal_failed: i64 = 0;
@@ -132,7 +135,7 @@ pub fn run_sync<R: Runtime>(
             report.existing_papers,
             report.abstracts_added,
         );
-        match sync_journal(conn, &crossref, &openalex, j, &to, &mut report) {
+        match sync_journal(conn, &crossref, &openalex, j, &to, sync_now, &mut report) {
             Ok(res) => {
                 journal_completed += 1;
                 report.new_paper_ids.extend(res.inserted.iter().copied());
@@ -218,6 +221,7 @@ fn sync_journal(
     openalex: &OpenAlex,
     j: &Journal,
     to: &str,
+    sync_now: chrono::DateTime<chrono::Local>,
     report: &mut SyncReport,
 ) -> Result<JournalSyncResult, String> {
     // 多 ISSN：收集该 canonical Journal 的全部 identifiers（print/online/other），
@@ -241,16 +245,14 @@ fn sync_journal(
         return Err("缺少 ISSN".to_string());
     }
 
-    // 增量起点：上次成功同步 - 24h（首次回溯 30 天），满足 §7.2。
+    // Incremental sync starts 24h before the last successful sync. A new
+    // journal deliberately uses only the previous and current local calendar
+    // days, allowing for date-only source metadata and publication delays
+    // without importing a large historical backlog.
     let from = {
         let c = conn.lock().unwrap();
         let last = db::get_last_successful_sync_at(&c, j.id).map_err(|e| e.to_string())?;
-        match last {
-            Some(iso) => chrono::DateTime::parse_from_rfc3339(&iso)
-                .map(|dt| (dt - chrono::Duration::hours(24)).format("%Y-%m-%d").to_string())
-                .unwrap_or_else(|_| thirty_days_ago()),
-            None => thirty_days_ago(),
-        }
+        sync_window_start(last.as_deref(), sync_now)
     };
 
     // 发现：Crossref 为主力（多 ISSN 各自查询，DOI 去重由 upsert 的 normalized_doi 唯一索引保证），
@@ -434,6 +436,29 @@ pub(crate) fn source_discovery_succeeded(crossref_ok: bool, openalex_ok: bool) -
     crossref_ok || openalex_ok
 }
 
-fn thirty_days_ago() -> String {
-    (chrono::Utc::now() - chrono::Duration::days(30)).format("%Y-%m-%d").to_string()
+/// Initial discovery covers at most two local calendar days: today and the
+/// immediately preceding day. Keep this helper as the single initial-window
+/// policy so startup, manual, daily, and single-journal sync all agree.
+pub(crate) fn initial_safe_window(
+    now: chrono::DateTime<chrono::Local>,
+) -> (String, String) {
+    (
+        (now - chrono::Duration::days(1)).format("%Y-%m-%d").to_string(),
+        now.format("%Y-%m-%d").to_string(),
+    )
+}
+
+/// Select the inclusive discovery start date for a journal. Invalid legacy
+/// timestamps remain bounded to an incremental 24-hour overlap rather than
+/// falling back to a broad historical fetch.
+pub(crate) fn sync_window_start(
+    last_successful_sync_at: Option<&str>,
+    now: chrono::DateTime<chrono::Local>,
+) -> String {
+    match last_successful_sync_at {
+        None => initial_safe_window(now).0,
+        Some(iso) => chrono::DateTime::parse_from_rfc3339(iso)
+            .map(|dt| (dt - chrono::Duration::hours(24)).format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|_| (now - chrono::Duration::hours(24)).format("%Y-%m-%d").to_string()),
+    }
 }
