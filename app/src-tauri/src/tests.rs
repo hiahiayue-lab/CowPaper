@@ -1,6 +1,7 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 use std::thread;
 
 use crate::db;
@@ -41,21 +42,27 @@ fn candidate(
     }
 }
 
-fn title_mock_server(body: &str) -> String {
+fn title_response_sequence_server(responses: Vec<(&str, &str)>) -> (String, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
-    let body = body.to_string();
+    let responses: Vec<(String, String)> = responses.into_iter()
+        .map(|(status, body)| (status.to_string(), body.to_string())).collect();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let observed = requests.clone();
     thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut request = [0_u8; 8192];
-        let _ = stream.read(&mut request).unwrap();
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(), body
-        );
-        stream.write_all(response.as_bytes()).unwrap();
+        for (status, body) in responses {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 8192];
+            let _ = stream.read(&mut request).unwrap();
+            observed.fetch_add(1, Ordering::SeqCst);
+            let response = format!(
+                "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                status, body.len(), body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        }
     });
-    format!("http://{address}/chat/completions")
+    (format!("http://{address}/chat/completions"), requests)
 }
 
 #[test]
@@ -2428,14 +2435,17 @@ fn test_title_only_translation_preserves_missing_abstract_semantics() {
 }
 
 #[test]
-fn test_title_only_http_success_writes_one_row_without_changing_missing_semantics() {
+fn test_title_only_empty_retry_success_writes_one_row_without_changing_missing_semantics() {
     let conn = mem_db();
     let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
     let id = match db::upsert_paper(&conn, jid, &candidate(Some("10.1000/http-title"), "English-only title", None, None)).unwrap() {
         UpsertOutcome::New(id) => id,
         _ => panic!("expected new paper"),
     };
-    let endpoint = title_mock_server(r#"{"choices":[{"message":{"content":"HTTP 模拟中文标题"}}]}"#);
+    let (endpoint, requests) = title_response_sequence_server(vec![
+        ("200 OK", r#"{"choices":[{"message":{"content":" "},"finish_reason":"length"}]}"#),
+        ("200 OK", r#"{"choices":[{"message":{"content":"HTTP 模拟中文标题"},"finish_reason":"stop"}]}"#),
+    ]);
     let translated = crate::api::deepseek::DeepSeek::with_endpoint(endpoint)
         .translate_title("valid-test-key", "test-model", "English-only title")
         .unwrap();
@@ -2445,6 +2455,7 @@ fn test_title_only_http_success_writes_one_row_without_changing_missing_semantic
     assert_eq!(paper.abstract_quality, "missing");
     assert_eq!(paper.analysis_status, "waitingForAbstract");
     assert!(paper.total_score.is_none());
+    assert_eq!(requests.load(Ordering::SeqCst), 2, "empty title reply gets one bounded retry before DB write");
 }
 
 #[test]
