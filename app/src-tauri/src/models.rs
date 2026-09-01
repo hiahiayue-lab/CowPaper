@@ -360,6 +360,22 @@ pub struct Paper {
     pub abstract_last_checked_at: Option<String>,
     /// 摘要补抓失败计数
     pub abstract_retry_count: i64,
+    /// Round 7 Phase 1：摘要来源落地页 URL（provenance，如 publisher:nature 页面地址）
+    #[serde(default)]
+    pub abstract_source_url: Option<String>,
+    /// Round 7 Phase 1：内容类型（research_article / review / ... / unknown）。
+    /// UI 不直接展示技术字段，仅用于 recovery / recommendation 语义门控与产品文案。
+    #[serde(default)]
+    pub content_kind: String,
+    /// 内容类型判定证据来源（如 crossref:type / openalex:type / title-heuristic）
+    #[serde(default)]
+    pub content_kind_source: Option<String>,
+    /// 内容类型判定置信度（EXACT / HIGH / LOW / UNKNOWN）
+    #[serde(default)]
+    pub content_kind_confidence: String,
+    /// 摘要语义状态（available / missing_recoverable / not_expected / unknown）
+    #[serde(default)]
+    pub abstract_status: String,
     pub url: Option<String>,
     pub publisher_article_id: Option<String>,
     pub openalex_work_id: Option<String>,
@@ -424,6 +440,9 @@ pub struct PaperCandidate {
     pub year: Option<i32>,
     pub abstract_text: Option<String>,
     pub abstract_source: Option<String>,
+    /// Round 7 Phase 1：摘要来源落地页 URL（provenance；publisher fallback 必填，
+    /// API 来源保持 None，来源身份由 abstract_source 标识）。
+    pub abstract_source_url: Option<String>,
     pub url: Option<String>,
     pub publisher_article_id: Option<String>,
     pub openalex_work_id: Option<String>,

@@ -33,6 +33,7 @@ fn candidate(
         year: Some(2025),
         abstract_text: abstract_text.map(str::to_string),
         abstract_source: abstract_source.map(str::to_string),
+        abstract_source_url: None,
         url: doi.map(|d| format!("https://doi.org/{}", d)),
         publisher_article_id: None,
         openalex_work_id: None,
@@ -2068,7 +2069,7 @@ fn test_migration_v2_to_v3_preserves_data() {
 
     // 迁移到 v3
     db::init(&conn).unwrap();
-    assert_eq!(db::SCHEMA_VERSION, 12);
+    assert_eq!(db::SCHEMA_VERSION, 13);
 
     // 8) 旧 issn 迁移进 journal_identifiers（类型按列，不猜）
     let ids = db::list_journal_identifiers(&conn, jid).unwrap();
@@ -2109,7 +2110,7 @@ fn test_database_restart_persistence() {
     {
         let conn = db::open(&path).unwrap();
         db::init(&conn).unwrap(); // 幂等：user_version=3 不重复迁移
-        assert_eq!(db::SCHEMA_VERSION, 12);
+        assert_eq!(db::SCHEMA_VERSION, 13);
         let j = db::get_journal(&conn, 1).unwrap().expect("期刊持久化");
         assert_eq!(j.print_issn.as_deref(), Some("0025-1909"));
         assert_eq!(j.identifiers.len(), 1);
@@ -2736,7 +2737,7 @@ fn test_migration_v4_abstract_quality_init() {
     .unwrap();
 
     db::init(&conn).unwrap();
-    assert_eq!(db::SCHEMA_VERSION, 12);
+    assert_eq!(db::SCHEMA_VERSION, 13);
 
     let papers = db::list_papers(&conn, Some(jid), 100).unwrap();
     assert_eq!(papers.len(), 3, "迁移不得丢论文");
@@ -4376,4 +4377,446 @@ fn test_legacy_name_only_repair() {
     assert!(p.tag_matches.iter().all(|m| m.tag_id.is_some() && m.semantic_hash.is_some()));
     let s: f64 = conn.query_row("SELECT total_score FROM papers WHERE id=?1", params![pa], |r| r.get(0)).unwrap();
     assert!((s - 2.4).abs() < 1e-9, "repair 后 totalScore=2.4，实际 {}", s);
+}
+
+// ================= Round 7 Phase 1：Missing Abstract Intelligence =================
+
+/// 构造带 raw_json 的 candidate（crossref / openalex 风格由调用方决定）。
+fn cand_raw(doi: &str, title: &str, abstract_text: Option<&str>, raw_json: Option<&str>) -> PaperCandidate {
+    let mut c = candidate(Some(doi), title, abstract_text, None);
+    c.raw_json = raw_json.map(str::to_string);
+    c
+}
+
+/// 绕过 upsert 分类逻辑的「legacy 时代」原始插入（content_kind 等保持默认 unknown），
+/// 用于验证 v13 migration backfill。
+fn raw_insert_legacy_paper(
+    conn: &rusqlite::Connection,
+    jid: i64,
+    title: &str,
+    doi: &str,
+    abstract_text: Option<&str>,
+    raw_json: Option<&str>,
+) -> i64 {
+    conn.execute(
+        "INSERT INTO papers (journal_id, normalized_doi, title, abstract, analysis_status, abstract_quality, created_at, updated_at)
+         VALUES (?1,?2,?3,?4,'waitingForAbstract','missing',?5,?5)",
+        params![jid, doi, title, abstract_text, "2026-08-27T00:00:00Z"],
+    )
+    .unwrap();
+    let pid = conn.last_insert_rowid();
+    if let Some(raw) = raw_json {
+        conn.execute(
+            "INSERT INTO source_records (paper_id, source, source_id, raw_json, retrieved_at) VALUES (?1,'crossref',?2,?3,?4)",
+            params![pid, doi, raw, "2026-08-27T00:00:00Z"],
+        )
+        .unwrap();
+    }
+    pid
+}
+
+/// 模拟一次 v13 之前的存量库：全部迁移已完成、user_version 回退到 12，
+/// 再执行 db::init 只重跑 v13（columns 已存在 → 仅 backfill）。
+fn rerun_v13_migration(conn: &rusqlite::Connection) {
+    conn.pragma_update(None, "user_version", 12).unwrap();
+    db::init(conn).unwrap();
+}
+
+// A. research_article（显式可信证据）+ 无摘要 → missing_recoverable
+// Correctness Fix：journal-article 是 broad type，不能产出 research_article；
+// 此处直接以可信 content_kind 写入，验证 abstract_status 与 recovery 门控。
+#[test]
+fn test_r7_research_article_missing_is_recoverable() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let raw = r#"{"DOI":"10.1000/r7-a","type":"journal-article","title":["Platform Pricing"]}"#;
+    let id = match db::upsert_paper(&conn, jid, &cand_raw("10.1000/r7-a", "Platform Pricing", None, Some(raw))).unwrap() {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new paper"),
+    };
+    // broad journal-article 只说明 journal-level item，不赋 research_article
+    let p = db::get_paper(&conn, id).unwrap().unwrap();
+    assert_eq!(p.content_kind, crate::content_kind::CK_UNKNOWN);
+    assert_eq!(p.abstract_status, crate::content_kind::ABST_UNKNOWN);
+    // 模拟未来足够明确的证据（Phase 2 或 publisher metadata）显式写入 research_article
+    conn.execute(
+        "UPDATE papers SET content_kind='research_article', content_kind_source='explicit', content_kind_confidence='EXACT' WHERE id=?1",
+        params![id],
+    )
+    .unwrap();
+    db::refresh_abstract_status(&conn, id).unwrap();
+    let p = db::get_paper(&conn, id).unwrap().unwrap();
+    assert_eq!(p.content_kind, crate::content_kind::CK_RESEARCH_ARTICLE);
+    assert_eq!(p.abstract_status, crate::content_kind::ABST_MISSING_RECOVERABLE);
+    // 在 recovery 候选集中
+    let ids = db::list_recoverable_paper_ids(&conn, &[id]).unwrap();
+    assert_eq!(ids, vec![id]);
+}
+
+// B. news → not_expected → 不进入 abstract recovery
+#[test]
+fn test_r7_news_is_not_expected_and_excluded_from_recovery() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let raw = r#"{"DOI":"10.1000/r7-b","type":"news","title":["A New Discovery"]}"#;
+    let id = match db::upsert_paper(&conn, jid, &cand_raw("10.1000/r7-b", "A New Discovery", None, Some(raw))).unwrap() {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new paper"),
+    };
+    let p = db::get_paper(&conn, id).unwrap().unwrap();
+    assert_eq!(p.content_kind, crate::content_kind::CK_NEWS);
+    assert_eq!(p.abstract_status, crate::content_kind::ABST_NOT_EXPECTED);
+    // 不得出现在 recovery 候选（单篇 + 批量）
+    assert!(db::list_recoverable_paper_ids(&conn, &[id]).unwrap().is_empty());
+    let research_raw = r#"{"DOI":"10.1000/r7-b2","type":"journal-article"}"#;
+    let rid = match db::upsert_paper(&conn, jid, &cand_raw("10.1000/r7-b2", "A Real Study", None, Some(research_raw))).unwrap() {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new paper"),
+    };
+    let ids = db::list_recoverable_paper_ids(&conn, &[id, rid]).unwrap();
+    assert_eq!(ids, vec![rid], "bulk recovery 必须只包含可恢复论文");
+}
+
+// C. editorial / correction / front_matter → not_expected
+#[test]
+fn test_r7_non_research_kinds_are_not_expected() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let cases = [
+        ("10.1000/r7-ed", "editorial", "Editorial Note", "editorial"),
+        ("10.1000/r7-cor", "correction", "Correction to: Pricing", "correction"),
+        ("10.1000/r7-fm", "journal-issue", "Issue Information", "front_matter"),
+    ];
+    for (doi, ty, title, expected_kind) in cases {
+        let raw = format!(r#"{{"DOI":"{}","type":"{}","title":["{}"]}}"#, doi, ty, title);
+        let id = match db::upsert_paper(&conn, jid, &cand_raw(doi, title, None, Some(&raw))).unwrap() {
+            UpsertOutcome::New(id) => id,
+            _ => panic!("expected new paper"),
+        };
+        let p = db::get_paper(&conn, id).unwrap().unwrap();
+        assert_eq!(p.content_kind, expected_kind);
+        assert_eq!(p.abstract_status, crate::content_kind::ABST_NOT_EXPECTED);
+        assert!(db::list_recoverable_paper_ids(&conn, &[id]).unwrap().is_empty());
+    }
+}
+
+// D. review → missing_recoverable + 保留推荐资格；news 被推荐门控排除
+#[test]
+fn test_r7_review_keeps_recommendation_eligibility_news_gated() {
+    use chrono::Local;
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let review_raw = r#"{"DOI":"10.1000/r7-rev","type":"review-article","title":["A Review of X"]}"#;
+    let news_raw = r#"{"DOI":"10.1000/r7-news","type":"news","title":["News Item"]}"#;
+    let res_raw = r#"{"DOI":"10.1000/r7-res","type":"journal-article","title":["A Study"]}"#;
+    let rev = match db::upsert_paper(&conn, jid, &cand_raw("10.1000/r7-rev", "A Review of X", None, Some(review_raw))).unwrap() {
+        UpsertOutcome::New(id) => id, _ => panic!(),
+    };
+    let news = match db::upsert_paper(&conn, jid, &cand_raw("10.1000/r7-news", "News Item", None, Some(news_raw))).unwrap() {
+        UpsertOutcome::New(id) => id, _ => panic!(),
+    };
+    let res = match db::upsert_paper(&conn, jid, &cand_raw("10.1000/r7-res", "A Study", None, Some(res_raw))).unwrap() {
+        UpsertOutcome::New(id) => id, _ => panic!(),
+    };
+    let p = db::get_paper(&conn, rev).unwrap().unwrap();
+    assert_eq!(p.content_kind, crate::content_kind::CK_REVIEW);
+    assert_eq!(p.abstract_status, crate::content_kind::ABST_MISSING_RECOVERABLE);
+    // 模拟 Full AI 已完成（DB 状态齐全），验证推荐资格门控
+    for (id, score) in [(rev, 5.0), (news, 9.0), (res, 7.0)] {
+        conn.execute(
+            "UPDATE papers SET analysis_status='analysisSucceeded', total_score=?1,
+                chinese_title='中', chinese_abstract='中', one_sentence_summary='中',
+                evidence_hash='h' WHERE id=?2",
+            params![score, id],
+        )
+        .unwrap();
+    }
+    let run_id = crate::recommendation::refresh_current_recommendations(&conn, &Local::now(), "09:00").unwrap();
+    let items = db::list_recommendation_items(&conn, run_id).unwrap();
+    let paper_ids: Vec<i64> = items.iter().map(|i| i.paper_id).collect();
+    assert!(paper_ids.contains(&rev), "review 必须保留推荐资格");
+    assert!(paper_ids.contains(&res), "research_article 保持原规则");
+    assert!(!paper_ids.contains(&news), "news（not_expected）不得进入研究推荐");
+}
+
+// E. Nature DOI exact landing page + dc.description → recovered + provenance
+#[test]
+fn test_r7_nature_landing_page_dc_description_recovery_with_provenance() {
+    use crate::api::publisher::{extract_public_abstract, page_identity_matches, page_doi};
+    let doi = "10.1038/s41586-024-00001-2";
+    let url = format!("https://www.nature.com/articles/s41586-024-00001-2");
+    let text = "We study how climate policy interacts with firm investment and quantify welfare effects. Our model explains equilibrium outcomes across heterogeneous regions with explicit mechanisms and robust results. Policy implications follow directly from the calibrated evidence we present.";
+    let html = format!(
+        r#"<html><head>
+<meta name="citation_doi" content="{}">
+<meta name="dc.description" content="{}">
+</head><body><p>ignored body text</p></body></html>"#,
+        doi, text
+    );
+    // 解析器只认显式 metadata，不认正文
+    assert_eq!(extract_public_abstract(&html).as_deref(), Some(text));
+    assert_eq!(page_doi(&html).as_deref(), Some(doi));
+    assert!(page_identity_matches(&html, &url, doi));
+
+    // 端到端 recovery 合并：provenance 完整记录
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let raw = format!(r#"{{"DOI":"{}","type":"journal-article"}}"#, doi);
+    let id = match db::upsert_paper(&conn, jid, &cand_raw(doi, "Climate Policy", None, Some(&raw))).unwrap() {
+        UpsertOutcome::New(id) => id, _ => panic!(),
+    };
+    let p0 = db::get_paper(&conn, id).unwrap().unwrap();
+    assert_eq!(p0.abstract_status, crate::content_kind::ABST_UNKNOWN, "broad journal-article → unknown");
+    assert_eq!(db::list_recoverable_paper_ids(&conn, &[id]).unwrap(), vec![id], "unknown 仍允许 recovery");
+    db::merge_recovered_abstract_with_url(&conn, id, "publisher:nature", text, Some(&url)).unwrap();
+    let p = db::get_paper(&conn, id).unwrap().unwrap();
+    assert_eq!(p.abstract_text.as_deref(), Some(text));
+    assert_eq!(p.abstract_source.as_deref(), Some("publisher:nature"));
+    assert_eq!(p.abstract_source_url.as_deref(), Some(url.as_str()));
+    assert_eq!(p.abstract_quality, crate::models::ABQ_COMPLETE);
+    assert_eq!(p.abstract_status, crate::content_kind::ABST_AVAILABLE);
+}
+
+// F. Springer DOI exact（URL 含 DOI，无 citation_doi meta）→ 身份验证通过
+#[test]
+fn test_r7_springer_url_doi_identity_and_recovery() {
+    use crate::api::publisher::{extract_public_abstract, page_identity_matches};
+    let doi = "10.1007/s10683-024-00001-2";
+    let text = "We study auction design with entry costs and show that equilibrium bidding deviates systematically. Our experiments confirm the predicted comparative statics with high statistical precision and robustness across specifications. The results inform practical auction implementations.";
+    // Springer 页面：dc.description 存在，但无 citation_doi meta —— identity 靠 URL
+    let html = format!(r#"<meta name="dc.description" content="{}">"#, text);
+    assert_eq!(extract_public_abstract(&html).as_deref(), Some(text));
+    assert!(page_identity_matches(
+        &html,
+        "https://link.springer.com/article/10.1007/s10683-024-00001-2",
+        doi
+    ));
+    // %2F 编码形式（部分 Springer 链接）
+    assert!(page_identity_matches(
+        &html,
+        "https://link.springer.com/article/10.1007%2Fs10683-024-00001-2",
+        doi
+    ));
+
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let raw = format!(r#"{{"DOI":"{}","type":"journal-article"}}"#, doi);
+    let id = match db::upsert_paper(&conn, jid, &cand_raw(doi, "Auction Design", None, Some(&raw))).unwrap() {
+        UpsertOutcome::New(id) => id, _ => panic!(),
+    };
+    db::merge_recovered_abstract_with_url(&conn, id, "publisher:springer", text, Some("https://link.springer.com/article/10.1007/s10683-024-00001-2")).unwrap();
+    let p = db::get_paper(&conn, id).unwrap().unwrap();
+    assert_eq!(p.abstract_source.as_deref(), Some("publisher:springer"));
+    assert_eq!(p.abstract_status, crate::content_kind::ABST_AVAILABLE);
+}
+
+// G. publisher DOI mismatch → 摘要拒绝（identity 验证失败）
+#[test]
+fn test_r7_publisher_doi_mismatch_rejects_abstract() {
+    use crate::api::publisher::{page_identity_matches, page_doi};
+    // 页面声称另一个 DOI
+    let html = r#"<meta name="citation_doi" content="10.1038/s41586-024-99999-9">
+<meta name="dc.description" content="Some other article's abstract with enough words to be a complete sentence.">"#;
+    assert_eq!(page_doi(html).as_deref(), Some("10.1038/s41586-024-99999-9"));
+    assert!(!page_identity_matches(
+        html,
+        "https://www.nature.com/articles/s41586-024-99999-9",
+        "10.1038/s41586-024-00001-2"
+    ), "目标 DOI 与页面 DOI 不一致 → 必须拒绝");
+
+    // 页面完全无 DOI identity evidence → 拒绝
+    let no_identity = r#"<meta name="description" content="Generic teaser text that looks like an abstract sentence.">"#;
+    assert_eq!(page_doi(no_identity), None);
+    assert!(!page_identity_matches(no_identity, "https://www.nature.com/articles/s41586-024-00001-2", "10.1038/s41586-024-00001-2"));
+
+    // 显式错误的页面 DOI 即使最终 URL 含目标 DOI，也必须拒绝。
+    let conflicting_identity = r#"<meta name="citation_doi" content="10.1038/s41586-024-99999-9">"#;
+    assert!(!page_identity_matches(
+        conflicting_identity,
+        "https://www.nature.com/articles/s41586-024-00001-2",
+        "10.1038/s41586-024-00001-2"
+    ));
+}
+
+// H. not_expected → 排除出 bulk recovery（list_recoverable_paper_ids 已覆盖 B，
+// 此处验证 mixed scope：broad journal-article → unknown 仍可恢复）
+#[test]
+fn test_r7_bulk_recovery_scope_excludes_not_expected() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let mut ids = Vec::new();
+    for (i, ty) in ["journal-article", "news", "review-article", "editorial"].iter().enumerate() {
+        let doi = format!("10.1000/r7-bulk{}", i);
+        let raw = format!(r#"{{"DOI":"{}","type":"{}"}}"#, doi, ty);
+        let id = match db::upsert_paper(&conn, jid, &cand_raw(&doi, &format!("T{}", i), None, Some(&raw))).unwrap() {
+            UpsertOutcome::New(id) => id, _ => panic!(),
+        };
+        ids.push(id);
+    }
+    let eligible = db::list_recoverable_paper_ids(&conn, &ids).unwrap();
+    assert_eq!(eligible.len(), 2, "journal-article(unknown) 和 review-article 可恢复；news/editorial 排除");
+    let kinds: Vec<String> = eligible.iter().map(|id| db::get_paper(&conn, *id).unwrap().unwrap().content_kind).collect();
+    assert!(kinds.contains(&crate::content_kind::CK_UNKNOWN.to_string()), "broad journal-article → unknown，仍允许 recovery");
+    assert!(kinds.contains(&crate::content_kind::CK_REVIEW.to_string()));
+}
+
+// I. not_expected → title translation 仍允许
+#[test]
+fn test_r7_not_expected_still_eligible_for_title_translation() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let news_raw = r#"{"DOI":"10.1000/r7-i1","type":"news","title":["News Item"]}"#;
+    let news = match db::upsert_paper(&conn, jid, &cand_raw("10.1000/r7-i1", "News Item", None, Some(news_raw))).unwrap() {
+        UpsertOutcome::New(id) => id, _ => panic!(),
+    };
+    let p = db::get_paper(&conn, news).unwrap().unwrap();
+    assert_eq!(p.abstract_status, crate::content_kind::ABST_NOT_EXPECTED);
+    let candidates = db::list_missing_title_translation_candidates(&conn, None).unwrap();
+    assert!(candidates.iter().any(|(id, _)| *id == news), "not_expected 论文仍应可翻译标题");
+}
+
+// J. 已有真实摘要 → migration backfill 不覆盖
+#[test]
+fn test_r7_backfill_does_not_overwrite_existing_abstract() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let abstract_text = "An existing complete abstract that must survive migration with all its original words and meaning intact.";
+    let raw = r#"{"DOI":"10.1000/r7-j","type":"news"}"#;
+    let pid = raw_insert_legacy_paper(&conn, jid, "Already Abstracted", "10.1000/r7-j", Some(abstract_text), Some(raw));
+    conn.execute(
+        "UPDATE papers SET abstract_source='crossref', abstract_quality='complete', is_favorite=1 WHERE id=?1",
+        params![pid],
+    )
+    .unwrap();
+    rerun_v13_migration(&conn);
+    let (abs, src, quality): (Option<String>, Option<String>, String) = conn
+        .query_row("SELECT abstract, abstract_source, abstract_quality FROM papers WHERE id=?1", params![pid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap();
+    assert_eq!(abs.as_deref(), Some(abstract_text), "backfill 不得覆盖真实摘要");
+    assert_eq!(src.as_deref(), Some("crossref"));
+    assert_eq!(quality, "complete");
+    let (kind, status): (String, String) = conn
+        .query_row("SELECT content_kind, abstract_status FROM papers WHERE id=?1", params![pid], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap();
+    assert_eq!(kind, "news", "类型按证据解析");
+    assert_eq!(status, "available", "已有摘要 → available（不因类型是 news 而丢失）");
+}
+
+// K. History / first_seen 语义 → migration 不变
+#[test]
+fn test_r7_migration_preserves_first_seen_and_history_semantics() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let raw = r#"{"DOI":"10.1000/r7-k","type":"news"}"#;
+    let pid = raw_insert_legacy_paper(&conn, jid, "History Paper", "10.1000/r7-k", None, Some(raw));
+    conn.execute(
+        "UPDATE papers SET first_seen_cycle='2026-08-27', first_seen_abstract_missing=1, is_favorite=1, is_ignored=0 WHERE id=?1",
+        params![pid],
+    )
+    .unwrap();
+    let run_id = db::create_recommendation_run(&conn, "2026-08-27", crate::recommendation::RC_OPEN).unwrap();
+    conn.execute(
+        "INSERT INTO recommendation_items (run_id, paper_id, rank, score_snapshot, added_at) VALUES (?1,?2,1,1.0,?3)",
+        params![run_id, pid, "2026-08-27T00:00:00Z"],
+    )
+    .unwrap();
+    let before_items: i64 = conn.query_row("SELECT COUNT(*) FROM recommendation_items", [], |r| r.get(0)).unwrap();
+    assert_eq!(before_items, 1);
+
+    rerun_v13_migration(&conn);
+
+    let (cycle, missing, fav, ign): (Option<String>, i64, i64, i64) = conn
+        .query_row(
+            "SELECT first_seen_cycle, first_seen_abstract_missing, is_favorite, is_ignored FROM papers WHERE id=?1",
+            params![pid],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(cycle.as_deref(), Some("2026-08-27"));
+    assert_eq!(missing, 1);
+    assert_eq!(fav, 1);
+    assert_eq!(ign, 0);
+    let after_items: i64 = conn.query_row("SELECT COUNT(*) FROM recommendation_items", [], |r| r.get(0)).unwrap();
+    assert_eq!(after_items, 1, "recommendation snapshot 历史不得被 migration 改变");
+}
+
+// v13 backfill：crossref / openalex / letter-upgrade / 无证据 → unknown
+#[test]
+fn test_r7_v13_backfill_classifies_from_raw_json() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    // A: crossref news
+    let a = raw_insert_legacy_paper(&conn, jid, "News A", "10.1000/v13-a", None, Some(r#"{"DOI":"10.1000/v13-a","type":"news"}"#));
+    // B: openalex article
+    let b = raw_insert_legacy_paper(&conn, jid, "Study B", "10.1000/v13-b", None, Some(r#"{"doi":"10.1000/v13-b","type":"article","authorships":[]}"#));
+    // C: 无 raw_json → unknown（不误标）
+    let c = raw_insert_legacy_paper(&conn, jid, "An Interesting Model of Pricing", "10.1000/v13-c", None, None);
+    // D: crossref letter + openalex article → 保持 letter，不自动升级
+    let d = raw_insert_legacy_paper(&conn, jid, "Letter D", "10.1000/v13-d", None, Some(r#"{"DOI":"10.1000/v13-d","type":"letter"}"#));
+    conn.execute(
+        "INSERT INTO source_records (paper_id, source, source_id, raw_json, retrieved_at) VALUES (?1,'openalex','x',?2,'t')",
+        params![d, r#"{"doi":"10.1000/v13-d","type":"article","authorships":[]}"#],
+    )
+    .unwrap();
+    rerun_v13_migration(&conn);
+
+    let kind_of = |id: i64| -> (String, String, String) {
+        conn.query_row(
+            "SELECT content_kind, content_kind_source, content_kind_confidence FROM papers WHERE id=?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+    };
+    let (ka, _, ca) = kind_of(a);
+    assert_eq!(ka, "news");
+    assert_eq!(ca, "EXACT");
+    // Correctness Fix：OpenAlex broad article 不产出 research_article → unknown
+    let (kb, sb, cb) = kind_of(b);
+    assert_eq!(kb, "unknown", "OpenAlex article 是 broad type，不得映射 research_article");
+    assert_eq!(sb, "none");
+    assert_eq!(cb, "UNKNOWN");
+    let (kc, _, cc) = kind_of(c);
+    assert_eq!(kc, "unknown", "低置信度必须保留 unknown，不得误标");
+    assert_eq!(cc, "UNKNOWN");
+    // Correctness Fix：Crossref letter + OpenAlex article → letter（不升级 research_article）
+    let (kd, sd, cd) = kind_of(d);
+    assert_eq!(kd, "letter", "Crossref 显式 letter 保持 letter，不被 broad article 升级");
+    assert_eq!(sd, "crossref:type");
+    assert_eq!(cd, "EXACT");
+    let st: String = conn.query_row("SELECT abstract_status FROM papers WHERE id=?1", params![a], |r| r.get(0)).unwrap();
+    assert_eq!(st, "not_expected");
+    let st: String = conn.query_row("SELECT abstract_status FROM papers WHERE id=?1", params![b], |r| r.get(0)).unwrap();
+    assert_eq!(st, "unknown", "unknown + 无摘要 → abstract_status unknown（仍可 recovery）");
+    let st: String = conn.query_row("SELECT abstract_status FROM papers WHERE id=?1", params![d], |r| r.get(0)).unwrap();
+    assert_eq!(st, "not_expected", "letter 保守 → not_expected");
+}
+
+// 运行时补充分类：unknown → 第二次 upsert 带 raw_json 后填上；broad 证据不覆盖已分类
+#[test]
+fn test_r7_existing_upsert_fills_kind_when_unknown() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let id = match db::upsert_paper(&conn, jid, &cand_raw("10.1000/r7-fill", "First Pass", None, None)).unwrap() {
+        UpsertOutcome::New(id) => id, _ => panic!(),
+    };
+    let p = db::get_paper(&conn, id).unwrap().unwrap();
+    assert_eq!(p.content_kind, "unknown");
+    // 第二次 upsert 带 crossref news 证据 → 填充（显式细分类型）
+    let raw = r#"{"DOI":"10.1000/r7-fill","type":"news"}"#;
+    db::upsert_paper(&conn, jid, &cand_raw("10.1000/r7-fill", "First Pass", None, Some(raw))).unwrap();
+    let p = db::get_paper(&conn, id).unwrap().unwrap();
+    assert_eq!(p.content_kind, "news");
+    assert_eq!(p.abstract_status, "not_expected");
+    // 第三次 upsert 换 broad journal-article 证据 → 不覆盖已分类（review #7）
+    let raw2 = r#"{"DOI":"10.1000/r7-fill","type":"journal-article"}"#;
+    db::upsert_paper(&conn, jid, &cand_raw("10.1000/r7-fill", "First Pass", None, Some(raw2))).unwrap();
+    let p = db::get_paper(&conn, id).unwrap().unwrap();
+    assert_eq!(p.content_kind, "news", "broad 类型证据不得覆盖已有可信分类");
+    assert_eq!(p.abstract_status, "not_expected");
+    // 显式 editorial 分类后，broad journal-article 证据同样不覆盖
+    let raw3 = r#"{"DOI":"10.1000/r7-fill","type":"editorial"}"#;
+    db::upsert_paper(&conn, jid, &cand_raw("10.1000/r7-fill", "First Pass", None, Some(raw3))).unwrap();
+    let p = db::get_paper(&conn, id).unwrap().unwrap();
+    assert_eq!(p.content_kind, "news", "已分类结果（news）不得被 editorial 覆盖，因为 fill 只补 unknown");
 }

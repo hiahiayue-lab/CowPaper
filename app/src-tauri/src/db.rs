@@ -85,10 +85,11 @@ pub fn open(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-/// 当前 schema 版本（Round 5B：abstract_quality / paper_abstract_sources 为 v4）。
+/// 当前 schema 版本（Round 5B：abstract_quality / paper_abstract_sources 为 v4；
+/// Round 7 Phase 1：content_kind / abstract_status 为 v13）。
 /// 生产构建中仅由迁移系统隐式使用；测试中直接断言。
 #[allow(dead_code)]
-pub const SCHEMA_VERSION: i64 = 12;
+pub const SCHEMA_VERSION: i64 = 13;
 
 pub fn init(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
@@ -819,9 +820,9 @@ fn merge_abstract(conn: &Connection, paper_id: i64, c: &PaperCandidate) -> Resul
             conn.execute(
                 "UPDATE papers SET abstract = ?1, abstract_source = ?2, abstract_quality = ?3,
                     abstract_retrieved_at = ?4, abstract_last_checked_at = ?4, updated_at = ?4,
-                    evidence_hash = NULL
-                 WHERE id = ?5",
-                params![best.text, best.source, best.quality, now, paper_id],
+                    abstract_source_url = ?5, evidence_hash = NULL
+                 WHERE id = ?6",
+                params![best.text, best.source, best.quality, now, c.abstract_source_url, paper_id],
             )?;
             if !had_abstract {
                 filled = true;
@@ -847,7 +848,66 @@ fn merge_abstract(conn: &Connection, paper_id: i64, c: &PaperCandidate) -> Resul
     // 填充其他缺失字段（保持原有行为）
     fill_other_fields(conn, paper_id, c)?;
 
+    // Round 7 Phase 1：补充分类（unknown → 有证据才填）+ 重算 abstract_status。
+    // 摘要被填/升级/清空后，语义状态必须与 content_kind + 摘要有无保持一致。
+    fill_content_kind_if_unknown(conn, paper_id, c)?;
+    refresh_abstract_status(conn, paper_id)?;
+
     Ok((filled, upgraded))
+}
+
+/// Round 7 Phase 1：若 content_kind 仍为 unknown，用候选中的 raw JSON
+/// （provider explicit type）+ title 补充分类。绝不覆盖已分类结果。
+fn fill_content_kind_if_unknown(conn: &Connection, paper_id: i64, c: &PaperCandidate) -> Result<()> {
+    let current: String = conn
+        .query_row(
+            "SELECT content_kind FROM papers WHERE id = ?1",
+            params![paper_id],
+            |r| r.get(0),
+        )
+        .unwrap_or_else(|_| crate::content_kind::CK_UNKNOWN.to_string());
+    if current != crate::content_kind::CK_UNKNOWN {
+        return Ok(());
+    }
+    let raw = match c.raw_json.as_deref() {
+        Some(raw) => raw,
+        None => return Ok(()),
+    };
+    let (provider, ty) = match crate::content_kind::provider_type_from_raw_json(raw) {
+        Some(v) => v,
+        None => return Ok(()),
+    };
+    let (crossref_type, openalex_type) = match provider {
+        "crossref" => (Some(ty.as_str()), None),
+        "openalex" => (None, Some(ty.as_str())),
+        _ => return Ok(()),
+    };
+    let res = crate::content_kind::resolve_content_kind(crossref_type, openalex_type, c.title.as_deref());
+    if res.kind != crate::content_kind::CK_UNKNOWN {
+        conn.execute(
+            "UPDATE papers SET content_kind=?1, content_kind_source=?2, content_kind_confidence=?3 WHERE id=?4",
+            params![res.kind, res.source, res.confidence, paper_id],
+        )?;
+    }
+    Ok(())
+}
+
+/// Round 7 Phase 1：重算 abstract_status（content_kind + 摘要有无 的纯函数）。
+/// 摘要被填/升级/清空后调用，保证语义状态始终一致。
+pub fn refresh_abstract_status(conn: &Connection, paper_id: i64) -> Result<()> {
+    let (kind, has_abstract): (String, i64) = conn.query_row(
+        "SELECT content_kind,
+                CASE WHEN abstract IS NOT NULL AND abstract != '' THEN 1 ELSE 0 END
+         FROM papers WHERE id = ?1",
+        params![paper_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let status = crate::content_kind::abstract_status_for(&kind, has_abstract != 0);
+    conn.execute(
+        "UPDATE papers SET abstract_status=?1 WHERE id=?2",
+        params![status, paper_id],
+    )?;
+    Ok(())
 }
 
 /// Feed a public recovery result back through the same source ledger and
@@ -859,10 +919,23 @@ pub fn merge_recovered_abstract(
     source: &str,
     abstract_text: &str,
 ) -> Result<(bool, bool)> {
+    merge_recovered_abstract_with_url(conn, paper_id, source, abstract_text, None)
+}
+
+/// Recovery 变体：记录摘要来源落地页 URL（provenance，如 publisher:nature 页面地址）。
+pub fn merge_recovered_abstract_with_url(
+    conn: &Connection,
+    paper_id: i64,
+    source: &str,
+    abstract_text: &str,
+    abstract_source_url: Option<&str>,
+) -> Result<(bool, bool)> {
     merge_abstract(conn, paper_id, &PaperCandidate {
         normalized_doi: None, original_doi: None, title: None, authors: Vec::new(),
         published_date: None, year: None, abstract_text: Some(abstract_text.to_string()),
-        abstract_source: Some(source.to_string()), url: None, publisher_article_id: None,
+        abstract_source: Some(source.to_string()),
+        abstract_source_url: abstract_source_url.map(str::to_string),
+        url: None, publisher_article_id: None,
         openalex_work_id: None, discovery_source: source.to_string(), source_id: None, raw_json: None,
     })
 }
@@ -935,16 +1008,37 @@ pub fn upsert_paper(conn: &Connection, journal_id: i64, c: &PaperCandidate) -> R
     } else {
         ST_PENDING
     };
+    // Round 7 Phase 1：内容类型解析（provider explicit type → title heuristic → unknown）
+    let mut crossref_type: Option<String> = None;
+    let mut openalex_type: Option<String> = None;
+    if let Some(raw) = c.raw_json.as_deref() {
+        if let Some((provider, ty)) = crate::content_kind::provider_type_from_raw_json(raw) {
+            match provider {
+                "crossref" => crossref_type = Some(ty),
+                "openalex" => openalex_type = Some(ty),
+                _ => {}
+            }
+        }
+    }
+    let ck = crate::content_kind::resolve_content_kind(
+        crossref_type.as_deref(),
+        openalex_type.as_deref(),
+        c.title.as_deref(),
+    );
+    let has_abstract = abs_quality != crate::models::ABQ_MISSING;
+    let abstract_status = crate::content_kind::abstract_status_for(&ck.kind, has_abstract);
     let now = now_utc();
     let first_seen_cycle = chrono::Local::now().format("%Y-%m-%d").to_string();
 
     conn.execute(
         "INSERT INTO papers (
             journal_id, normalized_doi, original_doi, title, title_norm, authors_json,
-            published_date, year, abstract, abstract_source, abstract_retrieved_at,
+            published_date, year, abstract, abstract_source, abstract_retrieved_at, abstract_source_url,
             url, publisher_article_id, openalex_work_id, discovery_source,
-            analysis_status, abstract_quality, abstract_last_checked_at, first_seen_cycle, first_seen_abstract_missing, created_at, updated_at
-         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?21)",
+            analysis_status, abstract_quality, abstract_last_checked_at, first_seen_cycle, first_seen_abstract_missing,
+            content_kind, content_kind_source, content_kind_confidence, abstract_status,
+            created_at, updated_at
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?26)",
         params![
             journal_id,
             c.normalized_doi,
@@ -957,6 +1051,7 @@ pub fn upsert_paper(conn: &Connection, journal_id: i64, c: &PaperCandidate) -> R
             abs_norm,
             c.abstract_source,
             now.clone(),
+            None::<String>, // abstract_source_url：初始来源由 abstract_source 标识（crossref/openalex API）
             c.url,
             c.publisher_article_id,
             c.openalex_work_id,
@@ -966,6 +1061,10 @@ pub fn upsert_paper(conn: &Connection, journal_id: i64, c: &PaperCandidate) -> R
             now.clone(),
             first_seen_cycle,
             if abs_quality == crate::models::ABQ_MISSING { 1 } else { 0 },
+            ck.kind,
+            ck.source,
+            ck.confidence,
+            abstract_status,
             now
         ],
     )?;
@@ -1019,6 +1118,11 @@ fn row_to_paper(row: &rusqlite::Row) -> Result<Paper> {
         abstract_quality: row.get("abstract_quality")?,
         abstract_last_checked_at: row.get("abstract_last_checked_at")?,
         abstract_retry_count: row.get("abstract_retry_count")?,
+        abstract_source_url: row.get("abstract_source_url")?,
+        content_kind: row.get("content_kind")?,
+        content_kind_source: row.get("content_kind_source")?,
+        content_kind_confidence: row.get("content_kind_confidence")?,
+        abstract_status: row.get("abstract_status")?,
         url: row.get("url")?,
         publisher_article_id: row.get("publisher_article_id")?,
         openalex_work_id: row.get("openalex_work_id")?,
@@ -1243,7 +1347,108 @@ fn migrations() -> Vec<(i64, &'static str, fn(&Connection) -> Result<()>)> {
         (10, "abstract-recovery-batches", migrate_to_v10),
         (11, "daily-paper-first-seen-cycle", migrate_to_v11),
         (12, "backfill-first-seen-missing-from-recovery", migrate_to_v12),
+        (13, "round7-content-kind", migrate_to_v13),
     ]
+}
+
+/// v13：Round 7 Phase 1 —— Missing Abstract Intelligence。
+/// - papers 新增 content_kind / content_kind_source / content_kind_confidence /
+///   abstract_status / abstract_source_url（全部 nullable 或带默认值，兼容存量行）。
+/// - 安全 backfill：只写这 5 个新列；绝不覆盖已有 abstract / favorite / ignore /
+///   first_seen_* / recommendation 历史。幂等（重复执行结果一致）。
+fn migrate_to_v13(conn: &Connection) -> Result<()> {
+    for (name, ty) in [
+        ("content_kind", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("content_kind_source", "TEXT"),
+        ("content_kind_confidence", "TEXT NOT NULL DEFAULT 'UNKNOWN'"),
+        ("abstract_status", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("abstract_source_url", "TEXT"),
+    ] {
+        if !column_exists(conn, "papers", name) {
+            conn.execute(&format!("ALTER TABLE papers ADD COLUMN {} {}", name, ty), [])?;
+        }
+    }
+    backfill_content_kind_and_abstract_status(conn)?;
+    Ok(())
+}
+
+/// 存量 backfill：优先根据 source_records 中已保存的 Crossref / OpenAlex raw JSON
+/// （provider explicit type）+ 可靠 title heuristic 推导 content_kind / abstract_status。
+/// - 低置信度必须保留 unknown，不批量误标 news/editorial。
+/// - 只写 v13 新增列；不触碰 abstract、favorite/ignore、first_seen、recommendation。
+/// - 已分类（非 unknown）的行不覆盖（尊重运行时解析结果），但 abstract_status 恒重算
+///   （它是 content_kind + 摘要有无的纯函数，重算幂等）。
+fn backfill_content_kind_and_abstract_status(conn: &Connection) -> Result<()> {
+    let papers: Vec<(i64, bool, Option<String>)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id,
+                    CASE WHEN abstract IS NOT NULL AND abstract != '' THEN 1 ELSE 0 END,
+                    title
+             FROM papers",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? != 0, r.get::<_, Option<String>>(2)?))
+        })?;
+        rows.collect::<Result<Vec<_>>>()?
+    };
+    // 一次读全部 source_records，按 paper 分组（论文量通常 < 数千，内存足够）。
+    let mut raw_by_paper: std::collections::HashMap<i64, Vec<String>> =
+        std::collections::HashMap::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT paper_id, raw_json FROM source_records WHERE raw_json IS NOT NULL AND raw_json != ''",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (pid, raw) = row?;
+            raw_by_paper.entry(pid).or_default().push(raw);
+        }
+    }
+    for (id, has_abstract, title) in papers {
+        let mut crossref_type: Option<String> = None;
+        let mut openalex_type: Option<String> = None;
+        if let Some(raws) = raw_by_paper.get(&id) {
+            for raw in raws {
+                if let Some((provider, ty)) = crate::content_kind::provider_type_from_raw_json(raw) {
+                    match provider {
+                        "crossref" if crossref_type.is_none() => crossref_type = Some(ty),
+                        "openalex" if openalex_type.is_none() => openalex_type = Some(ty),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        let kind: String = conn
+            .query_row(
+                "SELECT content_kind FROM papers WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap_or_else(|_| crate::content_kind::CK_UNKNOWN.to_string());
+        // 未分类 → 解析；已分类 → 尊重现有结果。
+        let effective_kind = if kind == crate::content_kind::CK_UNKNOWN {
+            let res = crate::content_kind::resolve_content_kind(
+                crossref_type.as_deref(),
+                openalex_type.as_deref(),
+                title.as_deref(),
+            );
+            conn.execute(
+                "UPDATE papers SET content_kind=?1, content_kind_source=?2, content_kind_confidence=?3 WHERE id=?4",
+                params![res.kind, res.source, res.confidence, id],
+            )?;
+            res.kind
+        } else {
+            kind
+        };
+        let status = crate::content_kind::abstract_status_for(&effective_kind, has_abstract);
+        conn.execute(
+            "UPDATE papers SET abstract_status=?1 WHERE id=?2",
+            params![status, id],
+        )?;
+    }
+    Ok(())
 }
 
 /// v12 data-only repair: v11 could initialise a recovered paper as non-missing
@@ -1825,7 +2030,7 @@ pub fn list_recoverable_paper_ids(conn: &Connection, paper_ids: &[i64]) -> Resul
         "SELECT id FROM papers WHERE id IN (",
     );
     sql.push_str(&ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(","));
-    sql.push_str(") AND abstract_quality != 'complete' ORDER BY id ASC LIMIT ");
+    sql.push_str(") AND abstract_quality != 'complete' AND abstract_status != 'not_expected' ORDER BY id ASC LIMIT ");
     sql.push_str(&ABSTRACT_RECOVERY_BATCH_LIMIT.to_string());
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], |r| r.get(0))?;

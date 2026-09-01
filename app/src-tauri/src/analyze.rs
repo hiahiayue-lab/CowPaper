@@ -9,6 +9,14 @@ use crate::util::hash64;
 
 pub const PROMPT_VERSION: &str = "v1";
 
+// ================= 不变式（Round 7 Phase 1，Section 15）=================
+// CowPaper 永远不能：title → DeepSeek → AI 生成 abstract → 保存成真实 abstract。
+// - 两个 AI 入口（analyze_paper_once / tag_only_analyze）都要求真实摘要非空，
+//   否则直接拒绝 —— 缺少摘要的论文只能走 title-only 翻译（只写 chinese_title）。
+// - AI 未来只允许：classification / parsing assistance / version matching assistance，
+//   绝不生成缺失摘要。title-only 翻译永远不写 abstract / chinese_abstract。
+// ======================================================================
+
 /// 标签上下文：入队时快照一次，整批复用（仅包含当前启用标签 = canonical set）。
 /// 每项 (tag_id, name, description)——Full AI 保存时必须写 tag identity（Round small fix）。
 #[derive(Debug, Clone)]
@@ -72,7 +80,7 @@ pub fn analyze_paper_once(
     abstract_quality: &str,
     ctx: &AnalyzeContext,
 ) -> Result<bool, AiError> {
-    if title.is_empty() || abstract_text.is_empty() {
+    if title.trim().is_empty() || abstract_text.trim().is_empty() {
         return Err(AiError::Paper("缺少标题或摘要".to_string()));
     }
     let tag_names: String = ctx
@@ -144,6 +152,10 @@ pub fn tag_only_analyze(
     abstract_quality: &str,
     tags: &[(i64, String, String)],
 ) -> Result<Vec<(i64, f64)>, AiError> {
+    // 不变式：没有真实摘要绝不调用 AI（防止任何 title→AI→abstract 路径）。
+    if title.trim().is_empty() || abstract_text.trim().is_empty() {
+        return Err(AiError::Paper("缺少标题或摘要".to_string()));
+    }
     let id_strs: Vec<(String, String, String)> = tags
         .iter()
         .map(|(id, n, d)| (id.to_string(), n.clone(), d.clone()))

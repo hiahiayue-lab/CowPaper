@@ -202,6 +202,7 @@ fn parse_work(item: &Value) -> Option<PaperCandidate> {
         year,
         abstract_text: abstract_text.clone(),
         abstract_source: abstract_text.map(|_| "crossref".to_string()),
+        abstract_source_url: None,
         url,
         publisher_article_id,
         openalex_work_id: None,

@@ -23,6 +23,16 @@ where F: FnMut(AbstractRecoveryProgress) {
         let paper = { let c = db_arc.lock().unwrap(); db::get_paper(&c, item.paper_id).map_err(|e| e.to_string())? };
         let Some(paper) = paper else { continue };
         if paper.abstract_quality == "complete" { continue; }
+        // Round 7 Phase 1：not_expected（news/editorial/correction/front_matter/...）
+        // 不再自动 recovery、不安排重试 —— 该内容类型通常不提供研究摘要。
+        if paper.abstract_status == "not_expected"
+            || crate::content_kind::is_not_expected_kind(&paper.content_kind)
+        {
+            { let c = db_arc.lock().unwrap(); db::finish_abstract_recovery_item(&c, item.id, "notExpected", None, None).map_err(|e| e.to_string())?; db::update_abstract_recovery_batch_counts(&c, batch_id).map_err(|e| e.to_string())?; }
+            completed += 1;
+            emit(progress(batch_id, completed, total, paper.title.clone(), None, "paperFinished", recovered, not_found, failed));
+            continue;
+        }
         { let c = db_arc.lock().unwrap(); db::mark_abstract_recovery_attempt(&c, paper.id).map_err(|e| e.to_string())?; }
         let (title, before) = (paper.title.clone(), paper.abstract_quality.clone());
         let mut network_failure = false;
@@ -45,7 +55,7 @@ where F: FnMut(AbstractRecoveryProgress) {
                 { let c = db_arc.lock().unwrap(); db::start_abstract_recovery_item(&c, item.id, source).map_err(|e| e.to_string())?; }
                 emit(progress(batch_id, completed, total, title.clone(), Some(source.into()), "sourceStarted", recovered, not_found, failed));
                 let (outcome, error) = match publisher.abstract_by_doi(doi) {
-                    Ok(Some(text)) => { let c = db_arc.lock().unwrap(); db::merge_recovered_abstract(&c, paper.id, "publisher", &text).map_err(|e| e.to_string())?; ("recovered", None) }
+                    Ok(Some(meta)) => { let c = db_arc.lock().unwrap(); db::merge_recovered_abstract_with_url(&c, paper.id, &meta.source, &meta.abstract_text, Some(&meta.url)).map_err(|e| e.to_string())?; ("recovered", None) }
                     Ok(None) => ("notFound", None), Err(err) => { network_failure = true; ("networkFailure", Some(err)) }
                 };
                 { let c = db_arc.lock().unwrap(); db::finish_abstract_recovery_attempt(&c, item.id, source, outcome, error.as_deref()).map_err(|e| e.to_string())?; }

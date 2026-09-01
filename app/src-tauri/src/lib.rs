@@ -1,6 +1,7 @@
 mod abstract_quality;
 mod abstract_recovery;
 mod catalog;
+mod content_kind;
 mod recommendation;
 mod tag_config;
 mod ai_queue;

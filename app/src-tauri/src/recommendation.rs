@@ -80,18 +80,28 @@ pub fn refresh_current_recommendations(
         .map_err(|e| e.to_string())?;
     tx.execute("DELETE FROM recommendation_items WHERE run_id = ?1", params![run_id])
         .map_err(|e| e.to_string())?;
+    // Round 7 Phase 1：not_expected 内容类型默认不进入 research 推荐。
+    // 排除集与 content_kind 常量单一来源，避免 SQL 与 Rust 规则漂移。
+    let excluded = crate::content_kind::NOT_EXPECTED_KINDS
+        .iter()
+        .map(|k| format!("'{}'", k))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT p.id, COALESCE(p.total_score, 0) FROM papers p
+         WHERE p.analysis_status = 'analysisSucceeded'
+           AND p.total_score IS NOT NULL AND p.is_ignored = 0
+           AND COALESCE(TRIM(p.chinese_title), '') != ''
+           AND COALESCE(TRIM(p.chinese_abstract), '') != ''
+           AND COALESCE(TRIM(p.one_sentence_summary), '') != ''
+           AND p.evidence_hash IS NOT NULL
+           AND p.content_kind NOT IN ({})
+           AND NOT EXISTS (SELECT 1 FROM recommendation_items ri WHERE ri.paper_id = p.id)
+         ORDER BY p.total_score DESC, p.published_date DESC, p.id DESC",
+        excluded
+    );
     let mut stmt = tx
-        .prepare(
-            "SELECT p.id, COALESCE(p.total_score, 0) FROM papers p
-             WHERE p.analysis_status = 'analysisSucceeded'
-               AND p.total_score IS NOT NULL AND p.is_ignored = 0
-               AND COALESCE(TRIM(p.chinese_title), '') != ''
-               AND COALESCE(TRIM(p.chinese_abstract), '') != ''
-               AND COALESCE(TRIM(p.one_sentence_summary), '') != ''
-               AND p.evidence_hash IS NOT NULL
-               AND NOT EXISTS (SELECT 1 FROM recommendation_items ri WHERE ri.paper_id = p.id)
-             ORDER BY p.total_score DESC, p.published_date DESC, p.id DESC",
-        )
+        .prepare(&sql)
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?)))

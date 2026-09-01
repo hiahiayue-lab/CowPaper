@@ -73,8 +73,11 @@ pub fn assess_abstract_quality(normalized: &str) -> (&'static str, &'static str)
 
 /// 来源优先级（次级规则，仅在 quality 相同时使用）。
 /// quality 永远优先于来源优先级；publisher 若只是营销 teaser 会被 quality 规则排除。
+/// Round 7 Phase 1：publisher:*（publisher:nature / publisher:springer）按 publisher 处理。
 pub fn source_priority(source: &str) -> u8 {
-    match source.to_ascii_lowercase().as_str() {
+    let s = source.to_ascii_lowercase();
+    let base = if s.starts_with("publisher") { "publisher".to_string() } else { s };
+    match base.as_str() {
         "publisher" => 0,
         "crossref" => 1,
         "openalex" => 2,

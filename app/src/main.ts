@@ -56,6 +56,14 @@ interface Paper {
   abstractSource: string | null;
   abstractQuality: string;
   abstractRetrievedAt: string | null;
+  /** Round 7 Phase 1：摘要来源落地页 URL（provenance） */
+  abstractSourceUrl: string | null;
+  /** Round 7 Phase 1：内容类型（技术字段，UI 不直接展示） */
+  contentKind: string;
+  /** Round 7 Phase 1：内容类型判定置信度（技术字段） */
+  contentKindConfidence: string;
+  /** Round 7 Phase 1：摘要语义状态 available | missing_recoverable | not_expected | unknown */
+  abstractStatus: string;
   url: string | null;
   discoverySource: string | null;
   analysisStatus: string;
@@ -1007,8 +1015,15 @@ function renderPaperCard(p: Paper, opts: RenderPaperOptions): string {
     } else if (lang === "zh" && !zhAbs) {
       abstractHtml = `<div class="abstract muted">中文摘要待生成</div>`;
     } else {
-      // missing：明确显示"暂无摘要"，不空白
-      abstractHtml = `<div class="abstract muted">未找到公开摘要</div>${p.analysisStatus === "waitingForAbstract" ? `<div class="muted small">可检查 Crossref · OpenAlex · Publisher</div><button class="ghost small" data-action="recover-paper-abstract" data-paper-id="${p.id}">重新获取摘要</button>` : ""}`;
+      // missing：按摘要语义状态区分产品语义（Round 7 Phase 1）。
+      // not_expected（news/editorial/correction/front_matter/...）不提供 recovery 按钮。
+      const absStatus = p.abstractStatus || "unknown";
+      if (absStatus === "not_expected") {
+        abstractHtml = `<div class="abstract muted">该内容类型通常不提供研究摘要</div>`;
+      } else {
+        // missing_recoverable / unknown：保持原「未找到公开摘要」+ 可重试语义。
+        abstractHtml = `<div class="abstract muted">未找到公开摘要</div>${p.analysisStatus === "waitingForAbstract" ? `<div class="muted small">可检查 Crossref · OpenAlex · Publisher</div><button class="ghost small" data-action="recover-paper-abstract" data-paper-id="${p.id}">重新获取摘要</button>` : ""}`;
+      }
     }
   }
 
