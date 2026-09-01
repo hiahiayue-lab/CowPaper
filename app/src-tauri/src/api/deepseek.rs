@@ -241,7 +241,7 @@ impl DeepSeek {
         model: &str,
         title: &str,
     ) -> Result<String, AiError> {
-        self.translate_title_observed(api_key, model, title, |_| {})
+        self.translate_title_observed(api_key, model, title, |_, _, _| {})
     }
 
     pub fn translate_title_observed<F>(
