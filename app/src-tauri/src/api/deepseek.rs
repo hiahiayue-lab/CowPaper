@@ -30,8 +30,8 @@ pub enum AiError {
     /// 单篇论文级错误：响应 JSON 不合法 / 内容异常，不影响其他论文，不重试。
     Paper(String),
     /// Title-only 请求收到了 HTTP 成功响应，但没有可用的最终内容。
-    /// 这种情况通常是模型在有限 token 内只产生了 reasoning，允许 title
-    /// worker 进行一次受限重试。
+    /// 除了被 `finish_reason=length` 截断的响应外，允许 title worker
+    /// 进行一次受限重试。
     EmptyTitleResponse(String),
 }
 
@@ -72,7 +72,9 @@ impl AiError {
     }
 
     fn title_retryable(&self) -> bool {
-        self.retryable() || matches!(self, AiError::EmptyTitleResponse(_))
+        self.retryable()
+            || matches!(self, AiError::EmptyTitleResponse(message)
+                if !message.contains("finish_reason=length"))
     }
 }
 
@@ -294,16 +296,7 @@ impl DeepSeek {
         // This is deliberately a plain-text protocol.  A title does not need
         // JSON, and forcing JSON on a reasoning-capable model can consume the
         // small completion budget before it emits its final answer.
-        let body = json!({
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system_title_translation_prompt()},
-                {"role": "user", "content": format!("论文标题：\n{}", title)}
-            ],
-            "temperature": 0.0,
-            "max_tokens": 512,
-            "stream": false
-        });
+        let body = title_translation_request_body(model, title);
         let resp = self.title_client.post(&self.endpoint)
             .header("Authorization", format!("Bearer {}", api_key))
             .json(&body).send().map_err(|e| AiError::Network(e.to_string()))?;
@@ -429,6 +422,20 @@ impl DeepSeek {
         }
         Ok(out)
     }
+}
+
+fn title_translation_request_body(model: &str, title: &str) -> Value {
+    json!({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_title_translation_prompt()},
+            {"role": "user", "content": format!("论文标题：\n{}", title)}
+        ],
+        "thinking": {"type": "disabled"},
+        "temperature": 0.0,
+        "max_tokens": 256,
+        "stream": false
+    })
 }
 
 /// Title-only replies are deliberately accepted as either the requested small
@@ -617,6 +624,14 @@ mod tests {
     }
 
     #[test]
+    fn title_translation_request_disables_thinking_and_uses_a_small_budget() {
+        let body = title_translation_request_body("deepseek-v4-flash", "English title");
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert_eq!(body["max_tokens"], 256);
+        assert_eq!(body["model"], "deepseek-v4-flash");
+    }
+
+    #[test]
     fn title_translation_emits_request_http_parse_stages_in_order() {
         let endpoint = one_response_server(
             "200 OK",
@@ -645,26 +660,26 @@ mod tests {
     }
 
     #[test]
-    fn title_translation_retries_one_empty_http_200_then_saves_a_real_title() {
+    fn title_translation_does_not_retry_length_truncated_empty_content() {
         let (endpoint, requests) = response_sequence_server(vec![
             ("200 OK", r#"{"choices":[{"message":{"content":"   ","reasoning_content":"internal reasoning"},"finish_reason":"length"}],"usage":{"prompt_tokens":12,"completion_tokens":512,"total_tokens":524}}"#),
             ("200 OK", r#"{"choices":[{"message":{"content":"重试后的中文标题"},"finish_reason":"stop"}]}"#),
         ]);
         let client = DeepSeek::with_endpoint(endpoint);
-        assert_eq!(client.translate_title("test-key", "test-model", "English title").unwrap(), "重试后的中文标题");
-        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        let error = client.translate_title("test-key", "test-model", "English title").unwrap_err();
+        assert!(matches!(error, AiError::EmptyTitleResponse(_)));
+        assert!(error.to_string().contains("finish_reason=length"));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
     }
 
     #[test]
-    fn title_translation_empty_after_retry_is_reported_without_a_fake_title() {
+    fn title_translation_retries_empty_content_without_length_once() {
         let (endpoint, requests) = response_sequence_server(vec![
-            ("200 OK", r#"{"choices":[{"message":{"content":null,"reasoning_content":"reasoning"},"finish_reason":"length"}]}"#),
-            ("200 OK", r#"{"choices":[{"message":{"content":"\n\t"},"finish_reason":"length"}]}"#),
+            ("200 OK", r#"{"choices":[{"message":{"content":null,"reasoning_content":"reasoning"},"finish_reason":"stop"}]}"#),
+            ("200 OK", r#"{"choices":[{"message":{"content":"重试后的中文标题"},"finish_reason":"stop"}]}"#),
         ]);
         let client = DeepSeek::with_endpoint(endpoint);
-        let error = client.translate_title("test-key", "test-model", "English title").unwrap_err();
-        assert!(matches!(error, AiError::EmptyTitleResponse(_)));
-        assert!(error.to_string().contains("HTTP 200"));
+        assert_eq!(client.translate_title("test-key", "test-model", "English title").unwrap(), "重试后的中文标题");
         assert_eq!(requests.load(Ordering::SeqCst), 2);
     }
 
