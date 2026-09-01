@@ -4,6 +4,12 @@ use serde_json::{json, Value};
 use crate::models::TagMatch;
 
 const ENDPOINT: &str = "https://api.deepseek.com/chat/completions";
+/// Full paper analysis may legitimately need a long completion window.
+pub const FULL_ANALYSIS_TIMEOUT_SECS: u64 = 180;
+/// A title-only request has a tiny prompt and output.  Bound it separately so
+/// one unhealthy request cannot hold the title backlog indefinitely.
+pub const TITLE_TRANSLATION_TIMEOUT_SECS: u64 = 45;
+const TITLE_TRANSLATION_CONNECT_TIMEOUT_SECS: u64 = 10;
 
 /// 结构化 AI 错误，供队列区分「可重试 / 全局配置错误 / 单篇错误」。
 #[derive(Debug)]
@@ -79,16 +85,39 @@ pub struct AnalysisOutput {
 
 pub struct DeepSeek {
     client: Client,
+    title_client: Client,
     endpoint: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TitleRequestStage {
+    RequestStart,
+    HttpComplete,
+    ParseComplete,
+}
+
+impl TitleRequestStage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RequestStart => "request_start",
+            Self::HttpComplete => "http_complete",
+            Self::ParseComplete => "parse_complete",
+        }
+    }
 }
 
 impl DeepSeek {
     pub fn new() -> Self {
         let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(180))
+            .timeout(std::time::Duration::from_secs(FULL_ANALYSIS_TIMEOUT_SECS))
             .build()
             .expect("build deepseek client");
-        DeepSeek { client, endpoint: ENDPOINT.to_string() }
+        let title_client = Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(TITLE_TRANSLATION_CONNECT_TIMEOUT_SECS))
+            .timeout(std::time::Duration::from_secs(TITLE_TRANSLATION_TIMEOUT_SECS))
+            .build()
+            .expect("build title-only deepseek client");
+        DeepSeek { client, title_client, endpoint: ENDPOINT.to_string() }
     }
 
     #[cfg(test)]
@@ -97,7 +126,12 @@ impl DeepSeek {
             .timeout(std::time::Duration::from_secs(5))
             .build()
             .expect("build test deepseek client");
-        DeepSeek { client, endpoint }
+        let title_client = Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("build test title-only deepseek client");
+        DeepSeek { client, title_client, endpoint }
     }
 
     pub fn analyze(
@@ -207,13 +241,35 @@ impl DeepSeek {
         model: &str,
         title: &str,
     ) -> Result<String, AiError> {
+        self.translate_title_observed(api_key, model, title, |_| {})
+    }
+
+    pub fn translate_title_observed<F>(
+        &self,
+        api_key: &str,
+        model: &str,
+        title: &str,
+        mut observe: F,
+    ) -> Result<String, AiError>
+    where
+        F: FnMut(TitleRequestStage, usize, u128),
+    {
         if title.trim().is_empty() {
             return Err(AiError::Paper("缺少英文标题".to_string()));
         }
         let mut last_error = None;
         for attempt in 0..=1 {
-            match self.translate_title_once(api_key, model, title) {
-                Ok(translated) => return Ok(translated),
+            let attempt_number = attempt + 1;
+            observe(TitleRequestStage::RequestStart, attempt_number, 0);
+            let started = std::time::Instant::now();
+            let result = self.translate_title_once(api_key, model, title);
+            let elapsed = started.elapsed().as_millis();
+            observe(TitleRequestStage::HttpComplete, attempt_number, elapsed);
+            match result {
+                Ok(translated) => {
+                    observe(TitleRequestStage::ParseComplete, attempt_number, elapsed);
+                    return Ok(translated);
+                }
                 Err(error) if attempt == 0 && error.title_retryable() => {
                     // A bounded retry is intentionally limited to one extra
                     // request.  It covers transient transport/server replies
@@ -248,7 +304,7 @@ impl DeepSeek {
             "max_tokens": 512,
             "stream": false
         });
-        let resp = self.client.post(&self.endpoint)
+        let resp = self.title_client.post(&self.endpoint)
             .header("Authorization", format!("Bearer {}", api_key))
             .json(&body).send().map_err(|e| AiError::Network(e.to_string()))?;
         if !resp.status().is_success() {
@@ -558,6 +614,34 @@ mod tests {
         );
         let client = DeepSeek::with_endpoint(endpoint);
         assert_eq!(client.translate_title("test-key", "test-model", "English title").unwrap(), "中文标题");
+    }
+
+    #[test]
+    fn title_translation_emits_request_http_parse_stages_in_order() {
+        let endpoint = one_response_server(
+            "200 OK",
+            r#"{"choices":[{"message":{"content":"可观测中文标题"},"finish_reason":"stop"}]}"#,
+        );
+        let client = DeepSeek::with_endpoint(endpoint);
+        let mut stages = Vec::new();
+        assert_eq!(
+            client.translate_title_observed("test-key", "test-model", "English title", |stage, attempt, _| {
+                stages.push((stage, attempt));
+            }).unwrap(),
+            "可观测中文标题"
+        );
+        assert_eq!(stages, vec![
+            (TitleRequestStage::RequestStart, 1),
+            (TitleRequestStage::HttpComplete, 1),
+            (TitleRequestStage::ParseComplete, 1),
+        ]);
+    }
+
+    #[test]
+    fn title_timeout_is_bounded_without_changing_full_analysis_timeout() {
+        assert_eq!(FULL_ANALYSIS_TIMEOUT_SECS, 180);
+        assert!(TITLE_TRANSLATION_TIMEOUT_SECS >= 30 && TITLE_TRANSLATION_TIMEOUT_SECS <= 60);
+        assert!(TITLE_TRANSLATION_TIMEOUT_SECS < FULL_ANALYSIS_TIMEOUT_SECS);
     }
 
     #[test]

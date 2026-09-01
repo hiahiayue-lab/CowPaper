@@ -18,7 +18,7 @@ mod tests;
 
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
@@ -63,6 +63,36 @@ impl Drop for TitleTranslationPermit {
             *running = false;
         }
     }
+}
+
+/// Emit title-only lifecycle telemetry without ever exposing credentials or a
+/// response body.  An emit failure must be visible in the runtime log rather
+/// than silently leaving the frontend waiting for an event it will never get.
+fn emit_title_event(app: &AppHandle, event: &str, payload: serde_json::Value) -> bool {
+    if let Err(error) = app.emit(event, payload) {
+        eprintln!("title translation emit failed: event={event}; error={error}");
+        false
+    } else {
+        true
+    }
+}
+
+fn emit_title_progress(
+    app: &AppHandle,
+    stage: &str,
+    paper_id: Option<i64>,
+    attempt: Option<usize>,
+    elapsed_ms: u128,
+    error: Option<&str>,
+) {
+    let mut payload = serde_json::json!({
+        "stage": stage,
+        "elapsedMs": elapsed_ms,
+    });
+    if let Some(id) = paper_id { payload["paperId"] = serde_json::json!(id); }
+    if let Some(number) = attempt { payload["attempt"] = serde_json::json!(number); }
+    if let Some(message) = error { payload["error"] = serde_json::json!(message); }
+    let _ = emit_title_event(app, "title-translation://progress", payload);
 }
 
 /// Ensures a persisted SyncBatch cannot remain `running` when its worker
@@ -1266,42 +1296,86 @@ fn translate_missing_titles(
     let scheduled = candidates.len() as i64;
     if candidates.is_empty() { return Ok(0); }
     let candidate_ids: Vec<i64> = candidates.iter().map(|(id, _)| *id).collect();
-    app.emit("title-translation://started", serde_json::json!({
+    if let Err(error) = app.emit("title-translation://started", serde_json::json!({
         "scheduled": scheduled,
         "paperIds": candidate_ids,
-    })).map_err(|e| e.to_string())?;
+    })) {
+        eprintln!("title translation emit failed: event=title-translation://started; error={error}");
+        return Err(error.to_string());
+    }
     let worker_db = state.inner().clone();
     std::thread::spawn(move || {
         let _permit = permit;
-        let client = api::deepseek::DeepSeek::new();
-        let mut translated = 0_i64;
-        let mut failed = 0_i64;
-        let mut translated_ids: Vec<i64> = Vec::new();
-        let mut errors: Vec<String> = Vec::new();
-        for (id, title) in candidates {
-            match client.translate_title(&api_key, &model, &title) {
-                Ok(chinese_title) => match worker_db.lock()
-                    .map_err(|_| "数据库锁定".to_string())
-                    .and_then(|conn| db::save_title_translation(&conn, id, &chinese_title).map_err(|e| e.to_string())) {
-                    Ok(true) => { translated += 1; translated_ids.push(id); },
-                    Ok(false) => {},
+        let worker = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let batch_started = Instant::now();
+            emit_title_progress(&app, "batch_start", None, None, 0, None);
+            let client = api::deepseek::DeepSeek::new();
+            let mut translated = 0_i64;
+            let mut failed = 0_i64;
+            let mut translated_ids: Vec<i64> = Vec::new();
+            let mut errors: Vec<String> = Vec::new();
+            for (id, title) in candidates {
+                let paper_started = Instant::now();
+                emit_title_progress(&app, "paper_start", Some(id), None, 0, None);
+                let request_app = app.clone();
+                match client.translate_title_observed(&api_key, &model, &title, |stage, attempt, elapsed_ms| {
+                    emit_title_progress(&request_app, stage.as_str(), Some(id), Some(attempt), elapsed_ms, None);
+                }) {
+                    Ok(chinese_title) => {
+                        emit_title_progress(&app, "db_write_start", Some(id), None, paper_started.elapsed().as_millis(), None);
+                        let saved = match worker_db.lock() {
+                            Ok(conn) => {
+                                emit_title_progress(&app, "db_write_acquired", Some(id), None, paper_started.elapsed().as_millis(), None);
+                                db::save_title_translation(&conn, id, &chinese_title).map_err(|e| e.to_string())
+                            }
+                            Err(_) => Err("数据库锁定".to_string()),
+                        };
+                        match saved {
+                            Ok(true) => {
+                                translated += 1;
+                                translated_ids.push(id);
+                                emit_title_progress(&app, "db_write_complete", Some(id), None, paper_started.elapsed().as_millis(), None);
+                                emit_title_progress(&app, "paper_success", Some(id), None, paper_started.elapsed().as_millis(), None);
+                            }
+                            Ok(false) => {
+                                // A stale candidate was already translated by an earlier operation;
+                                // it is terminal but not a translation failure.
+                                emit_title_progress(&app, "db_write_complete", Some(id), None, paper_started.elapsed().as_millis(), None);
+                                emit_title_progress(&app, "paper_success", Some(id), None, paper_started.elapsed().as_millis(), None);
+                            }
+                            Err(err) => {
+                                failed += 1;
+                                let message = format!("论文 {} 保存标题失败：{}", id, err);
+                                emit_title_progress(&app, "paper_failure", Some(id), None, paper_started.elapsed().as_millis(), Some(&message));
+                                errors.push(message);
+                            }
+                        }
+                    }
                     Err(err) => {
                         failed += 1;
-                        errors.push(format!("论文 {} 保存标题失败：{}", id, err));
-                    },
-                },
-                Err(err) => {
-                    failed += 1;
-                    errors.push(format!("论文 {} 标题翻译失败：{}", id, err));
-                },
+                        let message = format!("论文 {} 标题翻译失败：{}", id, err);
+                        emit_title_progress(&app, "paper_failure", Some(id), None, paper_started.elapsed().as_millis(), Some(&message));
+                        errors.push(message);
+                    }
+                }
+            }
+            let payload = serde_json::json!({
+                "translated": translated,
+                "failed": failed,
+                "translatedIds": translated_ids,
+                "errors": errors,
+            });
+            emit_title_progress(&app, "batch_done", None, None, batch_started.elapsed().as_millis(), None);
+            payload
+        }));
+        match worker {
+            Ok(payload) => { let _ = emit_title_event(&app, "title-translation://done", payload); }
+            Err(_) => {
+                let message = "标题翻译 worker 异常终止";
+                emit_title_progress(&app, "batch_fatal", None, None, 0, Some(message));
+                let _ = emit_title_event(&app, "title-translation://fatal", serde_json::json!({ "error": message }));
             }
         }
-        let _ = app.emit("title-translation://done", serde_json::json!({
-            "translated": translated,
-            "failed": failed,
-            "translatedIds": translated_ids,
-            "errors": errors,
-        }));
     });
     Ok(scheduled)
 }

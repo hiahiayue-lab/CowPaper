@@ -1538,6 +1538,42 @@ async function requireKey(): Promise<boolean> {
  */
 let missingTitleBacklogInFlight = false;
 let missingTitleBacklogDraining = false;
+let missingTitleLastProgressAt = 0;
+let missingTitleLivenessTimer: number | null = null;
+// Rust bounds one title request at 45 seconds and retries it at most once.
+// Give event delivery/rendering headroom, but never leave the frontend gate
+// permanently occupied if the worker dies before it can emit a terminal event.
+const TITLE_TRANSLATION_LIVENESS_WINDOW_MS = 120_000;
+
+function clearMissingTitleLivenessWatch(): void {
+  if (missingTitleLivenessTimer !== null) {
+    window.clearInterval(missingTitleLivenessTimer);
+    missingTitleLivenessTimer = null;
+  }
+}
+
+function releaseStaleMissingTitleState(): void {
+  if (!missingTitleBacklogInFlight) return;
+  if (Date.now() - missingTitleLastProgressAt <= TITLE_TRANSLATION_LIVENESS_WINDOW_MS) return;
+  // This only releases stale frontend state. The Rust process-wide permit
+  // remains authoritative, so a later invoke cannot create a second worker.
+  missingTitleBacklogInFlight = false;
+  missingTitleBacklogDraining = false;
+  clearMissingTitleLivenessWatch();
+  setStatus("标题翻译任务长时间无进度；前端状态已释放，后端仍会防止重复任务", "error");
+  console.error("title-only translation liveness timeout");
+}
+
+function startMissingTitleLivenessWatch(): void {
+  clearMissingTitleLivenessWatch();
+  missingTitleLivenessTimer = window.setInterval(releaseStaleMissingTitleState, 5_000);
+}
+
+function releaseMissingTitleState(): void {
+  missingTitleBacklogInFlight = false;
+  missingTitleBacklogDraining = false;
+  clearMissingTitleLivenessWatch();
+}
 
 async function startMissingTitleTranslation(drainBacklog: boolean): Promise<number> {
   if (missingTitleBacklogInFlight) {
@@ -1547,6 +1583,8 @@ async function startMissingTitleTranslation(drainBacklog: boolean): Promise<numb
   if (!(await hasKey())) return 0;
 
   missingTitleBacklogInFlight = true;
+  missingTitleLastProgressAt = Date.now();
+  startMissingTitleLivenessWatch();
   if (drainBacklog) missingTitleBacklogDraining = true;
   try {
     const scheduled = await invoke<number>("translate_missing_titles", { paperIds: null, model: getModel() });
@@ -1555,13 +1593,11 @@ async function startMissingTitleTranslation(drainBacklog: boolean): Promise<numb
     } else {
       // The command does not emit a completion event when there is no work.
       // Always release the UI gate on this path so a future sync/launch can retry.
-      missingTitleBacklogInFlight = false;
-      missingTitleBacklogDraining = false;
+      releaseMissingTitleState();
     }
     return scheduled;
   } catch (err) {
-    missingTitleBacklogInFlight = false;
-    missingTitleBacklogDraining = false;
+    releaseMissingTitleState();
     setStatus(`标题翻译启动失败：${safeError(err)}`, "error");
     console.error("translate_missing_titles invoke failed", err);
     return 0;
@@ -1946,8 +1982,7 @@ async function setupListeners() {
     const continueDraining = missingTitleBacklogDraining && r.translated > 0 && r.failed === 0;
     // Release before any rendering work: a listener/rendering failure must
     // never leave the automatic backlog permanently suppressed.
-    missingTitleBacklogInFlight = false;
-    missingTitleBacklogDraining = false;
+    releaseMissingTitleState();
     try {
       await loadPapers();
       // The title-only worker may finish while Today or a historical missing
@@ -1967,8 +2002,19 @@ async function setupListeners() {
   });
   await listen("title-translation://started", (e) => {
     const r = e.payload as { scheduled: number; paperIds: number[] };
+    missingTitleLastProgressAt = Date.now();
     console.info("title-only translation started", r);
     setStatus(`正在翻译 ${r.scheduled} 篇缺摘要论文标题…`, "running");
+  });
+  await listen("title-translation://progress", (e) => {
+    const progress = e.payload as { paperId?: number; attempt?: number; stage: string; elapsedMs: number; error?: string };
+    missingTitleLastProgressAt = Date.now();
+    console.info("title-only translation progress", progress);
+  });
+  await listen("title-translation://fatal", (e) => {
+    const r = e.payload as { error?: string };
+    releaseMissingTitleState();
+    setStatus(`标题翻译任务异常终止：${r.error || "未知错误"}`, "error");
   });
 
   await listen("ai://progress", (e) => {
