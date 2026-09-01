@@ -2435,7 +2435,7 @@ fn test_title_only_translation_preserves_missing_abstract_semantics() {
 }
 
 #[test]
-fn test_title_only_empty_retry_success_writes_one_row_without_changing_missing_semantics() {
+fn test_title_only_length_truncated_empty_response_does_not_retry_or_write_title() {
     let conn = mem_db();
     let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
     let id = match db::upsert_paper(&conn, jid, &candidate(Some("10.1000/http-title"), "English-only title", None, None)).unwrap() {
@@ -2444,18 +2444,41 @@ fn test_title_only_empty_retry_success_writes_one_row_without_changing_missing_s
     };
     let (endpoint, requests) = title_response_sequence_server(vec![
         ("200 OK", r#"{"choices":[{"message":{"content":" "},"finish_reason":"length"}]}"#),
+    ]);
+    let error = crate::api::deepseek::DeepSeek::with_endpoint(endpoint)
+        .translate_title("valid-test-key", "test-model", "English-only title")
+        .unwrap_err();
+    assert!(error.to_string().contains("finish_reason=length"));
+    let paper = db::get_paper(&conn, id).unwrap().unwrap();
+    assert!(paper.chinese_title.is_none());
+    assert_eq!(paper.abstract_quality, "missing");
+    assert_eq!(paper.analysis_status, "waitingForAbstract");
+    assert!(paper.total_score.is_none());
+    assert_eq!(requests.load(Ordering::SeqCst), 1, "length-truncated output must not retry with the same configuration");
+}
+
+#[test]
+fn test_title_only_transient_empty_retry_success_writes_one_row_without_changing_missing_semantics() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let id = match db::upsert_paper(&conn, jid, &candidate(Some("10.1000/http-title-retry"), "English-only title", None, None)).unwrap() {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new paper"),
+    };
+    let (endpoint, requests) = title_response_sequence_server(vec![
+        ("200 OK", r#"{"choices":[{"message":{"content":" "},"finish_reason":"stop"}]}"#),
         ("200 OK", r#"{"choices":[{"message":{"content":"HTTP 模拟中文标题"},"finish_reason":"stop"}]}"#),
     ]);
     let translated = crate::api::deepseek::DeepSeek::with_endpoint(endpoint)
         .translate_title("valid-test-key", "test-model", "English-only title")
         .unwrap();
-    assert!(db::save_title_translation(&conn, id, &translated).unwrap(), "UPDATE must affect one candidate row");
+    assert!(db::save_title_translation(&conn, id, &translated).unwrap());
     let paper = db::get_paper(&conn, id).unwrap().unwrap();
     assert_eq!(paper.chinese_title.as_deref(), Some("HTTP 模拟中文标题"));
     assert_eq!(paper.abstract_quality, "missing");
     assert_eq!(paper.analysis_status, "waitingForAbstract");
     assert!(paper.total_score.is_none());
-    assert_eq!(requests.load(Ordering::SeqCst), 2, "empty title reply gets one bounded retry before DB write");
+    assert_eq!(requests.load(Ordering::SeqCst), 2, "transient empty output gets one bounded retry");
 }
 
 #[test]
