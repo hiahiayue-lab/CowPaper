@@ -117,7 +117,7 @@ jobs:
           }
 
       - name: Build NSIS installer
-        run: npx tauri build --config src-tauri/tauri.windows.conf.json --target x86_64-pc-windows-msvc
+        run: npx tauri build --config src-tauri/tauri.windows-beta.conf.json --target x86_64-pc-windows-msvc
 
       - name: Discover and normalize NSIS installer
         id: installer

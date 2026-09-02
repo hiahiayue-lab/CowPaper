@@ -61,7 +61,7 @@ jobs:
           dmg_path="$bundle_dir/dmg/CowPaper_${version}_aarch64.dmg"
 
           set +e
-          npx tauri build --target aarch64-apple-darwin
+          npx tauri build --config src-tauri/tauri.macos-beta.conf.json --target aarch64-apple-darwin
           tauri_status=$?
           set -e
 

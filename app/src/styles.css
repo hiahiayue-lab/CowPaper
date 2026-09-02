@@ -404,6 +404,21 @@ button.full {
 .settings-row select {
   width: auto;
 }
+.update-panel {
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fafbfc;
+}
+.update-version-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 13px;
+}
+.update-version-row + .update-version-row {
+  margin-top: 6px;
+}
 
 /* ---------- 状态 ---------- */
 

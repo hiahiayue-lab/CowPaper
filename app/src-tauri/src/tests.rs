@@ -3350,6 +3350,76 @@ fn seed_paper_with_score(conn: &rusqlite::Connection, jid: i64, doi: &str, title
     id
 }
 
+/// Update integration invariant: replacing the installed app must reopen the
+/// same user-data directory and retain the DB, app settings, AI output,
+/// recommendation history, and the separately stored API key.
+#[test]
+fn test_update_reopen_preserves_user_data_and_settings() {
+    use crate::secure_store::{LocalFileSecretStore, SecureStore};
+
+    let data_dir = std::env::temp_dir().join(format!(
+        "cowpaper-update-preservation-{}-{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+    ));
+    let _ = std::fs::remove_dir_all(&data_dir);
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let db_path = data_dir.join("cowpaper.db");
+
+    {
+        let conn = db::open(&db_path).unwrap();
+        db::init(&conn).unwrap();
+        db::set_setting(&conn, "settings.daily_sync_time", "07:30").unwrap();
+        db::set_setting(&conn, "settings.default_abstract_lang", "en").unwrap();
+        let jid = db::insert_journal(&conn, "Preserved Journal", Some("0025-1909"), None, None, None).unwrap();
+        let paper_id = seed_paper_with_score(&conn, jid, "10.1000/update-preserve", "Preserved Paper", 4.2);
+        db::save_title_translation(&conn, paper_id, "保留的中文标题").unwrap();
+        let run_id = crate::recommendation::refresh_current_recommendations(
+            &conn,
+            &chrono::Local::now(),
+            "07:30",
+        )
+        .unwrap();
+        assert_eq!(db::list_recommendation_items(&conn, run_id).unwrap().len(), 1);
+
+        let store = LocalFileSecretStore::new(&data_dir);
+        store.save("sk-update-preserve").unwrap();
+    }
+
+    // Simulate an app bundle/installer upgrade: reopen and initialize the
+    // existing paths. No updater code removes or recreates this directory.
+    {
+        let conn = db::open(&db_path).unwrap();
+        db::init(&conn).unwrap();
+        assert_eq!(db::get_setting(&conn, "settings.daily_sync_time").as_deref(), Some("07:30"));
+        assert_eq!(db::get_setting(&conn, "settings.default_abstract_lang").as_deref(), Some("en"));
+        let paper = db::get_paper(&conn, 1).unwrap().unwrap();
+        assert_eq!(paper.chinese_title.as_deref(), Some("保留的中文标题"));
+        assert_eq!(paper.one_sentence_summary.as_deref(), Some("句"));
+        assert_eq!(paper.total_score, Some(4.2));
+        assert_eq!(db::list_recommendation_runs(&conn).unwrap().len(), 1);
+        assert_eq!(db::list_recommendation_items(&conn, 1).unwrap().len(), 1);
+
+        let store = LocalFileSecretStore::new(&data_dir);
+        assert_eq!(store.get().unwrap().as_deref(), Some("sk-update-preserve"));
+    }
+
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn test_updater_config_requires_signed_cross_platform_artifacts() {
+    let config_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tauri.conf.json");
+    let config: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(config_path).unwrap()).unwrap();
+    assert_eq!(config["bundle"]["createUpdaterArtifacts"], true);
+    assert!(config["plugins"]["updater"]["pubkey"].as_str().unwrap().len() > 20);
+    let endpoints = config["plugins"]["updater"]["endpoints"].as_array().unwrap();
+    assert_eq!(endpoints.len(), 1);
+    assert!(endpoints[0].as_str().unwrap().starts_with("https://github.com/"));
+    assert!(endpoints[0].as_str().unwrap().ends_with("/latest/download/latest.json"));
+    assert_eq!(db::SCHEMA_VERSION, 13, "updater must not claim v13/v14 migration ownership");
+}
+
 #[test]
 fn test_recommendation_cycle_lifecycle() {
     use crate::recommendation::{ensure_current_recommendation_cycle, refresh_current_recommendations};

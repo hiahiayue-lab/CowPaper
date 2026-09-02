@@ -1,6 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { relaunch } from "@tauri-apps/plugin-process";
+import { check, type Update } from "@tauri-apps/plugin-updater";
 
 interface Journal {
   id: number;
@@ -281,6 +284,9 @@ let aiStatus: AiStatus = emptyAiStatus();
 let activity: ActivityState = emptyActivity();
 let settings: Settings | null = null;
 let abstractLang: "zh" | "en" = "zh";
+let currentAppVersion = "0.1.2";
+let pendingUpdate: Update | null = null;
+let updateBusy = false;
 /// 纯卡片 UI 状态必须按实例隔离；favorite/ignore 等持久业务状态仍按 paper id。
 const expandedCardInstanceIds = new Set<string>();
 const cardLanguageState = new Map<string, "zh" | "en">();
@@ -361,7 +367,7 @@ function getModel(): string {
   return localStorage.getItem(MODEL_NAME) || DEFAULT_MODEL;
 }
 
-// ---------- API Key（存 macOS Keychain，前端不长期保存真实 Key） ----------
+// ---------- API Key（本地 secret 文件，前端不长期保存真实 Key） ----------
 
 async function hasKey(): Promise<boolean> {
   try {
@@ -416,6 +422,98 @@ async function loadSettings() {
     ($("set-daily-sync") as HTMLInputElement).checked = settings.dailyAutoSync;
     ($("set-daily-time") as HTMLInputElement).value = settings.dailySyncTime;
     ($("set-abstract-lang") as HTMLSelectElement).value = abstractLang;
+  }
+}
+
+function setUpdateStatus(text: string, cls: "muted small" | "ok small" | "error") {
+  const el = $("update-status");
+  el.textContent = text;
+  el.className = cls;
+}
+
+function setUpdateButtonState() {
+  const button = $("btn-check-update") as HTMLButtonElement;
+  const install = $("btn-install-update");
+  button.disabled = updateBusy;
+  if (pendingUpdate && !updateBusy) install.classList.remove("hidden");
+  else install.classList.add("hidden");
+}
+
+async function loadCurrentVersion() {
+  try {
+    currentAppVersion = await getVersion();
+  } catch {
+    // Vite/browser preview has no Tauri runtime; keep the manifest fallback.
+  }
+  $("current-version").textContent = currentAppVersion;
+}
+
+async function checkForUpdates() {
+  if (updateBusy) return;
+  updateBusy = true;
+  await pendingUpdate?.close().catch(() => {});
+  pendingUpdate = null;
+  setUpdateButtonState();
+  $("latest-version").textContent = "检查中…";
+  $("update-notes").classList.add("hidden");
+  setUpdateStatus("正在检查更新…", "muted small");
+  try {
+    const update = await check({ timeout: 15_000 });
+    pendingUpdate = update;
+    if (!update) {
+      $("latest-version").textContent = currentAppVersion;
+      setUpdateStatus("已是最新版本。", "ok small");
+      return;
+    }
+    $("latest-version").textContent = update.version;
+    const notes = [update.body, update.date ? `发布日期：${update.date.slice(0, 10)}` : ""]
+      .filter(Boolean).join("\n");
+    const notesEl = $("update-notes");
+    notesEl.textContent = notes;
+    notesEl.classList.toggle("hidden", !notes);
+    setUpdateStatus("发现新版本，请确认后下载并安装。", "ok small");
+  } catch (error) {
+    $("latest-version").textContent = "检查失败";
+    setUpdateStatus(`更新检查失败，CowPaper 仍可正常使用：${String(error)}`, "error");
+  } finally {
+    updateBusy = false;
+    setUpdateButtonState();
+  }
+}
+
+async function installPendingUpdate() {
+  if (!pendingUpdate || updateBusy) return;
+  const update = pendingUpdate;
+  const confirmed = await showConfirmModal({
+    title: `安装 CowPaper ${update.version}？`,
+    message: "更新只替换应用 bundle/installer，不删除本机数据库、设置、API Key 或 Library 数据。签名验证失败时安装会被拒绝。",
+    confirmText: "下载并安装",
+    cancelText: "稍后",
+  });
+  if (!confirmed) return;
+  updateBusy = true;
+  setUpdateButtonState();
+  setUpdateStatus("正在下载并验证签名…", "muted small");
+  try {
+    let downloaded = 0;
+    await update.downloadAndInstall((event) => {
+      if (event.event === "Started") {
+        downloaded = 0;
+        setUpdateStatus("开始下载更新…", "muted small");
+      } else if (event.event === "Progress") {
+        downloaded += event.data.chunkLength;
+        setUpdateStatus(`正在下载更新… ${Math.round(downloaded / 1024 / 1024)} MB`, "muted small");
+      } else {
+        setUpdateStatus("下载完成，正在重启…", "ok small");
+      }
+    }, { restartAfterInstall: false });
+    await relaunch();
+  } catch (error) {
+    // The plugin rejects invalid signatures and failed downloads. Keep the app
+    // usable and allow a later manual retry.
+    setUpdateStatus(`更新未安装，CowPaper 仍可正常使用：${String(error)}`, "error");
+    updateBusy = false;
+    setUpdateButtonState();
   }
 }
 
@@ -2449,6 +2547,8 @@ window.addEventListener("DOMContentLoaded", () => {
     }
   });
   $("btn-save-settings").addEventListener("click", saveSettings);
+  $("btn-check-update").addEventListener("click", checkForUpdates);
+  $("btn-install-update").addEventListener("click", installPendingUpdate);
   $("journal-search").addEventListener("input", renderJournals);
   $("catalog-search").addEventListener("input", () => {
     if (selectedCatalogCode) renderCatalogRows();
@@ -2468,7 +2568,7 @@ window.addEventListener("DOMContentLoaded", () => {
 
   (async () => {
     await setupListeners();
-    await Promise.all([loadJournals(), loadSettings()]);
+    await Promise.all([loadJournals(), loadSettings(), loadCurrentVersion()]);
     await loadPapers();
     // 统一工作状态刷新（Work Center / 积压 / 待处理区 / 计数）
     await refreshWorkState();
