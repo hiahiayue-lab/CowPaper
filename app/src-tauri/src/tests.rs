@@ -4687,7 +4687,11 @@ fn test_title_translation_candidates_are_not_gated_by_abstract_or_analysis_state
     };
 
     // A complete abstract must not block title-only backlog eligibility.
-    let complete = create("10.1000/title-complete", "Complete title", Some("real abstract"));
+    let complete = create(
+        "10.1000/title-complete",
+        "Complete title",
+        Some("A complete abstract with methods, results, and implications. ".repeat(8).as_str()),
+    );
     // These are deliberately inconsistent states: the title backlog must be
     // independent from abstract_status, content_kind, and analysis_status.
     let unknown = create("10.1000/title-unknown", "Unknown title", None);
@@ -4716,6 +4720,20 @@ fn test_title_translation_candidates_are_not_gated_by_abstract_or_analysis_state
     }
     assert!(!ids.contains(&existing_title), "existing Chinese title must be excluded");
     assert!(!ids.contains(&blank), "blank source title must be excluded");
+
+    // Eligibility and persistence must use the same state-independent rule:
+    // a complete-abstract paper that receives a title-only translation must
+    // persist only chinese_title, without changing analysis data.
+    assert!(db::save_title_translation(&conn, complete, "完整标题的中文翻译").unwrap());
+    let translated = db::get_paper(&conn, complete).unwrap().unwrap();
+    assert_eq!(translated.chinese_title.as_deref(), Some("完整标题的中文翻译"));
+    assert_eq!(translated.abstract_quality, "complete");
+    assert_eq!(translated.abstract_status, "unknown");
+    assert_eq!(translated.analysis_status, "analysisSucceeded");
+    assert!(translated.chinese_abstract.is_none());
+    assert!(translated.one_sentence_summary.is_none());
+    assert!(translated.total_score.is_none());
+    assert!(translated.tag_matches.is_empty());
 }
 
 #[test]

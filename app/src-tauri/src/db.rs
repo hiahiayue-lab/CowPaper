@@ -2041,7 +2041,7 @@ pub fn list_recoverable_paper_ids(conn: &Connection, paper_ids: &[i64]) -> Resul
 pub fn save_title_translation(conn: &Connection, id: i64, chinese_title: &str) -> Result<bool> {
     let changed = conn.execute(
         "UPDATE papers SET chinese_title = ?1, updated_at = ?2
-         WHERE id = ?3 AND abstract_quality = 'missing'
+         WHERE id = ?3
            AND (chinese_title IS NULL OR TRIM(chinese_title) = '')",
         params![chinese_title, now_utc(), id],
     )?;
