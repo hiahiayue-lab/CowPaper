@@ -1364,6 +1364,7 @@ function renderLibraryNavigation() {
   const children = (parentId: number | null, depth = 0): string => libraryCollections
     .filter((c) => c.parentId === parentId)
     .map((c) => `<div class="library-nav-item"><button class="library-nav-row" style="padding-left:${12 + depth * 14}px" data-action="library-filter-collection" data-collection-id="${c.id}">${escapeHtml(c.name)}</button><button class="nav-child" title="在此文献夹下新建" data-action="library-create-child" data-parent-id="${c.id}">＋</button><button class="nav-manage" title="重命名文献夹" data-action="library-rename-collection" data-collection-id="${c.id}">✎</button><button class="nav-manage danger" title="删除文献夹" data-action="library-delete-collection" data-collection-id="${c.id}">×</button></div>${children(c.id, depth + 1)}`)
+    .map((c) => `<div class="library-nav-item"><button class="library-nav-row" style="padding-left:${12 + depth * 14}px" data-action="library-filter-collection" data-collection-id="${c.id}">${escapeHtml(c.name)}</button><button class="nav-child" title="在此文献夹下新建" data-action="library-create-child" data-parent-id="${c.id}">＋</button><button class="nav-manage" title="重命名文献夹" data-action="library-rename-collection" data-collection-id="${c.id}">✎</button><button class="nav-manage danger" title="删除文献夹" data-action="library-delete-collection" data-collection-id="${c.id}">×</button></div>${children(c.id, depth + 1)}`)
     .join("");
   collections.innerHTML = children(null) || '<span class="muted small nav-empty">暂无文献夹</span>';
   $("library-tag-nav").innerHTML = libraryTags.length
@@ -2514,6 +2515,13 @@ async function setupListeners() {
       const name = await showPromptModal("新建文献夹", "名称");
       if (!name) return;
       await invoke("create_library_collection", { name, parentId: null });
+      await loadLibraryData(libraryView); return;
+    }
+    const childCollection = t.closest("[data-action='library-create-child']") as HTMLElement | null;
+    if (childCollection) {
+      const name = await showPromptModal("新建子文献夹", "名称");
+      if (!name) return;
+      await invoke("create_library_collection", { name, parentId: Number(childCollection.dataset.parentId) });
       await loadLibraryData(libraryView); return;
     }
     if (t.closest("[data-action='library-create-tag']")) {

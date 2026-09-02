@@ -981,6 +981,12 @@ button.full {
 .nav-add { padding: 0 3px; color: var(--muted); font-size: 15px; }
 .library-nav-row { display: block; width: 100%; padding: 7px 12px; border-radius: 7px; text-align: left; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .library-nav-row:hover { background: #e4e8ee; }
+.library-nav-item { display: flex; align-items: center; }
+.library-nav-item .library-nav-row { flex: 1; }
+.nav-child { padding: 2px 5px; color: var(--muted); font-size: 13px; opacity: 0; }
+.nav-manage { padding: 2px 4px; color: var(--muted); font-size: 12px; opacity: 0; }
+.nav-manage.danger:hover { color: var(--danger, #b42318); }
+.library-nav-item:hover .nav-child, .library-nav-item:hover .nav-manage, .nav-child:focus, .nav-manage:focus { opacity: 1; }
 .nav-empty { display: block; padding: 4px 12px; }
 .tag-dot { display: inline-block; width: 7px; height: 7px; margin-right: 8px; border-radius: 50%; }
 .library-view { padding: 0; overflow: hidden; }
