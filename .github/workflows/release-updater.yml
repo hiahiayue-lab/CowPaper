@@ -20,6 +20,8 @@ jobs:
     steps:
       - name: Check out release SHA
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
@@ -41,8 +43,11 @@ jobs:
         with:
           projectPath: app
           tagName: ${{ github.ref_name }}
-          releaseName: CowPaper ${{ github.ref_name }}
-          releaseBody: Signed CowPaper updater release.
+          releaseName: CowPaper ${{ github.ref_name }} Beta
+          releaseBody: |
+            Beta release with signed CowPaper updater artifacts.
+          releaseDraft: true
+          prerelease: false
           args: --target aarch64-apple-darwin
           uploadUpdaterJson: true
 
@@ -55,6 +60,8 @@ jobs:
     steps:
       - name: Check out release SHA
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
@@ -76,8 +83,25 @@ jobs:
         with:
           projectPath: app
           tagName: ${{ github.ref_name }}
-          releaseName: CowPaper ${{ github.ref_name }}
-          releaseBody: Signed CowPaper updater release.
+          releaseName: CowPaper ${{ github.ref_name }} Beta
+          releaseBody: |
+            Beta release with signed CowPaper updater artifacts.
+          releaseDraft: true
+          prerelease: false
           args: --config src-tauri/tauri.windows.conf.json --target x86_64-pc-windows-msvc
           updaterJsonPreferNsis: true
           uploadUpdaterJson: true
+
+  publish-release:
+    needs:
+      - macos-arm64
+      - windows-x64
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Publish complete release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease=false
