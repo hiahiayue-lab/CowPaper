@@ -1628,6 +1628,19 @@ fn get_analysis_batch(id: i64, state: State<Db>) -> Result<(models::AnalysisBatc
     Ok((batch, items))
 }
 
+#[cfg(target_os = "macos")]
+fn restore_main_window<R: Runtime>(app: &AppHandle<R>) {
+    if let Some(window) = app.get_webview_window("main") {
+        if window.is_minimized().unwrap_or(false) {
+            let _ = window.unminimize();
+        }
+        if !window.is_visible().unwrap_or(false) {
+            let _ = window.show();
+        }
+        let _ = window.set_focus();
+    }
+}
+
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -1823,6 +1836,12 @@ pub fn run() {
             get_tag_config_baseline,
             get_active_tag_config
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            #[cfg(target_os = "macos")]
+            if matches!(event, tauri::RunEvent::Reopen { .. }) {
+                restore_main_window(app);
+            }
+        });
 }
