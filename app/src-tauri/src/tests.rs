@@ -3373,7 +3373,19 @@ fn test_update_reopen_preserves_user_data_and_settings() {
         db::set_setting(&conn, "settings.default_abstract_lang", "en").unwrap();
         let jid = db::insert_journal(&conn, "Preserved Journal", Some("0025-1909"), None, None, None).unwrap();
         let paper_id = seed_paper_with_score(&conn, jid, "10.1000/update-preserve", "Preserved Paper", 4.2);
-        db::save_title_translation(&conn, paper_id, "保留的中文标题").unwrap();
+        db::save_analysis(
+            &conn,
+            paper_id,
+            "保留的中文标题",
+            "摘要",
+            "句",
+            "[]",
+            4.2,
+            "m",
+            "v1",
+            &format!("H-{}", paper_id),
+        )
+        .unwrap();
         let run_id = crate::recommendation::refresh_current_recommendations(
             &conn,
             &chrono::Local::now(),
