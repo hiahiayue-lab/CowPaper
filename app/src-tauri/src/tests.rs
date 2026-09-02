@@ -4675,6 +4675,67 @@ fn test_r7_not_expected_still_eligible_for_title_translation() {
     assert!(candidates.iter().any(|(id, _)| *id == news), "not_expected 论文仍应可翻译标题");
 }
 
+#[test]
+fn test_title_translation_candidates_are_not_gated_by_abstract_or_analysis_state() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let create = |doi: &str, title: &str, abstract_text: Option<&str>| {
+        match db::upsert_paper(&conn, jid, &candidate(Some(doi), title, abstract_text, None)).unwrap() {
+            UpsertOutcome::New(id) => id,
+            _ => panic!("expected new paper"),
+        }
+    };
+
+    // A complete abstract must not block title-only backlog eligibility.
+    let complete = create("10.1000/title-complete", "Complete title", Some("real abstract"));
+    // These are deliberately inconsistent states: the title backlog must be
+    // independent from abstract_status, content_kind, and analysis_status.
+    let unknown = create("10.1000/title-unknown", "Unknown title", None);
+    let not_expected = create("10.1000/title-not-expected", "News title", None);
+    let editorial = create("10.1000/title-editorial", "Editorial title", None);
+    let letter = create("10.1000/title-letter", "Letter title", None);
+    conn.execute("UPDATE papers SET abstract_status='unknown', content_kind='unknown', analysis_status='analysisSucceeded' WHERE id=?1", params![complete]).unwrap();
+    conn.execute("UPDATE papers SET abstract_status='unknown', content_kind='unknown' WHERE id=?1", params![unknown]).unwrap();
+    conn.execute("UPDATE papers SET abstract_status='not_expected', content_kind='news' WHERE id=?1", params![not_expected]).unwrap();
+    conn.execute("UPDATE papers SET abstract_status='not_expected', content_kind='editorial' WHERE id=?1", params![editorial]).unwrap();
+    conn.execute("UPDATE papers SET abstract_status='not_expected', content_kind='letter' WHERE id=?1", params![letter]).unwrap();
+
+    let existing_title = create("10.1000/title-existing", "Already translated", None);
+    conn.execute("UPDATE papers SET chinese_title='已有中文标题' WHERE id=?1", params![existing_title]).unwrap();
+    let mut blank_candidate = candidate(Some("10.1000/title-blank"), "placeholder", None, None);
+    blank_candidate.title = Some("   ".into());
+    let blank = match db::upsert_paper(&conn, jid, &blank_candidate).unwrap() {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new paper"),
+    };
+
+    let candidates = db::list_missing_title_translation_candidates(&conn, None).unwrap();
+    let ids: Vec<i64> = candidates.iter().map(|(id, _)| *id).collect();
+    for id in [complete, unknown, not_expected, editorial, letter] {
+        assert!(ids.contains(&id), "paper {} must remain title-translation eligible", id);
+    }
+    assert!(!ids.contains(&existing_title), "existing Chinese title must be excluded");
+    assert!(!ids.contains(&blank), "blank source title must be excluded");
+}
+
+#[test]
+fn test_title_translation_candidate_batch_limit_is_twenty_five_without_state_filter() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    for n in 0..30 {
+        let mut paper = candidate(Some(&format!("10.1000/title-limit-{}", n)), &format!("Title {}", n), Some("abstract"), None);
+        paper.title = Some(format!("Title {}", n));
+        let id = match db::upsert_paper(&conn, jid, &paper).unwrap() {
+            UpsertOutcome::New(id) => id,
+            _ => panic!("expected new paper"),
+        };
+        conn.execute("UPDATE papers SET abstract_status='not_expected', content_kind='news' WHERE id=?1", params![id]).unwrap();
+    }
+    let candidates = db::list_missing_title_translation_candidates(&conn, None).unwrap();
+    assert_eq!(candidates.len(), 25);
+    assert_eq!(db::TITLE_TRANSLATION_BATCH_LIMIT, 25);
+}
+
 // J. 已有真实摘要 → migration backfill 不覆盖
 #[test]
 fn test_r7_backfill_does_not_overwrite_existing_abstract() {

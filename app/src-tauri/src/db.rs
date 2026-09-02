@@ -1985,21 +1985,20 @@ pub fn list_pending_papers(conn: &Connection, paper_ids: Option<&[i64]>) -> Resu
     rows.collect()
 }
 
-/// Missing-abstract papers may receive a title-only translation. This query
-/// intentionally excludes papers with an abstract or an existing Chinese
-/// title, and does not use or alter full-analysis state.  It deliberately
-/// has no sync-batch or first-seen predicate: historical papers are backlog
-/// candidates too. A bounded, newest-first batch lets the missing papers
-/// currently visible after a sync get their titles in this session, without
-/// turning one launch or sync into an unbounded API run.
+/// Papers with a valid source title may receive a title-only translation. This
+/// query intentionally excludes only an existing Chinese title or an invalid
+/// source title; abstract/content/analysis state must not gate this backlog.
+/// It deliberately has no sync-batch or first-seen predicate: historical
+/// papers are backlog candidates too. A bounded, newest-first batch lets the
+/// papers currently visible after a sync get their titles in this session,
+/// without turning one launch or sync into an unbounded API run.
 pub const TITLE_TRANSLATION_BATCH_LIMIT: usize = 25;
 pub fn list_missing_title_translation_candidates(
     conn: &Connection,
     paper_ids: Option<&[i64]>,
 ) -> Result<Vec<(i64, String)>> {
     let mut sql = String::from(
-        "SELECT id, title FROM papers WHERE abstract_quality = 'missing' \
-         AND title IS NOT NULL AND TRIM(title) != '' \
+        "SELECT id, title FROM papers WHERE title IS NOT NULL AND TRIM(title) != '' \
          AND (chinese_title IS NULL OR TRIM(chinese_title) = '')",
     );
     if let Some(ids) = paper_ids {
