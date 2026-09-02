@@ -46,10 +46,11 @@ from accepting future updates.
 
 The existing beta workflows deliberately override
 `createUpdaterArtifacts` to `false`, because beta builds are currently
-unsigned. A formal release workflow must enable the base setting, build both
-platforms from the same candidate SHA, sign both artifacts, generate/upload
-`latest.json`, and publish the release. This branch does not alter the v0.1.2
-tag or release.
+unsigned. `release-updater.yml` enables the base setting, builds both
+platforms from the same tag SHA in sequence, signs both artifacts, and lets
+the official action generate/upload `latest.json`. It does not run until a
+future `v*` tag is pushed. This branch does not alter the v0.1.2 or v0.1.3
+tag/release.
 
 ## User data locations and invariant
 

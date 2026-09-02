@@ -1,0 +1,83 @@
+name: Signed Updater Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+# Keep the platform jobs ordered. The second tauri-action invocation sees the
+# first platform's assets and refreshes latest.json with both entries instead
+# of racing two independent metadata uploads.
+jobs:
+  macos-arm64:
+    runs-on: macos-14
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - name: Check out release SHA
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - name: Set up Rust arm64
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: Build and publish signed macOS updater artifact
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: app
+          tagName: ${{ github.ref_name }}
+          releaseName: CowPaper ${{ github.ref_name }}
+          releaseBody: Signed CowPaper updater release.
+          args: --target aarch64-apple-darwin
+          uploadUpdaterJson: true
+
+  windows-x64:
+    needs: macos-arm64
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - name: Check out release SHA
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - name: Set up Rust MSVC
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: Build and publish signed Windows updater artifact
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: app
+          tagName: ${{ github.ref_name }}
+          releaseName: CowPaper ${{ github.ref_name }}
+          releaseBody: Signed CowPaper updater release.
+          args: --config src-tauri/tauri.windows.conf.json --target x86_64-pc-windows-msvc
+          updaterJsonPreferNsis: true
+          uploadUpdaterJson: true

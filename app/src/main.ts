@@ -284,7 +284,7 @@ let aiStatus: AiStatus = emptyAiStatus();
 let activity: ActivityState = emptyActivity();
 let settings: Settings | null = null;
 let abstractLang: "zh" | "en" = "zh";
-let currentAppVersion = "0.1.2";
+let currentAppVersion = "0.1.4";
 let pendingUpdate: Update | null = null;
 let updateBusy = false;
 /// 纯卡片 UI 状态必须按实例隔离；favorite/ignore 等持久业务状态仍按 paper id。
