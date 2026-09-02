@@ -86,10 +86,11 @@ pub fn open(path: &Path) -> Result<Connection> {
 }
 
 /// 当前 schema 版本（Round 5B：abstract_quality / paper_abstract_sources 为 v4；
-/// Round 7 Phase 1：content_kind / abstract_status 为 v13）。
+/// Round 7 Phase 1：content_kind / abstract_status 为 v13；
+/// Literature Workspace 为 v14）。
 /// 生产构建中仅由迁移系统隐式使用；测试中直接断言。
 #[allow(dead_code)]
-pub const SCHEMA_VERSION: i64 = 13;
+pub const SCHEMA_VERSION: i64 = 14;
 
 pub fn init(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
@@ -1270,6 +1271,360 @@ pub fn get_paper(conn: &Connection, id: i64) -> Result<Option<Paper>> {
     }
 }
 
+// ---------- Literature Workspace ----------
+
+fn library_collection_from_row(row: &rusqlite::Row) -> Result<crate::models::LibraryCollection> {
+    Ok(crate::models::LibraryCollection {
+        id: row.get("id")?,
+        parent_id: row.get("parent_id")?,
+        name: row.get("name")?,
+        sort_order: row.get("sort_order")?,
+        created_at: row.get("created_at")?,
+        updated_at: row.get("updated_at")?,
+    })
+}
+
+fn library_tag_from_row(row: &rusqlite::Row) -> Result<crate::models::LibraryTag> {
+    Ok(crate::models::LibraryTag {
+        id: row.get("id")?,
+        name: row.get("name")?,
+        color: row.get("color")?,
+        created_at: row.get("created_at")?,
+        updated_at: row.get("updated_at")?,
+    })
+}
+
+fn paper_exists(conn: &Connection, paper_id: i64) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM papers WHERE id = ?1)",
+        params![paper_id],
+        |r| r.get(0),
+    )
+}
+
+fn library_item_exists(conn: &Connection, paper_id: i64) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM library_items WHERE paper_id = ?1)",
+        params![paper_id],
+        |r| r.get(0),
+    )
+}
+
+fn validate_collection_ids(conn: &Connection, ids: &[i64]) -> Result<()> {
+    for id in ids {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM library_collections WHERE id = ?1)",
+            params![id],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
+    }
+    Ok(())
+}
+
+fn validate_library_tag_ids(conn: &Connection, ids: &[i64]) -> Result<()> {
+    for id in ids {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM library_tags WHERE id = ?1)",
+            params![id],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
+    }
+    Ok(())
+}
+
+fn library_metadata(
+    conn: &Connection,
+    paper_id: i64,
+) -> Result<(String, String, Vec<crate::models::LibraryCollection>, Vec<crate::models::LibraryTag>)> {
+    let (added_at, added_source): (String, String) = conn.query_row(
+        "SELECT added_at, added_source FROM library_items WHERE paper_id = ?1",
+        params![paper_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let mut collections_stmt = conn.prepare(
+        "SELECT c.* FROM library_collections c
+         JOIN library_collection_items i ON i.collection_id = c.id
+         WHERE i.paper_id = ?1 ORDER BY c.parent_id IS NOT NULL, c.sort_order, c.name, c.id",
+    )?;
+    let collections = collections_stmt
+        .query_map(params![paper_id], library_collection_from_row)?
+        .collect::<Result<Vec<_>>>()?;
+    let mut tags_stmt = conn.prepare(
+        "SELECT t.* FROM library_tags t
+         JOIN library_item_tags i ON i.tag_id = t.id
+         WHERE i.paper_id = ?1 ORDER BY t.name, t.id",
+    )?;
+    let tags = tags_stmt
+        .query_map(params![paper_id], library_tag_from_row)?
+        .collect::<Result<Vec<_>>>()?;
+    Ok((added_at, added_source, collections, tags))
+}
+
+fn library_paper(conn: &Connection, paper: Paper) -> Result<crate::models::LibraryPaper> {
+    let (added_at, added_source, collections, tags) = library_metadata(conn, paper.id)?;
+    Ok(crate::models::LibraryPaper {
+        paper,
+        added_at,
+        added_source,
+        collections,
+        tags,
+    })
+}
+
+pub fn get_library_membership(
+    conn: &Connection,
+    paper_id: i64,
+) -> Result<Option<crate::models::LibraryMembership>> {
+    let base: Option<(String, String)> = conn
+        .query_row(
+            "SELECT added_at, added_source FROM library_items WHERE paper_id = ?1",
+            params![paper_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((added_at, added_source)) = base else {
+        return Ok(None);
+    };
+    let collection_ids = conn
+        .prepare("SELECT collection_id FROM library_collection_items WHERE paper_id = ?1 ORDER BY collection_id")?
+        .query_map(params![paper_id], |r| r.get(0))?
+        .collect::<Result<Vec<i64>>>()?;
+    let tag_ids = conn
+        .prepare("SELECT tag_id FROM library_item_tags WHERE paper_id = ?1 ORDER BY tag_id")?
+        .query_map(params![paper_id], |r| r.get(0))?
+        .collect::<Result<Vec<i64>>>()?;
+    Ok(Some(crate::models::LibraryMembership {
+        paper_id,
+        added_at,
+        added_source,
+        collection_ids,
+        tag_ids,
+    }))
+}
+
+pub fn add_paper_to_library(
+    conn: &Connection,
+    paper_id: i64,
+    collection_ids: &[i64],
+    tag_ids: &[i64],
+    added_source: &str,
+) -> Result<crate::models::LibraryMembership> {
+    if added_source.trim().is_empty() {
+        return Err(rusqlite::Error::InvalidParameterName("added_source".into()));
+    }
+    let tx = conn.unchecked_transaction()?;
+    if !paper_exists(&tx, paper_id)? {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    validate_collection_ids(&tx, collection_ids)?;
+    validate_library_tag_ids(&tx, tag_ids)?;
+    let now = now_utc();
+    tx.execute(
+        "INSERT INTO library_items (paper_id, added_at, added_source)
+         VALUES (?1, ?2, ?3) ON CONFLICT(paper_id) DO NOTHING",
+        params![paper_id, now, added_source],
+    )?;
+    // The caller's selection is authoritative for this membership.
+    tx.execute("DELETE FROM library_collection_items WHERE paper_id = ?1", params![paper_id])?;
+    tx.execute("DELETE FROM library_item_tags WHERE paper_id = ?1", params![paper_id])?;
+    for collection_id in collection_ids.iter().copied() {
+        tx.execute(
+            "INSERT OR IGNORE INTO library_collection_items (collection_id, paper_id, added_at)
+             VALUES (?1, ?2, ?3)",
+            params![collection_id, paper_id, now],
+        )?;
+    }
+    for tag_id in tag_ids.iter().copied() {
+        tx.execute(
+            "INSERT OR IGNORE INTO library_item_tags (paper_id, tag_id, added_at)
+             VALUES (?1, ?2, ?3)",
+            params![paper_id, tag_id, now],
+        )?;
+    }
+    tx.execute(
+        "UPDATE papers SET is_favorite = 0, updated_at = ?1 WHERE id = ?2",
+        params![now, paper_id],
+    )?;
+    tx.commit()?;
+    get_library_membership(conn, paper_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
+}
+
+pub fn remove_paper_from_library(conn: &Connection, paper_id: i64) -> Result<bool> {
+    let tx = conn.unchecked_transaction()?;
+    let changed = tx.execute("DELETE FROM library_items WHERE paper_id = ?1", params![paper_id])?;
+    // Keep membership cleanup explicit so this invariant also holds for
+    // test/legacy connections that do not enable SQLite foreign keys.
+    tx.execute("DELETE FROM library_collection_items WHERE paper_id = ?1", params![paper_id])?;
+    tx.execute("DELETE FROM library_item_tags WHERE paper_id = ?1", params![paper_id])?;
+    tx.commit()?;
+    Ok(changed == 1)
+}
+
+pub fn set_paper_collections(conn: &Connection, paper_id: i64, collection_ids: &[i64]) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    if !library_item_exists(&tx, paper_id)? {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    validate_collection_ids(&tx, collection_ids)?;
+    let now = now_utc();
+    tx.execute("DELETE FROM library_collection_items WHERE paper_id = ?1", params![paper_id])?;
+    for collection_id in collection_ids.iter().copied() {
+        tx.execute(
+            "INSERT OR IGNORE INTO library_collection_items (collection_id, paper_id, added_at)
+             VALUES (?1, ?2, ?3)",
+            params![collection_id, paper_id, now],
+        )?;
+    }
+    tx.commit()
+}
+
+pub fn set_paper_library_tags(conn: &Connection, paper_id: i64, tag_ids: &[i64]) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    if !library_item_exists(&tx, paper_id)? {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    validate_library_tag_ids(&tx, tag_ids)?;
+    let now = now_utc();
+    tx.execute("DELETE FROM library_item_tags WHERE paper_id = ?1", params![paper_id])?;
+    for tag_id in tag_ids.iter().copied() {
+        tx.execute(
+            "INSERT OR IGNORE INTO library_item_tags (paper_id, tag_id, added_at)
+             VALUES (?1, ?2, ?3)",
+            params![paper_id, tag_id, now],
+        )?;
+    }
+    tx.commit()
+}
+
+pub fn list_library_papers(conn: &Connection, view: &str, limit: i64) -> Result<Vec<crate::models::LibraryPaper>> {
+    let order = match view {
+        "recent" => "li.added_at DESC, p.id DESC",
+        "all" | "unfiled" => "COALESCE(p.published_date, p.created_at) DESC, p.id DESC",
+        _ => return Err(rusqlite::Error::InvalidParameterName("view".into())),
+    };
+    let filter = if view == "unfiled" {
+        "AND NOT EXISTS (SELECT 1 FROM library_collection_items ci WHERE ci.paper_id = p.id)"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "SELECT p.*, j.name AS journal_name FROM papers p
+         JOIN journals j ON j.id = p.journal_id
+         JOIN library_items li ON li.paper_id = p.id
+         WHERE 1=1 {} ORDER BY {} LIMIT ?1",
+        filter, order
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![limit], row_to_paper)?;
+    let mut papers = rows.collect::<Result<Vec<_>>>()?;
+    enrich_papers_collections(conn, &mut papers)?;
+    filter_current_tag_matches(conn, &mut papers)?;
+    papers.into_iter().map(|p| library_paper(conn, p)).collect()
+}
+
+pub fn get_library_paper(conn: &Connection, paper_id: i64) -> Result<Option<crate::models::LibraryPaper>> {
+    let paper = conn
+        .query_row(
+            "SELECT p.*, j.name AS journal_name FROM papers p
+             JOIN journals j ON j.id = p.journal_id
+             JOIN library_items li ON li.paper_id = p.id WHERE p.id = ?1",
+            params![paper_id],
+            row_to_paper,
+        )
+        .optional()?;
+    let Some(mut paper) = paper else { return Ok(None); };
+    enrich_papers_collections(conn, std::slice::from_mut(&mut paper))?;
+    filter_current_tag_matches(conn, std::slice::from_mut(&mut paper))?;
+    Ok(Some(library_paper(conn, paper)?))
+}
+
+pub fn list_library_collections(conn: &Connection) -> Result<Vec<crate::models::LibraryCollection>> {
+    let mut stmt = conn.prepare(
+        "SELECT * FROM library_collections
+         ORDER BY parent_id IS NOT NULL, parent_id, sort_order, name, id",
+    )?;
+    let rows = stmt.query_map([], library_collection_from_row)?;
+    rows.collect()
+}
+
+pub fn create_library_collection(conn: &Connection, name: &str, parent_id: Option<i64>) -> Result<crate::models::LibraryCollection> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(rusqlite::Error::InvalidParameterName("name".into()));
+    }
+    if let Some(parent_id) = parent_id {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM library_collections WHERE id = ?1)",
+            params![parent_id],
+            |r| r.get(0),
+        )?;
+        if !exists { return Err(rusqlite::Error::QueryReturnedNoRows); }
+    }
+    let now = now_utc();
+    conn.execute(
+        "INSERT INTO library_collections (parent_id, name, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?3)",
+        params![parent_id, name, now],
+    )?;
+    conn.query_row(
+        "SELECT * FROM library_collections WHERE id = ?1",
+        params![conn.last_insert_rowid()],
+        library_collection_from_row,
+    )
+}
+
+pub fn rename_library_collection(conn: &Connection, id: i64, name: &str) -> Result<()> {
+    let name = name.trim();
+    if name.is_empty() { return Err(rusqlite::Error::InvalidParameterName("name".into())); }
+    conn.execute(
+        "UPDATE library_collections SET name = ?1, updated_at = ?2 WHERE id = ?3",
+        params![name, now_utc(), id],
+    )?;
+    Ok(())
+}
+
+pub fn delete_library_collection(conn: &Connection, id: i64) -> Result<bool> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("UPDATE library_collections SET parent_id = NULL, updated_at = ?1 WHERE parent_id = ?2", params![now_utc(), id])?;
+    let changed = tx.execute("DELETE FROM library_collections WHERE id = ?1", params![id])?;
+    tx.commit()?;
+    Ok(changed == 1)
+}
+
+pub fn list_library_tags(conn: &Connection) -> Result<Vec<crate::models::LibraryTag>> {
+    let mut stmt = conn.prepare("SELECT * FROM library_tags ORDER BY name, id")?;
+    let rows = stmt.query_map([], library_tag_from_row)?;
+    rows.collect()
+}
+
+pub fn create_library_tag(conn: &Connection, name: &str, color: Option<&str>) -> Result<crate::models::LibraryTag> {
+    let name = name.trim();
+    if name.is_empty() { return Err(rusqlite::Error::InvalidParameterName("name".into())); }
+    let now = now_utc();
+    conn.execute(
+        "INSERT INTO library_tags (name, color, created_at, updated_at) VALUES (?1, ?2, ?3, ?3)",
+        params![name, color, now],
+    )?;
+    conn.query_row("SELECT * FROM library_tags WHERE id = ?1", params![conn.last_insert_rowid()], library_tag_from_row)
+}
+
+pub fn rename_library_tag(conn: &Connection, id: i64, name: &str) -> Result<()> {
+    let name = name.trim();
+    if name.is_empty() { return Err(rusqlite::Error::InvalidParameterName("name".into())); }
+    conn.execute("UPDATE library_tags SET name = ?1, updated_at = ?2 WHERE id = ?3", params![name, now_utc(), id])?;
+    Ok(())
+}
+
+pub fn delete_library_tag(conn: &Connection, id: i64) -> Result<bool> {
+    Ok(conn.execute("DELETE FROM library_tags WHERE id = ?1", params![id])? == 1)
+}
+
 pub fn count_waiting_for_abstract(conn: &Connection) -> Result<i64> {
     conn.query_row(
         "SELECT COUNT(*) FROM papers WHERE analysis_status = 'waitingForAbstract'",
@@ -1348,6 +1703,7 @@ fn migrations() -> Vec<(i64, &'static str, fn(&Connection) -> Result<()>)> {
         (11, "daily-paper-first-seen-cycle", migrate_to_v11),
         (12, "backfill-first-seen-missing-from-recovery", migrate_to_v12),
         (13, "round7-content-kind", migrate_to_v13),
+        (14, "literature-workspace-library", migrate_to_v14),
     ]
 }
 
@@ -1448,6 +1804,57 @@ fn backfill_content_kind_and_abstract_status(conn: &Connection) -> Result<()> {
             params![status, id],
         )?;
     }
+    Ok(())
+}
+
+/// v14：Literature Workspace core.
+/// Library membership references the canonical papers row; existing papers
+/// are never auto-added during migration.
+fn migrate_to_v14(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS library_items (
+            paper_id INTEGER PRIMARY KEY REFERENCES papers(id) ON DELETE CASCADE,
+            added_at TEXT NOT NULL,
+            added_source TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_library_items_added_at ON library_items(added_at DESC);
+
+        CREATE TABLE IF NOT EXISTS library_collections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            parent_id INTEGER REFERENCES library_collections(id) ON DELETE SET NULL,
+            name TEXT NOT NULL,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_library_collections_parent ON library_collections(parent_id, sort_order, id);
+
+        CREATE TABLE IF NOT EXISTS library_collection_items (
+            collection_id INTEGER NOT NULL REFERENCES library_collections(id) ON DELETE CASCADE,
+            paper_id INTEGER NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+            added_at TEXT NOT NULL,
+            PRIMARY KEY (collection_id, paper_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_library_collection_items_paper ON library_collection_items(paper_id);
+
+        CREATE TABLE IF NOT EXISTS library_tags (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            color TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS library_item_tags (
+            paper_id INTEGER NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+            tag_id INTEGER NOT NULL REFERENCES library_tags(id) ON DELETE CASCADE,
+            added_at TEXT NOT NULL,
+            PRIMARY KEY (paper_id, tag_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_library_item_tags_tag ON library_item_tags(tag_id);
+        "#,
+    )?;
     Ok(())
 }
 
@@ -2111,6 +2518,13 @@ pub fn get_evidence_hash(conn: &Connection, id: i64) -> Result<Option<String>> {
 }
 
 pub fn set_paper_flag(conn: &Connection, id: i64, flag: &str, value: bool) -> Result<()> {
+    // Library membership wins over the legacy Read Later flag. Keep this as an
+    // application-level invariant; no cross-table trigger is required.
+    let value = if flag == "favorite" && value && library_item_exists(conn, id)? {
+        false
+    } else {
+        value
+    };
     let col = match flag {
         "favorite" => "is_favorite",
         "read" => "is_read",

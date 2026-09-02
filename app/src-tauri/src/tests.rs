@@ -2069,7 +2069,7 @@ fn test_migration_v2_to_v3_preserves_data() {
 
     // 迁移到 v3
     db::init(&conn).unwrap();
-    assert_eq!(db::SCHEMA_VERSION, 13);
+    assert_eq!(db::SCHEMA_VERSION, 14);
 
     // 8) 旧 issn 迁移进 journal_identifiers（类型按列，不猜）
     let ids = db::list_journal_identifiers(&conn, jid).unwrap();
@@ -2110,7 +2110,7 @@ fn test_database_restart_persistence() {
     {
         let conn = db::open(&path).unwrap();
         db::init(&conn).unwrap(); // 幂等：user_version=3 不重复迁移
-        assert_eq!(db::SCHEMA_VERSION, 13);
+        assert_eq!(db::SCHEMA_VERSION, 14);
         let j = db::get_journal(&conn, 1).unwrap().expect("期刊持久化");
         assert_eq!(j.print_issn.as_deref(), Some("0025-1909"));
         assert_eq!(j.identifiers.len(), 1);
@@ -2737,7 +2737,7 @@ fn test_migration_v4_abstract_quality_init() {
     .unwrap();
 
     db::init(&conn).unwrap();
-    assert_eq!(db::SCHEMA_VERSION, 13);
+    assert_eq!(db::SCHEMA_VERSION, 14);
 
     let papers = db::list_papers(&conn, Some(jid), 100).unwrap();
     assert_eq!(papers.len(), 3, "迁移不得丢论文");
@@ -3429,7 +3429,7 @@ fn test_updater_config_requires_signed_cross_platform_artifacts() {
     assert_eq!(endpoints.len(), 1);
     assert!(endpoints[0].as_str().unwrap().starts_with("https://github.com/"));
     assert!(endpoints[0].as_str().unwrap().ends_with("/latest/download/latest.json"));
-    assert_eq!(db::SCHEMA_VERSION, 13, "updater must not claim v13/v14 migration ownership");
+    assert_eq!(db::SCHEMA_VERSION, 14, "updater must not claim migration ownership");
 }
 
 #[test]
@@ -4980,4 +4980,175 @@ fn test_r7_existing_upsert_fills_kind_when_unknown() {
     db::upsert_paper(&conn, jid, &cand_raw("10.1000/r7-fill", "First Pass", None, Some(raw3))).unwrap();
     let p = db::get_paper(&conn, id).unwrap().unwrap();
     assert_eq!(p.content_kind, "news", "已分类结果（news）不得被 editorial 覆盖，因为 fill 只补 unknown");
+#[test]
+fn test_library_migration_v13_to_v14_preserves_existing_data() {
+    let conn = mem_db();
+    // Turn a fully initialized in-memory database into a representative v13
+    // database by removing only the Library tables created by the test setup.
+    for table in [
+        "library_item_tags",
+        "library_collection_items",
+        "library_items",
+        "library_tags",
+        "library_collections",
+    ] {
+        conn.execute(&format!("DROP TABLE {}", table), []).unwrap();
+    }
+    conn.pragma_update(None, "user_version", 13).unwrap();
+
+    let jid = db::insert_journal(&conn, "Migration J", Some("0025-1909"), None, None, None).unwrap();
+    let pid = match db::upsert_paper(
+        &conn,
+        jid,
+        &candidate(Some("10.1000/v13-v14"), "Migration Paper", Some("preserved abstract"), None),
+    )
+    .unwrap()
+    {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new paper"),
+    };
+    conn.execute(
+        "UPDATE papers SET chinese_title='保留中文标题', chinese_abstract='保留中文摘要',
+            one_sentence_summary='保留 AI 分析', total_score=4.8, is_favorite=1 WHERE id=?1",
+        params![pid],
+    )
+    .unwrap();
+    let run_id = db::create_recommendation_run(&conn, "2026-09-03", crate::recommendation::RC_OPEN).unwrap();
+    conn.execute(
+        "INSERT INTO recommendation_items (run_id, paper_id, rank, score_snapshot, added_at) VALUES (?1,?2,1,4.8,?3)",
+        params![run_id, pid, "2026-09-03T00:00:00Z"],
+    )
+    .unwrap();
+    db::set_setting(&conn, "settings.daily_sync_time", "08:30").unwrap();
+
+    db::init(&conn).unwrap();
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+    assert_eq!(version, 14);
+    let paper = db::get_paper(&conn, pid).unwrap().unwrap();
+    assert_eq!(paper.abstract_text.as_deref(), Some("preserved abstract"));
+    assert_eq!(paper.chinese_title.as_deref(), Some("保留中文标题"));
+    assert_eq!(paper.chinese_abstract.as_deref(), Some("保留中文摘要"));
+    assert_eq!(paper.one_sentence_summary.as_deref(), Some("保留 AI 分析"));
+    assert_eq!(paper.total_score, Some(4.8));
+    assert!(paper.is_favorite);
+    assert_eq!(db::list_recommendation_runs(&conn).unwrap().len(), 1);
+    assert_eq!(db::list_recommendation_items(&conn, run_id).unwrap().len(), 1);
+    assert_eq!(db::get_setting(&conn, "settings.daily_sync_time").as_deref(), Some("08:30"));
+
+    db::init(&conn).unwrap();
+    let version_again: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+    assert_eq!(version_again, 14);
+    for table in [
+        "library_items",
+        "library_collections",
+        "library_collection_items",
+        "library_tags",
+        "library_item_tags",
+    ] {
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                params![table],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(exists, "缺少 Library 表 {table}");
+    }
+}
+
+#[test]
+fn test_library_migration_is_empty_and_idempotent() {
+    let conn = mem_db();
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+    assert_eq!(version, db::SCHEMA_VERSION);
+    for table in [
+        "library_items",
+        "library_collections",
+        "library_collection_items",
+        "library_tags",
+        "library_item_tags",
+    ] {
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                params![table],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(exists, "缺少 Library 表 {table}");
+    }
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM library_items", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    // CREATE TABLE IF NOT EXISTS migration can safely be rerun.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS library_items (paper_id INTEGER PRIMARY KEY, added_at TEXT NOT NULL, added_source TEXT NOT NULL);",
+    )
+    .unwrap();
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM library_items", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+}
+
+#[test]
+fn test_library_membership_is_canonical_idempotent_and_clears_read_later() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let pid = match db::upsert_paper(&conn, jid, &candidate(Some("10.1000/library"), "Library Paper", Some("abstract"), Some("crossref")).clone()).unwrap() {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new paper"),
+    };
+    db::set_paper_flag(&conn, pid, "favorite", true).unwrap();
+    let first = db::add_paper_to_library(&conn, pid, &[], &[], "read_later").unwrap();
+    let second = db::add_paper_to_library(&conn, pid, &[], &[], "recommendation").unwrap();
+    assert_eq!(first.paper_id, pid);
+    assert_eq!(second.paper_id, pid);
+    assert_eq!(second.added_source, "read_later", "重复加入不覆盖首次 provenance");
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM library_items WHERE paper_id=?1", params![pid], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    let p = db::get_paper(&conn, pid).unwrap().unwrap();
+    assert!(!p.is_favorite, "加入 Library 必须清除 Read Later");
+    db::set_paper_flag(&conn, pid, "favorite", true).unwrap();
+    assert!(!db::get_paper(&conn, pid).unwrap().unwrap().is_favorite, "Library Paper 不得重新进入 Read Later");
+}
+
+#[test]
+fn test_library_collections_tags_views_and_removal_preserve_paper() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let a = match db::upsert_paper(&conn, jid, &candidate(Some("10.1000/library-a"), "Paper A", Some("abstract"), Some("crossref")).clone()).unwrap() { UpsertOutcome::New(id) => id, _ => panic!() };
+    let b = match db::upsert_paper(&conn, jid, &candidate(Some("10.1000/library-b"), "Paper B", Some("abstract"), Some("crossref")).clone()).unwrap() { UpsertOutcome::New(id) => id, _ => panic!() };
+    conn.execute("UPDATE papers SET total_score = 4.2 WHERE id = ?1", params![a]).unwrap();
+    let score_before: Option<f64> = conn.query_row("SELECT total_score FROM papers WHERE id = ?1", params![a], |r| r.get(0)).unwrap();
+    let root = db::create_library_collection(&conn, "博士论文", None).unwrap();
+    let child = db::create_library_collection(&conn, "实证", Some(root.id)).unwrap();
+    let other = db::create_library_collection(&conn, "准备引用", None).unwrap();
+    let tag_a = db::create_library_tag(&conn, "核心文献", Some("#2563eb")).unwrap();
+    let tag_b = db::create_library_tag(&conn, "待引用", None).unwrap();
+    let membership = db::add_paper_to_library(&conn, a, &[root.id, child.id, other.id], &[tag_a.id, tag_b.id], "manual").unwrap();
+    assert_eq!(membership.collection_ids.len(), 3);
+    assert_eq!(membership.tag_ids.len(), 2);
+    db::add_paper_to_library(&conn, b, &[], &[], "history").unwrap();
+    let score_after: Option<f64> = conn.query_row("SELECT total_score FROM papers WHERE id = ?1", params![a], |r| r.get(0)).unwrap();
+    assert_eq!(score_after, score_before, "Library membership must not alter recommendation score");
+    assert_eq!(db::list_library_papers(&conn, "all", 100).unwrap().len(), 2);
+    assert_eq!(db::list_library_papers(&conn, "unfiled", 100).unwrap().len(), 1);
+    assert_eq!(db::list_library_papers(&conn, "recent", 100).unwrap().len(), 2);
+    assert_eq!(db::list_library_tags(&conn).unwrap().len(), 2);
+    assert_eq!(db::list_tags(&conn).unwrap().len(), 6, "Library Tags 不得污染 Research Tags");
+    db::remove_paper_from_library(&conn, a).unwrap();
+    assert!(db::get_paper(&conn, a).unwrap().is_some());
+    assert!(db::get_library_membership(&conn, a).unwrap().is_none());
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM library_collection_items WHERE paper_id=?1", params![a], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM library_item_tags WHERE paper_id=?1", params![a], |r| r.get::<_, i64>(0)).unwrap(), 0);
+}
+
+#[test]
+fn test_library_collection_delete_detaches_children_without_deleting_paper() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let pid = match db::upsert_paper(&conn, jid, &candidate(Some("10.1000/library-delete"), "Paper", Some("abstract"), Some("crossref")).clone()).unwrap() { UpsertOutcome::New(id) => id, _ => panic!() };
+    let parent = db::create_library_collection(&conn, "Parent", None).unwrap();
+    let child = db::create_library_collection(&conn, "Child", Some(parent.id)).unwrap();
+    db::add_paper_to_library(&conn, pid, &[child.id], &[], "manual").unwrap();
+    assert!(db::delete_library_collection(&conn, parent.id).unwrap());
+    let child_parent: Option<i64> = conn.query_row("SELECT parent_id FROM library_collections WHERE id=?1", params![child.id], |r| r.get(0)).unwrap();
+    assert_eq!(child_parent, None);
+    assert!(db::get_paper(&conn, pid).unwrap().is_some());
+    assert!(db::get_library_membership(&conn, pid).unwrap().is_some());
 }

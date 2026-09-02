@@ -932,6 +932,102 @@ fn list_papers(journal_id: Option<i64>, state: State<Db>) -> Result<Vec<models::
 }
 
 #[tauri::command]
+fn list_library_papers(view: String, state: State<Db>) -> Result<Vec<models::LibraryPaper>, String> {
+    let conn = state.inner().lock().unwrap();
+    db::list_library_papers(&conn, &view, 1000).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_library_membership(paper_id: i64, state: State<Db>) -> Result<Option<models::LibraryMembership>, String> {
+    let conn = state.inner().lock().unwrap();
+    db::get_library_membership(&conn, paper_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn add_paper_to_library(
+    paper_id: i64,
+    collection_ids: Vec<i64>,
+    tag_ids: Vec<i64>,
+    added_source: Option<String>,
+    state: State<Db>,
+) -> Result<models::LibraryMembership, String> {
+    let conn = state.inner().lock().unwrap();
+    db::add_paper_to_library(
+        &conn,
+        paper_id,
+        &collection_ids,
+        &tag_ids,
+        added_source.as_deref().unwrap_or("manual"),
+    ).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn remove_paper_from_library(paper_id: i64, state: State<Db>) -> Result<bool, String> {
+    let conn = state.inner().lock().unwrap();
+    db::remove_paper_from_library(&conn, paper_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_paper_collections(paper_id: i64, collection_ids: Vec<i64>, state: State<Db>) -> Result<(), String> {
+    let conn = state.inner().lock().unwrap();
+    db::set_paper_collections(&conn, paper_id, &collection_ids).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_paper_library_tags(paper_id: i64, tag_ids: Vec<i64>, state: State<Db>) -> Result<(), String> {
+    let conn = state.inner().lock().unwrap();
+    db::set_paper_library_tags(&conn, paper_id, &tag_ids).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn list_library_collections(state: State<Db>) -> Result<Vec<models::LibraryCollection>, String> {
+    let conn = state.inner().lock().unwrap();
+    db::list_library_collections(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn create_library_collection(name: String, parent_id: Option<i64>, state: State<Db>) -> Result<models::LibraryCollection, String> {
+    let conn = state.inner().lock().unwrap();
+    db::create_library_collection(&conn, &name, parent_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn rename_library_collection(id: i64, name: String, state: State<Db>) -> Result<(), String> {
+    let conn = state.inner().lock().unwrap();
+    db::rename_library_collection(&conn, id, &name).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn delete_library_collection(id: i64, state: State<Db>) -> Result<bool, String> {
+    let conn = state.inner().lock().unwrap();
+    db::delete_library_collection(&conn, id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn list_library_tags(state: State<Db>) -> Result<Vec<models::LibraryTag>, String> {
+    let conn = state.inner().lock().unwrap();
+    db::list_library_tags(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn create_library_tag(name: String, color: Option<String>, state: State<Db>) -> Result<models::LibraryTag, String> {
+    let conn = state.inner().lock().unwrap();
+    db::create_library_tag(&conn, &name, color.as_deref()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn rename_library_tag(id: i64, name: String, state: State<Db>) -> Result<(), String> {
+    let conn = state.inner().lock().unwrap();
+    db::rename_library_tag(&conn, id, &name).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn delete_library_tag(id: i64, state: State<Db>) -> Result<bool, String> {
+    let conn = state.inner().lock().unwrap();
+    db::delete_library_tag(&conn, id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn list_today_missing_papers(state: State<Db>) -> Result<Vec<models::Paper>, String> {
     let c = state.inner().lock().unwrap();
     db::list_current_missing_papers_for_cycle(&c, &chrono::Local::now().format("%Y-%m-%d").to_string()).map_err(|e| e.to_string())
@@ -1782,6 +1878,20 @@ pub fn run() {
             set_journal_enabled,
             delete_journal,
             list_papers,
+            list_library_papers,
+            get_library_membership,
+            add_paper_to_library,
+            remove_paper_from_library,
+            set_paper_collections,
+            set_paper_library_tags,
+            list_library_collections,
+            create_library_collection,
+            rename_library_collection,
+            delete_library_collection,
+            list_library_tags,
+            create_library_tag,
+            rename_library_tag,
+            delete_library_tag,
             list_today_missing_papers,
             list_daily_paper_summaries,
             list_daily_papers,

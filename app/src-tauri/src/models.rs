@@ -399,6 +399,51 @@ pub struct Paper {
     pub collections: Vec<String>,
 }
 
+/// Literature workspace collection. This is intentionally separate from
+/// journal_collections, which groups subscribed journals.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryCollection {
+    pub id: i64,
+    pub parent_id: Option<i64>,
+    pub name: String,
+    pub sort_order: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryTag {
+    pub id: i64,
+    pub name: String,
+    pub color: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryMembership {
+    pub paper_id: i64,
+    pub added_at: String,
+    pub added_source: String,
+    pub collection_ids: Vec<i64>,
+    pub tag_ids: Vec<i64>,
+}
+
+/// Library list row: the canonical Paper plus library-only membership data.
+/// No second paper entity is introduced.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryPaper {
+    pub paper: Paper,
+    pub added_at: String,
+    pub added_source: String,
+    pub collections: Vec<LibraryCollection>,
+    pub tags: Vec<LibraryTag>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AddJournalResult {

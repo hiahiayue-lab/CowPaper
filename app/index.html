@@ -11,23 +11,37 @@
     <div class="app">
       <aside class="sidebar">
         <div class="brand">CowPaper<span class="muted">论文工作台</span></div>
-        <nav class="nav">
-          <button class="nav-item active" data-view="recommend">今日推荐</button>
+        <nav class="nav workspace-nav" data-workspace-nav="discovery">
+          <button class="nav-item active" data-view="recommend">今日</button>
           <button class="nav-item" data-view="recommend-history">历史</button>
-          <button class="nav-item" data-view="favorites">收藏</button>
-          <button class="nav-item" data-view="papers">所有论文</button>
-          <button class="nav-item" data-view="journals">期刊订阅</button>
-          <button class="nav-item" data-view="tags">标签</button>
+          <button class="nav-item" data-view="favorites">稍后看</button>
+          <button class="nav-item" data-view="journals">期刊</button>
+          <button class="nav-item" data-view="tags">研究兴趣</button>
           <button class="nav-item" data-view="activity">活动</button>
-          <button class="nav-item" data-view="settings">设置</button>
+        </nav>
+        <nav class="nav workspace-nav hidden" data-workspace-nav="library">
+          <button class="nav-item active" data-view="library-all">全部文献</button>
+          <button class="nav-item" data-view="library-recent">最近收录</button>
+          <button class="nav-item" data-view="library-unfiled">未分类</button>
+          <div class="nav-section-label">文献夹 <button class="nav-add" data-action="library-create-collection">＋</button></div>
+          <div id="library-collection-nav"></div>
+          <div class="nav-section-label">文献标签 <button class="nav-add" data-action="library-create-tag">＋</button></div>
+          <div id="library-tag-nav"></div>
         </nav>
       </aside>
 
       <main class="main">
         <header class="topbar">
-          <div class="topbar-title" id="view-title">今日推荐</div>
+          <div class="topbar-leading">
+            <div class="topbar-title" id="view-title">今日</div>
+            <div class="workspace-switcher" role="tablist" aria-label="工作空间">
+              <button class="workspace-tab active" data-workspace="discovery">发现</button>
+              <button class="workspace-tab" data-workspace="library">文献库</button>
+            </div>
+          </div>
           <div class="topbar-actions">
             <span id="status" class="status idle">就绪</span>
+            <button id="btn-settings-global" class="icon-button" title="设置" aria-label="设置">⚙</button>
           </div>
         </header>
 
@@ -90,6 +104,18 @@
         <section id="view-favorites" class="view">
           <ul id="favorites-list" class="list"></ul>
         </section>
+
+        <section id="view-library-all" class="view library-view">
+          <div class="library-layout">
+            <div class="library-list-pane">
+              <div class="library-list-head"><div><h2 id="library-view-title">全部文献</h2><span id="library-count" class="muted small"></span></div><button class="ghost small" data-action="library-refresh">刷新</button></div>
+              <div id="library-list" class="library-list"></div>
+            </div>
+            <aside id="library-inspector" class="library-inspector"><div class="empty">选择一篇文献查看详情</div></aside>
+          </div>
+        </section>
+        <section id="view-library-recent" class="view library-view"></section>
+        <section id="view-library-unfiled" class="view library-view"></section>
 
         <section id="view-journals" class="view">
           <div class="journal-tabs">
@@ -228,6 +254,14 @@
           </div>
         </section>
       </main>
+    </div>
+
+    <div id="library-capture-modal" class="modal-overlay hidden">
+      <div class="modal-card library-capture-card" role="dialog" aria-modal="true" aria-labelledby="library-capture-title">
+        <h3 id="library-capture-title" class="modal-title">收录到文献库</h3>
+        <div id="library-capture-body"></div>
+        <div class="modal-actions"><button class="ghost" data-action="library-capture-cancel">取消</button><button class="primary" data-action="library-capture-submit">收录</button></div>
+      </div>
     </div>
 
     <!-- 应用内确认 Modal：替代 WebView 原生 confirm/alert/prompt（WKWebView 下原生 dialog 不可靠） -->

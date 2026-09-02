@@ -84,6 +84,39 @@ interface Paper {
   collections: string[];
 }
 
+interface LibraryCollection {
+  id: number;
+  parentId: number | null;
+  name: string;
+  sortOrder: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface LibraryTag {
+  id: number;
+  name: string;
+  color: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface LibraryMembership {
+  paperId: number;
+  addedAt: string;
+  addedSource: string;
+  collectionIds: number[];
+  tagIds: number[];
+}
+
+interface LibraryPaper {
+  paper: Paper;
+  addedAt: string;
+  addedSource: string;
+  collections: LibraryCollection[];
+  tags: LibraryTag[];
+}
+
 interface AiStatus {
   state: string;
   batchSize: number;
@@ -280,6 +313,15 @@ const DEFAULT_MODEL = "deepseek-v4-flash"; // 已验证可用的模型
 
 let journals: Journal[] = [];
 let papers: Paper[] = [];
+let libraryPapers: LibraryPaper[] = [];
+let libraryCollections: LibraryCollection[] = [];
+let libraryTags: LibraryTag[] = [];
+let libraryView: "all" | "recent" | "unfiled" = "all";
+let selectedLibraryPaperId: number | null = null;
+let libraryCapturePaperId: number | null = null;
+let libraryScope: { kind: "collection" | "tag"; id: number } | null = null;
+const libraryPaperIds = new Set<number>();
+let activeWorkspace: "discovery" | "library" = "discovery";
 let aiStatus: AiStatus = emptyAiStatus();
 let activity: ActivityState = emptyActivity();
 let settings: Settings | null = null;
@@ -399,6 +441,33 @@ async function loadPapers() {
   renderPapers();
   renderRecommend();
   renderFavorites();
+}
+
+async function loadLibraryData(view: "all" | "recent" | "unfiled" = libraryView) {
+  libraryView = view;
+  try {
+    [libraryPapers, libraryCollections, libraryTags] = await Promise.all([
+      invoke<LibraryPaper[]>("list_library_papers", { view }),
+      invoke<LibraryCollection[]>("list_library_collections"),
+      invoke<LibraryTag[]>("list_library_tags"),
+    ]);
+    libraryPaperIds.clear();
+    // The all view is also the cheap membership index used by Discovery cards.
+    if (view !== "all") {
+      const all = await invoke<LibraryPaper[]>("list_library_papers", { view: "all" });
+      all.forEach((item) => libraryPaperIds.add(item.paper.id));
+    } else {
+      libraryPapers.forEach((item) => libraryPaperIds.add(item.paper.id));
+    }
+    renderLibraryNavigation();
+    renderLibrary();
+    renderRecommend();
+    renderFavorites();
+  } catch (err) {
+    console.error("loadLibraryData 失败:", err);
+    libraryPapers = [];
+    renderLibrary();
+  }
 }
 
 async function loadAiStatus() {
@@ -1137,7 +1206,8 @@ function renderPaperCard(p: Paper, opts: RenderPaperOptions): string {
       ${scoreRow}
       ${abstractHtml}
       <div class="paper-actions">
-        <button class="ghost small" data-action="toggle-favorite" data-paper-id="${p.id}">${p.isFavorite ? "★ 收藏" : "☆ 收藏"}</button>
+        ${libraryPaperIds.has(p.id) ? '<button class="ghost small" data-action="open-library">✓ 已收录</button>' : '<button class="ghost small" data-action="add-library" data-paper-id="' + p.id + '">收录</button>'}
+        ${libraryPaperIds.has(p.id) ? '' : `<button class="ghost small" data-action="toggle-favorite" data-paper-id="${p.id}">${p.isFavorite ? "★ 稍后看" : "☆ 稍后看"}</button>`}
         <button class="ghost small" data-action="ignore" data-id="${p.id}">${p.isIgnored ? "取消忽略" : "忽略"}</button>
         ${p.url ? `<a href="#" class="ghost small" data-action="open" data-url="${escapeHtml(p.url)}">原文 ↗</a>` : ""}
         <span class="muted small detail">${escapeHtml(p.normalizedDoi || "")} · 来源 ${escapeHtml(p.discoverySource || "—")} · ${p.abstractSource ? "摘要 " + escapeHtml(p.abstractSource) : ""}</span>
@@ -1282,7 +1352,104 @@ function renderFavorites() {
   const list = papers.filter((p) => p.isFavorite);
   $("favorites-list").innerHTML = list.length
     ? list.map((p) => renderPaperCard(p, { withAbstract: true, context: "favorites" })).join("")
-    : '<li class="empty">暂无收藏。在论文卡片上点 ☆ 收藏。</li>';
+    : '<li class="empty">暂无稍后看的论文。在论文卡片上点「稍后看」。</li>';
+}
+
+function libraryTitle(p: Paper): string {
+  return p.chineseTitle || p.title || "（无标题）";
+}
+
+function renderLibraryNavigation() {
+  const collections = $("library-collection-nav");
+  const children = (parentId: number | null, depth = 0): string => libraryCollections
+    .filter((c) => c.parentId === parentId)
+    .map((c) => `<div class="library-nav-item"><button class="library-nav-row" style="padding-left:${12 + depth * 14}px" data-action="library-filter-collection" data-collection-id="${c.id}">${escapeHtml(c.name)}</button><button class="nav-child" title="在此文献夹下新建" data-action="library-create-child" data-parent-id="${c.id}">＋</button><button class="nav-manage" title="重命名文献夹" data-action="library-rename-collection" data-collection-id="${c.id}">✎</button><button class="nav-manage danger" title="删除文献夹" data-action="library-delete-collection" data-collection-id="${c.id}">×</button></div>${children(c.id, depth + 1)}`)
+    .join("");
+  collections.innerHTML = children(null) || '<span class="muted small nav-empty">暂无文献夹</span>';
+  $("library-tag-nav").innerHTML = libraryTags.length
+    ? libraryTags.map((t) => `<button class="library-nav-row" data-action="library-filter-tag" data-tag-id="${t.id}"><span class="tag-dot" style="background:${escapeHtml(t.color || "#9ca3af")}"></span>${escapeHtml(t.name)}</button>`).join("")
+    : '<span class="muted small nav-empty">暂无文献标签</span>';
+}
+
+function renderLibrary() {
+  const title = libraryView === "recent" ? "最近收录" : libraryView === "unfiled" ? "未分类" : "全部文献";
+  const titleEl = $("library-view-title");
+  if (titleEl) titleEl.textContent = title;
+  const count = $("library-count");
+  const visiblePapers = libraryScope?.kind === "collection"
+    ? libraryPapers.filter((item) => item.collections.some((c) => c.id === libraryScope!.id))
+    : libraryScope?.kind === "tag"
+      ? libraryPapers.filter((item) => item.tags.some((t) => t.id === libraryScope!.id))
+      : libraryPapers;
+  if (count) count.textContent = `${visiblePapers.length} 篇`;
+  const list = $("library-list");
+  if (!list) return;
+  list.innerHTML = visiblePapers.length ? visiblePapers.map((item) => {
+    const p = item.paper;
+    const selected = p.id === selectedLibraryPaperId ? " selected" : "";
+    const tags = item.tags.slice(0, 3).map((t) => `<span class="library-tag-chip">${escapeHtml(t.name)}</span>`).join("");
+    return `<button class="library-paper-row${selected}" data-action="library-select-paper" data-paper-id="${p.id}">
+      <span class="library-row-title">${escapeHtml(libraryTitle(p))}</span>
+      <span class="library-row-meta">${escapeHtml(authorText(p.authors))}</span>
+      <span class="library-row-meta">${escapeHtml(p.journalName || "—")} · ${fmtDate(p.publishedDate)}</span>
+      ${tags ? `<span class="library-row-tags">${tags}</span>` : ""}
+    </button>`;
+  }).join("") : '<div class="empty">文献库还是空的。可以从发现页收录论文。</div>';
+  const selected = visiblePapers.find((item) => item.paper.id === selectedLibraryPaperId) || visiblePapers[0];
+  if (selected) {
+    selectedLibraryPaperId = selected.paper.id;
+    renderLibraryInspector(selected);
+  } else {
+    selectedLibraryPaperId = null;
+    $("library-inspector").innerHTML = '<div class="empty">选择一篇文献查看详情</div>';
+  }
+}
+
+function renderLibraryInspector(item: LibraryPaper) {
+  const p = item.paper;
+  const selectedCollections = new Set(item.collections.map((c) => c.id));
+  const selectedTags = new Set(item.tags.map((t) => t.id));
+  const collectionChecks = libraryCollections.map((c) => `<label class="check compact"><input type="checkbox" data-library-collection-id="${c.id}" ${selectedCollections.has(c.id) ? "checked" : ""}/> ${escapeHtml(c.name)}</label>`).join("");
+  const tagChecks = libraryTags.map((t) => `<label class="check compact"><input type="checkbox" data-library-tag-id="${t.id}" ${selectedTags.has(t.id) ? "checked" : ""}/> ${escapeHtml(t.name)}</label>`).join("");
+  $("library-inspector").innerHTML = `<div class="inspector-head"><div class="muted small">文献库 · ${fmtDate(item.addedAt)}</div><button class="ghost small danger" data-action="library-remove" data-paper-id="${p.id}">移出文献库</button></div>
+    <h2>${escapeHtml(libraryTitle(p))}</h2>
+    ${p.chineseTitle ? `<div class="inspector-secondary">${escapeHtml(p.title || "")}</div>` : ""}
+    <dl class="inspector-meta"><dt>作者</dt><dd>${escapeHtml(authorText(p.authors))}</dd><dt>期刊</dt><dd>${escapeHtml(p.journalName || "—")}</dd><dt>年份</dt><dd>${fmtDate(p.publishedDate)}</dd><dt>DOI</dt><dd>${escapeHtml(p.normalizedDoi || "—")}</dd></dl>
+    <div class="inspector-section"><h3>摘要</h3><p>${escapeHtml(p.abstractText || "未找到公开摘要")}</p></div>
+    ${p.oneSentenceSummary ? `<div class="inspector-section"><h3>AI 摘要</h3><p>${escapeHtml(p.oneSentenceSummary)}</p></div>` : ""}
+    <div class="inspector-section"><h3>文献夹</h3><div class="inspector-checks">${collectionChecks || '<span class="muted small">暂无文献夹</span>'}</div><button class="ghost small" data-action="library-save-collections" data-paper-id="${p.id}">保存文献夹</button></div>
+    <div class="inspector-section"><h3>文献标签</h3><div class="inspector-checks">${tagChecks || '<span class="muted small">暂无文献标签</span>'}</div><button class="ghost small" data-action="library-save-tags" data-paper-id="${p.id}">保存标签</button></div>`;
+}
+
+async function openLibraryCapture(paperId: number) {
+  libraryCapturePaperId = paperId;
+  const membership = await invoke<LibraryMembership | null>("get_library_membership", { paperId });
+  const selectedCollections = new Set(membership?.collectionIds || []);
+  const selectedTags = new Set(membership?.tagIds || []);
+  $("library-capture-body").innerHTML = `<p class="muted small">可不选文献夹或标签，稍后也可以在 Inspector 中调整。</p>
+    <h4>文献夹 <button class="ghost small" data-action="library-capture-create-collection">＋ 新建</button></h4><div class="capture-options">${libraryCollections.map((c) => `<label class="check compact"><input type="checkbox" data-capture-collection-id="${c.id}" ${selectedCollections.has(c.id) ? "checked" : ""}/> ${escapeHtml(c.name)}</label>`).join("") || '<span class="muted small">暂无文献夹</span>'}</div>
+    <h4>文献标签 <button class="ghost small" data-action="library-capture-create-tag">＋ 新建</button></h4><div class="capture-options">${libraryTags.map((t) => `<label class="check compact"><input type="checkbox" data-capture-tag-id="${t.id}" ${selectedTags.has(t.id) ? "checked" : ""}/> ${escapeHtml(t.name)}</label>`).join("") || '<span class="muted small">暂无文献标签</span>'}</div>`;
+  $("library-capture-modal").classList.remove("hidden");
+}
+
+function closeLibraryCapture() {
+  libraryCapturePaperId = null;
+  $("library-capture-modal").classList.add("hidden");
+}
+
+async function submitLibraryCapture() {
+  if (libraryCapturePaperId == null) return;
+  const collectionIds = [...document.querySelectorAll<HTMLInputElement>("[data-capture-collection-id]:checked")].map((e) => Number(e.dataset.captureCollectionId));
+  const tagIds = [...document.querySelectorAll<HTMLInputElement>("[data-capture-tag-id]:checked")].map((e) => Number(e.dataset.captureTagId));
+  const paper = papers.find((p) => p.id === libraryCapturePaperId) || recPapers.find((p) => p.id === libraryCapturePaperId);
+  const context = (document.querySelector(`[data-paper-id="${libraryCapturePaperId}"]`) as HTMLElement | null)?.dataset.cardContext || "manual";
+  const addedSource = context.startsWith("today") ? "recommendation" : context.startsWith("history") ? "history" : context === "favorites" ? "read_later" : "manual";
+  await invoke("add_paper_to_library", { paperId: libraryCapturePaperId, collectionIds, tagIds, addedSource });
+  libraryPaperIds.add(libraryCapturePaperId);
+  if (paper) { paper.isFavorite = false; }
+  closeLibraryCapture();
+  setStatus("已收录到文献库", "done");
+  await Promise.all([loadPapers(), loadLibraryData(libraryView)]);
 }
 
 function renderBacklog() {
@@ -1601,10 +1768,17 @@ function switchView(name: string) {
 }
 
 function doSwitch(name: string) {
+  const isLibrary = name.startsWith("library-");
+  activeWorkspace = isLibrary ? "library" : "discovery";
+  document.querySelectorAll(".workspace-nav").forEach((nav) => nav.classList.toggle("hidden", (nav as HTMLElement).dataset.workspaceNav !== activeWorkspace));
+  document.querySelectorAll(".workspace-tab").forEach((tab) => tab.classList.toggle("active", (tab as HTMLElement).dataset.workspace === activeWorkspace));
   document.querySelectorAll(".nav-item").forEach((t) => t.classList.toggle("active", (t as HTMLElement).dataset.view === name));
-  document.querySelectorAll(".view").forEach((v) => v.classList.toggle("active", v.id === `view-${name}`));
+  // Recent/unfiled are views of the same three-column shell; only the data set changes.
+  const visualView = isLibrary ? "library-all" : name;
+  document.querySelectorAll(".view").forEach((v) => v.classList.toggle("active", v.id === `view-${visualView}`));
   const titles: Record<string, string> = {
-    recommend: "今日推荐", "recommend-history": "历史", papers: "所有论文", favorites: "收藏", journals: "期刊订阅", tags: "研究标签", settings: "设置", activity: "活动",
+    recommend: "今日", "recommend-history": "历史", papers: "所有论文", favorites: "稍后看", journals: "期刊", tags: "研究兴趣", settings: "设置", activity: "活动",
+    "library-all": "全部文献", "library-recent": "最近收录", "library-unfiled": "未分类",
   };
   $("view-title").textContent = titles[name] || name;
   // 进入活动页时渲染 master-detail（数据来自统一 activity + 批次查询）
@@ -1618,6 +1792,10 @@ function doSwitch(name: string) {
   }
   // 进入标签页时加载 Draft Editor
   if (name === "tags") loadTagEditor();
+  if (isLibrary) {
+    const view = name === "library-recent" ? "recent" : name === "library-unfiled" ? "unfiled" : "all";
+    loadLibraryData(view);
+  }
 }
 
 interface SyncStartResult {
@@ -2200,10 +2378,149 @@ async function setupListeners() {
 
   document.addEventListener("click", async (ev) => {
     const t = ev.target as HTMLElement;
+    const workspaceTab = t.closest("[data-workspace]") as HTMLElement | null;
+    if (workspaceTab) {
+      const workspace = workspaceTab.dataset.workspace as "discovery" | "library";
+      if (workspace === "library") {
+        libraryScope = null;
+        doSwitch("library-all");
+        await loadLibraryData("all");
+      } else {
+        doSwitch("recommend");
+      }
+      return;
+    }
     const nav = t.closest(".nav-item") as HTMLElement | null;
     if (nav) {
       switchView(nav.dataset.view!);
       return;
+    }
+    const addLibrary = t.closest("[data-action='add-library']") as HTMLElement | null;
+    if (addLibrary) {
+      try { await openLibraryCapture(parseInt(addLibrary.dataset.paperId!, 10)); }
+      catch (err) { setStatus(`打开收录面板失败：${String(err)}`, "error"); }
+      return;
+    }
+    if (t.closest("[data-action='open-library']")) {
+      const card = t.closest("[data-paper-id]") as HTMLElement | null;
+      libraryScope = null;
+      doSwitch("library-all");
+      await loadLibraryData("all");
+      if (card) {
+        selectedLibraryPaperId = parseInt(card.dataset.paperId!, 10);
+        renderLibrary();
+      }
+      return;
+    }
+    if (t.closest("[data-action='library-capture-create-collection']")) {
+      const name = await showPromptModal("新建文献夹", "名称");
+      if (!name || libraryCapturePaperId == null) return;
+      await invoke("create_library_collection", { name, parentId: null });
+      await loadLibraryData(libraryView);
+      await openLibraryCapture(libraryCapturePaperId);
+      return;
+    }
+    if (t.closest("[data-action='library-capture-create-tag']")) {
+      const name = await showPromptModal("新建文献标签", "名称");
+      if (!name || libraryCapturePaperId == null) return;
+      await invoke("create_library_tag", { name, color: null });
+      await loadLibraryData(libraryView);
+      await openLibraryCapture(libraryCapturePaperId);
+      return;
+    }
+    if (t.closest("[data-action='library-capture-cancel']")) { closeLibraryCapture(); return; }
+    if (t.closest("[data-action='library-capture-submit']")) {
+      try { await submitLibraryCapture(); } catch (err) { setStatus(`收录失败：${String(err)}`, "error"); }
+      return;
+    }
+    const librarySelect = t.closest("[data-action='library-select-paper']") as HTMLElement | null;
+    if (librarySelect) {
+      selectedLibraryPaperId = parseInt(librarySelect.dataset.paperId!, 10);
+      renderLibrary();
+      return;
+    }
+    const collectionFilter = t.closest("[data-action='library-filter-collection']") as HTMLElement | null;
+    if (collectionFilter) {
+      libraryScope = { kind: "collection", id: parseInt(collectionFilter.dataset.collectionId!, 10) };
+      if (libraryView !== "all") await loadLibraryData("all"); else renderLibrary();
+      return;
+    }
+    const renameCollection = t.closest("[data-action='library-rename-collection']") as HTMLElement | null;
+    if (renameCollection) {
+      const id = Number(renameCollection.dataset.collectionId);
+      const collection = libraryCollections.find((item) => item.id === id);
+      const name = await showPromptModal("重命名文献夹", "名称", collection?.name || "");
+      if (!name) return;
+      try {
+        await invoke("rename_library_collection", { id, name });
+        await loadLibraryData(libraryView);
+        setStatus("文献夹已重命名", "done");
+      } catch (err) {
+        setStatus(`重命名文献夹失败：${String(err)}`, "error");
+      }
+      return;
+    }
+    const deleteCollection = t.closest("[data-action='library-delete-collection']") as HTMLElement | null;
+    if (deleteCollection) {
+      const id = Number(deleteCollection.dataset.collectionId);
+      const collection = libraryCollections.find((item) => item.id === id);
+      const ok = await showConfirmModal({
+        title: "删除文献夹",
+        message: `删除「${collection?.name || "此文献夹"}」？只删除文献夹及其归类关系，不删除文献。`,
+        confirmText: "删除",
+        cancelText: "取消",
+      });
+      if (!ok) return;
+      try {
+        await invoke("delete_library_collection", { id });
+        if (libraryScope?.kind === "collection" && libraryScope.id === id) libraryScope = null;
+        await loadLibraryData(libraryView);
+        setStatus("文献夹已删除，文献仍保留", "done");
+      } catch (err) {
+        setStatus(`删除文献夹失败：${String(err)}`, "error");
+      }
+      return;
+    }
+    const tagFilter = t.closest("[data-action='library-filter-tag']") as HTMLElement | null;
+    if (tagFilter) {
+      libraryScope = { kind: "tag", id: parseInt(tagFilter.dataset.tagId!, 10) };
+      if (libraryView !== "all") await loadLibraryData("all"); else renderLibrary();
+      return;
+    }
+    if (t.closest("[data-action='library-refresh']")) { await loadLibraryData(libraryView); return; }
+    const libraryRemove = t.closest("[data-action='library-remove']") as HTMLElement | null;
+    if (libraryRemove) {
+      const ok = await showConfirmModal({ title: "移出文献库", message: "只移除文献库关系，不删除论文。", confirmText: "移出", cancelText: "取消" });
+      if (!ok) return;
+      await invoke("remove_paper_from_library", { paperId: parseInt(libraryRemove.dataset.paperId!, 10) });
+      selectedLibraryPaperId = null;
+      await Promise.all([loadPapers(), loadLibraryData(libraryView)]);
+      setStatus("已移出文献库", "done");
+      return;
+    }
+    const saveCollections = t.closest("[data-action='library-save-collections']") as HTMLElement | null;
+    if (saveCollections) {
+      const ids = [...document.querySelectorAll<HTMLInputElement>("#library-inspector [data-library-collection-id]:checked")].map((e) => Number(e.dataset.libraryCollectionId));
+      await invoke("set_paper_collections", { paperId: Number(saveCollections.dataset.paperId), collectionIds: ids });
+      await loadLibraryData(libraryView); setStatus("文献夹已更新", "done"); return;
+    }
+    const saveTags = t.closest("[data-action='library-save-tags']") as HTMLElement | null;
+    if (saveTags) {
+      const ids = [...document.querySelectorAll<HTMLInputElement>("#library-inspector [data-library-tag-id]:checked")].map((e) => Number(e.dataset.libraryTagId));
+      await invoke("set_paper_library_tags", { paperId: Number(saveTags.dataset.paperId), tagIds: ids });
+      await loadLibraryData(libraryView); setStatus("文献标签已更新", "done"); return;
+    }
+    if (t.closest("[data-action='library-create-collection']")) {
+      const name = await showPromptModal("新建文献夹", "名称");
+      if (!name) return;
+      await invoke("create_library_collection", { name, parentId: null });
+      await loadLibraryData(libraryView); return;
+    }
+    if (t.closest("[data-action='library-create-tag']")) {
+      const name = await showPromptModal("新建文献标签", "名称");
+      if (!name) return;
+      await invoke("create_library_tag", { name, color: null });
+      await loadLibraryData(libraryView); return;
     }
     const open = t.closest("[data-action='open']") as HTMLElement | null;
     if (open) {
@@ -2527,6 +2844,7 @@ async function setupListeners() {
 }
 
 window.addEventListener("DOMContentLoaded", () => {
+  $("btn-settings-global").addEventListener("click", () => switchView("settings"));
   $("add-form").addEventListener("submit", addJournalHandler);
   $("btn-refresh").addEventListener("click", loadPapers);
   $("journal-filter").addEventListener("change", renderPapers);
@@ -2570,6 +2888,7 @@ window.addEventListener("DOMContentLoaded", () => {
     await setupListeners();
     await Promise.all([loadJournals(), loadSettings(), loadCurrentVersion()]);
     await loadPapers();
+    await loadLibraryData("all");
     // 统一工作状态刷新（Work Center / 积压 / 待处理区 / 计数）
     await refreshWorkState();
     // 每日推荐：启动时前滚周期并填充当前推荐（Rust 侧已 ensure；此处同步 UI）
