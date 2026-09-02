@@ -49,7 +49,7 @@ jobs:
           releaseDraft: true
           prerelease: false
           args: --target aarch64-apple-darwin
-          uploadUpdaterJson: true
+          includeUpdaterJson: true
 
   windows-x64:
     needs: macos-arm64
@@ -90,7 +90,7 @@ jobs:
           prerelease: false
           args: --config src-tauri/tauri.windows.conf.json --target x86_64-pc-windows-msvc
           updaterJsonPreferNsis: true
-          uploadUpdaterJson: true
+          includeUpdaterJson: true
 
   publish-release:
     needs:

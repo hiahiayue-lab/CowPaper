@@ -38,7 +38,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "ZFc1MGNuVnpkR1ZrSUdOdmJXMWxiblE2SUcxcGJtbHphV2R1SUhCMVlteHBZeUJyWlhrNklFRTVORE0wTmprek9VSkZSVVUxTXpRS1VsZFJNRFZsTm1Kck1GcEVjVkZJVUhoTEwweFdORkZ1ZW1wVFVrRTBOMU5KU3pZMWQzZHlkR3hXTUhRNU1WYzVObXhDT0RacFJXZ0s=",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEE5NDM0NjkzOUJFRUU1MzQKUldRMDVlNmJrMFpEcVFIUHhLL0xWNFFuempTUkE0N1NJSzY1d3dydGxWMHQ5MVc5NmxCODZpRWgK",
       "endpoints": [
         "https://github.com/hiahiayue-lab/CowPaper/releases/latest/download/latest.json"
       ],
