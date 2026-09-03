@@ -4980,6 +4980,8 @@ fn test_r7_existing_upsert_fills_kind_when_unknown() {
     db::upsert_paper(&conn, jid, &cand_raw("10.1000/r7-fill", "First Pass", None, Some(raw3))).unwrap();
     let p = db::get_paper(&conn, id).unwrap().unwrap();
     assert_eq!(p.content_kind, "news", "已分类结果（news）不得被 editorial 覆盖，因为 fill 只补 unknown");
+}
+
 #[test]
 fn test_library_migration_v13_to_v14_preserves_existing_data() {
     let conn = mem_db();
