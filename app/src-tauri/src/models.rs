@@ -432,6 +432,60 @@ pub struct LibraryMembership {
     pub tag_ids: Vec<i64>,
 }
 
+/// A linked or managed file relation owned by CowPaper.  v15 only creates
+/// `linked` rows; `managed` is retained as a schema-compatible enum value for
+/// a future file-copy implementation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaperAttachment {
+    pub id: i64,
+    pub paper_id: i64,
+    pub kind: String,
+    pub storage_mode: String,
+    pub absolute_path: String,
+    pub relative_path: Option<String>,
+    pub url: Option<String>,
+    pub filename: String,
+    pub mime_type: String,
+    pub sha256: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    /// Computed at read time. Missing files retain their attachment row.
+    pub missing: bool,
+}
+
+/// Library-only personal metadata.  These values never overwrite the
+/// canonical fields on `papers`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryItemMetadata {
+    pub paper_id: i64,
+    pub title_override: Option<String>,
+    pub chinese_title_override: Option<String>,
+    pub source_override: Option<String>,
+    pub year_override: Option<i32>,
+    pub authors_override: Option<Vec<Author>>,
+    pub abstract_override: Option<String>,
+    pub chinese_abstract_override: Option<String>,
+    pub note: Option<String>,
+    pub updated_at: String,
+}
+
+/// Full replacement input for a Library metadata row. `None` clears an
+/// override (or note), so reset-to-canonical is explicit and deterministic.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryItemMetadataInput {
+    pub title_override: Option<String>,
+    pub chinese_title_override: Option<String>,
+    pub source_override: Option<String>,
+    pub year_override: Option<i32>,
+    pub authors_override: Option<Vec<Author>>,
+    pub abstract_override: Option<String>,
+    pub chinese_abstract_override: Option<String>,
+    pub note: Option<String>,
+}
+
 /// Library list row: the canonical Paper plus library-only membership data.
 /// No second paper entity is introduced.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -442,6 +496,54 @@ pub struct LibraryPaper {
     pub added_source: String,
     pub collections: Vec<LibraryCollection>,
     pub tags: Vec<LibraryTag>,
+    pub metadata: Option<LibraryItemMetadata>,
+    pub effective_title: Option<String>,
+    pub effective_chinese_title: Option<String>,
+    pub effective_source: Option<String>,
+    pub effective_year: Option<i32>,
+    pub effective_authors: Vec<Author>,
+    pub effective_abstract: Option<String>,
+    pub effective_chinese_abstract: Option<String>,
+    pub note: Option<String>,
+    pub attachments: Vec<PaperAttachment>,
+}
+
+/// Metadata discovered from a local PDF without making any network or AI
+/// calls. It is returned with an import result so the UI can request manual
+/// confirmation when identity is not exact.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalPdfMetadata {
+    pub filename: String,
+    pub title: Option<String>,
+    pub authors: Vec<Author>,
+    pub year: Option<i32>,
+    pub doi: Option<String>,
+    pub scholarly_id: Option<String>,
+    pub abstract_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalPdfCandidate {
+    pub paper_id: i64,
+    pub title: Option<String>,
+    pub authors: Vec<Author>,
+    pub year: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalPdfImportResult {
+    /// `existingDoi`, `existingScholarlyId`, `needsManualConfirmation`, or
+    /// `createdExternalPaper`.
+    pub outcome: String,
+    pub paper_id: Option<i64>,
+    pub attachment: Option<PaperAttachment>,
+    pub metadata: ExternalPdfMetadata,
+    pub candidate: Option<ExternalPdfCandidate>,
+    pub candidates: Vec<ExternalPdfCandidate>,
+    pub requires_confirmation: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

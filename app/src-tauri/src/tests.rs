@@ -66,6 +66,16 @@ fn title_response_sequence_server(responses: Vec<(&str, &str)>) -> (String, Arc<
     (format!("http://{address}/chat/completions"), requests)
 }
 
+fn test_pdf_path(label: &str, body: &str) -> std::path::PathBuf {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("cowpaper-{label}-{}-{stamp}.pdf", std::process::id()));
+    std::fs::write(&path, body.as_bytes()).unwrap();
+    path
+}
+
 #[test]
 fn test_normalize_doi() {
     assert_eq!(
@@ -2069,7 +2079,7 @@ fn test_migration_v2_to_v3_preserves_data() {
 
     // 迁移到 v3
     db::init(&conn).unwrap();
-    assert_eq!(db::SCHEMA_VERSION, 14);
+    assert_eq!(db::SCHEMA_VERSION, 15);
 
     // 8) 旧 issn 迁移进 journal_identifiers（类型按列，不猜）
     let ids = db::list_journal_identifiers(&conn, jid).unwrap();
@@ -2110,7 +2120,7 @@ fn test_database_restart_persistence() {
     {
         let conn = db::open(&path).unwrap();
         db::init(&conn).unwrap(); // 幂等：user_version=3 不重复迁移
-        assert_eq!(db::SCHEMA_VERSION, 14);
+        assert_eq!(db::SCHEMA_VERSION, 15);
         let j = db::get_journal(&conn, 1).unwrap().expect("期刊持久化");
         assert_eq!(j.print_issn.as_deref(), Some("0025-1909"));
         assert_eq!(j.identifiers.len(), 1);
@@ -2737,7 +2747,7 @@ fn test_migration_v4_abstract_quality_init() {
     .unwrap();
 
     db::init(&conn).unwrap();
-    assert_eq!(db::SCHEMA_VERSION, 14);
+    assert_eq!(db::SCHEMA_VERSION, 15);
 
     let papers = db::list_papers(&conn, Some(jid), 100).unwrap();
     assert_eq!(papers.len(), 3, "迁移不得丢论文");
@@ -3429,7 +3439,7 @@ fn test_updater_config_requires_signed_cross_platform_artifacts() {
     assert_eq!(endpoints.len(), 1);
     assert!(endpoints[0].as_str().unwrap().starts_with("https://github.com/"));
     assert!(endpoints[0].as_str().unwrap().ends_with("/latest/download/latest.json"));
-    assert_eq!(db::SCHEMA_VERSION, 14, "updater must not claim migration ownership");
+    assert_eq!(db::SCHEMA_VERSION, 15, "updater must not claim migration ownership");
 }
 
 #[test]
@@ -4983,7 +4993,7 @@ fn test_r7_existing_upsert_fills_kind_when_unknown() {
 }
 
 #[test]
-fn test_library_migration_v13_to_v14_preserves_existing_data() {
+fn test_library_migration_v13_to_v15_preserves_existing_data() {
     let conn = mem_db();
     // Turn a fully initialized in-memory database into a representative v13
     // database by removing only the Library tables created by the test setup.
@@ -4993,6 +5003,8 @@ fn test_library_migration_v13_to_v14_preserves_existing_data() {
         "library_items",
         "library_tags",
         "library_collections",
+        "paper_attachments",
+        "library_item_metadata",
     ] {
         conn.execute(&format!("DROP TABLE {}", table), []).unwrap();
     }
@@ -5025,7 +5037,7 @@ fn test_library_migration_v13_to_v14_preserves_existing_data() {
 
     db::init(&conn).unwrap();
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-    assert_eq!(version, 14);
+    assert_eq!(version, 15);
     let paper = db::get_paper(&conn, pid).unwrap().unwrap();
     assert_eq!(paper.abstract_text.as_deref(), Some("preserved abstract"));
     assert_eq!(paper.chinese_title.as_deref(), Some("保留中文标题"));
@@ -5039,13 +5051,15 @@ fn test_library_migration_v13_to_v14_preserves_existing_data() {
 
     db::init(&conn).unwrap();
     let version_again: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-    assert_eq!(version_again, 14);
+    assert_eq!(version_again, 15);
     for table in [
         "library_items",
         "library_collections",
         "library_collection_items",
         "library_tags",
         "library_item_tags",
+        "paper_attachments",
+        "library_item_metadata",
     ] {
         let exists: bool = conn
             .query_row(
@@ -5055,6 +5069,26 @@ fn test_library_migration_v13_to_v14_preserves_existing_data() {
             )
             .unwrap();
         assert!(exists, "缺少 Library 表 {table}");
+    }
+}
+
+#[test]
+fn test_migration_v14_to_v15_creates_attachment_and_metadata_tables() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "v14 Journal", Some("0025-1909"), None, None, None).unwrap();
+    let pid = match db::upsert_paper(&conn, jid, &candidate(Some("10.1000/v14-v15"), "v14 Paper", None, None)).unwrap() {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new paper"),
+    };
+    db::add_paper_to_library(&conn, pid, &[], &[], "manual").unwrap();
+    conn.execute("DROP TABLE library_item_metadata", []).unwrap();
+    conn.execute("DROP TABLE paper_attachments", []).unwrap();
+    conn.pragma_update(None, "user_version", 14).unwrap();
+    db::init(&conn).unwrap();
+    assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 15);
+    assert!(db::get_library_membership(&conn, pid).unwrap().is_some(), "v15 不得破坏 v14 Library membership");
+    for table in ["paper_attachments", "library_item_metadata"] {
+        assert!(conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)", params![table], |r| r.get::<_, bool>(0)).unwrap());
     }
 }
 
@@ -5069,6 +5103,8 @@ fn test_library_migration_is_empty_and_idempotent() {
         "library_collection_items",
         "library_tags",
         "library_item_tags",
+        "paper_attachments",
+        "library_item_metadata",
     ] {
         let exists: bool = conn
             .query_row(
@@ -5209,4 +5245,160 @@ fn test_library_tag_rename_delete_preserves_paper_and_recommendation_fields() {
         )
         .unwrap();
     assert_eq!(recommendation_after, recommendation_before, "Library Tag 管理不得改变推荐分析字段");
+}
+
+#[test]
+fn test_v15_linked_attachment_detach_missing_and_relink() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "Attachment J", Some("0025-1909"), None, None, None).unwrap();
+    let pid = match db::upsert_paper(&conn, jid, &candidate(Some("10.1000/attachment"), "Attachment Paper", Some("abstract"), Some("crossref"))).unwrap() {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new paper"),
+    };
+    let first = test_pdf_path("attachment-a", "%PDF-1.7\n/Title (A)\n");
+    let second = test_pdf_path("attachment-b", "%PDF-1.7\n/Title (B)\n");
+    let attachment = db::attach_pdf_to_paper(&conn, pid, first.to_str().unwrap()).unwrap();
+    assert_eq!(attachment.storage_mode, "linked");
+    assert!(!attachment.missing);
+    assert!(attachment.sha256.as_ref().is_some_and(|value| value.len() == 64));
+    assert!(first.exists());
+
+    std::fs::remove_file(&first).unwrap();
+    assert!(db::list_paper_attachments(&conn, pid).unwrap()[0].missing, "missing 只影响读取状态，不删除关系");
+    let relinked = db::relink_pdf(&conn, attachment.id, second.to_str().unwrap()).unwrap();
+    assert!(!relinked.missing);
+    assert!(second.exists());
+    assert!(db::detach_pdf(&conn, attachment.id).unwrap());
+    assert!(second.exists(), "detach 不得删除用户 PDF");
+    assert!(db::list_paper_attachments(&conn, pid).unwrap().is_empty());
+    let _ = std::fs::remove_file(second);
+}
+
+#[test]
+fn test_discovery_attach_pdf_adds_library_and_clears_read_later_atomically() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "Discovery J", Some("0025-1909"), None, None, None).unwrap();
+    let pid = match db::upsert_paper(&conn, jid, &candidate(Some("10.1000/discovery-attach"), "Discovery Paper", None, None)).unwrap() {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new paper"),
+    };
+    db::set_paper_flag(&conn, pid, "favorite", true).unwrap();
+    let path = test_pdf_path("discovery", "%PDF-1.7\n/Title (Discovery)\n");
+    let attachment = db::attach_discovery_pdf(&conn, pid, path.to_str().unwrap()).unwrap();
+    assert_eq!(attachment.paper_id, pid);
+    let membership = db::get_library_membership(&conn, pid).unwrap().unwrap();
+    assert_eq!(membership.added_source, "discovery_attach_pdf");
+    assert!(!db::get_paper(&conn, pid).unwrap().unwrap().is_favorite);
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM library_items WHERE paper_id=?1", params![pid], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn test_external_pdf_doi_import_does_not_duplicate_canonical_paper() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "Existing J", Some("0025-1909"), None, None, None).unwrap();
+    let pid = match db::upsert_paper(&conn, jid, &candidate(Some("10.1000/exact-pdf"), "Existing Paper", Some("real abstract"), Some("crossref"))).unwrap() {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new paper"),
+    };
+    let path = test_pdf_path(
+        "doi-import",
+        "%PDF-1.7\n1 0 obj << /Title (Imported Filename) /Author (PDF Author) /CreationDate (D:2024) /DOI (10.1000/exact-pdf) >>\n",
+    );
+    let result = db::import_external_pdf(&conn, path.to_str().unwrap(), None).unwrap();
+    assert_eq!(result.outcome, "existingDoi");
+    assert_eq!(result.paper_id, Some(pid));
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM papers", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    assert!(db::get_library_membership(&conn, pid).unwrap().is_some());
+    assert_eq!(db::list_paper_attachments(&conn, pid).unwrap().len(), 1);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn test_external_pdf_without_identity_creates_canonical_paper_and_never_generates_abstract() {
+    let conn = mem_db();
+    let path = test_pdf_path(
+        "new-external",
+        "%PDF-1.7\n1 0 obj << /Title (A New External Paper) /Author (New Author) /CreationDate (D:2023) >>\n",
+    );
+    let result = db::import_external_pdf(&conn, path.to_str().unwrap(), None).unwrap();
+    assert_eq!(result.outcome, "createdExternalPaper");
+    let pid = result.paper_id.unwrap();
+    let paper = db::get_paper(&conn, pid).unwrap().unwrap();
+    assert_eq!(paper.title.as_deref(), Some("A New External Paper"));
+    assert_eq!(paper.year, Some(2023));
+    assert!(paper.abstract_text.is_none(), "title 不得生成 abstract");
+    assert!(db::get_library_membership(&conn, pid).unwrap().is_some());
+    assert!(db::list_paper_attachments(&conn, pid).unwrap()[0].absolute_path.contains("new-external"));
+    for table in ["library_papers", "external_library_papers"] {
+        assert!(!conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)", params![table], |r| r.get::<_, bool>(0)).unwrap(), "禁止第二 Paper 表 {table}");
+    }
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn test_external_pdf_title_author_year_is_manual_candidate_only() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "Candidate J", Some("0025-1909"), None, None, None).unwrap();
+    let mut existing = candidate(None, "Candidate Paper", None, None);
+    existing.authors = vec![Author { given: None, family: None, name: Some("Alice Smith".into()) }];
+    let pid = match db::upsert_paper(&conn, jid, &existing).unwrap() {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new paper"),
+    };
+    let path = test_pdf_path(
+        "candidate",
+        "%PDF-1.7\n1 0 obj << /Title (Candidate Paper) /Author (Alice Smith) /CreationDate (D:2025) >>\n",
+    );
+    let pending = db::import_external_pdf(&conn, path.to_str().unwrap(), None).unwrap();
+    assert_eq!(pending.outcome, "needsManualConfirmation");
+    assert!(pending.requires_confirmation);
+    assert_eq!(pending.candidate.unwrap().paper_id, pid);
+    assert!(db::get_library_membership(&conn, pid).unwrap().is_none());
+    let confirmed = db::import_external_pdf(&conn, path.to_str().unwrap(), Some(pid)).unwrap();
+    assert_eq!(confirmed.outcome, "manualConfirmation");
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM papers", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    assert!(db::get_library_membership(&conn, pid).unwrap().is_some());
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn test_library_metadata_overrides_effective_values_without_mutating_canonical_paper() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "Canonical Journal", Some("0025-1909"), None, None, None).unwrap();
+    let pid = match db::upsert_paper(&conn, jid, &candidate(Some("10.1000/metadata"), "Canonical Title", Some("Canonical Abstract"), Some("crossref"))).unwrap() {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new paper"),
+    };
+    db::add_paper_to_library(&conn, pid, &[], &[], "manual").unwrap();
+    let input = crate::models::LibraryItemMetadataInput {
+        title_override: Some("Personal Title".into()),
+        chinese_title_override: Some("个人标题".into()),
+        source_override: Some("Personal Source".into()),
+        year_override: Some(2020),
+        authors_override: Some(vec![Author { given: None, family: None, name: Some("Personal Author".into()) }]),
+        abstract_override: Some("Personal Abstract".into()),
+        chinese_abstract_override: Some("个人摘要".into()),
+        note: Some("Keep for review".into()),
+    };
+    let metadata = db::set_library_item_metadata(&conn, pid, &input).unwrap();
+    assert_eq!(metadata.note.as_deref(), Some("Keep for review"));
+    let item = db::get_library_paper(&conn, pid).unwrap().unwrap();
+    assert_eq!(item.effective_title.as_deref(), Some("Personal Title"));
+    assert_eq!(item.effective_source.as_deref(), Some("Personal Source"));
+    assert_eq!(item.effective_year, Some(2020));
+    assert_eq!(item.effective_abstract.as_deref(), Some("Personal Abstract"));
+    assert_eq!(item.note.as_deref(), Some("Keep for review"));
+    let canonical = db::get_paper(&conn, pid).unwrap().unwrap();
+    assert_eq!(canonical.title.as_deref(), Some("Canonical Title"));
+    assert_eq!(canonical.year, Some(2025));
+    assert_eq!(canonical.abstract_text.as_deref(), Some("Canonical Abstract"));
+
+    db::set_library_item_note(&conn, pid, Some("Updated note")).unwrap();
+    assert_eq!(db::get_library_item_metadata(&conn, pid).unwrap().unwrap().note.as_deref(), Some("Updated note"));
+    db::clear_library_item_overrides(&conn, pid).unwrap();
+    let reset = db::get_library_paper(&conn, pid).unwrap().unwrap();
+    assert_eq!(reset.effective_title.as_deref(), Some("Canonical Title"));
+    assert_eq!(reset.effective_abstract.as_deref(), Some("Canonical Abstract"));
+    assert_eq!(reset.note.as_deref(), Some("Updated note"), "reset override 不得清除 note");
 }

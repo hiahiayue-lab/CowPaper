@@ -1028,6 +1028,129 @@ fn delete_library_tag(id: i64, state: State<Db>) -> Result<bool, String> {
 }
 
 #[tauri::command]
+fn get_library_item_metadata(
+    paper_id: i64,
+    state: State<Db>,
+) -> Result<Option<models::LibraryItemMetadata>, String> {
+    let conn = state.inner().lock().unwrap();
+    db::get_library_item_metadata(&conn, paper_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_library_item_metadata(
+    paper_id: i64,
+    metadata: models::LibraryItemMetadataInput,
+    state: State<Db>,
+) -> Result<models::LibraryItemMetadata, String> {
+    let conn = state.inner().lock().unwrap();
+    db::set_library_item_metadata(&conn, paper_id, &metadata).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn update_library_item_metadata(
+    paper_id: i64,
+    metadata: models::LibraryItemMetadataInput,
+    state: State<Db>,
+) -> Result<models::LibraryItemMetadata, String> {
+    set_library_item_metadata(paper_id, metadata, state)
+}
+
+#[tauri::command]
+fn set_library_item_note(
+    paper_id: i64,
+    note: Option<String>,
+    state: State<Db>,
+) -> Result<models::LibraryItemMetadata, String> {
+    let conn = state.inner().lock().unwrap();
+    db::set_library_item_note(&conn, paper_id, note.as_deref()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn clear_library_item_overrides(
+    paper_id: i64,
+    state: State<Db>,
+) -> Result<Option<models::LibraryItemMetadata>, String> {
+    let conn = state.inner().lock().unwrap();
+    db::clear_library_item_overrides(&conn, paper_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn list_paper_attachments(
+    paper_id: i64,
+    state: State<Db>,
+) -> Result<Vec<models::PaperAttachment>, String> {
+    let conn = state.inner().lock().unwrap();
+    db::list_paper_attachments(&conn, paper_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn attach_pdf(
+    paper_id: i64,
+    path: String,
+    state: State<Db>,
+) -> Result<models::PaperAttachment, String> {
+    let conn = state.inner().lock().unwrap();
+    db::attach_pdf_to_paper(&conn, paper_id, &path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn attach_discovery_pdf(
+    paper_id: i64,
+    path: String,
+    state: State<Db>,
+) -> Result<models::PaperAttachment, String> {
+    let conn = state.inner().lock().unwrap();
+    db::attach_discovery_pdf(&conn, paper_id, &path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn detach_pdf(
+    attachment_id: i64,
+    state: State<Db>,
+) -> Result<bool, String> {
+    let conn = state.inner().lock().unwrap();
+    db::detach_pdf(&conn, attachment_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn relink_pdf(
+    attachment_id: i64,
+    path: String,
+    state: State<Db>,
+) -> Result<models::PaperAttachment, String> {
+    let conn = state.inner().lock().unwrap();
+    db::relink_pdf(&conn, attachment_id, &path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn open_pdf(
+    attachment_id: i64,
+    state: State<Db>,
+) -> Result<(), String> {
+    let conn = state.inner().lock().unwrap();
+    db::open_pdf(&conn, attachment_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn reveal_pdf(
+    attachment_id: i64,
+    state: State<Db>,
+) -> Result<(), String> {
+    let conn = state.inner().lock().unwrap();
+    db::reveal_pdf(&conn, attachment_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn import_pdf(
+    path: String,
+    confirmed_paper_id: Option<i64>,
+    state: State<Db>,
+) -> Result<models::ExternalPdfImportResult, String> {
+    let conn = state.inner().lock().unwrap();
+    db::import_external_pdf(&conn, &path, confirmed_paper_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn list_today_missing_papers(state: State<Db>) -> Result<Vec<models::Paper>, String> {
     let c = state.inner().lock().unwrap();
     db::list_current_missing_papers_for_cycle(&c, &chrono::Local::now().format("%Y-%m-%d").to_string()).map_err(|e| e.to_string())
@@ -1892,6 +2015,19 @@ pub fn run() {
             create_library_tag,
             rename_library_tag,
             delete_library_tag,
+            get_library_item_metadata,
+            set_library_item_metadata,
+            update_library_item_metadata,
+            set_library_item_note,
+            clear_library_item_overrides,
+            list_paper_attachments,
+            attach_pdf,
+            attach_discovery_pdf,
+            detach_pdf,
+            relink_pdf,
+            open_pdf,
+            reveal_pdf,
+            import_pdf,
             list_today_missing_papers,
             list_daily_paper_summaries,
             list_daily_papers,

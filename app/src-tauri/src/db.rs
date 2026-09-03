@@ -1,5 +1,9 @@
 use rusqlite::{params, Connection, OptionalExtension, Result};
-use std::path::Path;
+use sha2::{Digest, Sha256};
+use std::fs::File;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use crate::models::{
     AnalysisBatch, AnalysisBatchItem, Author, Journal, Paper, PaperCandidate,
@@ -87,10 +91,10 @@ pub fn open(path: &Path) -> Result<Connection> {
 
 /// 当前 schema 版本（Round 5B：abstract_quality / paper_abstract_sources 为 v4；
 /// Round 7 Phase 1：content_kind / abstract_status 为 v13；
-/// Literature Workspace 为 v14）。
+/// Literature Workspace 为 v14；v15 为 Library Attachments + User Metadata。
 /// 生产构建中仅由迁移系统隐式使用；测试中直接断言。
 #[allow(dead_code)]
-pub const SCHEMA_VERSION: i64 = 14;
+pub const SCHEMA_VERSION: i64 = 15;
 
 pub fn init(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
@@ -1368,12 +1372,796 @@ fn library_metadata(
 
 fn library_paper(conn: &Connection, paper: Paper) -> Result<crate::models::LibraryPaper> {
     let (added_at, added_source, collections, tags) = library_metadata(conn, paper.id)?;
+    let metadata = get_library_item_metadata(conn, paper.id)?;
+    let effective_title = metadata.as_ref().and_then(|m| m.title_override.clone()).or_else(|| paper.title.clone());
+    let effective_chinese_title = metadata
+        .as_ref()
+        .and_then(|m| m.chinese_title_override.clone())
+        .or_else(|| paper.chinese_title.clone());
+    let effective_source = metadata
+        .as_ref()
+        .and_then(|m| m.source_override.clone())
+        .or_else(|| paper.journal_name.clone());
+    let effective_year = metadata.as_ref().and_then(|m| m.year_override).or(paper.year);
+    let effective_authors = metadata
+        .as_ref()
+        .and_then(|m| m.authors_override.clone())
+        .unwrap_or_else(|| paper.authors.clone());
+    let effective_abstract = metadata
+        .as_ref()
+        .and_then(|m| m.abstract_override.clone())
+        .or_else(|| paper.abstract_text.clone());
+    let effective_chinese_abstract = metadata
+        .as_ref()
+        .and_then(|m| m.chinese_abstract_override.clone())
+        .or_else(|| paper.chinese_abstract.clone());
+    let note = metadata.as_ref().and_then(|m| m.note.clone());
+    let attachments = list_paper_attachments(conn, paper.id)?;
     Ok(crate::models::LibraryPaper {
         paper,
         added_at,
         added_source,
         collections,
         tags,
+        metadata,
+        effective_title,
+        effective_chinese_title,
+        effective_source,
+        effective_year,
+        effective_authors,
+        effective_abstract,
+        effective_chinese_abstract,
+        note,
+        attachments,
+    })
+}
+
+fn clean_optional_text(value: Option<&str>) -> Option<String> {
+    value.map(str::trim).filter(|value| !value.is_empty()).map(str::to_string)
+}
+
+fn library_item_metadata_from_row(row: &rusqlite::Row) -> Result<crate::models::LibraryItemMetadata> {
+    let authors_override = row
+        .get::<_, Option<String>>("authors_override")?
+        .and_then(|value| serde_json::from_str::<Vec<crate::models::Author>>(&value).ok());
+    Ok(crate::models::LibraryItemMetadata {
+        paper_id: row.get("paper_id")?,
+        title_override: row.get("title_override")?,
+        chinese_title_override: row.get("chinese_title_override")?,
+        source_override: row.get("source_override")?,
+        year_override: row.get("year_override")?,
+        authors_override,
+        abstract_override: row.get("abstract_override")?,
+        chinese_abstract_override: row.get("chinese_abstract_override")?,
+        note: row.get("note")?,
+        updated_at: row.get("updated_at")?,
+    })
+}
+
+/// Read the optional Library metadata row. A missing row means all fields use
+/// canonical Paper values; callers should not materialize an empty row merely
+/// to display a Library item.
+pub fn get_library_item_metadata(
+    conn: &Connection,
+    paper_id: i64,
+) -> Result<Option<crate::models::LibraryItemMetadata>> {
+    conn.query_row(
+        "SELECT * FROM library_item_metadata WHERE paper_id = ?1",
+        params![paper_id],
+        library_item_metadata_from_row,
+    )
+    .optional()
+}
+
+/// Replace the Library-only metadata layer. `None` clears an override and
+/// therefore restores the canonical value without mutating `papers`.
+pub fn set_library_item_metadata(
+    conn: &Connection,
+    paper_id: i64,
+    input: &crate::models::LibraryItemMetadataInput,
+) -> Result<crate::models::LibraryItemMetadata> {
+    let tx = conn.unchecked_transaction()?;
+    if !library_item_exists(&tx, paper_id)? {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    let authors_json = input
+        .authors_override
+        .as_ref()
+        .map(|authors| serde_json::to_string(authors).unwrap_or_else(|_| "[]".to_string()));
+    let now = now_utc();
+    tx.execute(
+        "INSERT INTO library_item_metadata (
+            paper_id, title_override, chinese_title_override, source_override,
+            year_override, authors_override, abstract_override,
+            chinese_abstract_override, note, updated_at
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+         ON CONFLICT(paper_id) DO UPDATE SET
+            title_override=excluded.title_override,
+            chinese_title_override=excluded.chinese_title_override,
+            source_override=excluded.source_override,
+            year_override=excluded.year_override,
+            authors_override=excluded.authors_override,
+            abstract_override=excluded.abstract_override,
+            chinese_abstract_override=excluded.chinese_abstract_override,
+            note=excluded.note,
+            updated_at=excluded.updated_at",
+        params![
+            paper_id,
+            clean_optional_text(input.title_override.as_deref()),
+            clean_optional_text(input.chinese_title_override.as_deref()),
+            clean_optional_text(input.source_override.as_deref()),
+            input.year_override,
+            authors_json,
+            clean_optional_text(input.abstract_override.as_deref()),
+            clean_optional_text(input.chinese_abstract_override.as_deref()),
+            clean_optional_text(input.note.as_deref()),
+            now,
+        ],
+    )?;
+    tx.commit()?;
+    get_library_item_metadata(conn, paper_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
+}
+
+/// Update only the personal note while retaining all other overrides.
+pub fn set_library_item_note(
+    conn: &Connection,
+    paper_id: i64,
+    note: Option<&str>,
+) -> Result<crate::models::LibraryItemMetadata> {
+    let tx = conn.unchecked_transaction()?;
+    if !library_item_exists(&tx, paper_id)? {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    tx.execute(
+        "INSERT INTO library_item_metadata (paper_id, note, updated_at)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(paper_id) DO UPDATE SET note=excluded.note, updated_at=excluded.updated_at",
+        params![paper_id, clean_optional_text(note), now_utc()],
+    )?;
+    tx.commit()?;
+    get_library_item_metadata(conn, paper_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
+}
+
+/// Reset all editable metadata fields while preserving the personal note.
+pub fn clear_library_item_overrides(
+    conn: &Connection,
+    paper_id: i64,
+) -> Result<Option<crate::models::LibraryItemMetadata>> {
+    if !library_item_exists(conn, paper_id)? {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    conn.execute(
+        "UPDATE library_item_metadata SET
+            title_override=NULL, chinese_title_override=NULL, source_override=NULL,
+            year_override=NULL, authors_override=NULL, abstract_override=NULL,
+            chinese_abstract_override=NULL, updated_at=?1 WHERE paper_id=?2",
+        params![now_utc(), paper_id],
+    )?;
+    get_library_item_metadata(conn, paper_id)
+}
+
+struct LinkedFile {
+    absolute_path: PathBuf,
+    filename: String,
+    sha256: String,
+    metadata: crate::models::ExternalPdfMetadata,
+}
+
+fn resolve_linked_pdf_path(input: &str) -> Result<PathBuf> {
+    let raw = input.trim();
+    if raw.is_empty() {
+        return Err(rusqlite::Error::InvalidParameterName("path".into()));
+    }
+    let path = PathBuf::from(raw);
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?
+            .join(path)
+    };
+    if !absolute.is_file() {
+        return Err(rusqlite::Error::InvalidParameterName("path".into()));
+    }
+    std::fs::canonicalize(absolute).map_err(|_| rusqlite::Error::InvalidParameterName("path".into()))
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = File::open(path).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|_| rusqlite::Error::InvalidQuery)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn is_pdf_file(path: &Path) -> Result<bool> {
+    if path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("pdf")) {
+        return Ok(true);
+    }
+    let mut file = File::open(path).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let mut header = [0_u8; 5];
+    let count = file.read(&mut header).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    Ok(count == 5 && &header == b"%PDF-")
+}
+
+fn linked_file(input: &str) -> Result<LinkedFile> {
+    let absolute_path = resolve_linked_pdf_path(input)?;
+    if !is_pdf_file(&absolute_path)? {
+        return Err(rusqlite::Error::InvalidParameterName("pdf_path".into()));
+    }
+    let filename = absolute_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("document.pdf")
+        .to_string();
+    let metadata = parse_external_pdf_metadata(&absolute_path, &filename)?;
+    let sha256 = sha256_file(&absolute_path)?;
+    Ok(LinkedFile { absolute_path, filename, sha256, metadata })
+}
+
+fn paper_attachment_from_row(row: &rusqlite::Row) -> Result<crate::models::PaperAttachment> {
+    let absolute_path: String = row.get("absolute_path")?;
+    Ok(crate::models::PaperAttachment {
+        id: row.get("id")?,
+        paper_id: row.get("paper_id")?,
+        kind: row.get("kind")?,
+        storage_mode: row.get("storage_mode")?,
+        missing: !Path::new(&absolute_path).is_file(),
+        absolute_path,
+        relative_path: row.get("relative_path")?,
+        url: row.get("url")?,
+        filename: row.get("filename")?,
+        mime_type: row.get("mime_type")?,
+        sha256: row.get("sha256")?,
+        created_at: row.get("created_at")?,
+        updated_at: row.get("updated_at")?,
+    })
+}
+
+pub fn get_paper_attachment(conn: &Connection, attachment_id: i64) -> Result<Option<crate::models::PaperAttachment>> {
+    conn.query_row(
+        "SELECT * FROM paper_attachments WHERE id=?1",
+        params![attachment_id],
+        paper_attachment_from_row,
+    )
+    .optional()
+}
+
+pub fn list_paper_attachments(conn: &Connection, paper_id: i64) -> Result<Vec<crate::models::PaperAttachment>> {
+    let mut stmt = conn.prepare(
+        "SELECT * FROM paper_attachments WHERE paper_id=?1 ORDER BY created_at DESC, id DESC",
+    )?;
+    let rows = stmt.query_map(params![paper_id], paper_attachment_from_row)?;
+    rows.collect()
+}
+
+fn insert_linked_attachment(
+    conn: &Connection,
+    paper_id: i64,
+    file: &LinkedFile,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO paper_attachments (
+            paper_id, kind, storage_mode, absolute_path, relative_path, url,
+            filename, mime_type, sha256, created_at, updated_at
+         ) VALUES (?1,'pdf','linked',?2,NULL,NULL,?3,'application/pdf',?4,?5,?5)",
+        params![paper_id, file.absolute_path.to_string_lossy().as_ref(), file.filename, file.sha256, now_utc()],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Attach an existing local PDF to a canonical Paper. The source file is
+/// read only for metadata/hash purposes and is never copied or removed.
+pub fn attach_pdf_to_paper(
+    conn: &Connection,
+    paper_id: i64,
+    path: &str,
+) -> Result<crate::models::PaperAttachment> {
+    let file = linked_file(path)?;
+    let tx = conn.unchecked_transaction()?;
+    if !paper_exists(&tx, paper_id)? {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    let id = insert_linked_attachment(&tx, paper_id, &file)?;
+    tx.commit()?;
+    get_paper_attachment(conn, id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
+}
+
+/// Discovery's Attach PDF action is a durable Library action. It atomically
+/// creates membership (when absent), clears Read Later, and inserts the link.
+pub fn attach_discovery_pdf(
+    conn: &Connection,
+    paper_id: i64,
+    path: &str,
+) -> Result<crate::models::PaperAttachment> {
+    let file = linked_file(path)?;
+    let tx = conn.unchecked_transaction()?;
+    if !paper_exists(&tx, paper_id)? {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    let now = now_utc();
+    tx.execute(
+        "INSERT INTO library_items (paper_id, added_at, added_source)
+         VALUES (?1,?2,'discovery_attach_pdf') ON CONFLICT(paper_id) DO NOTHING",
+        params![paper_id, now],
+    )?;
+    tx.execute(
+        "UPDATE papers SET is_favorite=0, updated_at=?1 WHERE id=?2",
+        params![now, paper_id],
+    )?;
+    let id = insert_linked_attachment(&tx, paper_id, &file)?;
+    tx.commit()?;
+    get_paper_attachment(conn, id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
+}
+
+/// Detach only removes the CowPaper relation. It deliberately does not touch
+/// the linked source file.
+pub fn detach_pdf(conn: &Connection, attachment_id: i64) -> Result<bool> {
+    Ok(conn.execute("DELETE FROM paper_attachments WHERE id=?1", params![attachment_id])? == 1)
+}
+
+pub fn relink_pdf(
+    conn: &Connection,
+    attachment_id: i64,
+    path: &str,
+) -> Result<crate::models::PaperAttachment> {
+    let file = linked_file(path)?;
+    let current = get_paper_attachment(conn, attachment_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+    if current.storage_mode != "linked" {
+        return Err(rusqlite::Error::InvalidParameterName("storage_mode".into()));
+    }
+    conn.execute(
+        "UPDATE paper_attachments SET absolute_path=?1, relative_path=NULL,
+            url=NULL, filename=?2, mime_type='application/pdf', sha256=?3, updated_at=?4
+         WHERE id=?5",
+        params![file.absolute_path.to_string_lossy().as_ref(), file.filename, file.sha256, now_utc(), attachment_id],
+    )?;
+    get_paper_attachment(conn, attachment_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
+}
+
+fn launch_file_action(path: &Path, reveal: bool) -> Result<()> {
+    if !path.is_file() {
+        return Err(rusqlite::Error::InvalidParameterName("missing_attachment".into()));
+    }
+    #[cfg(target_os = "macos")]
+    let status = if reveal {
+        Command::new("open").arg("-R").arg(path).status()
+    } else {
+        Command::new("open").arg(path).status()
+    };
+    #[cfg(target_os = "windows")]
+    let status = if reveal {
+        Command::new("explorer").arg(format!("/select,{}", path.display())).status()
+    } else {
+        let path_string = path.to_string_lossy().into_owned();
+        Command::new("cmd").args(["/C", "start", ""]).arg(path_string).status()
+    };
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let status = if reveal {
+        Command::new("xdg-open").arg(path.parent().unwrap_or(path)).status()
+    } else {
+        Command::new("xdg-open").arg(path).status()
+    };
+    match status {
+        Ok(status) if status.success() => Ok(()),
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
+}
+
+pub fn open_pdf(conn: &Connection, attachment_id: i64) -> Result<()> {
+    let attachment = get_paper_attachment(conn, attachment_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+    launch_file_action(Path::new(&attachment.absolute_path), false)
+}
+
+pub fn reveal_pdf(conn: &Connection, attachment_id: i64) -> Result<()> {
+    let attachment = get_paper_attachment(conn, attachment_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+    launch_file_action(Path::new(&attachment.absolute_path), true)
+}
+
+fn decode_pdf_literal(value: &str) -> String {
+    let mut out = String::new();
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('b') => out.push('\u{0008}'),
+            Some('f') => out.push('\u{000c}'),
+            Some('\n') => {}
+            Some(next @ '0'..='7') => {
+                let mut octal = String::from(next);
+                for _ in 0..2 {
+                    if chars.peek().is_some_and(|c| matches!(c, '0'..='7')) {
+                        octal.push(chars.next().unwrap());
+                    } else {
+                        break;
+                    }
+                }
+                if let Ok(value) = u8::from_str_radix(&octal, 8) {
+                    out.push(value as char);
+                }
+            }
+            Some(next) => out.push(next),
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+fn pdf_info_value(text: &str, key: &str) -> Option<String> {
+    let marker = format!("/{}", key);
+    let start = text.find(&marker)? + marker.len();
+    let rest = &text[start..];
+    let first = rest.char_indices().find(|(_, ch)| !ch.is_whitespace())?;
+    let value = &rest[first.0..];
+    if value.starts_with('(') {
+        let mut depth = 1_i32;
+        let mut escaped = false;
+        let mut body = String::new();
+        for ch in value[1..].chars() {
+            if escaped {
+                body.push('\\');
+                body.push(ch);
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == '(' {
+                depth += 1;
+                body.push(ch);
+            } else if ch == ')' {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+                body.push(ch);
+            } else {
+                body.push(ch);
+            }
+        }
+        let value = decode_pdf_literal(&body);
+        return clean_optional_text(Some(&value));
+    }
+    if value.starts_with('<') {
+        let end = value.find('>')?;
+        return clean_optional_text(Some(&value[1..end]));
+    }
+    let end = value.find(|ch: char| ch.is_whitespace() || ch == '/' || ch == '>').unwrap_or(value.len());
+    clean_optional_text(Some(&value[..end]))
+}
+
+fn xml_metadata_value(text: &str, tags: &[&str]) -> Option<String> {
+    for tag in tags {
+        let open = format!("<{}", tag);
+        let Some(start) = text.find(&open) else { continue; };
+        let Some(open_end) = text[start..].find('>') else { continue; };
+        let content_start = open_end + start + 1;
+        let close = format!("</{}>", tag);
+        let Some(close_offset) = text[content_start..].find(&close) else { continue; };
+        let end = close_offset + content_start;
+        let value = crate::util::strip_html(&text[content_start..end]);
+        if let Some(value) = clean_optional_text(Some(&value)) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn first_doi(value: Option<&str>) -> Option<String> {
+    let value = value?;
+    let mut offset = 0;
+    while let Some(found) = value[offset..].to_ascii_lowercase().find("10.") {
+        let start = offset + found;
+        let candidate = value[start..]
+            .chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '/' | '-' | '_' | ':' | ';' | '(' | ')'))
+            .collect::<String>();
+        let candidate = candidate.trim_end_matches(|ch: char| matches!(ch, '.' | ',' | ';' | ':' | ')' | ']'));
+        if candidate.contains('/') {
+            if let Some(doi) = crate::util::normalize_doi(candidate) {
+                if doi.starts_with("10.") && doi.contains('/') {
+                    return Some(doi);
+                }
+            }
+        }
+        offset = start + 3;
+        if offset >= value.len() {
+            break;
+        }
+    }
+    None
+}
+
+fn author_key(author: &crate::models::Author) -> String {
+    author
+        .name
+        .as_deref()
+        .or_else(|| author.family.as_deref())
+        .unwrap_or("")
+        .chars()
+        .filter(|ch| ch.is_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
+}
+
+fn parse_author_metadata(value: Option<&str>) -> Vec<crate::models::Author> {
+    let Some(value) = value else { return Vec::new(); };
+    value
+        .split(|ch| ch == ';' || ch == '\n' || ch == '\r')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(|name| crate::models::Author { given: None, family: None, name: Some(name.to_string()) })
+        .collect()
+}
+
+fn parse_year_metadata(value: Option<&str>) -> Option<i32> {
+    let value = value?;
+    let bytes = value.as_bytes();
+    for start in 0..=bytes.len().saturating_sub(4) {
+        let part = &bytes[start..start + 4];
+        if part.iter().all(|byte| byte.is_ascii_digit()) {
+            let year = i32::from(part[0] - b'0') * 1000
+                + i32::from(part[1] - b'0') * 100
+                + i32::from(part[2] - b'0') * 10
+                + i32::from(part[3] - b'0');
+            if (1500..=2200).contains(&year) {
+                return Some(year);
+            }
+        }
+    }
+    None
+}
+
+/// Parse only lightweight PDF Info/XMP metadata. This intentionally does not
+/// extract PDF text, annotations, or inferred academic facts.
+pub fn parse_external_pdf_metadata(path: &Path, filename: &str) -> Result<crate::models::ExternalPdfMetadata> {
+    let bytes = std::fs::read(path).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let text = String::from_utf8_lossy(&bytes);
+    let title = pdf_info_value(&text, "Title")
+        .or_else(|| xml_metadata_value(&text, &["dc:title", "title"]))
+        .or_else(|| Path::new(filename).file_stem().and_then(|value| value.to_str()).map(str::to_string));
+    let author_value = pdf_info_value(&text, "Author")
+        .or_else(|| xml_metadata_value(&text, &["dc:creator", "creator", "Author"]));
+    let xmp_doi = xml_metadata_value(&text, &["prism:doi", "bibo:doi", "doi"]);
+    let doi = first_doi(pdf_info_value(&text, "DOI").as_deref().or(xmp_doi.as_deref()));
+    // A DOI-looking filename is useful only as a deterministic exact identity
+    // hint; arbitrary title text is never treated as an identity.
+    let doi = doi.or_else(|| first_doi(Some(filename)));
+    let scholarly_id = pdf_info_value(&text, "OpenAlex")
+        .or_else(|| pdf_info_value(&text, "PMID"))
+        .or_else(|| pdf_info_value(&text, "PMCID"))
+        .or_else(|| pdf_info_value(&text, "arXiv"))
+        .or_else(|| xml_metadata_value(&text, &["openalex", "pmid", "pmcid", "arXiv"]));
+    let abstract_text = pdf_info_value(&text, "Abstract")
+        .or_else(|| xml_metadata_value(&text, &["dc:description", "abstract"]));
+    let creation_date = pdf_info_value(&text, "CreationDate");
+    let mod_date = pdf_info_value(&text, "ModDate");
+    let year = parse_year_metadata(creation_date.as_deref().or(mod_date.as_deref()))
+        .or_else(|| parse_year_metadata(Some(filename)));
+    Ok(crate::models::ExternalPdfMetadata {
+        filename: filename.to_string(),
+        title,
+        authors: parse_author_metadata(author_value.as_deref()),
+        year,
+        doi,
+        scholarly_id: clean_optional_text(scholarly_id.as_deref()),
+        abstract_text,
+    })
+}
+
+fn title_author_year_candidates(
+    conn: &Connection,
+    metadata: &crate::models::ExternalPdfMetadata,
+) -> Result<Vec<crate::models::ExternalPdfCandidate>> {
+    let (Some(title), Some(year)) = (metadata.title.as_deref(), metadata.year) else {
+        return Ok(Vec::new());
+    };
+    let title_norm = normalize_title(title);
+    if title_norm.is_empty() || metadata.authors.is_empty() {
+        return Ok(Vec::new());
+    }
+    let imported_authors: std::collections::HashSet<String> = metadata
+        .authors
+        .iter()
+        .map(author_key)
+        .filter(|value| !value.is_empty())
+        .collect();
+    if imported_authors.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT id, title, authors_json, year FROM papers WHERE title_norm=?1 AND year=?2 ORDER BY id",
+    )?;
+    let rows = stmt.query_map(params![title_norm, year], |row| {
+        let paper_id: i64 = row.get(0)?;
+        let title: Option<String> = row.get(1)?;
+        let authors_json: Option<String> = row.get(2)?;
+        let authors = authors_json
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<Vec<crate::models::Author>>(value).ok())
+            .unwrap_or_default();
+        Ok((paper_id, title, authors, row.get::<_, Option<i32>>(3)?))
+    })?;
+    let mut candidates = Vec::new();
+    for row in rows {
+        let (paper_id, title, authors, candidate_year) = row?;
+        let matches_author = authors.iter().map(author_key).any(|key| imported_authors.contains(&key));
+        if matches_author {
+            candidates.push(crate::models::ExternalPdfCandidate { paper_id, title, authors, year: candidate_year });
+        }
+    }
+    Ok(candidates)
+}
+
+fn find_paper_by_exact_scholarly_id(conn: &Connection, id: &str) -> Result<Option<i64>> {
+    conn.query_row(
+        "SELECT id FROM papers
+         WHERE lower(openalex_work_id)=lower(?1) OR lower(publisher_article_id)=lower(?1)
+         ORDER BY id LIMIT 1",
+        params![id.trim()],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+fn ensure_external_pdf_journal(conn: &Connection) -> Result<i64> {
+    const NAME: &str = "External PDF Import";
+    if let Some(id) = conn
+        .query_row("SELECT id FROM journals WHERE name=?1 ORDER BY id LIMIT 1", params![NAME], |row| row.get(0))
+        .optional()?
+    {
+        return Ok(id);
+    }
+    let now = now_utc();
+    conn.execute(
+        "INSERT INTO journals (name, enabled, priority, created_at, updated_at)
+         VALUES (?1,0,-100,?2,?2)",
+        params![NAME, now],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+fn add_library_and_attach(
+    conn: &Connection,
+    paper_id: i64,
+    file: &LinkedFile,
+    added_source: &str,
+) -> Result<crate::models::PaperAttachment> {
+    let tx = conn.unchecked_transaction()?;
+    if !paper_exists(&tx, paper_id)? {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    let now = now_utc();
+    tx.execute(
+        "INSERT INTO library_items (paper_id, added_at, added_source)
+         VALUES (?1,?2,?3) ON CONFLICT(paper_id) DO NOTHING",
+        params![paper_id, now, added_source],
+    )?;
+    tx.execute("UPDATE papers SET is_favorite=0, updated_at=?1 WHERE id=?2", params![now, paper_id])?;
+    let id = insert_linked_attachment(&tx, paper_id, file)?;
+    tx.commit()?;
+    get_paper_attachment(conn, id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
+}
+
+/// Import a local PDF into the canonical Paper graph. Exact DOI and exact
+/// scholarly IDs merge immediately; title+authors+year is a candidate only
+/// and remains pending until the caller supplies explicit confirmation.
+pub fn import_external_pdf(
+    conn: &Connection,
+    path: &str,
+    confirmed_paper_id: Option<i64>,
+) -> Result<crate::models::ExternalPdfImportResult> {
+    let file = linked_file(path)?;
+    let metadata = file.metadata.clone();
+
+    if let Some(doi) = metadata.doi.as_deref() {
+        if let Some(paper_id) = conn
+            .query_row("SELECT id FROM papers WHERE normalized_doi=?1", params![doi], |row| row.get(0))
+            .optional()?
+        {
+            let attachment = add_library_and_attach(conn, paper_id, &file, "external_pdf_import")?;
+            return Ok(crate::models::ExternalPdfImportResult {
+                outcome: "existingDoi".to_string(),
+                paper_id: Some(paper_id),
+                attachment: Some(attachment),
+                metadata,
+                candidate: None,
+                candidates: Vec::new(),
+                requires_confirmation: false,
+            });
+        }
+    }
+
+    if let Some(scholarly_id) = metadata.scholarly_id.as_deref() {
+        if let Some(paper_id) = find_paper_by_exact_scholarly_id(conn, scholarly_id)? {
+            let attachment = add_library_and_attach(conn, paper_id, &file, "external_pdf_import")?;
+            return Ok(crate::models::ExternalPdfImportResult {
+                outcome: "existingScholarlyId".to_string(),
+                paper_id: Some(paper_id),
+                attachment: Some(attachment),
+                metadata,
+                candidate: None,
+                candidates: Vec::new(),
+                requires_confirmation: false,
+            });
+        }
+    }
+
+    let candidates = title_author_year_candidates(conn, &metadata)?;
+    if let Some(paper_id) = confirmed_paper_id {
+        if !paper_exists(conn, paper_id)? {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
+        let attachment = add_library_and_attach(conn, paper_id, &file, "external_pdf_manual_confirmation")?;
+        return Ok(crate::models::ExternalPdfImportResult {
+            outcome: "manualConfirmation".to_string(),
+            paper_id: Some(paper_id),
+            attachment: Some(attachment),
+            metadata,
+            candidate: candidates.iter().find(|candidate| candidate.paper_id == paper_id).cloned(),
+            candidates,
+            requires_confirmation: false,
+        });
+    }
+    if let Some(candidate) = candidates.first().cloned() {
+        return Ok(crate::models::ExternalPdfImportResult {
+            outcome: "needsManualConfirmation".to_string(),
+            paper_id: None,
+            attachment: None,
+            metadata,
+            candidate: Some(candidate),
+            candidates,
+            requires_confirmation: true,
+        });
+    }
+
+    let journal_id = ensure_external_pdf_journal(conn)?;
+    let doi = metadata.doi.clone();
+    let abstract_source = metadata.abstract_text.as_ref().map(|_| "pdf_metadata".to_string());
+    let candidate = crate::models::PaperCandidate {
+        normalized_doi: doi.clone(),
+        original_doi: doi.clone(),
+        title: metadata.title.clone(),
+        authors: metadata.authors.clone(),
+        published_date: metadata.year.map(|year| format!("{}-01-01", year)),
+        year: metadata.year,
+        abstract_text: metadata.abstract_text.clone(),
+        abstract_source,
+        abstract_source_url: None,
+        url: doi.as_deref().map(|doi| format!("https://doi.org/{}", doi)),
+        publisher_article_id: metadata.scholarly_id.clone(),
+        openalex_work_id: None,
+        discovery_source: "external_pdf_import".to_string(),
+        source_id: doi,
+        raw_json: None,
+    };
+    let paper_id = match upsert_paper(conn, journal_id, &candidate)? {
+        UpsertOutcome::New(id) => id,
+        UpsertOutcome::Existing { id, .. } => id,
+    };
+    let attachment = add_library_and_attach(conn, paper_id, &file, "external_pdf_import")?;
+    Ok(crate::models::ExternalPdfImportResult {
+        outcome: "createdExternalPaper".to_string(),
+        paper_id: Some(paper_id),
+        attachment: Some(attachment),
+        metadata,
+        candidate: None,
+        candidates: Vec::new(),
+        requires_confirmation: false,
     })
 }
 
@@ -1704,6 +2492,7 @@ fn migrations() -> Vec<(i64, &'static str, fn(&Connection) -> Result<()>)> {
         (12, "backfill-first-seen-missing-from-recovery", migrate_to_v12),
         (13, "round7-content-kind", migrate_to_v13),
         (14, "literature-workspace-library", migrate_to_v14),
+        (15, "literature-library-attachments-metadata", migrate_to_v15),
     ]
 }
 
@@ -1853,6 +2642,48 @@ fn migrate_to_v14(conn: &Connection) -> Result<()> {
             PRIMARY KEY (paper_id, tag_id)
         );
         CREATE INDEX IF NOT EXISTS idx_library_item_tags_tag ON library_item_tags(tag_id);
+        "#,
+    )?;
+    Ok(())
+}
+
+/// v15：linked PDF relations and Library-only metadata overrides.
+///
+/// `managed` remains a valid storage mode for forward schema compatibility,
+/// but no v15 operation copies, moves, or deletes a user file.
+fn migrate_to_v15(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS paper_attachments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            paper_id INTEGER NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+            kind TEXT NOT NULL DEFAULT 'pdf',
+            storage_mode TEXT NOT NULL DEFAULT 'linked'
+                CHECK (storage_mode IN ('linked', 'managed')),
+            absolute_path TEXT NOT NULL,
+            relative_path TEXT,
+            url TEXT,
+            filename TEXT NOT NULL,
+            mime_type TEXT NOT NULL DEFAULT 'application/pdf',
+            sha256 TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_paper_attachments_paper
+            ON paper_attachments(paper_id, created_at DESC, id DESC);
+
+        CREATE TABLE IF NOT EXISTS library_item_metadata (
+            paper_id INTEGER PRIMARY KEY REFERENCES papers(id) ON DELETE CASCADE,
+            title_override TEXT,
+            chinese_title_override TEXT,
+            source_override TEXT,
+            year_override INTEGER,
+            authors_override TEXT,
+            abstract_override TEXT,
+            chinese_abstract_override TEXT,
+            note TEXT,
+            updated_at TEXT NOT NULL
+        );
         "#,
     )?;
     Ok(())
