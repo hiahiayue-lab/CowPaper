@@ -5154,3 +5154,59 @@ fn test_library_collection_delete_detaches_children_without_deleting_paper() {
     assert!(db::get_paper(&conn, pid).unwrap().is_some());
     assert!(db::get_library_membership(&conn, pid).unwrap().is_some());
 }
+
+#[test]
+fn test_library_tag_rename_delete_preserves_paper_and_recommendation_fields() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
+    let pid = match db::upsert_paper(
+        &conn,
+        jid,
+        &candidate(Some("10.1000/library-tag-management"), "Tagged Paper", Some("abstract"), Some("crossref")),
+    )
+    .unwrap()
+    {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new paper"),
+    };
+    conn.execute(
+        "UPDATE papers SET chinese_title='中文标题', one_sentence_summary='AI summary',
+            tag_matches_json='[{\"tag\":\"核心\",\"score\":1}]', total_score=4.6,
+            analysis_status='analysisSucceeded', analyzed_at='2026-09-03T00:00:00Z' WHERE id=?1",
+        params![pid],
+    )
+    .unwrap();
+    let tag = db::create_library_tag(&conn, "Original Library Tag", Some("#2563eb")).unwrap();
+    db::add_paper_to_library(&conn, pid, &[], &[tag.id], "manual").unwrap();
+
+    let recommendation_before: (Option<f64>, Option<String>, String, Option<String>) = conn
+        .query_row(
+            "SELECT total_score, tag_matches_json, analysis_status, analyzed_at FROM papers WHERE id=?1",
+            params![pid],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    db::rename_library_tag(&conn, tag.id, "Renamed Library Tag").unwrap();
+    assert_eq!(db::list_library_tags(&conn).unwrap()[0].name, "Renamed Library Tag");
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM library_item_tags WHERE paper_id=?1 AND tag_id=?2", params![pid, tag.id], |r| r.get::<_, i64>(0)).unwrap(),
+        1,
+    );
+
+    assert!(db::delete_library_tag(&conn, tag.id).unwrap());
+    assert!(db::list_library_tags(&conn).unwrap().is_empty());
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM library_item_tags WHERE paper_id=?1", params![pid], |r| r.get::<_, i64>(0)).unwrap(),
+        0,
+    );
+    assert!(db::get_paper(&conn, pid).unwrap().is_some(), "删除文献标签不得删除 canonical Paper");
+    assert!(db::get_library_membership(&conn, pid).unwrap().is_some(), "删除文献标签不得移出 Library");
+    let recommendation_after: (Option<f64>, Option<String>, String, Option<String>) = conn
+        .query_row(
+            "SELECT total_score, tag_matches_json, analysis_status, analyzed_at FROM papers WHERE id=?1",
+            params![pid],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(recommendation_after, recommendation_before, "Library Tag 管理不得改变推荐分析字段");
+}

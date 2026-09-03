@@ -1367,7 +1367,7 @@ function renderLibraryNavigation() {
     .join("");
   collections.innerHTML = children(null) || '<span class="muted small nav-empty">暂无文献夹</span>';
   $("library-tag-nav").innerHTML = libraryTags.length
-    ? libraryTags.map((t) => `<button class="library-nav-row" data-action="library-filter-tag" data-tag-id="${t.id}"><span class="tag-dot" style="background:${escapeHtml(t.color || "#9ca3af")}"></span>${escapeHtml(t.name)}</button>`).join("")
+    ? libraryTags.map((t) => `<div class="library-nav-item"><button class="library-nav-row" data-action="library-filter-tag" data-tag-id="${t.id}"><span class="tag-dot" style="background:${escapeHtml(t.color || "#9ca3af")}"></span>${escapeHtml(t.name)}</button><button class="nav-manage" title="重命名文献标签" data-action="library-rename-tag" data-tag-id="${t.id}">✎</button><button class="nav-manage danger" title="删除文献标签" data-action="library-delete-tag" data-tag-id="${t.id}">×</button></div>`).join("")
     : '<span class="muted small nav-empty">暂无文献标签</span>';
 }
 
@@ -2485,6 +2485,42 @@ async function setupListeners() {
     if (tagFilter) {
       libraryScope = { kind: "tag", id: parseInt(tagFilter.dataset.tagId!, 10) };
       if (libraryView !== "all") await loadLibraryData("all"); else renderLibrary();
+      return;
+    }
+    const renameLibraryTag = t.closest("[data-action='library-rename-tag']") as HTMLElement | null;
+    if (renameLibraryTag) {
+      const id = Number(renameLibraryTag.dataset.tagId);
+      const tag = libraryTags.find((item) => item.id === id);
+      const name = await showPromptModal("重命名文献标签", "名称", tag?.name || "");
+      if (!name) return;
+      try {
+        await invoke("rename_library_tag", { id, name });
+        await loadLibraryData(libraryView);
+        setStatus("文献标签已重命名", "done");
+      } catch (err) {
+        setStatus(`重命名文献标签失败：${String(err)}`, "error");
+      }
+      return;
+    }
+    const deleteLibraryTag = t.closest("[data-action='library-delete-tag']") as HTMLElement | null;
+    if (deleteLibraryTag) {
+      const id = Number(deleteLibraryTag.dataset.tagId);
+      const tag = libraryTags.find((item) => item.id === id);
+      const ok = await showConfirmModal({
+        title: "删除文献标签",
+        message: `删除「${tag?.name || "此文献标签"}」？只删除标签及其关联关系，不删除论文。`,
+        confirmText: "删除",
+        cancelText: "取消",
+      });
+      if (!ok) return;
+      try {
+        await invoke("delete_library_tag", { id });
+        if (libraryScope?.kind === "tag" && libraryScope.id === id) libraryScope = null;
+        await loadLibraryData(libraryView);
+        setStatus("文献标签已删除，论文仍保留", "done");
+      } catch (err) {
+        setStatus(`删除文献标签失败：${String(err)}`, "error");
+      }
       return;
     }
     if (t.closest("[data-action='library-refresh']")) { await loadLibraryData(libraryView); return; }
