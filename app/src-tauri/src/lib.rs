@@ -1123,6 +1123,36 @@ fn relink_pdf(
 }
 
 #[tauri::command]
+fn reorganize_pdf(
+    attachment_id: i64,
+    mode: String,
+    state: State<Db>,
+) -> Result<models::PaperAttachment, String> {
+    let conn = state.inner().lock().unwrap();
+    db::reorganize_pdf(&conn, attachment_id, &mode).map_err(|e| e.to_string())
+}
+
+/// Alias with the product-facing wording used by the future attachment
+/// inspector action.
+#[tauri::command]
+fn manage_pdf_attachment(
+    attachment_id: i64,
+    mode: String,
+    state: State<Db>,
+) -> Result<models::PaperAttachment, String> {
+    reorganize_pdf(attachment_id, mode, state)
+}
+
+#[tauri::command]
+fn rename_managed_pdf(
+    attachment_id: i64,
+    state: State<Db>,
+) -> Result<models::PaperAttachment, String> {
+    let conn = state.inner().lock().unwrap();
+    db::rename_managed_pdf(&conn, attachment_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn open_pdf(
     attachment_id: i64,
     state: State<Db>,
@@ -1815,6 +1845,14 @@ fn read_settings(conn: &Connection) -> models::Settings {
             == "1",
         default_abstract_lang: db::get_setting(conn, "settings.default_abstract_lang")
             .unwrap_or_else(|| "zh".into()),
+        pdf_file_handling_mode: db::get_setting(conn, "settings.pdf_file_handling_mode")
+            .unwrap_or_else(models::default_pdf_file_handling_mode),
+        pdf_library_root: db::get_setting(conn, "settings.pdf_library_root")
+            .unwrap_or_default(),
+        pdf_naming_template: db::get_setting(conn, "settings.pdf_naming_template")
+            .unwrap_or_else(models::default_pdf_naming_template),
+        pdf_subfolder_rule: db::get_setting(conn, "settings.pdf_subfolder_rule")
+            .unwrap_or_else(models::default_pdf_subfolder_rule),
     }
 }
 
@@ -1829,6 +1867,12 @@ fn set_settings(s: models::Settings, state: State<Db>) -> Result<(), String> {
     if !valid_daily_sync_time(&s.daily_sync_time) {
         return Err("每日检查时间必须为 HH:MM".to_string());
     }
+    db::validate_pdf_storage_settings(
+        &s.pdf_file_handling_mode,
+        &s.pdf_library_root,
+        &s.pdf_naming_template,
+        &s.pdf_subfolder_rule,
+    )?;
     let conn = state.inner().lock().unwrap();
     db::set_setting(
         &conn,
@@ -1848,6 +1892,14 @@ fn set_settings(s: models::Settings, state: State<Db>) -> Result<(), String> {
         if s.auto_analyze_new { "1" } else { "0" },
     ).map_err(|e| e.to_string())?;
     db::set_setting(&conn, "settings.default_abstract_lang", &s.default_abstract_lang)
+        .map_err(|e| e.to_string())?;
+    db::set_setting(&conn, "settings.pdf_file_handling_mode", &s.pdf_file_handling_mode)
+        .map_err(|e| e.to_string())?;
+    db::set_setting(&conn, "settings.pdf_library_root", &s.pdf_library_root)
+        .map_err(|e| e.to_string())?;
+    db::set_setting(&conn, "settings.pdf_naming_template", &s.pdf_naming_template)
+        .map_err(|e| e.to_string())?;
+    db::set_setting(&conn, "settings.pdf_subfolder_rule", &s.pdf_subfolder_rule)
         .map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -2096,6 +2148,9 @@ pub fn run() {
             attach_discovery_pdf,
             detach_pdf,
             relink_pdf,
+            reorganize_pdf,
+            manage_pdf_attachment,
+            rename_managed_pdf,
             open_pdf,
             reveal_pdf,
             import_pdf,

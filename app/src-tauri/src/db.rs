@@ -1,6 +1,6 @@
 use rusqlite::{params, Connection, OptionalExtension, Result};
 use sha2::{Digest, Sha256};
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -1549,6 +1549,31 @@ pub fn clear_library_item_overrides(
     get_library_item_metadata(conn, paper_id)
 }
 
+const PDF_FILE_HANDLING_MODE_KEY: &str = "settings.pdf_file_handling_mode";
+const PDF_LIBRARY_ROOT_KEY: &str = "settings.pdf_library_root";
+const PDF_NAMING_TEMPLATE_KEY: &str = "settings.pdf_naming_template";
+const PDF_SUBFOLDER_RULE_KEY: &str = "settings.pdf_subfolder_rule";
+const MAX_MANAGED_FILENAME_BYTES: usize = 180;
+
+#[derive(Debug, Clone)]
+struct PdfStorageConfig {
+    mode: String,
+    library_root: String,
+    naming_template: String,
+    subfolder_rule: String,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedPdfStorage {
+    storage_mode: String,
+    absolute_path: PathBuf,
+    relative_path: String,
+    source_path: PathBuf,
+    source_sha256: String,
+    delete_source: bool,
+    created_destination: bool,
+}
+
 struct LinkedFile {
     absolute_path: PathBuf,
     filename: String,
@@ -1573,6 +1598,411 @@ fn resolve_linked_pdf_path(input: &str) -> Result<PathBuf> {
         return Err(rusqlite::Error::InvalidParameterName("path".into()));
     }
     std::fs::canonicalize(absolute).map_err(|_| rusqlite::Error::InvalidParameterName("path".into()))
+}
+
+pub fn validate_pdf_storage_settings(
+    mode: &str,
+    library_root: &str,
+    naming_template: &str,
+    subfolder_rule: &str,
+) -> std::result::Result<(), String> {
+    if !matches!(mode, "none" | "copy" | "move") {
+        return Err("PDF file handling mode 必须为 none、copy 或 move".to_string());
+    }
+    if !matches!(subfolder_rule, "none" | "year" | "journal/source") {
+        return Err("PDF 子文件夹规则必须为 none、year 或 journal/source".to_string());
+    }
+    if naming_template.trim().is_empty() {
+        return Err("PDF 命名模板不能为空".to_string());
+    }
+    if mode != "none" {
+        let root = Path::new(library_root.trim());
+        if library_root.trim().is_empty() {
+            return Err("copy/move 模式必须配置 Library root directory".to_string());
+        }
+        if !root.is_absolute() {
+            return Err("Library root directory 必须是绝对路径".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn pdf_storage_config(conn: &Connection) -> Result<PdfStorageConfig> {
+    let mode = get_setting(conn, PDF_FILE_HANDLING_MODE_KEY)
+        .unwrap_or_else(crate::models::default_pdf_file_handling_mode);
+    let library_root = get_setting(conn, PDF_LIBRARY_ROOT_KEY).unwrap_or_default();
+    let naming_template = get_setting(conn, PDF_NAMING_TEMPLATE_KEY)
+        .unwrap_or_else(crate::models::default_pdf_naming_template);
+    let subfolder_rule = get_setting(conn, PDF_SUBFOLDER_RULE_KEY)
+        .unwrap_or_else(crate::models::default_pdf_subfolder_rule);
+    validate_pdf_storage_settings(&mode, &library_root, &naming_template, &subfolder_rule)
+        .map_err(rusqlite::Error::InvalidParameterName)?;
+    Ok(PdfStorageConfig { mode, library_root, naming_template, subfolder_rule })
+}
+
+fn author_display_name(author: &Author) -> String {
+    if let Some(name) = author.name.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        return name.to_string();
+    }
+    match (
+        author.given.as_deref().map(str::trim).filter(|value| !value.is_empty()),
+        author.family.as_deref().map(str::trim).filter(|value| !value.is_empty()),
+    ) {
+        (Some(given), Some(family)) => format!("{given} {family}"),
+        (Some(given), None) => given.to_string(),
+        (None, Some(family)) => family.to_string(),
+        (None, None) => String::new(),
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct PdfNamingContext {
+    title: String,
+    journal: String,
+    source: String,
+    year: String,
+    authors: String,
+    first_author: String,
+    doi: String,
+}
+
+fn paper_naming_context(conn: &Connection, paper_id: i64) -> Result<PdfNamingContext> {
+    conn.query_row(
+        "SELECT p.title, p.authors_json, p.year, p.normalized_doi, p.original_doi,
+                p.discovery_source, j.name
+         FROM papers p LEFT JOIN journals j ON j.id = p.journal_id
+         WHERE p.id=?1",
+        params![paper_id],
+        |row| {
+            let authors_json: Option<String> = row.get(1)?;
+            let authors: Vec<Author> = authors_json
+                .as_deref()
+                .and_then(|value| serde_json::from_str(value).ok())
+                .unwrap_or_default();
+            let author_names: Vec<String> = authors
+                .iter()
+                .map(author_display_name)
+                .filter(|value| !value.is_empty())
+                .collect();
+            let journal = row.get::<_, Option<String>>(6)?.unwrap_or_default();
+            let source = row.get::<_, Option<String>>(5)?.unwrap_or_default();
+            Ok(PdfNamingContext {
+                title: row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                journal: journal.clone(),
+                source: if source.trim().is_empty() { journal } else { source },
+                year: row.get::<_, Option<i32>>(2)?.map(|value| value.to_string()).unwrap_or_default(),
+                authors: author_names.join(", "),
+                first_author: author_names.first().cloned().unwrap_or_default(),
+                doi: row.get::<_, Option<String>>(3)?.or(row.get(4)?).unwrap_or_default(),
+            })
+        },
+    )
+}
+
+fn template_token_value<'a>(token: &str, context: &'a PdfNamingContext) -> Option<&'a str> {
+    match token {
+        "title" => Some(&context.title),
+        "journal" => Some(&context.journal),
+        "source" => Some(&context.source),
+        "year" => Some(&context.year),
+        "authors" => Some(&context.authors),
+        "first_author" => Some(&context.first_author),
+        "doi" => Some(&context.doi),
+        _ => None,
+    }
+}
+
+fn is_template_separator(ch: char) -> bool {
+    matches!(ch, '-' | '–' | '—' | '_')
+}
+
+fn has_trailing_template_separator(value: &str) -> bool {
+    value.trim_end().chars().last().is_some_and(is_template_separator)
+}
+
+fn strip_leading_template_separator(value: &str) -> String {
+    let mut chars = value.char_indices();
+    while let Some((index, ch)) = chars.next() {
+        if ch.is_whitespace() {
+            continue;
+        } else if is_template_separator(ch) {
+            let mut end = index + ch.len_utf8();
+            while let Some((next_index, next)) = chars.next() {
+                if !next.is_whitespace() {
+                    return value[next_index..].to_string();
+                }
+                end = next_index + next.len_utf8();
+            }
+            return value[end..].to_string();
+        } else {
+            break;
+        }
+    }
+    value.to_string()
+}
+
+fn trim_trailing_template_separator_before_extension(value: &mut String) {
+    let Some(extension_start) = value.to_ascii_lowercase().rfind(".pdf") else { return; };
+    let mut stem = value[..extension_start].trim_end().to_string();
+    while stem.chars().last().is_some_and(is_template_separator) {
+        stem.pop();
+        while stem.chars().last().is_some_and(|ch| ch.is_whitespace()) {
+            stem.pop();
+        }
+    }
+    *value = format!("{}{}", stem.trim_end(), &value[extension_start..]);
+}
+
+fn render_pdf_filename(template: &str, context: &PdfNamingContext) -> String {
+    let mut output = String::new();
+    let mut cursor = 0;
+    let mut skip_leading_separator = false;
+    while cursor < template.len() {
+        let Some(open_offset) = template[cursor..].find('{') else {
+            let literal = &template[cursor..];
+            if skip_leading_separator {
+                let stripped = strip_leading_template_separator(literal);
+                output.push_str(&stripped);
+            } else {
+                output.push_str(literal);
+            }
+            break;
+        };
+        let open = cursor + open_offset;
+        let literal = &template[cursor..open];
+        if skip_leading_separator {
+            output.push_str(&strip_leading_template_separator(literal));
+        } else {
+            output.push_str(literal);
+        }
+        let Some(close_offset) = template[open + 1..].find('}') else {
+            output.push_str(&template[open..]);
+            break;
+        };
+        let close = open + 1 + close_offset;
+        let token = &template[open + 1..close];
+        if let Some(value) = template_token_value(token, context) {
+            if value.trim().is_empty() {
+                skip_leading_separator = !has_trailing_template_separator(&output);
+            } else {
+                output.push_str(value.trim());
+                skip_leading_separator = false;
+            }
+        } else {
+            // Unknown tokens are treated as empty fields so a future template
+            // token can never leak braces or an unsafe path component to disk.
+            skip_leading_separator = !has_trailing_template_separator(&output);
+        }
+        cursor = close + 1;
+    }
+    trim_trailing_template_separator_before_extension(&mut output);
+    let output = output.trim().to_string();
+    if output.is_empty() { "document.pdf".to_string() } else { output }
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes { return value.to_string(); }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) { end -= 1; }
+    value[..end].to_string()
+}
+
+fn is_windows_reserved_basename(value: &str) -> bool {
+    let upper = value.trim().to_ascii_uppercase();
+    let basename = upper.split('.').next().unwrap_or(upper.as_str());
+    matches!(basename, "CON" | "PRN" | "AUX" | "NUL")
+        || ((basename.starts_with("COM") || basename.starts_with("LPT"))
+            && basename[3..].parse::<u8>().is_ok_and(|number| (1..=9).contains(&number)))
+}
+
+fn sanitize_filename(value: &str) -> String {
+    let mut sanitized: String = value
+        .chars()
+        .map(|ch| if ch.is_control() || matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { ch })
+        .collect();
+    sanitized = sanitized.trim().trim_matches('.').trim().to_string();
+    if sanitized.is_empty() { sanitized = "document".to_string(); }
+    let has_pdf_extension = sanitized.to_ascii_lowercase().ends_with(".pdf");
+    if !has_pdf_extension { sanitized.push_str(".pdf"); }
+    let extension = ".pdf";
+    let stem_end = sanitized.len().saturating_sub(extension.len());
+    let mut stem = truncate_utf8(&sanitized[..stem_end], MAX_MANAGED_FILENAME_BYTES.saturating_sub(extension.len()));
+    if stem.trim().is_empty() { stem = "document".to_string(); }
+    if is_windows_reserved_basename(&stem) {
+        stem.insert(0, '_');
+        stem = truncate_utf8(&stem, MAX_MANAGED_FILENAME_BYTES.saturating_sub(extension.len()));
+    }
+    truncate_utf8(&format!("{stem}{extension}"), MAX_MANAGED_FILENAME_BYTES)
+}
+
+fn sanitize_folder_component(value: &str) -> String {
+    let mut component: String = value
+        .chars()
+        .map(|ch| if ch.is_control() || matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { ch })
+        .collect();
+    component = component.trim().trim_matches('.').trim().to_string();
+    if component.is_empty() { component = "Unknown".to_string(); }
+    if is_windows_reserved_basename(&component) { component.insert(0, '_'); }
+    truncate_utf8(&component, 120)
+}
+
+fn managed_destination_directory(root: &Path, rule: &str, context: &PdfNamingContext) -> PathBuf {
+    match rule {
+        "year" => root.join(sanitize_folder_component(if context.year.is_empty() { "Unknown" } else { &context.year })),
+        "journal/source" => root
+            .join(sanitize_folder_component(if context.journal.is_empty() { "Unknown" } else { &context.journal }))
+            .join(sanitize_folder_component(if context.source.is_empty() { "Unknown" } else { &context.source })),
+        _ => root.to_path_buf(),
+    }
+}
+
+fn collision_filename(filename: &str, number: usize) -> String {
+    let suffix = format!(" ({number})");
+    let extension = ".pdf";
+    let stem = filename.strip_suffix(extension).unwrap_or(filename);
+    let max_stem_bytes = MAX_MANAGED_FILENAME_BYTES.saturating_sub(extension.len() + suffix.len());
+    format!("{}{}{}", truncate_utf8(stem, max_stem_bytes), suffix, extension)
+}
+
+fn copy_file_verified(source: &Path, source_sha256: &str, directory: &Path, filename: &str) -> Result<PathBuf> {
+    std::fs::create_dir_all(directory).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    for number in 1..=10_000_usize {
+        let candidate_name = if number == 1 { filename.to_string() } else { collision_filename(filename, number) };
+        let candidate = directory.join(candidate_name);
+        let mut destination = match OpenOptions::new().write(true).create_new(true).open(&candidate) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return Err(rusqlite::Error::InvalidQuery),
+        };
+        let copy_result = (|| {
+            let mut input = File::open(source).map_err(|_| rusqlite::Error::InvalidQuery)?;
+            std::io::copy(&mut input, &mut destination).map_err(|_| rusqlite::Error::InvalidQuery)?;
+            destination.sync_all().map_err(|_| rusqlite::Error::InvalidQuery)?;
+            Ok::<(), rusqlite::Error>(())
+        })();
+        drop(destination);
+        if let Err(error) = copy_result {
+            let _ = std::fs::remove_file(&candidate);
+            return Err(error);
+        }
+        let destination_hash = sha256_file(&candidate);
+        if !destination_hash.is_ok_and(|hash| hash == source_sha256) {
+            let _ = std::fs::remove_file(&candidate);
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        return std::fs::canonicalize(&candidate).map_err(|_| rusqlite::Error::InvalidQuery);
+    }
+    Err(rusqlite::Error::InvalidQuery)
+}
+
+fn managed_relative_path(root: &Path, destination: &Path) -> Result<String> {
+    destination
+        .strip_prefix(root)
+        .map(|relative| relative.to_string_lossy().into_owned())
+        .map_err(|_| rusqlite::Error::InvalidParameterName("managed_path".into()))
+}
+
+fn prepare_managed_pdf(
+    conn: &Connection,
+    paper_id: i64,
+    source_path: &Path,
+    source_sha256: &str,
+    mode: &str,
+) -> Result<PreparedPdfStorage> {
+    if !matches!(mode, "copy" | "move") {
+        return Err(rusqlite::Error::InvalidParameterName("storage_mode".into()));
+    }
+    let config = pdf_storage_config(conn)?;
+    let root = PathBuf::from(config.library_root.trim());
+    std::fs::create_dir_all(&root).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let root = std::fs::canonicalize(&root).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let context = paper_naming_context(conn, paper_id)?;
+    let directory = managed_destination_directory(&root, &config.subfolder_rule, &context);
+    std::fs::create_dir_all(&directory).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let directory = std::fs::canonicalize(&directory).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let filename = sanitize_filename(&render_pdf_filename(&config.naming_template, &context));
+    let preferred = directory.join(&filename);
+    let source_is_preferred = source_path == preferred.as_path()
+        || std::fs::canonicalize(&preferred).ok().is_some_and(|path| path.as_path() == source_path);
+    let destination = if source_is_preferred {
+        source_path.to_path_buf()
+    } else {
+        copy_file_verified(source_path, source_sha256, &directory, &filename)?
+    };
+    let relative_path = managed_relative_path(&root, &destination)?;
+    Ok(PreparedPdfStorage {
+        storage_mode: "managed".to_string(),
+        absolute_path: destination,
+        relative_path,
+        source_path: source_path.to_path_buf(),
+        source_sha256: source_sha256.to_string(),
+        delete_source: mode == "move" && !source_is_preferred,
+        created_destination: !source_is_preferred,
+    })
+}
+
+fn insert_attachment_row(
+    conn: &Connection,
+    paper_id: i64,
+    file: &LinkedFile,
+    prepared: Option<&PreparedPdfStorage>,
+) -> Result<i64> {
+    let now = now_utc();
+    if let Some(prepared) = prepared {
+        conn.execute(
+            "INSERT INTO paper_attachments (
+                paper_id, kind, storage_mode, absolute_path, relative_path, url,
+                filename, mime_type, sha256, created_at, updated_at
+             ) VALUES (?1,'pdf',?2,?3,?4,NULL,?5,'application/pdf',?6,?7,?7)",
+            params![
+                paper_id,
+                prepared.storage_mode.as_str(),
+                prepared.absolute_path.to_string_lossy().as_ref(),
+                prepared.relative_path.as_str(),
+                prepared.absolute_path.file_name().and_then(|value| value.to_str()).unwrap_or(&file.filename),
+                prepared.source_sha256.as_str(),
+                now,
+            ],
+        )?;
+    } else {
+        conn.execute(
+            "INSERT INTO paper_attachments (
+                paper_id, kind, storage_mode, absolute_path, relative_path, url,
+                filename, mime_type, sha256, created_at, updated_at
+             ) VALUES (?1,'pdf','linked',?2,NULL,NULL,?3,'application/pdf',?4,?5,?5)",
+            params![paper_id, file.absolute_path.to_string_lossy().as_ref(), file.filename, file.sha256, now],
+        )?;
+    }
+    Ok(conn.last_insert_rowid())
+}
+
+fn finalize_prepared_storage(conn: &Connection, prepared: &PreparedPdfStorage) -> Result<()> {
+    if !prepared.absolute_path.is_file() || !sha256_file(&prepared.absolute_path).is_ok_and(|hash| hash == prepared.source_sha256) {
+        if prepared.created_destination { let _ = std::fs::remove_file(&prepared.absolute_path); }
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    if !prepared.delete_source || prepared.source_path == prepared.absolute_path {
+        return Ok(());
+    }
+    // A concurrent editor must not have its newer source content deleted after
+    // the copy. If the source changed, keep it and let the user retry.
+    if !prepared.source_path.is_file()
+        || !sha256_file(&prepared.source_path).is_ok_and(|hash| hash == prepared.source_sha256)
+    {
+        return Err(rusqlite::Error::InvalidParameterName("source_pdf_changed_during_move".into()));
+    }
+    let referenced_elsewhere: bool = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM paper_attachments
+            WHERE absolute_path=?1 AND absolute_path != ?2
+        )",
+        params![prepared.source_path.to_string_lossy().as_ref(), prepared.absolute_path.to_string_lossy().as_ref()],
+        |row| row.get(0),
+    )?;
+    if referenced_elsewhere {
+        return Err(rusqlite::Error::InvalidParameterName("source_pdf_is_still_referenced".into()));
+    }
+    std::fs::remove_file(&prepared.source_path).map_err(|_| rusqlite::Error::InvalidQuery)
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
@@ -1650,50 +2080,77 @@ pub fn list_paper_attachments(conn: &Connection, paper_id: i64) -> Result<Vec<cr
     rows.collect()
 }
 
-fn insert_linked_attachment(
+fn prepare_current_pdf_storage(
     conn: &Connection,
     paper_id: i64,
     file: &LinkedFile,
-) -> Result<i64> {
-    conn.execute(
-        "INSERT INTO paper_attachments (
-            paper_id, kind, storage_mode, absolute_path, relative_path, url,
-            filename, mime_type, sha256, created_at, updated_at
-         ) VALUES (?1,'pdf','linked',?2,NULL,NULL,?3,'application/pdf',?4,?5,?5)",
-        params![paper_id, file.absolute_path.to_string_lossy().as_ref(), file.filename, file.sha256, now_utc()],
-    )?;
-    Ok(conn.last_insert_rowid())
+) -> Result<Option<PreparedPdfStorage>> {
+    let config = pdf_storage_config(conn)?;
+    if config.mode == "none" {
+        Ok(None)
+    } else {
+        prepare_managed_pdf(conn, paper_id, &file.absolute_path, &file.sha256, &config.mode).map(Some)
+    }
 }
 
-/// Attach an existing local PDF to a canonical Paper. The source file is
-/// read only for metadata/hash purposes and is never copied or removed.
+fn cleanup_prepared_destination(prepared: &PreparedPdfStorage) {
+    if prepared.created_destination {
+        let _ = std::fs::remove_file(&prepared.absolute_path);
+    }
+}
+
+fn insert_file_attachment(
+    conn: &Connection,
+    paper_id: i64,
+    file: &LinkedFile,
+) -> Result<crate::models::PaperAttachment> {
+    if !paper_exists(conn, paper_id)? {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    let prepared = prepare_current_pdf_storage(conn, paper_id, file)?;
+    let tx = conn.unchecked_transaction()?;
+    let id = match insert_attachment_row(&tx, paper_id, file, prepared.as_ref()) {
+        Ok(id) => id,
+        Err(error) => {
+            if let Some(prepared) = prepared.as_ref() { cleanup_prepared_destination(prepared); }
+            return Err(error);
+        }
+    };
+    if let Err(error) = tx.commit() {
+        if let Some(prepared) = prepared.as_ref() { cleanup_prepared_destination(prepared); }
+        return Err(error);
+    }
+    if let Some(prepared) = prepared.as_ref() {
+        finalize_prepared_storage(conn, prepared)?;
+    }
+    get_paper_attachment(conn, id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
+}
+
+/// Attach an existing local PDF to a canonical Paper. The configured file
+/// handling mode decides whether it remains linked or becomes managed.
 pub fn attach_pdf_to_paper(
     conn: &Connection,
     paper_id: i64,
     path: &str,
 ) -> Result<crate::models::PaperAttachment> {
     let file = linked_file(path)?;
-    let tx = conn.unchecked_transaction()?;
-    if !paper_exists(&tx, paper_id)? {
-        return Err(rusqlite::Error::QueryReturnedNoRows);
-    }
-    let id = insert_linked_attachment(&tx, paper_id, &file)?;
-    tx.commit()?;
-    get_paper_attachment(conn, id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
+    insert_file_attachment(conn, paper_id, &file)
 }
 
 /// Discovery's Attach PDF action is a durable Library action. It atomically
-/// creates membership (when absent), clears Read Later, and inserts the link.
+/// creates membership (when absent), clears Read Later, and inserts the PDF
+/// using the configured file handling mode.
 pub fn attach_discovery_pdf(
     conn: &Connection,
     paper_id: i64,
     path: &str,
 ) -> Result<crate::models::PaperAttachment> {
     let file = linked_file(path)?;
-    let tx = conn.unchecked_transaction()?;
-    if !paper_exists(&tx, paper_id)? {
+    if !paper_exists(conn, paper_id)? {
         return Err(rusqlite::Error::QueryReturnedNoRows);
     }
+    let prepared = prepare_current_pdf_storage(conn, paper_id, &file)?;
+    let tx = conn.unchecked_transaction()?;
     let now = now_utc();
     tx.execute(
         "INSERT INTO library_items (paper_id, added_at, added_source)
@@ -1704,8 +2161,20 @@ pub fn attach_discovery_pdf(
         "UPDATE papers SET is_favorite=0, updated_at=?1 WHERE id=?2",
         params![now, paper_id],
     )?;
-    let id = insert_linked_attachment(&tx, paper_id, &file)?;
-    tx.commit()?;
+    let id = match insert_attachment_row(&tx, paper_id, &file, prepared.as_ref()) {
+        Ok(id) => id,
+        Err(error) => {
+            if let Some(prepared) = prepared.as_ref() { cleanup_prepared_destination(prepared); }
+            return Err(error);
+        }
+    };
+    if let Err(error) = tx.commit() {
+        if let Some(prepared) = prepared.as_ref() { cleanup_prepared_destination(prepared); }
+        return Err(error);
+    }
+    if let Some(prepared) = prepared.as_ref() {
+        finalize_prepared_storage(conn, prepared)?;
+    }
     get_paper_attachment(conn, id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
 }
 
@@ -1732,6 +2201,78 @@ pub fn relink_pdf(
         params![file.absolute_path.to_string_lossy().as_ref(), file.filename, file.sha256, now_utc(), attachment_id],
     )?;
     get_paper_attachment(conn, attachment_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
+}
+
+fn update_attachment_as_managed(
+    conn: &Connection,
+    attachment_id: i64,
+    prepared: &PreparedPdfStorage,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE paper_attachments SET storage_mode='managed', absolute_path=?1,
+            relative_path=?2, url=NULL, filename=?3, mime_type='application/pdf',
+            sha256=?4, updated_at=?5 WHERE id=?6",
+        params![
+            prepared.absolute_path.to_string_lossy().as_ref(),
+            prepared.relative_path.as_str(),
+            prepared.absolute_path.file_name().and_then(|value| value.to_str()).unwrap_or("document.pdf"),
+            prepared.source_sha256.as_str(),
+            now_utc(),
+            attachment_id,
+        ],
+    )?;
+    Ok(())
+}
+
+fn manage_existing_attachment(
+    conn: &Connection,
+    attachment_id: i64,
+    mode: &str,
+) -> Result<crate::models::PaperAttachment> {
+    if !matches!(mode, "copy" | "move") {
+        return Err(rusqlite::Error::InvalidParameterName("storage_mode".into()));
+    }
+    let current = get_paper_attachment(conn, attachment_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+    let source_path = resolve_linked_pdf_path(&current.absolute_path)?;
+    if !is_pdf_file(&source_path)? {
+        return Err(rusqlite::Error::InvalidParameterName("pdf_path".into()));
+    }
+    let source_sha256 = sha256_file(&source_path)?;
+    let prepared = prepare_managed_pdf(conn, current.paper_id, &source_path, &source_sha256, mode)?;
+    let tx = conn.unchecked_transaction()?;
+    if let Err(error) = update_attachment_as_managed(&tx, attachment_id, &prepared) {
+        cleanup_prepared_destination(&prepared);
+        return Err(error);
+    }
+    if let Err(error) = tx.commit() {
+        cleanup_prepared_destination(&prepared);
+        return Err(error);
+    }
+    finalize_prepared_storage(conn, &prepared)?;
+    get_paper_attachment(conn, attachment_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
+}
+
+/// Explicitly reorganize one existing linked/managed attachment into the
+/// configured library. Settings changes never call this implicitly.
+pub fn reorganize_pdf(
+    conn: &Connection,
+    attachment_id: i64,
+    mode: &str,
+) -> Result<crate::models::PaperAttachment> {
+    manage_existing_attachment(conn, attachment_id, mode)
+}
+
+/// Explicitly rename/reorganize a managed PDF using the current naming
+/// template and subfolder rule. Metadata edits do not invoke this command.
+pub fn rename_managed_pdf(
+    conn: &Connection,
+    attachment_id: i64,
+) -> Result<crate::models::PaperAttachment> {
+    let current = get_paper_attachment(conn, attachment_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+    if current.storage_mode != "managed" {
+        return Err(rusqlite::Error::InvalidParameterName("storage_mode".into()));
+    }
+    manage_existing_attachment(conn, attachment_id, "move")
 }
 
 fn launch_file_action(path: &Path, reveal: bool) -> Result<()> {
@@ -2050,10 +2591,11 @@ fn add_library_and_attach(
     file: &LinkedFile,
     added_source: &str,
 ) -> Result<crate::models::PaperAttachment> {
-    let tx = conn.unchecked_transaction()?;
-    if !paper_exists(&tx, paper_id)? {
+    if !paper_exists(conn, paper_id)? {
         return Err(rusqlite::Error::QueryReturnedNoRows);
     }
+    let prepared = prepare_current_pdf_storage(conn, paper_id, file)?;
+    let tx = conn.unchecked_transaction()?;
     let now = now_utc();
     tx.execute(
         "INSERT INTO library_items (paper_id, added_at, added_source)
@@ -2061,8 +2603,20 @@ fn add_library_and_attach(
         params![paper_id, now, added_source],
     )?;
     tx.execute("UPDATE papers SET is_favorite=0, updated_at=?1 WHERE id=?2", params![now, paper_id])?;
-    let id = insert_linked_attachment(&tx, paper_id, file)?;
-    tx.commit()?;
+    let id = match insert_attachment_row(&tx, paper_id, file, prepared.as_ref()) {
+        Ok(id) => id,
+        Err(error) => {
+            if let Some(prepared) = prepared.as_ref() { cleanup_prepared_destination(prepared); }
+            return Err(error);
+        }
+    };
+    if let Err(error) = tx.commit() {
+        if let Some(prepared) = prepared.as_ref() { cleanup_prepared_destination(prepared); }
+        return Err(error);
+    }
+    if let Some(prepared) = prepared.as_ref() {
+        finalize_prepared_storage(conn, prepared)?;
+    }
     get_paper_attachment(conn, id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
 }
 

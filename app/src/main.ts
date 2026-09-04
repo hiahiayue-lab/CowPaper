@@ -232,6 +232,10 @@ interface Settings {
   dailySyncTime: string;
   autoAnalyzeNew: boolean;
   defaultAbstractLang: string;
+  pdfFileHandlingMode: "none" | "copy" | "move";
+  pdfLibraryRoot: string;
+  pdfNamingTemplate: string;
+  pdfSubfolderRule: "none" | "year" | "journal/source";
 }
 
 interface SyncProgress {
@@ -572,6 +576,10 @@ async function loadSettings() {
     ($("set-daily-sync") as HTMLInputElement).checked = settings.dailyAutoSync;
     ($("set-daily-time") as HTMLInputElement).value = settings.dailySyncTime;
     ($("set-abstract-lang") as HTMLSelectElement).value = abstractLang;
+    ($("set-pdf-file-handling-mode") as HTMLSelectElement).value = settings.pdfFileHandlingMode;
+    ($("set-pdf-library-root") as HTMLInputElement).value = settings.pdfLibraryRoot;
+    ($("set-pdf-naming-template") as HTMLInputElement).value = settings.pdfNamingTemplate;
+    ($("set-pdf-subfolder-rule") as HTMLSelectElement).value = settings.pdfSubfolderRule;
   }
 }
 
@@ -1584,7 +1592,7 @@ function renderLibraryInspector(item: LibraryPaper) {
   const note = libraryNote(item);
   const editOpen = libraryEditingPaperId === p.id;
   const attachmentRows = item.attachments.length
-    ? item.attachments.map((attachment) => `<div class="attachment-row${attachment.missing ? " missing" : ""}"><div class="attachment-main"><span class="attachment-icon" aria-hidden="true">PDF</span><div class="attachment-copy"><strong title="${escapeHtml(attachment.absolutePath)}">${escapeHtml(attachment.filename)}</strong><span class="muted small">${attachment.missing ? "PDF 文件已移动 / 找不到文件" : "已链接 · 只读关联"}</span></div></div><div class="attachment-actions">${attachment.missing ? "" : `<button class="ghost small" data-action="library-open-pdf" data-attachment-id="${attachment.id}">打开</button><button class="ghost small" data-action="library-reveal-pdf" data-attachment-id="${attachment.id}">显示位置</button>`}<button class="ghost small" data-action="library-relink-pdf" data-attachment-id="${attachment.id}">重新链接</button><button class="ghost small danger" data-action="library-detach-pdf" data-attachment-id="${attachment.id}">解除关联</button></div></div>`).join("")
+    ? item.attachments.map((attachment) => `<div class="attachment-row${attachment.missing ? " missing" : ""}"><div class="attachment-main"><span class="attachment-icon" aria-hidden="true">PDF</span><div class="attachment-copy"><strong title="${escapeHtml(attachment.absolutePath)}">${escapeHtml(attachment.filename)}</strong><span class="muted small">${attachment.missing ? "PDF 文件已移动 / 找不到文件" : attachment.storageMode === "managed" ? "已纳入 CowPaper 文件库 · managed" : "已链接 · 原文件保留"}</span></div></div><div class="attachment-actions">${attachment.missing ? "" : `<button class="ghost small" data-action="library-open-pdf" data-attachment-id="${attachment.id}">打开</button><button class="ghost small" data-action="library-reveal-pdf" data-attachment-id="${attachment.id}">显示位置</button>`}<button class="ghost small" data-action="library-relink-pdf" data-attachment-id="${attachment.id}">重新链接</button><button class="ghost small danger" data-action="library-detach-pdf" data-attachment-id="${attachment.id}">解除关联</button></div></div>`).join("")
     : '<div class="inspector-placeholder"><span class="placeholder-icon" aria-hidden="true">⌑</span><span>尚未添加 PDF 附件。</span></div>';
   const attachmentBusy = libraryPdfBusyPaperId === p.id;
   const attachmentAdd = `<button class="ghost small" data-action="library-attach-pdf" data-paper-id="${p.id}"${attachmentBusy ? " disabled" : ""}>${attachmentBusy ? "添加中…" : "＋ 添加 PDF"}</button>`;
@@ -2505,6 +2513,10 @@ async function saveSettings() {
     dailySyncTime: ($("set-daily-time") as HTMLInputElement).value || "09:00",
     autoAnalyzeNew: ($("set-auto-analyze") as HTMLInputElement).checked,
     defaultAbstractLang: ($("set-abstract-lang") as HTMLSelectElement).value,
+    pdfFileHandlingMode: ($("set-pdf-file-handling-mode") as HTMLSelectElement).value as "none" | "copy" | "move",
+    pdfLibraryRoot: ($("set-pdf-library-root") as HTMLInputElement).value.trim(),
+    pdfNamingTemplate: ($("set-pdf-naming-template") as HTMLInputElement).value,
+    pdfSubfolderRule: ($("set-pdf-subfolder-rule") as HTMLSelectElement).value as "none" | "year" | "journal/source",
   };
   try {
     await invoke("set_settings", { s });
