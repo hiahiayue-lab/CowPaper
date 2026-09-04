@@ -5509,7 +5509,7 @@ fn test_external_pdf_import_uses_managed_storage_without_second_canonical_paper(
     assert!(path.exists(), "external import 的 copy 必须保留源 PDF");
     assert!(std::path::Path::new(&attachment.absolute_path).is_file());
     assert_eq!(conn.query_row("SELECT COUNT(*) FROM papers", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
-    assert!(attachment.relative_path.as_deref().unwrap().starts_with("2024/"));
+    assert!(std::path::Path::new(attachment.relative_path.as_deref().unwrap()).starts_with("2024"));
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(attachment.absolute_path);
     let _ = std::fs::remove_dir_all(root);
