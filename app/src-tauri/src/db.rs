@@ -996,6 +996,15 @@ pub fn upsert_paper(conn: &Connection, journal_id: i64, c: &PaperCandidate) -> R
         });
     }
 
+    Ok(UpsertOutcome::New(insert_paper_without_identity_merge(conn, journal_id, c)?))
+}
+
+/// Insert a canonical Paper without running identity matching first. This is
+/// used only after an external PDF import has already checked exact DOI and
+/// scholarly identity and has handled any title/author/year candidate through
+/// explicit UI confirmation. It prevents the generic title/year fallback in
+/// `upsert_paper` from silently merging an unconfirmed PDF.
+fn insert_paper_without_identity_merge(conn: &Connection, journal_id: i64, c: &PaperCandidate) -> Result<i64> {
     let authors_json = serde_json::to_string(&c.authors).unwrap_or_else(|_| "[]".to_string());
     let title_norm = c.title.as_deref().map(normalize_title);
     // 摘要质量（本地判定）决定初始 analysis_status：
@@ -1079,7 +1088,7 @@ pub fn upsert_paper(conn: &Connection, journal_id: i64, c: &PaperCandidate) -> R
         let (q, r) = crate::abstract_quality::assess_abstract_quality(t);
         let _ = record_abstract_source(conn, id, src, t, q, r);
     }
-    Ok(UpsertOutcome::New(id))
+    Ok(id)
 }
 
 pub fn insert_source_record(
@@ -2149,10 +2158,7 @@ pub fn import_external_pdf(
         source_id: doi,
         raw_json: None,
     };
-    let paper_id = match upsert_paper(conn, journal_id, &candidate)? {
-        UpsertOutcome::New(id) => id,
-        UpsertOutcome::Existing { id, .. } => id,
-    };
+    let paper_id = insert_paper_without_identity_merge(conn, journal_id, &candidate)?;
     let attachment = add_library_and_attach(conn, paper_id, &file, "external_pdf_import")?;
     Ok(crate::models::ExternalPdfImportResult {
         outcome: "createdExternalPaper".to_string(),

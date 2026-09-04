@@ -5337,6 +5337,30 @@ fn test_external_pdf_without_identity_creates_canonical_paper_and_never_generate
 }
 
 #[test]
+fn test_external_pdf_without_reliable_identity_does_not_title_merge() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "External PDF Import", None, None, None, None).unwrap();
+    let mut existing_candidate = candidate(None, "Same External Title", None, None);
+    existing_candidate.authors.clear();
+    existing_candidate.published_date = Some("2024-01-01".into());
+    existing_candidate.year = Some(2024);
+    let existing = match db::upsert_paper(&conn, jid, &existing_candidate).unwrap() {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new paper"),
+    };
+    assert!(existing > 0);
+    let path = test_pdf_path(
+        "same-title-no-author",
+        "%PDF-1.7\n1 0 obj << /Title (Same External Title) /CreationDate (D:2024) >>\n",
+    );
+    let result = db::import_external_pdf(&conn, path.to_str().unwrap(), None).unwrap();
+    assert_eq!(result.outcome, "createdExternalPaper");
+    assert_ne!(result.paper_id, Some(existing), "无可靠 identity 不得按标题静默合并");
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM papers", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn test_external_pdf_title_author_year_is_manual_candidate_only() {
     let conn = mem_db();
     let jid = db::insert_journal(&conn, "Candidate J", Some("0025-1909"), None, None, None).unwrap();
