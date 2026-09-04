@@ -451,8 +451,8 @@ let libraryPdfImportBusy = false;
 let libraryDropTargetPaperId: number | null = null;
 let libraryDropActive = false;
 let libraryDropQueue: LibraryDropItem[] = [];
-let libraryColumnWidths = loadLibraryColumnWidths();
-let libraryInspectorWidth = loadLibraryInspectorWidth();
+let libraryColumnWidths: Record<LibraryColumn, number>;
+let libraryInspectorWidth: number;
 let libraryColumnResize: { column: LibraryColumn; startX: number; startWidth: number } | null = null;
 let libraryInspectorResize: { startX: number; startWidth: number } | null = null;
 let currentAppVersion = "0.1.4";
@@ -569,6 +569,9 @@ function loadLibraryInspectorWidth(): number {
   const value = Number(localStorage.getItem(LIBRARY_INSPECTOR_STORAGE_KEY));
   return Number.isFinite(value) && value >= 300 && value <= 560 ? Math.round(value) : 392;
 }
+
+libraryColumnWidths = loadLibraryColumnWidths();
+libraryInspectorWidth = loadLibraryInspectorWidth();
 
 function persistLibraryLayout(): void {
   localStorage.setItem(LIBRARY_COLUMN_STORAGE_KEY, JSON.stringify(libraryColumnWidths));
