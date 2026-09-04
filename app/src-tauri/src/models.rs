@@ -339,6 +339,43 @@ pub struct Tag {
     pub updated_at: String,
 }
 
+/// A publisher/provider-sourced bibliographic keyword. This is deliberately
+/// separate from LibraryTag and ResearchTag data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaperKeyword {
+    pub id: i64,
+    pub paper_id: i64,
+    pub keyword: String,
+    pub normalized_keyword: String,
+    /// author_keyword | publisher_keyword | subject | concept
+    pub kind: String,
+    /// crossref | openalex | pdf_info | pdf_xmp | publisher
+    pub source: String,
+    /// EXACT | HIGH | MEDIUM | LOW
+    pub confidence: String,
+    pub source_locator: Option<String>,
+    pub source_record_id: Option<i64>,
+    pub language: Option<String>,
+    pub position: Option<i64>,
+    pub retrieved_at: String,
+    pub created_at: String,
+}
+
+/// Internal input used by metadata parsers before a keyword is attached to a
+/// canonical paper row.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaperKeywordInput {
+    pub keyword: String,
+    pub kind: String,
+    pub source: String,
+    pub confidence: String,
+    pub source_locator: Option<String>,
+    pub language: Option<String>,
+    pub position: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Paper {
@@ -397,6 +434,10 @@ pub struct Paper {
     pub updated_at: String,
     /// 所属期刊的 collection code 列表（paper → journal → collections 派生，不冗余）
     pub collections: Vec<String>,
+    /// Bibliographic keywords owned by the canonical paper. Library Tags and
+    /// Research Tags are intentionally not represented by this collection.
+    #[serde(default)]
+    pub keywords: Vec<PaperKeyword>,
 }
 
 /// Literature workspace collection. This is intentionally separate from
@@ -521,6 +562,11 @@ pub struct ExternalPdfMetadata {
     pub doi: Option<String>,
     pub scholarly_id: Option<String>,
     pub abstract_text: Option<String>,
+    /// Explicit PDF Info/XMP keyword evidence. It is never treated as an AI
+    /// suggestion and is stored with its source/provenance when a paper is
+    /// created or manually confirmed.
+    #[serde(default)]
+    pub keywords: Vec<PaperKeywordInput>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
