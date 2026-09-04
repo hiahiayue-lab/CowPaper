@@ -2104,7 +2104,7 @@ fn test_migration_v2_to_v3_preserves_data() {
 
     // 迁移到 v3
     db::init(&conn).unwrap();
-    assert_eq!(db::SCHEMA_VERSION, 15);
+    assert_eq!(db::SCHEMA_VERSION, 16);
 
     // 8) 旧 issn 迁移进 journal_identifiers（类型按列，不猜）
     let ids = db::list_journal_identifiers(&conn, jid).unwrap();
@@ -2145,7 +2145,7 @@ fn test_database_restart_persistence() {
     {
         let conn = db::open(&path).unwrap();
         db::init(&conn).unwrap(); // 幂等：user_version=3 不重复迁移
-        assert_eq!(db::SCHEMA_VERSION, 15);
+        assert_eq!(db::SCHEMA_VERSION, 16);
         let j = db::get_journal(&conn, 1).unwrap().expect("期刊持久化");
         assert_eq!(j.print_issn.as_deref(), Some("0025-1909"));
         assert_eq!(j.identifiers.len(), 1);
@@ -2772,7 +2772,7 @@ fn test_migration_v4_abstract_quality_init() {
     .unwrap();
 
     db::init(&conn).unwrap();
-    assert_eq!(db::SCHEMA_VERSION, 15);
+    assert_eq!(db::SCHEMA_VERSION, 16);
 
     let papers = db::list_papers(&conn, Some(jid), 100).unwrap();
     assert_eq!(papers.len(), 3, "迁移不得丢论文");
@@ -3464,7 +3464,7 @@ fn test_updater_config_requires_signed_cross_platform_artifacts() {
     assert_eq!(endpoints.len(), 1);
     assert!(endpoints[0].as_str().unwrap().starts_with("https://github.com/"));
     assert!(endpoints[0].as_str().unwrap().ends_with("/latest/download/latest.json"));
-    assert_eq!(db::SCHEMA_VERSION, 15, "updater must not claim migration ownership");
+    assert_eq!(db::SCHEMA_VERSION, 16, "updater must not claim migration ownership");
 }
 
 #[test]
@@ -5018,7 +5018,7 @@ fn test_r7_existing_upsert_fills_kind_when_unknown() {
 }
 
 #[test]
-fn test_library_migration_v13_to_v15_preserves_existing_data() {
+fn test_library_migration_v13_to_v16_preserves_existing_data() {
     let conn = mem_db();
     // Turn a fully initialized in-memory database into a representative v13
     // database by removing only the Library tables created by the test setup.
@@ -5030,6 +5030,7 @@ fn test_library_migration_v13_to_v15_preserves_existing_data() {
         "library_collections",
         "paper_attachments",
         "library_item_metadata",
+        "paper_keywords",
     ] {
         conn.execute(&format!("DROP TABLE {}", table), []).unwrap();
     }
@@ -5062,7 +5063,7 @@ fn test_library_migration_v13_to_v15_preserves_existing_data() {
 
     db::init(&conn).unwrap();
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-    assert_eq!(version, 15);
+    assert_eq!(version, 16);
     let paper = db::get_paper(&conn, pid).unwrap().unwrap();
     assert_eq!(paper.abstract_text.as_deref(), Some("preserved abstract"));
     assert_eq!(paper.chinese_title.as_deref(), Some("保留中文标题"));
@@ -5076,7 +5077,7 @@ fn test_library_migration_v13_to_v15_preserves_existing_data() {
 
     db::init(&conn).unwrap();
     let version_again: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-    assert_eq!(version_again, 15);
+    assert_eq!(version_again, 16);
     for table in [
         "library_items",
         "library_collections",
@@ -5085,6 +5086,7 @@ fn test_library_migration_v13_to_v15_preserves_existing_data() {
         "library_item_tags",
         "paper_attachments",
         "library_item_metadata",
+        "paper_keywords",
     ] {
         let exists: bool = conn
             .query_row(
@@ -5098,7 +5100,7 @@ fn test_library_migration_v13_to_v15_preserves_existing_data() {
 }
 
 #[test]
-fn test_migration_v14_to_v15_creates_attachment_and_metadata_tables() {
+fn test_migration_v14_to_v16_creates_attachment_metadata_and_keyword_tables() {
     let conn = mem_db();
     let jid = db::insert_journal(&conn, "v14 Journal", Some("0025-1909"), None, None, None).unwrap();
     let pid = match db::upsert_paper(&conn, jid, &candidate(Some("10.1000/v14-v15"), "v14 Paper", None, None)).unwrap() {
@@ -5110,9 +5112,9 @@ fn test_migration_v14_to_v15_creates_attachment_and_metadata_tables() {
     conn.execute("DROP TABLE paper_attachments", []).unwrap();
     conn.pragma_update(None, "user_version", 14).unwrap();
     db::init(&conn).unwrap();
-    assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 15);
+    assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 16);
     assert!(db::get_library_membership(&conn, pid).unwrap().is_some(), "v15 不得破坏 v14 Library membership");
-    for table in ["paper_attachments", "library_item_metadata"] {
+    for table in ["paper_attachments", "library_item_metadata", "paper_keywords"] {
         assert!(conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)", params![table], |r| r.get::<_, bool>(0)).unwrap());
     }
 }
@@ -5130,6 +5132,7 @@ fn test_library_migration_is_empty_and_idempotent() {
         "library_item_tags",
         "paper_attachments",
         "library_item_metadata",
+        "paper_keywords",
     ] {
         let exists: bool = conn
             .query_row(
@@ -5509,7 +5512,7 @@ fn test_external_pdf_import_uses_managed_storage_without_second_canonical_paper(
     assert!(path.exists(), "external import 的 copy 必须保留源 PDF");
     assert!(std::path::Path::new(&attachment.absolute_path).is_file());
     assert_eq!(conn.query_row("SELECT COUNT(*) FROM papers", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
-    assert!(std::path::Path::new(attachment.relative_path.as_deref().unwrap()).starts_with("2024"));
+    assert!(std::path::Path::new(attachment.relative_path.as_deref().unwrap()).starts_with("Unknown"));
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(attachment.absolute_path);
     let _ = std::fs::remove_dir_all(root);
@@ -5527,7 +5530,7 @@ fn test_external_pdf_without_identity_creates_canonical_paper_and_never_generate
     let pid = result.paper_id.unwrap();
     let paper = db::get_paper(&conn, pid).unwrap().unwrap();
     assert_eq!(paper.title.as_deref(), Some("A New External Paper"));
-    assert_eq!(paper.year, Some(2023));
+    assert_eq!(paper.year, None);
     assert!(paper.abstract_text.is_none(), "title 不得生成 abstract");
     assert!(db::get_library_membership(&conn, pid).unwrap().is_some());
     assert!(db::list_paper_attachments(&conn, pid).unwrap()[0].absolute_path.contains("new-external"));
@@ -5573,7 +5576,7 @@ fn test_external_pdf_title_author_year_is_manual_candidate_only() {
     };
     let path = test_pdf_path(
         "candidate",
-        "%PDF-1.7\n1 0 obj << /Title (Candidate Paper) /Author (Alice Smith) /CreationDate (D:2025) >>\n",
+        "%PDF-1.7\n1 0 obj << /Title (Candidate Paper) /Author (Alice Smith) /Year (2025) /CreationDate (D:2099) >>\n",
     );
     let pending = db::import_external_pdf(&conn, path.to_str().unwrap(), None).unwrap();
     assert_eq!(pending.outcome, "needsManualConfirmation");
@@ -5626,4 +5629,160 @@ fn test_library_metadata_overrides_effective_values_without_mutating_canonical_p
     assert_eq!(reset.effective_title.as_deref(), Some("Canonical Title"));
     assert_eq!(reset.effective_abstract.as_deref(), Some("Canonical Abstract"));
     assert_eq!(reset.note.as_deref(), Some("Updated note"), "reset override 不得清除 note");
+}
+
+#[test]
+fn test_v16_keywords_have_fk_dedup_kind_and_provenance() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "Keyword Journal", None, None, None, None).unwrap();
+    let pid = match db::upsert_paper(&conn, jid, &candidate(None, "Keyword Paper", None, None)).unwrap() {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new paper"),
+    };
+    let author = crate::models::PaperKeywordInput {
+        keyword: "  Machine   Learning ".into(),
+        kind: "publisher_keyword".into(),
+        source: "jats".into(),
+        confidence: "EXACT".into(),
+        source_locator: Some("article-meta/kwd-group[1]/kwd[1]".into()),
+        language: Some("en".into()),
+        position: Some(0),
+    };
+    assert_eq!(db::insert_keyword_inputs(&conn, pid, &[author.clone()], None).unwrap(), 1);
+    assert_eq!(db::insert_keyword_inputs(&conn, pid, &[author], None).unwrap(), 0);
+    let concept_disguised_as_author = crate::models::PaperKeywordInput {
+        keyword: "Graph theory".into(),
+        kind: "author_keyword".into(),
+        source: "openalex".into(),
+        confidence: "HIGH".into(),
+        ..Default::default()
+    };
+    assert_eq!(db::insert_keyword_inputs(&conn, pid, &[concept_disguised_as_author], None).unwrap(), 0);
+    let crossref_raw = r#"{"message":{"DOI":"10.1000/kw","subject":["Operations Research","Decision Science"]}}"#;
+    db::insert_source_record(&conn, pid, "crossref", Some("10.1000/kw"), Some(crossref_raw)).unwrap();
+    let openalex_raw = r#"{"id":"https://openalex.org/W1","keywords":[{"keyword":"graph learning","score":0.9}],"concepts":[{"display_name":"Machine learning","score":0.8}]}"#;
+    db::insert_source_record(&conn, pid, "openalex", Some("W1"), Some(openalex_raw)).unwrap();
+    let keywords = db::list_paper_keywords(&conn, pid).unwrap();
+    assert!(keywords.iter().any(|k| k.kind == "publisher_keyword" && k.source == "jats"));
+    assert!(keywords.iter().filter(|k| k.source == "crossref").all(|k| k.kind == "subject"));
+    assert!(keywords.iter().filter(|k| k.source == "openalex").all(|k| k.kind == "concept"));
+    assert!(keywords.iter().any(|k| k.source_locator.as_deref() == Some("message.subject[0]")));
+    assert_eq!(conn.query_row(
+        "SELECT COUNT(*) FROM paper_keywords WHERE paper_id=?1 AND normalized_keyword='machine learning' AND kind='publisher_keyword' AND source='jats'",
+        params![pid],
+        |row| row.get::<_, i64>(0),
+    ).unwrap(), 1);
+    let foreign_key_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_foreign_key_list('paper_keywords') WHERE \"table\"='papers'",
+        [],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(foreign_key_count, 1);
+    assert!(conn.execute(
+        "INSERT INTO paper_keywords (paper_id,keyword,normalized_keyword,kind,source,confidence,retrieved_at,created_at)
+         VALUES (999,'x','x','concept','test','LOW','now','now')",
+        [],
+    ).is_err());
+}
+
+#[test]
+fn test_external_pdf_parser_uses_bounded_doi_and_real_publication_fields_only() {
+    let path = test_pdf_path(
+        "metadata-v16",
+        "%PDF-1.7\nDOI: 10.5555/from-first-page\n1 0 obj << /Title (Local PDF Title) /Author (Local Author) /Year (2022) /CreationDate (D:2099) /Keywords (author supplied; evidence) >>\n",
+    );
+    let metadata = db::parse_external_pdf_metadata(&path, "metadata-v16.pdf").unwrap();
+    assert_eq!(metadata.doi.as_deref(), Some("10.5555/from-first-page"));
+    assert_eq!(metadata.title.as_deref(), Some("Local PDF Title"));
+    assert_eq!(metadata.year, Some(2022));
+    assert!(metadata.keywords.iter().all(|keyword| keyword.kind != "author_keyword"));
+    assert!(metadata.keywords.iter().any(|keyword| keyword.source == "pdf_info" && keyword.kind == "publisher_keyword"));
+    let _ = std::fs::remove_file(path);
+
+    let creation_only = test_pdf_path(
+        "creation-date-is-not-publication-year",
+        "%PDF-1.7\n1 0 obj << /Title (No Publication Year) /CreationDate (D:2099) /ModDate (D:2100) >>\n",
+    );
+    let metadata = db::parse_external_pdf_metadata(&creation_only, "creation-date-is-not-publication-year.pdf").unwrap();
+    assert_eq!(metadata.year, None);
+    let _ = std::fs::remove_file(creation_only);
+}
+
+#[test]
+fn test_exact_provider_enrichment_is_fill_only_and_does_not_touch_recommendation_fields() {
+    let mut local = crate::models::ExternalPdfMetadata {
+        filename: "local.pdf".into(),
+        title: Some("User Visible Title".into()),
+        authors: vec![Author { given: None, family: None, name: Some("User Author".into()) }],
+        year: Some(2020),
+        doi: Some("10.1000/fill-only".into()),
+        ..Default::default()
+    };
+    let mut provider = candidate(Some("10.1000/fill-only"), "Provider Title", Some("Provider abstract"), Some("crossref"));
+    provider.raw_json = Some(r#"{"DOI":"10.1000/fill-only","subject":["Subject from Crossref"]}"#.into());
+    db::merge_external_pdf_metadata_from_candidate(&mut local, &provider, "crossref");
+    assert_eq!(local.title.as_deref(), Some("User Visible Title"));
+    assert_eq!(local.authors[0].name.as_deref(), Some("User Author"));
+    assert_eq!(local.year, Some(2020));
+    assert_eq!(local.abstract_text.as_deref(), Some("Provider abstract"));
+    assert!(local.keywords.iter().all(|keyword| keyword.kind == "subject"));
+
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "Canonical Journal", None, None, None, None).unwrap();
+    let pid = match db::upsert_paper(&conn, jid, &candidate(Some("10.1000/canonical"), "Canonical Title", Some("Canonical abstract"), Some("crossref"))).unwrap() {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new paper"),
+    };
+    conn.execute(
+        "UPDATE papers SET year=2020,total_score=4.2,tag_matches_json='[{\"name\":\"keep\"}]',analysis_status='analysisSucceeded' WHERE id=?1",
+        params![pid],
+    ).unwrap();
+    let before: (Option<f64>, String, String) = conn.query_row(
+        "SELECT total_score,tag_matches_json,analysis_status FROM papers WHERE id=?1",
+        params![pid],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).unwrap();
+    let conflicting = candidate(Some("10.1000/canonical"), "Conflicting Provider Title", Some("Conflicting abstract"), Some("crossref"));
+    db::fill_missing_canonical_metadata_from_candidate(&conn, pid, &conflicting).unwrap();
+    let after: (Option<f64>, String, String, Option<String>, Option<i32>) = conn.query_row(
+        "SELECT total_score,tag_matches_json,analysis_status,title,year FROM papers WHERE id=?1",
+        params![pid],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+    ).unwrap();
+    assert_eq!((after.0, after.1.clone(), after.2.clone()), before);
+    assert_eq!(after.3.as_deref(), Some("Canonical Title"));
+    assert_eq!(after.4, Some(2020));
+}
+
+#[test]
+fn test_bibliographic_keywords_are_not_recommendation_inputs() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "Isolation Journal", None, None, None, None).unwrap();
+    let pid = match db::upsert_paper(&conn, jid, &candidate(Some("10.1000/isolation"), "Isolation Paper", Some("abstract"), Some("crossref"))).unwrap() {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new paper"),
+    };
+    conn.execute(
+        "UPDATE papers SET total_score=7.7,tag_matches_json='[{\"tagId\":1,\"score\":7.7}]',analysis_status='analysisSucceeded' WHERE id=?1",
+        params![pid],
+    ).unwrap();
+    let before: (Option<f64>, String, String) = conn.query_row(
+        "SELECT total_score,tag_matches_json,analysis_status FROM papers WHERE id=?1",
+        params![pid],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).unwrap();
+    db::insert_keyword_inputs(&conn, pid, &[crate::models::PaperKeywordInput {
+        keyword: "Research direction".into(),
+        kind: "concept".into(),
+        source: "openalex".into(),
+        confidence: "HIGH".into(),
+        ..Default::default()
+    }], None).unwrap();
+    let after: (Option<f64>, String, String) = conn.query_row(
+        "SELECT total_score,tag_matches_json,analysis_status FROM papers WHERE id=?1",
+        params![pid],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).unwrap();
+    assert_eq!(before, after);
+    assert_eq!(db::get_paper(&conn, pid).unwrap().unwrap().keywords.len(), 1);
 }

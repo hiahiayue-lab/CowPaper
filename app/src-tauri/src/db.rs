@@ -1,5 +1,8 @@
 use rusqlite::{params, Connection, OptionalExtension, Result};
 use sha2::{Digest, Sha256};
+use lopdf::{Document, LoadOptions, Object};
+use quick_xml::events::Event;
+use quick_xml::Reader;
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -91,10 +94,11 @@ pub fn open(path: &Path) -> Result<Connection> {
 
 /// 当前 schema 版本（Round 5B：abstract_quality / paper_abstract_sources 为 v4；
 /// Round 7 Phase 1：content_kind / abstract_status 为 v13；
-/// Literature Workspace 为 v14；v15 为 Library Attachments + User Metadata。
+/// Literature Workspace 为 v14；v15 为 Library Attachments + User Metadata；
+/// v16 为 canonical bibliographic keywords。
 /// 生产构建中仅由迁移系统隐式使用；测试中直接断言。
 #[allow(dead_code)]
-pub const SCHEMA_VERSION: i64 = 15;
+pub const SCHEMA_VERSION: i64 = 16;
 
 pub fn init(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
@@ -962,16 +966,21 @@ fn fill_other_fields(conn: &Connection, id: i64, c: &PaperCandidate) -> Result<(
     let authors_json = serde_json::to_string(&c.authors).unwrap_or_else(|_| "[]".to_string());
     conn.execute(
         "UPDATE papers SET
-            url = COALESCE(url, ?1),
-            title = COALESCE(title, ?2),
-            authors_json = CASE WHEN authors_json IS NULL OR authors_json = '[]' THEN ?3 ELSE authors_json END,
-            published_date = COALESCE(published_date, ?4),
-            year = COALESCE(year, ?5),
-            publisher_article_id = COALESCE(publisher_article_id, ?6),
-            openalex_work_id = COALESCE(openalex_work_id, ?7),
-            updated_at = ?8
-         WHERE id = ?9",
+            normalized_doi = COALESCE(normalized_doi, ?1),
+            original_doi = COALESCE(original_doi, ?2),
+            url = COALESCE(url, ?3),
+            title = COALESCE(title, ?4),
+            authors_json = CASE WHEN authors_json IS NULL OR authors_json = '[]' THEN ?5 ELSE authors_json END,
+            published_date = COALESCE(published_date, ?6),
+            year = COALESCE(year, ?7),
+            publisher_article_id = COALESCE(publisher_article_id, ?8),
+            openalex_work_id = COALESCE(openalex_work_id, ?9),
+            discovery_source = COALESCE(discovery_source, ?10),
+            updated_at = ?11
+         WHERE id = ?12",
         params![
+            c.normalized_doi,
+            c.original_doi,
             c.url,
             c.title,
             authors_json,
@@ -979,6 +988,7 @@ fn fill_other_fields(conn: &Connection, id: i64, c: &PaperCandidate) -> Result<(
             c.year,
             c.publisher_article_id,
             c.openalex_work_id,
+            c.discovery_source,
             now_utc(),
             id
         ],
@@ -1097,12 +1107,167 @@ pub fn insert_source_record(
     source: &str,
     source_id: Option<&str>,
     raw_json: Option<&str>,
-) -> Result<()> {
+) -> Result<i64> {
     conn.execute(
         "INSERT INTO source_records (paper_id, source, source_id, raw_json, retrieved_at) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![paper_id, source, source_id, raw_json, now_utc()],
     )?;
-    Ok(())
+    let source_record_id = conn.last_insert_rowid();
+    if let Some(raw_json) = raw_json {
+        let _ = insert_keyword_inputs(
+            conn,
+            paper_id,
+            &keyword_inputs_from_provider_json(source, raw_json),
+            Some(source_record_id),
+        )?;
+    }
+    Ok(source_record_id)
+}
+
+/// Normalize only for deterministic duplicate suppression. This does not
+/// rewrite the displayed keyword and does not perform semantic/fuzzy merging.
+pub fn normalize_keyword(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+fn accepted_keyword_kind(kind: &str) -> bool {
+    matches!(kind, "author_keyword" | "publisher_keyword" | "subject" | "concept")
+}
+
+fn keyword_input_is_allowed(input: &crate::models::PaperKeywordInput) -> bool {
+    if !accepted_keyword_kind(&input.kind) || input.source.trim().is_empty() {
+        return false;
+    }
+    // OpenAlex concepts/topics and Crossref subjects are not author keywords.
+    // AI output is not a bibliographic source at all.
+    if input.kind == "author_keyword"
+        && matches!(input.source.as_str(), "openalex" | "crossref" | "ai" | "ai_suggestion")
+    {
+        return false;
+    }
+    !matches!(input.source.as_str(), "ai" | "ai_suggestion")
+}
+
+/// Persist provider/PDF keyword evidence without touching any recommendation
+/// column on `papers`. `INSERT OR IGNORE` makes repeated sync/import passes
+/// idempotent under the v16 uniqueness key.
+pub fn insert_keyword_inputs(
+    conn: &Connection,
+    paper_id: i64,
+    inputs: &[crate::models::PaperKeywordInput],
+    source_record_id: Option<i64>,
+) -> Result<usize> {
+    let mut inserted = 0;
+    for input in inputs {
+        let keyword = input.keyword.trim();
+        let normalized_keyword = normalize_keyword(keyword);
+        if keyword.is_empty() || normalized_keyword.is_empty() || !keyword_input_is_allowed(input) {
+            continue;
+        }
+        inserted += conn.execute(
+            "INSERT OR IGNORE INTO paper_keywords (
+                paper_id, keyword, normalized_keyword, kind, source, confidence,
+                source_locator, source_record_id, language, position, retrieved_at, created_at
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?11)",
+            params![
+                paper_id,
+                keyword,
+                normalized_keyword,
+                input.kind,
+                input.source,
+                input.confidence,
+                input.source_locator,
+                source_record_id,
+                input.language,
+                input.position,
+                now_utc(),
+            ],
+        )?;
+    }
+    Ok(inserted)
+}
+
+pub fn list_paper_keywords(conn: &Connection, paper_id: i64) -> Result<Vec<crate::models::PaperKeyword>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, paper_id, keyword, normalized_keyword, kind, source, confidence,
+                source_locator, source_record_id, language, position, retrieved_at, created_at
+         FROM paper_keywords WHERE paper_id=?1 ORDER BY kind, position IS NULL, position, id",
+    )?;
+    let rows = stmt.query_map(params![paper_id], |r| {
+        Ok(crate::models::PaperKeyword {
+            id: r.get(0)?,
+            paper_id: r.get(1)?,
+            keyword: r.get(2)?,
+            normalized_keyword: r.get(3)?,
+            kind: r.get(4)?,
+            source: r.get(5)?,
+            confidence: r.get(6)?,
+            source_locator: r.get(7)?,
+            source_record_id: r.get(8)?,
+            language: r.get(9)?,
+            position: r.get(10)?,
+            retrieved_at: r.get(11)?,
+            created_at: r.get(12)?,
+        })
+    })?;
+    rows.collect()
+}
+
+fn value_text(value: &serde_json::Value) -> Option<String> {
+    value.as_str().map(str::trim).filter(|v| !v.is_empty()).map(str::to_string)
+}
+
+/// Extract only explicit source fields. In particular, OpenAlex `concepts`,
+/// `keywords`, and `topics` all become `concept`, never `author_keyword`.
+pub(crate) fn keyword_inputs_from_provider_json(source: &str, raw_json: &str) -> Vec<crate::models::PaperKeywordInput> {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(raw_json) else { return Vec::new(); };
+    if let Some(message) = value.get("message") {
+        value = message.clone();
+    }
+    let source = source.trim().to_lowercase();
+    let mut out = Vec::new();
+    if source == "crossref" {
+        if let Some(values) = value.get("subject").and_then(|v| v.as_array()) {
+            for (position, value) in values.iter().enumerate() {
+                if let Some(keyword) = value_text(value) {
+                    out.push(crate::models::PaperKeywordInput {
+                        keyword,
+                        kind: "subject".to_string(),
+                        source: "crossref".to_string(),
+                        confidence: "HIGH".to_string(),
+                        source_locator: Some(format!("message.subject[{}]", position)),
+                        language: None,
+                        position: Some(position as i64),
+                    });
+                }
+            }
+        }
+    } else if source == "openalex" {
+        for field in ["keywords", "concepts", "topics"] {
+            if let Some(values) = value.get(field).and_then(|v| v.as_array()) {
+                for (position, value) in values.iter().enumerate() {
+                    let keyword = value_text(value)
+                        .or_else(|| value.get("keyword").and_then(value_text))
+                        .or_else(|| value.get("display_name").and_then(value_text));
+                    if let Some(keyword) = keyword {
+                        out.push(crate::models::PaperKeywordInput {
+                            keyword,
+                            kind: "concept".to_string(),
+                            source: "openalex".to_string(),
+                            confidence: value.get("score").and_then(|v| v.as_f64())
+                                .map(|score| if score >= 0.75 { "HIGH" } else { "MEDIUM" })
+                                .unwrap_or("MEDIUM")
+                                .to_string(),
+                            source_locator: Some(format!("{}.{}", field, position)),
+                            language: None,
+                            position: Some(position as i64),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 fn row_to_paper(row: &rusqlite::Row) -> Result<Paper> {
@@ -1157,6 +1322,7 @@ fn row_to_paper(row: &rusqlite::Row) -> Result<Paper> {
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
         collections: Vec::new(),
+        keywords: Vec::new(),
     })
 }
 
@@ -1175,6 +1341,7 @@ pub fn list_papers(conn: &Connection, journal_id: Option<i64>, limit: i64) -> Re
     };
     let mut papers: Vec<Paper> = rows.collect::<Result<Vec<_>>>()?;
     enrich_papers_collections(conn, &mut papers)?;
+    enrich_papers_keywords(conn, &mut papers)?;
     filter_current_tag_matches(conn, &mut papers)?;
     Ok(papers)
 }
@@ -1189,6 +1356,7 @@ pub fn list_papers_for_first_seen_cycle(conn: &Connection, cycle_key: &str, miss
     let rows = stmt.query_map(params![cycle_key], row_to_paper)?;
     let mut papers: Vec<Paper> = rows.collect::<Result<Vec<_>>>()?;
     enrich_papers_collections(conn, &mut papers)?;
+    enrich_papers_keywords(conn, &mut papers)?;
     filter_current_tag_matches(conn, &mut papers)?;
     Ok(papers)
 }
@@ -1198,6 +1366,7 @@ pub fn list_current_missing_papers_for_cycle(conn: &Connection, cycle_key: &str)
     let rows = stmt.query_map(params![cycle_key], row_to_paper)?;
     let mut papers: Vec<Paper> = rows.collect::<Result<Vec<_>>>()?;
     enrich_papers_collections(conn, &mut papers)?;
+    enrich_papers_keywords(conn, &mut papers)?;
     filter_current_tag_matches(conn, &mut papers)?;
     Ok(papers)
 }
@@ -1264,6 +1433,16 @@ fn enrich_papers_collections(conn: &Connection, papers: &mut [Paper]) -> Result<
     Ok(())
 }
 
+/// Populate bibliographic keywords from the canonical relation. This keeps
+/// Discovery and Library on the same Paper DTO; Library-only tags and metadata
+/// overrides remain separate layers.
+fn enrich_papers_keywords(conn: &Connection, papers: &mut [Paper]) -> Result<()> {
+    for paper in papers.iter_mut() {
+        paper.keywords = list_paper_keywords(conn, paper.id)?;
+    }
+    Ok(())
+}
+
 /// 单篇论文（含 collections 派生）。
 pub fn get_paper(conn: &Connection, id: i64) -> Result<Option<Paper>> {
     let p = conn
@@ -1277,6 +1456,7 @@ pub fn get_paper(conn: &Connection, id: i64) -> Result<Option<Paper>> {
     if let Some(p) = p {
         v.push(p);
         enrich_papers_collections(conn, &mut v)?;
+        enrich_papers_keywords(conn, &mut v)?;
         filter_current_tag_matches(conn, &mut v)?;
         Ok(v.pop())
     } else {
@@ -2461,6 +2641,9 @@ fn parse_author_metadata(value: Option<&str>) -> Vec<crate::models::Author> {
 fn parse_year_metadata(value: Option<&str>) -> Option<i32> {
     let value = value?;
     let bytes = value.as_bytes();
+    if bytes.len() < 4 {
+        return None;
+    }
     for start in 0..=bytes.len().saturating_sub(4) {
         let part = &bytes[start..start + 4];
         if part.iter().all(|byte| byte.is_ascii_digit()) {
@@ -2476,40 +2659,217 @@ fn parse_year_metadata(value: Option<&str>) -> Option<i32> {
     None
 }
 
-/// Parse only lightweight PDF Info/XMP metadata. This intentionally does not
-/// extract PDF text, annotations, or inferred academic facts.
+fn parse_keyword_metadata(
+    value: Option<&str>,
+    kind: &str,
+    source: &str,
+    source_locator: &str,
+) -> Vec<crate::models::PaperKeywordInput> {
+    let Some(value) = value else { return Vec::new(); };
+    value
+        .split(|ch: char| matches!(ch, ';' | ',' | '\n' | '\r' | '|'))
+        .map(str::trim)
+        .filter(|keyword| !keyword.is_empty())
+        .enumerate()
+        .map(|(position, keyword)| crate::models::PaperKeywordInput {
+            keyword: keyword.to_string(),
+            kind: kind.to_string(),
+            source: source.to_string(),
+            confidence: "MEDIUM".to_string(),
+            source_locator: Some(source_locator.to_string()),
+            language: None,
+            position: Some(position as i64),
+        })
+        .collect()
+}
+
+fn xmp_element_values(xml: &str, names: &[&str]) -> Vec<String> {
+    let wanted: std::collections::HashSet<String> = names.iter().map(|name| name.to_ascii_lowercase()).collect();
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let mut values = Vec::new();
+    let mut capture: Option<(usize, String)> = None;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(event)) => {
+                let name = String::from_utf8_lossy(event.local_name().as_ref()).to_ascii_lowercase();
+                if let Some((depth, value)) = capture.as_mut() {
+                    *depth += 1;
+                    if !value.is_empty() { value.push(' '); }
+                } else if wanted.contains(&name) {
+                    capture = Some((1, String::new()));
+                }
+            }
+            Ok(Event::Text(event)) => {
+                if let Some((_, value)) = capture.as_mut() {
+                    if !value.is_empty() { value.push(' '); }
+                    value.push_str(String::from_utf8_lossy(event.as_ref()).trim());
+                }
+            }
+            Ok(Event::CData(event)) => {
+                if let Some((_, value)) = capture.as_mut() {
+                    if let Ok(text) = std::str::from_utf8(event.as_ref()) {
+                        if !value.is_empty() { value.push(' '); }
+                        value.push_str(text.trim());
+                    }
+                }
+            }
+            Ok(Event::End(_)) => {
+                if let Some((depth, _)) = capture.as_mut() {
+                    if *depth == 1 {
+                        if let Some((_, value)) = capture.take() {
+                            if let Some(value) = clean_optional_text(Some(&value)) { values.push(value); }
+                        }
+                    } else {
+                        *depth -= 1;
+                    }
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    values
+}
+
+fn xmp_container_list_values(xml: &str, container: &str) -> Vec<String> {
+    let lower = xml.to_ascii_lowercase();
+    let container_lower = container.to_ascii_lowercase();
+    let Some(start) = lower.find(&format!("<{}", container_lower)) else { return Vec::new(); };
+    let Some(end_offset) = lower[start..].find(&format!("</{}>", container_lower)) else { return Vec::new(); };
+    let end = start + end_offset + container.len() + 3;
+    xmp_element_values(&xml[start..end], &["li"])
+}
+
+fn pdf_xmp_text(path: &Path) -> Option<String> {
+    let doc = Document::load_with_options(path, LoadOptions::with_max_decompressed_size(8 * 1024 * 1024)).ok()?;
+    let metadata = doc.catalog().ok()?.get(b"Metadata").ok()?;
+    let (_, object) = doc.dereference(metadata).ok()?;
+    let stream = object.as_stream().ok()?;
+    let bytes = stream.decompressed_content_with_limit(512 * 1024).ok()?;
+    String::from_utf8(bytes).ok()
+}
+
+fn pdf_first_page_text(path: &Path) -> Option<String> {
+    let doc = Document::load_with_options(path, LoadOptions::with_max_decompressed_size(8 * 1024 * 1024)).ok()?;
+    if doc.get_pages().is_empty() { return None; }
+    doc.extract_text_with_limit(&[1], 512 * 1024).ok().filter(|text| !text.trim().is_empty())
+}
+
+fn first_page_title(text: &str) -> Option<String> {
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()).take(16) {
+        let lower = line.to_ascii_lowercase();
+        if line.len() < 12 || line.len() > 240 || lower.contains("doi") || lower.contains("abstract")
+            || lower.contains("keywords") || lower.contains("received") || lower.contains("published")
+            || lower.contains('@') || parse_year_metadata(Some(line)).is_some() { continue; }
+        if line.split_whitespace().count() >= 2 { return clean_optional_text(Some(line)); }
+    }
+    None
+}
+
+fn first_page_authors(text: &str) -> Vec<crate::models::Author> {
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()).take(24) {
+        let lower = line.to_ascii_lowercase();
+        for prefix in ["authors:", "author:", "by:"] {
+            if lower.starts_with(prefix) {
+                return parse_author_metadata(Some(line[prefix.len()..].trim()));
+            }
+        }
+    }
+    Vec::new()
+}
+
+fn first_page_year(text: &str) -> Option<i32> {
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()).take(32) {
+        let lower = line.to_ascii_lowercase();
+        if ["published", "publication", "year", "copyright", "accepted"].iter().any(|word| lower.contains(word)) {
+            if let Some(year) = parse_year_metadata(Some(line)) { return Some(year); }
+        }
+    }
+    None
+}
+
+fn pdf_object_text(value: &lopdf::Object) -> Option<String> {
+    match value {
+        Object::String(bytes, _) => String::from_utf8(bytes.clone()).ok().and_then(|v| clean_optional_text(Some(&v))),
+        Object::Name(bytes) => String::from_utf8(bytes.clone()).ok().and_then(|v| clean_optional_text(Some(&v))),
+        _ => None,
+    }
+}
+
+/// Parse PDF Info/XMP first, then bounded first-page text. File creation and
+/// modification dates are intentionally excluded: they describe the PDF file,
+/// not the publication year. Invalid/fixture PDFs retain the raw metadata
+/// fallback used by the existing import path.
 pub fn parse_external_pdf_metadata(path: &Path, filename: &str) -> Result<crate::models::ExternalPdfMetadata> {
     let bytes = std::fs::read(path).map_err(|_| rusqlite::Error::InvalidQuery)?;
-    let text = String::from_utf8_lossy(&bytes);
-    let title = pdf_info_value(&text, "Title")
-        .or_else(|| xml_metadata_value(&text, &["dc:title", "title"]))
+    const PDF_TEXT_SCAN_LIMIT: usize = 1024 * 1024;
+    let raw_text = String::from_utf8_lossy(&bytes);
+    let bounded_text = String::from_utf8_lossy(&bytes[..bytes.len().min(PDF_TEXT_SCAN_LIMIT)]);
+    let xmp = pdf_xmp_text(path).unwrap_or_default();
+    let first_page = pdf_first_page_text(path).unwrap_or_default();
+    let info = Document::load_metadata(path).ok();
+    let xmp_title = xmp_element_values(&xmp, &["title"]).into_iter().next()
+        .or_else(|| xml_metadata_value(&xmp, &["dc:title", "title"]));
+    let xmp_author = xmp_element_values(&xmp, &["creator"]).into_iter().next()
+        .or_else(|| xml_metadata_value(&xmp, &["dc:creator", "creator", "Author"]));
+    let xmp_doi = xmp_element_values(&xmp, &["doi", "identifier"]).into_iter().find_map(|value| first_doi(Some(&value)))
+        .or_else(|| xml_metadata_value(&xmp, &["prism:doi", "bibo:doi", "doi"]).and_then(|v| first_doi(Some(&v))));
+    let title = info.as_ref().and_then(|value| value.title.clone())
+        .or_else(|| pdf_info_value(&raw_text, "Title"))
+        .or(xmp_title)
+        .or_else(|| first_page_title(&first_page))
         .or_else(|| Path::new(filename).file_stem().and_then(|value| value.to_str()).map(str::to_string));
-    let author_value = pdf_info_value(&text, "Author")
-        .or_else(|| xml_metadata_value(&text, &["dc:creator", "creator", "Author"]));
-    let xmp_doi = xml_metadata_value(&text, &["prism:doi", "bibo:doi", "doi"]);
-    let doi = first_doi(pdf_info_value(&text, "DOI").as_deref().or(xmp_doi.as_deref()));
-    // A DOI-looking filename is useful only as a deterministic exact identity
-    // hint; arbitrary title text is never treated as an identity.
-    let doi = doi.or_else(|| first_doi(Some(filename)));
-    let scholarly_id = pdf_info_value(&text, "OpenAlex")
-        .or_else(|| pdf_info_value(&text, "PMID"))
-        .or_else(|| pdf_info_value(&text, "PMCID"))
-        .or_else(|| pdf_info_value(&text, "arXiv"))
-        .or_else(|| xml_metadata_value(&text, &["openalex", "pmid", "pmcid", "arXiv"]));
-    let abstract_text = pdf_info_value(&text, "Abstract")
-        .or_else(|| xml_metadata_value(&text, &["dc:description", "abstract"]));
-    let creation_date = pdf_info_value(&text, "CreationDate");
-    let mod_date = pdf_info_value(&text, "ModDate");
-    let year = parse_year_metadata(creation_date.as_deref().or(mod_date.as_deref()))
-        .or_else(|| parse_year_metadata(Some(filename)));
+    let author_value = info.as_ref().and_then(|value| value.author.clone())
+        .or_else(|| pdf_info_value(&raw_text, "Author"))
+        .or(xmp_author);
+    let doi = first_doi(info.as_ref().and_then(|value| value.custom.get(b"DOI".as_slice())).and_then(pdf_object_text).as_deref())
+        .or_else(|| first_doi(pdf_info_value(&raw_text, "DOI").as_deref()))
+        .or(xmp_doi)
+        .or_else(|| first_doi(Some(&first_page)))
+        .or_else(|| first_doi(Some(&bounded_text)));
+    let scholarly_id = pdf_info_value(&raw_text, "OpenAlex")
+        .or_else(|| pdf_info_value(&raw_text, "PMID"))
+        .or_else(|| pdf_info_value(&raw_text, "PMCID"))
+        .or_else(|| pdf_info_value(&raw_text, "arXiv"))
+        .or_else(|| xml_metadata_value(&xmp, &["openalex", "pmid", "pmcid", "arXiv"]));
+    let abstract_text = pdf_info_value(&raw_text, "Abstract")
+        .or_else(|| xml_metadata_value(&xmp, &["dc:description", "abstract"]));
+    let year = first_page_year(&first_page).or_else(|| parse_year_metadata(
+        pdf_info_value(&raw_text, "Year")
+            .or_else(|| pdf_info_value(&raw_text, "PublicationDate"))
+            .or_else(|| xml_metadata_value(&xmp, &["prism:publicationDate", "dc:date"]))
+            .as_deref(),
+    ));
+    let info_keywords = info
+        .as_ref()
+        .and_then(|value| value.keywords.clone())
+        .or_else(|| pdf_info_value(&raw_text, "Keywords"));
+    let mut keywords = parse_keyword_metadata(
+        info_keywords.as_deref(),
+        "publisher_keyword",
+        "pdf_info",
+        "Info.Keywords",
+    );
+    keywords.extend(parse_keyword_metadata(
+        xml_metadata_value(&xmp, &["dc:subject"]).as_deref(),
+        "subject",
+        "pdf_xmp",
+        "XMP.dc:subject",
+    ));
+    for (position, keyword) in xmp_container_list_values(&xmp, "dc:subject").into_iter().enumerate() {
+        keywords.push(crate::models::PaperKeywordInput { keyword, kind: "subject".to_string(), source: "pdf_xmp".to_string(), confidence: "MEDIUM".to_string(), source_locator: Some("XMP.dc:subject".to_string()), language: None, position: Some(position as i64) });
+    }
+    let authors = parse_author_metadata(author_value.as_deref());
     Ok(crate::models::ExternalPdfMetadata {
         filename: filename.to_string(),
         title,
-        authors: parse_author_metadata(author_value.as_deref()),
+        authors: if authors.is_empty() { first_page_authors(&first_page) } else { authors },
         year,
         doi,
         scholarly_id: clean_optional_text(scholarly_id.as_deref()),
         abstract_text,
+        keywords,
     })
 }
 
@@ -2620,6 +2980,136 @@ fn add_library_and_attach(
     get_paper_attachment(conn, id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
 }
 
+/// Apply one exact-identity provider result to the local PDF metadata. Every
+/// field is fill-only: an existing value shown to the user is never silently
+/// replaced by a conflicting provider value.
+pub(crate) fn merge_external_pdf_metadata_from_candidate(
+    metadata: &mut crate::models::ExternalPdfMetadata,
+    candidate: &PaperCandidate,
+    source: &str,
+) {
+    if metadata.title.as_deref().map(|v| v.trim().is_empty()).unwrap_or(true) {
+        metadata.title = candidate.title.clone();
+    }
+    if metadata.authors.is_empty() && !candidate.authors.is_empty() {
+        metadata.authors = candidate.authors.clone();
+    }
+    if metadata.year.is_none() {
+        metadata.year = candidate.year;
+    }
+    if metadata.doi.is_none() {
+        metadata.doi = candidate.normalized_doi.clone();
+    }
+    if metadata.abstract_text.as_deref().map(|v| v.trim().is_empty()).unwrap_or(true) {
+        metadata.abstract_text = candidate.abstract_text.clone();
+    }
+    if metadata.scholarly_id.is_none() {
+        metadata.scholarly_id = candidate
+            .openalex_work_id
+            .clone()
+            .or_else(|| candidate.publisher_article_id.clone());
+    }
+    if let Some(raw_json) = candidate.raw_json.as_deref() {
+        metadata.keywords.extend(keyword_inputs_from_provider_json(source, raw_json));
+    }
+}
+
+/// Resolve metadata only after an exact DOI was extracted. Network failures
+/// are non-fatal: the PDF's explicit local metadata remains importable.
+fn external_provider_candidates(doi: &str) -> Vec<(String, PaperCandidate)> {
+    #[cfg(test)]
+    {
+        let _ = doi;
+        return Vec::new();
+    }
+
+    #[cfg(not(test))]
+    {
+        const MAILTO: &str = "dev@cowpaper.local";
+        let crossref = crate::api::crossref::Crossref::new(MAILTO);
+        let openalex = crate::api::openalex::OpenAlex::new(MAILTO);
+        let mut out = Vec::new();
+        if let Ok(Some(candidate)) = crossref.work_by_doi(doi) {
+            out.push(("crossref".to_string(), candidate));
+        }
+        if let Ok(Some(candidate)) = openalex.work_by_doi(doi) {
+            out.push(("openalex".to_string(), candidate));
+        }
+        out
+    }
+}
+
+pub(crate) fn fill_missing_canonical_metadata_from_candidate(
+    conn: &Connection,
+    paper_id: i64,
+    candidate: &PaperCandidate,
+) -> Result<()> {
+    // This helper intentionally has no UPDATE path for an already populated
+    // title/authors/year/source/DOI. It is a conservative exact-identity fill.
+    fill_other_fields(conn, paper_id, candidate)?;
+    let current_abstract: Option<String> = conn.query_row(
+        "SELECT abstract FROM papers WHERE id=?1",
+        params![paper_id],
+        |row| row.get(0),
+    )?;
+    let abstract_missing = current_abstract
+        .as_deref()
+        .map(|value| value.trim().is_empty())
+        .unwrap_or(true);
+    if abstract_missing {
+        if let Some(text) = candidate.abstract_text.as_deref() {
+            let normalized = crate::abstract_quality::normalize_abstract_text(text);
+            if !normalized.trim().is_empty() {
+                let (quality, _) = crate::abstract_quality::assess_abstract_quality(&normalized);
+                let now = now_utc();
+                conn.execute(
+                    "UPDATE papers SET abstract=?1, abstract_source=?2,
+                        abstract_quality=?3, abstract_retrieved_at=?4,
+                        abstract_last_checked_at=?4, analysis_status='pendingAnalysis',
+                        updated_at=?4 WHERE id=?5",
+                    params![normalized, candidate.abstract_source, quality, now, paper_id],
+                )?;
+                record_abstract_source(
+                    conn,
+                    paper_id,
+                    candidate.abstract_source.as_deref().unwrap_or("provider"),
+                    &normalized,
+                    quality,
+                    "exact_identity_provider_fill",
+                )?;
+            }
+        }
+    }
+    refresh_abstract_status(conn, paper_id)?;
+    Ok(())
+}
+
+fn persist_external_metadata(
+    conn: &Connection,
+    paper_id: i64,
+    metadata: &crate::models::ExternalPdfMetadata,
+    providers: &[(String, PaperCandidate)],
+) -> Result<()> {
+    let pdf_record_id = insert_source_record(
+        conn,
+        paper_id,
+        "pdf_metadata",
+        Some(&metadata.filename),
+        None,
+    )?;
+    insert_keyword_inputs(conn, paper_id, &metadata.keywords, Some(pdf_record_id))?;
+    for (source, candidate) in providers {
+        insert_source_record(
+            conn,
+            paper_id,
+            source,
+            candidate.source_id.as_deref(),
+            candidate.raw_json.as_deref(),
+        )?;
+    }
+    Ok(())
+}
+
 /// Import a local PDF into the canonical Paper graph. Exact DOI and exact
 /// scholarly IDs merge immediately; title+authors+year is a candidate only
 /// and remains pending until the caller supplies explicit confirmation.
@@ -2629,14 +3119,26 @@ pub fn import_external_pdf(
     confirmed_paper_id: Option<i64>,
 ) -> Result<crate::models::ExternalPdfImportResult> {
     let file = linked_file(path)?;
-    let metadata = file.metadata.clone();
+    let mut metadata = file.metadata.clone();
+    let providers = metadata
+        .doi
+        .as_deref()
+        .map(external_provider_candidates)
+        .unwrap_or_default();
+    for (source, candidate) in &providers {
+        merge_external_pdf_metadata_from_candidate(&mut metadata, candidate, source);
+    }
 
     if let Some(doi) = metadata.doi.as_deref() {
         if let Some(paper_id) = conn
             .query_row("SELECT id FROM papers WHERE normalized_doi=?1", params![doi], |row| row.get(0))
             .optional()?
         {
+            for (_, candidate) in &providers {
+                fill_missing_canonical_metadata_from_candidate(conn, paper_id, candidate)?;
+            }
             let attachment = add_library_and_attach(conn, paper_id, &file, "external_pdf_import")?;
+            persist_external_metadata(conn, paper_id, &metadata, &providers)?;
             return Ok(crate::models::ExternalPdfImportResult {
                 outcome: "existingDoi".to_string(),
                 paper_id: Some(paper_id),
@@ -2651,7 +3153,11 @@ pub fn import_external_pdf(
 
     if let Some(scholarly_id) = metadata.scholarly_id.as_deref() {
         if let Some(paper_id) = find_paper_by_exact_scholarly_id(conn, scholarly_id)? {
+            for (_, candidate) in &providers {
+                fill_missing_canonical_metadata_from_candidate(conn, paper_id, candidate)?;
+            }
             let attachment = add_library_and_attach(conn, paper_id, &file, "external_pdf_import")?;
+            persist_external_metadata(conn, paper_id, &metadata, &providers)?;
             return Ok(crate::models::ExternalPdfImportResult {
                 outcome: "existingScholarlyId".to_string(),
                 paper_id: Some(paper_id),
@@ -2669,7 +3175,11 @@ pub fn import_external_pdf(
         if !paper_exists(conn, paper_id)? {
             return Err(rusqlite::Error::QueryReturnedNoRows);
         }
+        for (_, candidate) in &providers {
+            fill_missing_canonical_metadata_from_candidate(conn, paper_id, candidate)?;
+        }
         let attachment = add_library_and_attach(conn, paper_id, &file, "external_pdf_manual_confirmation")?;
+        persist_external_metadata(conn, paper_id, &metadata, &providers)?;
         return Ok(crate::models::ExternalPdfImportResult {
             outcome: "manualConfirmation".to_string(),
             paper_id: Some(paper_id),
@@ -2710,10 +3220,11 @@ pub fn import_external_pdf(
         openalex_work_id: None,
         discovery_source: "external_pdf_import".to_string(),
         source_id: doi,
-        raw_json: None,
+        raw_json: providers.first().and_then(|(_, candidate)| candidate.raw_json.clone()),
     };
     let paper_id = insert_paper_without_identity_merge(conn, journal_id, &candidate)?;
     let attachment = add_library_and_attach(conn, paper_id, &file, "external_pdf_import")?;
+    persist_external_metadata(conn, paper_id, &metadata, &providers)?;
     Ok(crate::models::ExternalPdfImportResult {
         outcome: "createdExternalPaper".to_string(),
         paper_id: Some(paper_id),
@@ -2872,6 +3383,7 @@ pub fn list_library_papers(conn: &Connection, view: &str, limit: i64) -> Result<
     let rows = stmt.query_map(params![limit], row_to_paper)?;
     let mut papers = rows.collect::<Result<Vec<_>>>()?;
     enrich_papers_collections(conn, &mut papers)?;
+    enrich_papers_keywords(conn, &mut papers)?;
     filter_current_tag_matches(conn, &mut papers)?;
     papers.into_iter().map(|p| library_paper(conn, p)).collect()
 }
@@ -2888,6 +3400,7 @@ pub fn get_library_paper(conn: &Connection, paper_id: i64) -> Result<Option<crat
         .optional()?;
     let Some(mut paper) = paper else { return Ok(None); };
     enrich_papers_collections(conn, std::slice::from_mut(&mut paper))?;
+    enrich_papers_keywords(conn, std::slice::from_mut(&mut paper))?;
     filter_current_tag_matches(conn, std::slice::from_mut(&mut paper))?;
     Ok(Some(library_paper(conn, paper)?))
 }
@@ -3053,6 +3566,7 @@ fn migrations() -> Vec<(i64, &'static str, fn(&Connection) -> Result<()>)> {
         (13, "round7-content-kind", migrate_to_v13),
         (14, "literature-workspace-library", migrate_to_v14),
         (15, "literature-library-attachments-metadata", migrate_to_v15),
+        (16, "bibliographic-keywords", migrate_to_v16),
     ]
 }
 
@@ -3244,6 +3758,41 @@ fn migrate_to_v15(conn: &Connection) -> Result<()> {
             note TEXT,
             updated_at TEXT NOT NULL
         );
+        "#,
+    )?;
+    Ok(())
+}
+
+/// v16: canonical bibliographic keywords. This relation is intentionally
+/// independent from Library Tags and Research Tags and never participates in
+/// recommendation scoring. The source/provenance columns make it possible for
+/// the UI to distinguish explicit publisher keywords from provider subjects or
+/// OpenAlex concepts.
+fn migrate_to_v16(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS paper_keywords (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            paper_id INTEGER NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+            keyword TEXT NOT NULL,
+            normalized_keyword TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK (kind IN ('author_keyword', 'publisher_keyword', 'subject', 'concept')),
+            source TEXT NOT NULL,
+            confidence TEXT NOT NULL,
+            source_locator TEXT,
+            source_record_id INTEGER REFERENCES source_records(id) ON DELETE SET NULL,
+            language TEXT,
+            position INTEGER,
+            retrieved_at TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE (paper_id, normalized_keyword, kind, source)
+        );
+        CREATE INDEX IF NOT EXISTS idx_paper_keywords_paper
+            ON paper_keywords(paper_id, kind, position, id);
+        CREATE INDEX IF NOT EXISTS idx_paper_keywords_normalized
+            ON paper_keywords(normalized_keyword, kind);
+        CREATE INDEX IF NOT EXISTS idx_paper_keywords_source_record
+            ON paper_keywords(source_record_id);
         "#,
     )?;
     Ok(())
