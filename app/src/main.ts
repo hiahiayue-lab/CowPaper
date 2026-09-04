@@ -48,6 +48,32 @@ interface TagMatch {
   semanticHash?: string | null;
 }
 
+interface PaperKeyword {
+  id: number;
+  paperId: number;
+  keyword: string;
+  normalizedKeyword: string;
+  kind: "author_keyword" | "publisher_keyword" | "subject" | "concept" | string;
+  source: string;
+  confidence: string;
+  sourceLocator: string | null;
+  sourceRecordId: number | null;
+  language: string | null;
+  position: number | null;
+  retrievedAt: string;
+  createdAt: string;
+}
+
+interface PaperKeywordInput {
+  keyword: string;
+  kind: string;
+  source: string;
+  confidence: string;
+  sourceLocator?: string | null;
+  language?: string | null;
+  position?: number | null;
+}
+
 interface Paper {
   id: number;
   journalId: number;
@@ -83,6 +109,8 @@ interface Paper {
   _lang?: "zh" | "en";
   /** 所属期刊的 collection code（paper → journal → collections 派生） */
   collections: string[];
+  /** canonical bibliographic keywords; separate from Library Tags */
+  keywords: PaperKeyword[];
 }
 
 interface LibraryCollection {
@@ -168,6 +196,15 @@ interface LibraryPaper {
   attachments: PaperAttachment[];
 }
 
+type LibraryInlineField = "title" | "chineseTitle" | "source" | "year" | "authors" | "note";
+
+interface LibraryDropItem {
+  name: string;
+  path: string | null;
+  state: "queued" | "processing" | "done" | "error";
+  message?: string;
+}
+
 interface ExternalPdfCandidate {
   paperId: number;
   title: string | null;
@@ -187,6 +224,7 @@ interface ExternalPdfImportResult {
     doi: string | null;
     scholarlyId: string | null;
     abstractText: string | null;
+    keywords: PaperKeywordInput[];
   };
   candidate: ExternalPdfCandidate | null;
   candidates: ExternalPdfCandidate[];
@@ -407,10 +445,16 @@ let activity: ActivityState = emptyActivity();
 let settings: Settings | null = null;
 let abstractLang: "zh" | "en" = "zh";
 let libraryInspectorAbstractLang: "zh" | "en" = "zh";
-let libraryEditingPaperId: number | null = null;
 let libraryInspectorCollapsed = false;
 let libraryPdfBusyPaperId: number | null = null;
 let libraryPdfImportBusy = false;
+let libraryDropTargetPaperId: number | null = null;
+let libraryDropActive = false;
+let libraryDropQueue: LibraryDropItem[] = [];
+let libraryColumnWidths = loadLibraryColumnWidths();
+let libraryInspectorWidth = loadLibraryInspectorWidth();
+let libraryColumnResize: { column: LibraryColumn; startX: number; startWidth: number } | null = null;
+let libraryInspectorResize: { startX: number; startWidth: number } | null = null;
 let currentAppVersion = "0.1.4";
 let pendingUpdate: Update | null = null;
 let updateBusy = false;
@@ -490,6 +534,91 @@ function setStatus(text: string, cls: "idle" | "running" | "error" | "done") {
   el.className = `status ${cls}`;
 }
 
+const LIBRARY_COLUMNS = ["title", "note", "source", "year", "authors"] as const;
+type LibraryColumn = typeof LIBRARY_COLUMNS[number];
+const LIBRARY_COLUMN_MIN: Record<LibraryColumn, number> = {
+  title: 240,
+  note: 120,
+  source: 150,
+  year: 72,
+  authors: 150,
+};
+const LIBRARY_COLUMN_DEFAULT: Record<LibraryColumn, number> = {
+  title: 320,
+  note: 160,
+  source: 190,
+  year: 82,
+  authors: 190,
+};
+const LIBRARY_COLUMN_STORAGE_KEY = "cowpaper.library.columns.v1";
+const LIBRARY_INSPECTOR_STORAGE_KEY = "cowpaper.library.inspector-width.v1";
+
+function loadLibraryColumnWidths(): Record<LibraryColumn, number> {
+  try {
+    const raw = JSON.parse(localStorage.getItem(LIBRARY_COLUMN_STORAGE_KEY) || "null") as Partial<Record<LibraryColumn, number>> | null;
+    return Object.fromEntries(LIBRARY_COLUMNS.map((column) => {
+      const value = raw?.[column];
+      return [column, typeof value === "number" && Number.isFinite(value) ? Math.max(LIBRARY_COLUMN_MIN[column], Math.round(value)) : LIBRARY_COLUMN_DEFAULT[column]];
+    })) as Record<LibraryColumn, number>;
+  } catch {
+    return { ...LIBRARY_COLUMN_DEFAULT };
+  }
+}
+
+function loadLibraryInspectorWidth(): number {
+  const value = Number(localStorage.getItem(LIBRARY_INSPECTOR_STORAGE_KEY));
+  return Number.isFinite(value) && value >= 300 && value <= 560 ? Math.round(value) : 392;
+}
+
+function persistLibraryLayout(): void {
+  localStorage.setItem(LIBRARY_COLUMN_STORAGE_KEY, JSON.stringify(libraryColumnWidths));
+  localStorage.setItem(LIBRARY_INSPECTOR_STORAGE_KEY, String(libraryInspectorWidth));
+}
+
+function libraryColumnTemplate(): string {
+  return LIBRARY_COLUMNS.map((column) => `${libraryColumnWidths[column]}px`).join(" ");
+}
+
+function applyLibraryLayoutMetrics(): void {
+  const pane = $("library-list-pane");
+  const layout = $("library-layout");
+  if (pane) pane.style.setProperty("--library-columns", libraryColumnTemplate());
+  if (layout) layout.style.setProperty("--inspector-width", `${libraryInspectorWidth}px`);
+}
+
+function renderLibraryDropState(): void {
+  const pane = $("library-list-pane");
+  const overlay = $("library-drop-overlay");
+  const label = $("library-drop-label");
+  if (!pane || !overlay || !label) return;
+  pane.classList.toggle("drop-active", libraryDropActive);
+  pane.classList.toggle("drop-existing", libraryDropActive && libraryDropTargetPaperId != null);
+  document.querySelectorAll(".library-paper-row").forEach((row) => {
+    row.classList.toggle("drop-target", libraryDropActive && Number((row as HTMLElement).dataset.paperId) === libraryDropTargetPaperId);
+  });
+  if (libraryDropActive) {
+    label.textContent = libraryDropTargetPaperId == null ? "导入为新文献" : "添加 PDF 到此文献";
+    overlay.classList.remove("hidden");
+  } else {
+    overlay.classList.add("hidden");
+  }
+  renderLibraryDropQueue();
+}
+
+function renderLibraryDropQueue(): void {
+  const queue = $("library-drop-queue");
+  if (!queue) return;
+  if (!libraryDropQueue.length) {
+    queue.classList.add("hidden");
+    queue.innerHTML = "";
+    return;
+  }
+  const completed = libraryDropQueue.filter((item) => item.state === "done").length;
+  const active = libraryDropQueue.find((item) => item.state === "processing");
+  queue.classList.remove("hidden");
+  queue.innerHTML = `<div class="drop-queue-head"><strong>PDF 队列</strong><span>${completed}/${libraryDropQueue.length}</span></div><div class="drop-queue-list">${libraryDropQueue.map((item) => `<div class="drop-queue-item ${item.state}"><span class="drop-queue-icon" aria-hidden="true">${item.state === "done" ? "✓" : item.state === "error" ? "!" : item.state === "processing" ? "…" : "•"}</span><span title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</span><span class="muted small">${escapeHtml(item.message || (item.state === "processing" ? "处理中" : item.state === "done" ? "完成" : item.state === "error" ? "失败" : "排队中"))}</span></div>`).join("")}</div>${active ? `<div class="drop-queue-progress" role="progressbar" aria-label="PDF 处理进度" aria-valuenow="${completed}" aria-valuemin="0" aria-valuemax="${libraryDropQueue.length}"><span style="width:${Math.round((completed / libraryDropQueue.length) * 100)}%"></span></div>` : ""}`;
+}
+
 function getModel(): string {
   return localStorage.getItem(MODEL_NAME) || DEFAULT_MODEL;
 }
@@ -563,6 +692,71 @@ async function loadAiStatus() {
   }
 }
 
+const DEFAULT_PDF_NAMING_TEMPLATE = "{title} - {journal} - {first_author} - {year}.pdf";
+const PDF_TEMPLATE_TOKENS = ["title", "journal", "source", "first_author", "authors", "year", "doi"] as const;
+const PDF_TEMPLATE_EXAMPLE: Record<typeof PDF_TEMPLATE_TOKENS[number], string> = {
+  title: "Minds and machines",
+  journal: "Research Policy",
+  source: "Research Policy",
+  first_author: "Mattia Pedota",
+  authors: "Mattia Pedota - John Smith",
+  year: "2026",
+  doi: "10.1016/j.respol.2026.105600",
+};
+
+function renderPdfTemplateExample(): string {
+  const templateInput = $("set-pdf-naming-template") as HTMLInputElement | null;
+  const modeInput = $("set-pdf-file-handling-mode") as HTMLSelectElement | null;
+  const rootInput = $("set-pdf-library-root") as HTMLInputElement | null;
+  const folderInput = $("set-pdf-subfolder-rule") as HTMLSelectElement | null;
+  if (!templateInput || !modeInput || !rootInput || !folderInput) return "";
+  const template = templateInput.value.trim() || DEFAULT_PDF_NAMING_TEMPLATE;
+  const unknownTokens = [...template.matchAll(/\{([^{}]+)\}/g)].map((match) => match[1]).filter((token) => !(PDF_TEMPLATE_TOKENS as readonly string[]).includes(token));
+  const filename = template.replace(/\{([^{}]+)\}/g, (_match, token: string) => (PDF_TEMPLATE_EXAMPLE as Record<string, string>)[token] ?? "");
+  const folder = folderInput.value === "year" ? PDF_TEMPLATE_EXAMPLE.year : folderInput.value === "journal/source" ? `${PDF_TEMPLATE_EXAMPLE.journal}/${PDF_TEMPLATE_EXAMPLE.source}` : "";
+  const root = rootInput.value.trim() || "Library root";
+  const previewPath = [root, folder, filename || "document.pdf"].filter(Boolean).join("/");
+  const preview = $("pdf-template-preview");
+  if (preview) preview.textContent = modeInput.value === "none" ? `链接模式 · ${filename || "document.pdf"}` : previewPath;
+  const warning = $("pdf-template-warning");
+  if (warning) {
+    warning.textContent = unknownTokens.length ? `未知 token 将留空：${unknownTokens.map((token) => `{${token}}`).join(", ")}` : "";
+    warning.classList.toggle("hidden", unknownTokens.length === 0);
+  }
+  const moveWarning = $("pdf-move-warning");
+  if (moveWarning) moveWarning.classList.toggle("hidden", modeInput.value !== "move");
+  return previewPath;
+}
+
+async function selectPdfLibraryRoot(): Promise<void> {
+  try {
+    const selected = await openFileDialog({ directory: true, multiple: false });
+    const path = Array.isArray(selected) ? selected[0] : selected;
+    if (path) {
+      ($("set-pdf-library-root") as HTMLInputElement).value = path;
+      renderPdfTemplateExample();
+    }
+  } catch (error) {
+    setStatus(`选择 PDF 文件库目录失败：${String(error)}`, "error");
+  }
+}
+
+function resetPdfLibraryRoot(): void {
+  ($("set-pdf-library-root") as HTMLInputElement).value = "";
+  renderPdfTemplateExample();
+}
+
+function insertPdfTemplateToken(token: string): void {
+  const input = $("set-pdf-naming-template") as HTMLInputElement;
+  const insertion = `{${token}}`;
+  const start = input.selectionStart ?? input.value.length;
+  const end = input.selectionEnd ?? start;
+  input.value = `${input.value.slice(0, start)}${insertion}${input.value.slice(end)}`;
+  input.focus();
+  input.setSelectionRange(start + insertion.length, start + insertion.length);
+  renderPdfTemplateExample();
+}
+
 async function loadSettings() {
   try {
     settings = await invoke<Settings>("get_settings");
@@ -581,6 +775,9 @@ async function loadSettings() {
     ($("set-pdf-naming-template") as HTMLInputElement).value = settings.pdfNamingTemplate;
     ($("set-pdf-subfolder-rule") as HTMLSelectElement).value = settings.pdfSubfolderRule;
   }
+  const templateInput = $("set-pdf-naming-template") as HTMLInputElement;
+  if (!templateInput.value.trim()) templateInput.value = DEFAULT_PDF_NAMING_TEMPLATE;
+  renderPdfTemplateExample();
 }
 
 function setUpdateStatus(text: string, cls: "muted small" | "ok small" | "error") {
@@ -1474,17 +1671,23 @@ function libraryNote(item: LibraryPaper): string {
   return item.note?.trim() || "";
 }
 
-function libraryHasOverrides(item: LibraryPaper): boolean {
-  const metadata = item.metadata;
-  return Boolean(metadata && [
-    metadata.titleOverride,
-    metadata.chineseTitleOverride,
-    metadata.sourceOverride,
-    metadata.yearOverride,
-    metadata.authorsOverride,
-    metadata.abstractOverride,
-    metadata.chineseAbstractOverride,
-  ].some((value) => value != null));
+const KEYWORD_KIND_LABEL: Record<string, string> = {
+  author_keyword: "作者关键词",
+  publisher_keyword: "发行方关键词",
+  subject: "主题",
+  concept: "概念",
+};
+
+function renderBibliographicKeywords(paper: Paper): string {
+  const keywords = paper.keywords || [];
+  if (!keywords.length) return '<span class="empty-value">暂无 bibliographic keywords</span>';
+  const groups = new Map<string, PaperKeyword[]>();
+  keywords.forEach((keyword) => {
+    const list = groups.get(keyword.kind) || [];
+    list.push(keyword);
+    groups.set(keyword.kind, list);
+  });
+  return `<div class="keyword-groups">${[...groups.entries()].map(([kind, values]) => `<div class="keyword-group"><span class="keyword-kind">${escapeHtml(KEYWORD_KIND_LABEL[kind] || kind)}</span><div class="keyword-chips">${values.map((keyword) => `<span class="keyword-chip keyword-kind-${escapeHtml(kind)}" title="来源：${escapeHtml(keyword.source)} · 置信度：${escapeHtml(keyword.confidence)}">${escapeHtml(keyword.keyword)}</span>`).join("")}</div></div>`).join("")}</div>`;
 }
 
 function libraryAuthorsFromInput(value: string): Author[] | null {
@@ -1492,32 +1695,64 @@ function libraryAuthorsFromInput(value: string): Author[] | null {
   return names.length ? names.map((name) => ({ given: null, family: null, name })) : null;
 }
 
-function libraryEditForm(item: LibraryPaper): string {
-  const title = libraryEnglishTitle(item) === "（无标题）" ? "" : libraryEnglishTitle(item);
-  const chineseTitle = libraryChineseTitle(item);
-  const source = librarySource(item) === "—" ? "" : librarySource(item);
-  const year = libraryYear(item) === "—" ? "" : libraryYear(item);
-  const authors = authorText(libraryAuthors(item)) === "—" ? "" : authorText(libraryAuthors(item));
-  const note = libraryNote(item);
-  const abstract = libraryAbstract(item, "en");
-  const chineseAbstract = libraryAbstract(item, "zh");
-  const clearButton = libraryHasOverrides(item)
-    ? `<button class="ghost small danger" data-action="library-clear-overrides" data-paper-id="${item.paper.id}">恢复原始 metadata</button>`
-    : "";
-  return `<div class="inspector-edit-form" aria-label="编辑文献字段">
-    <div class="inspector-edit-head"><div><h3>编辑字段</h3><p class="muted small">仅写入 Library metadata override，不会覆盖 canonical Paper。清空字段会恢复对应原始值。</p></div><button class="icon-button" title="取消编辑" aria-label="取消编辑" data-action="library-edit-cancel">×</button></div>
-    <div class="edit-field-grid">
-      <label>English title<input value="${escapeHtml(title)}" data-library-edit-field="title" /></label>
-      <label>中文标题<input value="${escapeHtml(chineseTitle)}" data-library-edit-field="chineseTitle" /></label>
-      <label>Source / Journal<input value="${escapeHtml(source)}" data-library-edit-field="source" /></label>
-      <label>Year<input value="${escapeHtml(year)}" data-library-edit-field="year" inputmode="numeric" /></label>
-      <label class="edit-field-wide">Authors<input value="${escapeHtml(authors)}" data-library-edit-field="authors" /></label>
-      <label class="edit-field-wide">Note<textarea rows="2" data-library-edit-field="note">${escapeHtml(note)}</textarea></label>
-      <label class="edit-field-wide">Abstract<textarea rows="4" data-library-edit-field="abstract">${escapeHtml(abstract)}</textarea></label>
-      <label class="edit-field-wide">中文摘要<textarea rows="4" data-library-edit-field="chineseAbstract">${escapeHtml(chineseAbstract)}</textarea></label>
-    </div>
-    <div class="inspector-edit-actions">${clearButton}<button class="ghost small" data-action="library-edit-cancel">取消</button><button class="primary small" data-action="library-save-metadata" data-paper-id="${item.paper.id}">保存</button></div>
-  </div>`;
+function libraryInlineEditButton(paperId: number, field: LibraryInlineField, label: string): string {
+  return `<button type="button" class="inline-edit-button" title="编辑 ${escapeHtml(label)}" aria-label="编辑 ${escapeHtml(label)}" data-action="library-inline-edit" data-paper-id="${paperId}" data-field="${field}">✎</button>`;
+}
+
+function libraryInspectorRow(label: string, value: string, editButton = "", className = ""): string {
+  return `<div class="inspector-form-row ${className}"><span class="field-label">${escapeHtml(label)}</span><span class="field-value" title="${escapeHtml(value.replace(/<[^>]+>/g, ""))}">${value}</span>${editButton}</div>`;
+}
+
+async function editLibraryInlineField(paperId: number, field: LibraryInlineField): Promise<void> {
+  const item = libraryPapers.find((candidate) => candidate.paper.id === paperId);
+  if (!item) return;
+  const labels: Record<LibraryInlineField, string> = {
+    title: "English Title", chineseTitle: "Chinese Title", source: "Source", year: "Year", authors: "Authors", note: "Note",
+  };
+  const current: Record<LibraryInlineField, string> = {
+    title: libraryEnglishTitle(item) === "（无标题）" ? "" : libraryEnglishTitle(item),
+    chineseTitle: libraryChineseTitle(item),
+    source: librarySource(item) === "—" ? "" : librarySource(item),
+    year: libraryYear(item) === "—" ? "" : libraryYear(item),
+    authors: authorText(libraryAuthors(item)) === "—" ? "" : authorText(libraryAuthors(item)),
+    note: libraryNote(item),
+  };
+  const value = await showPromptModal(`编辑 ${labels[field]}`, field === "authors" ? "用逗号分隔多个作者" : "清空后恢复原始值", current[field]);
+  if (value == null) return;
+  const trimmed = value.trim();
+  let year: number | null = item.metadata?.yearOverride ?? null;
+  if (field === "year" && trimmed) {
+    year = Number(trimmed);
+    if (!Number.isInteger(year) || year < 0 || year > 9999) {
+      setStatus("年份必须是有效的整数", "error");
+      return;
+    }
+  } else if (field === "year") {
+    year = null;
+  }
+  const existing = item.metadata;
+  const metadata: LibraryItemMetadataInput = {
+    titleOverride: existing?.titleOverride ?? null,
+    chineseTitleOverride: existing?.chineseTitleOverride ?? null,
+    sourceOverride: existing?.sourceOverride ?? null,
+    yearOverride: year,
+    authorsOverride: existing?.authorsOverride ?? null,
+    abstractOverride: existing?.abstractOverride ?? null,
+    chineseAbstractOverride: existing?.chineseAbstractOverride ?? null,
+    note: existing?.note ?? null,
+  };
+  if (field === "title") metadata.titleOverride = trimmed || null;
+  if (field === "chineseTitle") metadata.chineseTitleOverride = trimmed || null;
+  if (field === "source") metadata.sourceOverride = trimmed || null;
+  if (field === "authors") metadata.authorsOverride = libraryAuthorsFromInput(trimmed);
+  if (field === "note") metadata.note = trimmed || null;
+  try {
+    await invoke("set_library_item_metadata", { paperId, metadata });
+    await loadLibraryData(libraryView);
+    setStatus(`${labels[field]} 已更新`, "done");
+  } catch (error) {
+    setStatus(`${labels[field]} 更新失败：${String(error)}`, "error");
+  }
 }
 
 function renderLibraryNavigation() {
@@ -1540,6 +1775,9 @@ function renderLibraryNavigation() {
 function renderLibrary() {
   const title = libraryView === "recent" ? "最近收录" : libraryView === "unfiled" ? "未分类" : "全部文献";
   const titleEl = $("library-view-title");
+  const layout = $("library-layout");
+  layout.classList.toggle("inspector-collapsed", libraryInspectorCollapsed);
+  applyLibraryLayoutMetrics();
   if (titleEl) titleEl.textContent = title;
   const count = $("library-count");
   const visiblePapers = libraryScope?.kind === "collection"
@@ -1556,17 +1794,17 @@ function renderLibrary() {
     const note = libraryNote(item);
     const source = librarySource(item);
     const authors = authorText(libraryAuthors(item));
-    return `<button class="library-paper-row${selected}" data-action="library-select-paper" data-paper-id="${item.paper.id}">
-      <span class="library-cell library-row-title"><span class="library-title-en">${escapeHtml(libraryEnglishTitle(item))}</span>${chineseTitle ? `<span class="library-title-zh">${escapeHtml(chineseTitle)}</span>` : ""}</span>
+    return `<button type="button" class="library-paper-row${selected}" data-action="library-select-paper" data-paper-id="${item.paper.id}">
+      <span class="library-cell library-row-title" title="${escapeHtml(libraryEnglishTitle(item) + (chineseTitle ? ` · ${chineseTitle}` : ""))}"><span class="library-title-en">${escapeHtml(libraryEnglishTitle(item))}</span>${chineseTitle ? `<span class="library-title-zh">${escapeHtml(chineseTitle)}</span>` : ""}</span>
       <span class="library-cell library-row-note" title="${escapeHtml(note || "暂无备注")}">${escapeHtml(note || "—")}</span>
       <span class="library-cell library-row-source" title="${escapeHtml(source)}">${escapeHtml(source)}</span>
-      <span class="library-cell library-row-year">${escapeHtml(libraryYear(item))}</span>
+      <span class="library-cell library-row-year" title="${escapeHtml(libraryYear(item))}">${escapeHtml(libraryYear(item))}</span>
       <span class="library-cell library-row-authors" title="${escapeHtml(authors)}">${escapeHtml(authors)}</span>
     </button>`;
   }).join("") : '<div class="empty">文献库还是空的。可以从发现页收录论文。</div>';
   if (libraryInspectorCollapsed) {
-    selectedLibraryPaperId = null;
     $("library-inspector").innerHTML = '<div class="empty">Inspector 已收起。选择一篇文献查看详情</div>';
+    renderLibraryDropState();
     return;
   }
   const selected = visiblePapers.find((item) => item.paper.id === selectedLibraryPaperId) || visiblePapers[0];
@@ -1577,6 +1815,7 @@ function renderLibrary() {
     selectedLibraryPaperId = null;
     $("library-inspector").innerHTML = '<div class="empty">选择一篇文献查看详情</div>';
   }
+  renderLibraryDropState();
 }
 
 function renderLibraryInspector(item: LibraryPaper) {
@@ -1590,22 +1829,23 @@ function renderLibraryInspector(item: LibraryPaper) {
   const abstractText = libraryAbstract(item, abstractLanguage);
   const englishAbstract = libraryAbstract(item, "en");
   const note = libraryNote(item);
-  const editOpen = libraryEditingPaperId === p.id;
   const attachmentRows = item.attachments.length
     ? item.attachments.map((attachment) => `<div class="attachment-row${attachment.missing ? " missing" : ""}"><div class="attachment-main"><span class="attachment-icon" aria-hidden="true">PDF</span><div class="attachment-copy"><strong title="${escapeHtml(attachment.absolutePath)}">${escapeHtml(attachment.filename)}</strong><span class="muted small">${attachment.missing ? "PDF 文件已移动 / 找不到文件" : attachment.storageMode === "managed" ? "已纳入 CowPaper 文件库 · managed" : "已链接 · 原文件保留"}</span></div></div><div class="attachment-actions">${attachment.missing ? "" : `<button class="ghost small" data-action="library-open-pdf" data-attachment-id="${attachment.id}">打开</button><button class="ghost small" data-action="library-reveal-pdf" data-attachment-id="${attachment.id}">显示位置</button>`}<button class="ghost small" data-action="library-relink-pdf" data-attachment-id="${attachment.id}">重新链接</button><button class="ghost small danger" data-action="library-detach-pdf" data-attachment-id="${attachment.id}">解除关联</button></div></div>`).join("")
     : '<div class="inspector-placeholder"><span class="placeholder-icon" aria-hidden="true">⌑</span><span>尚未添加 PDF 附件。</span></div>';
   const attachmentBusy = libraryPdfBusyPaperId === p.id;
   const attachmentAdd = `<button class="ghost small" data-action="library-attach-pdf" data-paper-id="${p.id}"${attachmentBusy ? " disabled" : ""}>${attachmentBusy ? "添加中…" : "＋ 添加 PDF"}</button>`;
   const abstractTranslate = englishAbstract && !hasChineseAbstract ? `<button class="ghost small" data-action="library-translate-abstract" data-paper-id="${p.id}">翻译为中文</button>` : "";
-  $("library-inspector").innerHTML = `<div class="inspector-head"><div class="inspector-kicker"><span class="inspector-kicker-label">LIBRARY</span><span class="muted small">收录于 ${fmtDate(item.addedAt)}</span></div><div class="inspector-actions"><button class="icon-button" title="编辑文献字段" aria-label="编辑文献字段" data-action="library-edit" data-paper-id="${p.id}">✎</button><button class="icon-button inspector-close" title="收起 Inspector" aria-label="收起 Inspector" data-action="library-close-inspector">×</button><button class="ghost small danger" data-action="library-remove" data-paper-id="${p.id}">移出文献库</button></div></div>
-    <header class="inspector-title-block"><h2>${escapeHtml(libraryEnglishTitle(item))}</h2>${libraryChineseTitle(item) ? `<div class="inspector-chinese-title">${escapeHtml(libraryChineseTitle(item))}</div>` : ""}<div class="inspector-authors">${escapeHtml(authorText(libraryAuthors(item)))}</div></header>
-    ${editOpen ? libraryEditForm(item) : ""}
-    <section class="inspector-section inspector-metadata"><div class="inspector-section-head"><h3>Metadata</h3><span class="muted small">scholarly record</span></div><dl class="inspector-meta"><dt>Source</dt><dd>${escapeHtml(librarySource(item))}</dd><dt>Year</dt><dd>${escapeHtml(libraryYear(item))}</dd><dt>DOI</dt><dd>${escapeHtml(p.normalizedDoi || "—")}</dd><dt>URL</dt><dd>${p.url ? `<button class="inspector-link" data-action="open" data-url="${escapeHtml(p.url)}">${escapeHtml(p.url)}</button>` : "—"}</dd><dt>Abstract</dt><dd>${escapeHtml(p.abstractSource || "—")}</dd></dl></section>
-    <section class="inspector-section inspector-library"><div class="inspector-section-head"><h3>Library</h3><button class="ghost small" data-action="library-edit" data-paper-id="${p.id}">编辑字段</button></div><div class="inspector-field-row"><span class="field-label">Note</span><span class="field-value${note ? "" : " empty-value"}">${escapeHtml(note || "未添加备注")}</span></div><div class="inspector-subsection"><div class="inspector-subhead"><span class="field-label">Collections</span><button class="ghost small" data-action="library-save-collections" data-paper-id="${p.id}">保存</button></div><div class="inspector-checks">${collectionChecks || '<span class="muted small">暂无文集</span>'}</div></div><div class="inspector-subsection"><div class="inspector-subhead"><span class="field-label">Library Tags</span><button class="ghost small" data-action="library-save-tags" data-paper-id="${p.id}">保存</button></div><div class="inspector-checks">${tagChecks || '<span class="muted small">暂无标签</span>'}</div></div></section>
-    <section class="inspector-section inspector-abstract"><div class="inspector-section-head"><h3>Abstract</h3><div class="inspector-section-actions">${hasChineseAbstract ? `<div class="inspector-language-toggle" role="group" aria-label="摘要语言"><button class="seg ${abstractLanguage === "zh" ? "on" : ""}" data-action="library-abstract-lang" data-lang="zh">中文</button><button class="seg ${abstractLanguage === "en" ? "on" : ""}" data-action="library-abstract-lang" data-lang="en">English</button></div>` : `<span class="muted small">${englishAbstract ? "English" : "无摘要"}</span>`}${abstractTranslate}</div></div><p class="inspector-abstract-text${abstractText ? "" : " empty-value"}">${escapeHtml(abstractText || "暂无可用摘要")}</p></section>
-    ${p.oneSentenceSummary ? `<section class="inspector-section"><div class="inspector-section-head"><h3>AI Summary</h3></div><p>${escapeHtml(p.oneSentenceSummary)}</p></section>` : ""}
-    <section class="inspector-section inspector-attachments"><div class="inspector-section-head"><h3>PDF</h3>${attachmentAdd}</div><div class="attachment-list">${attachmentRows}</div></section>
-    <section class="inspector-section inspector-citation"><div class="inspector-section-head"><h3>Citation</h3><span class="muted small">基于当前 metadata</span></div><p>${escapeHtml(`${authorText(libraryAuthors(item))}${libraryYear(item) !== "—" ? ` (${libraryYear(item)})` : ""}. ${libraryEnglishTitle(item)}. ${librarySource(item)}.`)}</p></section>`;
+  const englishTitle = libraryEnglishTitle(item);
+  const chineseTitle = libraryChineseTitle(item);
+  const authors = authorText(libraryAuthors(item));
+  const citation = `${authors}${libraryYear(item) !== "—" ? ` (${libraryYear(item)})` : ""}. ${englishTitle}. ${librarySource(item)}.`;
+  $("library-inspector").innerHTML = `<div class="inspector-head"><div class="inspector-kicker"><span class="inspector-kicker-label">LIBRARY</span><span class="muted small">收录于 ${fmtDate(item.addedAt)}</span></div><div class="inspector-actions"><button type="button" class="icon-button inspector-close" title="收起 Inspector" aria-label="收起 Inspector" data-action="library-close-inspector">×</button><button type="button" class="ghost small danger" data-action="library-remove" data-paper-id="${p.id}">移出文献库</button></div></div>
+    <header class="inspector-title-block"><div class="inspector-title-line"><h2 title="${escapeHtml(englishTitle)}">${escapeHtml(englishTitle)}</h2>${libraryInlineEditButton(p.id, "title", "English Title")}</div>${libraryInspectorRow("Chinese Title", escapeHtml(chineseTitle || "未添加"), libraryInlineEditButton(p.id, "chineseTitle", "Chinese Title"), "inspector-hero-row")}${libraryInspectorRow("Authors", escapeHtml(authors), libraryInlineEditButton(p.id, "authors", "Authors"), "inspector-hero-row")}</header>
+    <section class="inspector-group inspector-metadata"><div class="inspector-section-head"><h3>Metadata</h3><span class="muted small">scholarly record</span></div><div class="inspector-rows">${libraryInspectorRow("Source", escapeHtml(librarySource(item)), libraryInlineEditButton(p.id, "source", "Source"))}${libraryInspectorRow("Year", escapeHtml(libraryYear(item)), libraryInlineEditButton(p.id, "year", "Year"))}${libraryInspectorRow("DOI", escapeHtml(p.normalizedDoi || "—"))}${libraryInspectorRow("URL", p.url ? `<button class="inspector-link" data-action="open" data-url="${escapeHtml(p.url)}">${escapeHtml(p.url)}</button>` : "—")}<div class="inspector-form-row inspector-form-row-stack"><span class="field-label">关键词</span><div class="inspector-keyword-value">${renderBibliographicKeywords(p)}</div></div></div></section>
+    <section class="inspector-group inspector-library"><div class="inspector-section-head"><h3>Library</h3><span class="muted small">personal layer</span></div><div class="inspector-rows">${libraryInspectorRow("Note", `<span class="${note ? "" : "empty-value"}">${escapeHtml(note || "未添加备注")}</span>`, libraryInlineEditButton(p.id, "note", "Note"))}<div class="inspector-form-row inspector-form-row-stack"><span class="field-label">Collections</span><div class="inspector-control"><div class="inspector-checks">${collectionChecks || '<span class="muted small">暂无文集</span>'}</div><button class="ghost small" data-action="library-save-collections" data-paper-id="${p.id}">保存</button></div></div><div class="inspector-form-row inspector-form-row-stack"><span class="field-label">Library Tags</span><div class="inspector-control"><div class="inspector-checks">${tagChecks || '<span class="muted small">暂无标签</span>'}</div><button class="ghost small" data-action="library-save-tags" data-paper-id="${p.id}">保存</button></div></div></div></section>
+    <section class="inspector-group inspector-abstract"><div class="inspector-section-head"><h3>Abstract</h3><div class="inspector-section-actions">${hasChineseAbstract ? `<div class="inspector-language-toggle" role="group" aria-label="摘要语言"><button class="seg ${abstractLanguage === "zh" ? "on" : ""}" data-action="library-abstract-lang" data-lang="zh">中文</button><button class="seg ${abstractLanguage === "en" ? "on" : ""}" data-action="library-abstract-lang" data-lang="en">English</button></div>` : `<span class="muted small">${englishAbstract ? "English" : "无摘要"}</span>`}${abstractTranslate}</div></div><p class="inspector-abstract-text${abstractText ? "" : " empty-value"}">${escapeHtml(abstractText || "暂无可用摘要")}</p>${p.oneSentenceSummary ? `<div class="inspector-ai-note"><span class="muted small">AI Summary</span><p>${escapeHtml(p.oneSentenceSummary)}</p></div>` : ""}</section>
+    <section class="inspector-group inspector-attachments"><div class="inspector-section-head"><h3>PDF</h3>${attachmentAdd}</div><div class="attachment-list">${attachmentRows}</div></section>
+    <section class="inspector-group inspector-citation"><div class="inspector-section-head"><h3>Citation</h3><span class="muted small">基于当前 metadata</span></div><p>${escapeHtml(citation)}</p></section>`;
 }
 
 async function openLibraryCapture(paperId: number) {
@@ -1752,6 +1992,200 @@ async function attachPdfToPaper(paperId: number) {
   }
 }
 
+interface LibraryDroppedFile {
+  name: string;
+  path: string | null;
+}
+
+async function importDroppedPdf(path: string): Promise<ExternalPdfImportResult> {
+  let result = await invoke<ExternalPdfImportResult>("import_pdf", { path, confirmedPaperId: null });
+  if (result.requiresConfirmation) {
+    const candidate = result.candidate || result.candidates[0];
+    if (!candidate) throw new Error("PDF 返回待确认状态，但没有可确认的论文候选");
+    const confirmed = await showConfirmModal({
+      title: "确认关联现有论文",
+      message: `PDF 元数据与一篇现有论文可能匹配：\n\n${formatPdfCandidate(candidate)}\n\n只新增 PDF 关联，不复制 Paper。`,
+      confirmText: "关联并导入",
+      cancelText: "跳过此文件",
+    });
+    if (!confirmed) throw new Error("已取消关联");
+    result = await invoke<ExternalPdfImportResult>("import_pdf", { path, confirmedPaperId: candidate.paperId });
+  }
+  if (result.paperId == null || result.attachment == null) throw new Error("PDF 导入未返回 Paper 或 attachment identity");
+  return result;
+}
+
+async function processLibraryDrop(files: LibraryDroppedFile[], targetPaperId: number | null): Promise<void> {
+  if (libraryDropQueue.length) return;
+  libraryDropQueue = files.map((file) => ({ name: file.name, path: file.path, state: "queued" }));
+  libraryDropTargetPaperId = targetPaperId;
+  libraryDropActive = false;
+  renderLibraryDropState();
+  let succeeded = 0;
+  for (const item of libraryDropQueue) {
+    item.state = "processing";
+    item.message = targetPaperId == null ? "导入中" : "添加中";
+    renderLibraryDropQueue();
+    try {
+      if (!item.path) throw new Error("当前 WebView 未提供本地文件路径");
+      if (targetPaperId != null) {
+        const attachment = await invoke<PaperAttachment>("attach_pdf", { paperId: targetPaperId, path: item.path });
+        item.message = attachment.filename;
+      } else {
+        const result = await importDroppedPdf(item.path);
+        item.message = result.attachment?.filename || "已导入";
+      }
+      item.state = "done";
+      succeeded += 1;
+    } catch (error) {
+      item.state = "error";
+      item.message = String(error).replace(/^Error:\s*/, "");
+    }
+    renderLibraryDropQueue();
+  }
+  if (succeeded > 0) {
+    await Promise.all([loadPapers(), loadLibraryData(libraryView)]);
+    if (targetPaperId != null) {
+      selectedLibraryPaperId = targetPaperId;
+      libraryInspectorCollapsed = false;
+      renderLibrary();
+    }
+  }
+  const failed = files.length - succeeded;
+  setStatus(`PDF 队列完成：成功 ${succeeded}${failed ? ` · 失败 ${failed}` : ""}`, failed ? "error" : "done");
+  window.setTimeout(() => {
+    if (!libraryDropQueue.some((item) => item.state === "processing")) {
+      libraryDropQueue = [];
+      libraryDropTargetPaperId = null;
+      renderLibraryDropQueue();
+    }
+  }, 3600);
+}
+
+function droppedFilesFromDataTransfer(dataTransfer: DataTransfer): LibraryDroppedFile[] {
+  return [...dataTransfer.files]
+    .filter((file) => file.name.toLowerCase().endsWith(".pdf"))
+    .map((file) => ({ name: file.name, path: (file as File & { path?: string }).path || null }));
+}
+
+function libraryDropTargetFromElement(element: Element | null): number | null {
+  const row = element?.closest(".library-paper-row") as HTMLElement | null;
+  return row ? Number(row.dataset.paperId) : null;
+}
+
+function setLibraryDropTarget(target: EventTarget | null): void {
+  const element = target instanceof Element ? target : null;
+  libraryDropTargetPaperId = libraryDropTargetFromElement(element);
+  libraryDropActive = true;
+  renderLibraryDropState();
+}
+
+function installLibraryInteractions(): void {
+  const pane = $("library-list-pane");
+  pane.addEventListener("dragenter", (event) => {
+    if (!event.dataTransfer?.types.includes("Files")) return;
+    event.preventDefault();
+    setLibraryDropTarget(event.target);
+  });
+  pane.addEventListener("dragover", (event) => {
+    if (!event.dataTransfer?.types.includes("Files")) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+    setLibraryDropTarget(event.target);
+  });
+  pane.addEventListener("dragleave", (event) => {
+    const related = event.relatedTarget as Node | null;
+    if (related && pane.contains(related)) return;
+    libraryDropActive = false;
+    libraryDropTargetPaperId = null;
+    renderLibraryDropState();
+  });
+  pane.addEventListener("drop", async (event) => {
+    event.preventDefault();
+    const targetPaperId = libraryDropTargetFromElement(event.target instanceof Element ? event.target : null);
+    const files = event.dataTransfer ? droppedFilesFromDataTransfer(event.dataTransfer) : [];
+    libraryDropActive = false;
+    libraryDropTargetPaperId = targetPaperId;
+    renderLibraryDropState();
+    if (!files.length) {
+      setStatus("只支持 PDF 文件", "error");
+      return;
+    }
+    await processLibraryDrop(files, targetPaperId);
+  });
+
+  // Tauri desktop drops expose absolute paths through webview drag events;
+  // keep the DOM handlers above for browser/dev-server fallback.
+  void listen("tauri://drag-over", (event) => {
+    const payload = event.payload as { position?: { x: number; y: number } };
+    const point = payload.position ? document.elementFromPoint(payload.position.x, payload.position.y) : null;
+    if (point && pane.contains(point)) setLibraryDropTarget(point);
+  });
+  void listen("tauri://drag-leave", () => {
+    libraryDropActive = false;
+    libraryDropTargetPaperId = null;
+    renderLibraryDropState();
+  });
+  void listen("tauri://drag-drop", (event) => {
+    const payload = event.payload as { paths?: string[]; position?: { x: number; y: number } };
+    const point = payload.position ? document.elementFromPoint(payload.position.x, payload.position.y) : null;
+    const targetPaperId = libraryDropTargetFromElement(point);
+    const files = (payload.paths || [])
+      .filter((path) => path.toLowerCase().endsWith(".pdf"))
+      .map((path) => ({ name: path.split(/[\\/]/).pop() || path, path }));
+    libraryDropActive = false;
+    libraryDropTargetPaperId = targetPaperId;
+    renderLibraryDropState();
+    if (files.length) void processLibraryDrop(files, targetPaperId);
+    else setStatus("只支持 PDF 文件", "error");
+  });
+
+  document.addEventListener("pointerdown", (event) => {
+    const target = (event.target as HTMLElement).closest("[data-column-resize]") as HTMLElement | null;
+    if (target) {
+      const column = target.dataset.columnResize as LibraryColumn;
+      if (!LIBRARY_COLUMNS.includes(column)) return;
+      libraryColumnResize = { column, startX: event.clientX, startWidth: libraryColumnWidths[column] };
+      document.body.classList.add("is-resizing-library");
+      event.preventDefault();
+      return;
+    }
+    if ((event.target as HTMLElement).closest("[data-inspector-resize]")) {
+      libraryInspectorResize = { startX: event.clientX, startWidth: libraryInspectorWidth };
+      document.body.classList.add("is-resizing-library");
+      event.preventDefault();
+    }
+  });
+  window.addEventListener("pointermove", (event) => {
+    if (libraryColumnResize) {
+      const { column, startX, startWidth } = libraryColumnResize;
+      libraryColumnWidths[column] = Math.max(LIBRARY_COLUMN_MIN[column], Math.round(startWidth + event.clientX - startX));
+      applyLibraryLayoutMetrics();
+      return;
+    }
+    if (libraryInspectorResize) {
+      const { startX, startWidth } = libraryInspectorResize;
+      const maxWidth = Math.min(560, Math.max(300, Math.round(window.innerWidth * 0.52)));
+      libraryInspectorWidth = Math.min(maxWidth, Math.max(300, Math.round(startWidth - (event.clientX - startX))));
+      applyLibraryLayoutMetrics();
+    }
+  });
+  window.addEventListener("pointerup", () => {
+    if (libraryColumnResize || libraryInspectorResize) persistLibraryLayout();
+    libraryColumnResize = null;
+    libraryInspectorResize = null;
+    document.body.classList.remove("is-resizing-library");
+  });
+  window.addEventListener("resize", () => {
+    if (window.innerWidth < 980 && !libraryInspectorCollapsed && activeWorkspace === "library") {
+      libraryInspectorCollapsed = true;
+      renderLibrary();
+    }
+    applyLibraryLayoutMetrics();
+  });
+  applyLibraryLayoutMetrics();
+}
+
 async function submitLibraryCapture() {
   if (libraryCapturePaperId == null) return;
   const collectionIds = [...document.querySelectorAll<HTMLInputElement>("[data-capture-collection-id]:checked")].map((e) => Number(e.dataset.captureCollectionId));
@@ -1839,13 +2273,15 @@ function renderWorkCenter() {
   const a = activity;
   const s = aiStatus;
   const syncRunning = !!(a.syncBatch && a.syncBatch.status === "running");
-  let html: string;
+  const detailEl = $("work-status-detail");
+  let compact = "已更新";
+  let detail = "已更新 · AI 待分析 0";
   let cls: string;
 
   if (syncRunning) {
-    // 同步优先：进行中显示进度，禁止同时高强调"待分析 N"
     cls = "running";
-    html = `正在检查新论文 · ${a.syncBatch!.journalCompleted}/${a.syncBatch!.journalTotal} 本期刊`;
+    compact = "同步中";
+    detail = `正在检查新论文 · ${a.syncBatch!.journalCompleted}/${a.syncBatch!.journalTotal} 本期刊`;
     syncBtn.disabled = true;
     syncBtn.textContent = "同步中…";
     aiBtn.disabled = false;
@@ -1856,30 +2292,32 @@ function renderWorkCenter() {
     if (s.state === "running" || s.state === "pausing") {
       cls = "running";
       const cur = s.currentPaperTitle
-        ? ` · 当前：${escapeHtml(s.currentPaperTitle.length > 42 ? s.currentPaperTitle.slice(0, 42) + "…" : s.currentPaperTitle)}`
+        ? ` · 当前：${s.currentPaperTitle.length > 42 ? s.currentPaperTitle.slice(0, 42) + "…" : s.currentPaperTitle}`
         : "";
-      html = `AI 分析中 · ${s.completed}/${s.batchSize}${cur}`;
+      compact = "AI 分析中";
+      detail = `AI 分析中 · ${s.completed}/${s.batchSize}${cur}`;
       aiBtn.textContent = "暂停";
     } else if (s.state === "paused") {
       cls = "paused";
-      html = `AI 已暂停 · ${s.completed}/${s.batchSize}（剩余 ${s.remaining} 篇）`;
+      compact = "AI 已暂停";
+      detail = `AI 已暂停 · ${s.completed}/${s.batchSize}（剩余 ${s.remaining} 篇）`;
       aiBtn.textContent = "继续";
     } else if (s.remaining > 0) {
       cls = "paused";
-      html = `AI 任务未完成 · 剩余 ${s.remaining} 篇`;
+      compact = `待分析 ${s.remaining}`;
+      detail = `AI 任务未完成 · 剩余 ${s.remaining} 篇`;
       aiBtn.textContent = "继续";
     } else if (a.analysisFailed > 0) {
-      // 真失败：红色，需要用户处理
       cls = "error";
-      html = `AI 分析失败 ${a.analysisFailed} 篇 · <button class="link-btn" data-action="ai-retry">重试</button>`;
+      compact = "分析失败";
+      detail = `AI 分析失败 ${a.analysisFailed} 篇 · 可在活动中重试`;
       aiBtn.textContent = "重试失败";
     } else if (a.pendingAnalysis > 0) {
-      // 待处理：中性橙，低强调
       cls = "pending";
-      html = `AI：待分析 ${a.pendingAnalysis} 篇`;
+      compact = `待分析 ${a.pendingAnalysis}`;
+      detail = `AI 待分析 ${a.pendingAnalysis} 篇`;
       aiBtn.textContent = "AI 分析";
     } else {
-      // 已完成 / healthy：绿色仅少量使用
       cls = "ok";
       const last = a.lastAnalysis;
       const time = fmtTimeNow();
@@ -1887,13 +2325,18 @@ function renderWorkCenter() {
         last && last.succeeded > 0
           ? ` · 上次成功分析 ${last.succeeded} 篇${last.finishedAt ? " · " + new Date(last.finishedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : ""}`
           : "";
-      html = `✓ 已更新 · ${time}　AI：待分析 0${lastText}`;
+      compact = "已更新";
+      detail = `已更新 · ${time} · AI 待分析 0${lastText}`;
       aiBtn.textContent = "AI 分析";
     }
   }
 
   statusEl.className = `work-status ${cls}`;
-  statusEl.innerHTML = html;
+  statusEl.innerHTML = `<span class="status-dot" aria-hidden="true"></span><span class="toolbar-status-label">${escapeHtml(compact)}</span>`;
+  statusEl.setAttribute("aria-label", detail.replace(/<[^>]+>/g, ""));
+  statusEl.setAttribute("title", `${detail.replace(/<[^>]+>/g, "")} · 点击查看详情`);
+  statusEl.setAttribute("data-status-detail", detail.replace(/<[^>]+>/g, ""));
+  if (detailEl) detailEl.textContent = detail.replace(/<[^>]+>/g, "");
 }
 
 /// Work Center 的 AI 按钮：按当前上下文分发（暂停 / 继续 / 重试失败 / 开始分析）。
@@ -2518,12 +2961,23 @@ async function saveSettings() {
     pdfNamingTemplate: ($("set-pdf-naming-template") as HTMLInputElement).value,
     pdfSubfolderRule: ($("set-pdf-subfolder-rule") as HTMLSelectElement).value as "none" | "year" | "journal/source",
   };
+  if (s.pdfFileHandlingMode !== "none" && !s.pdfLibraryRoot) {
+    $("settings-msg").textContent = "copy / move 模式需要先选择 Library root directory";
+    $("settings-msg").className = "error small";
+    return;
+  }
+  if (!s.pdfNamingTemplate.trim()) {
+    $("settings-msg").textContent = "PDF 命名模板不能为空";
+    $("settings-msg").className = "error small";
+    return;
+  }
   try {
     await invoke("set_settings", { s });
     settings = s;
     abstractLang = s.defaultAbstractLang === "en" ? "en" : "zh";
     renderPapers();
     renderNextCheck();
+    renderPdfTemplateExample();
     $("settings-msg").textContent = "设置已保存（每日时间修改后，运行中的调度器将在 30s 内采用）";
     $("settings-msg").className = "ok small";
   } catch (err) {
@@ -2554,7 +3008,12 @@ async function setupListeners() {
     const el = $("work-status");
     el.className = "work-status running";
     const checked = p.journalCompleted + p.journalFailed;
-    el.innerHTML = `正在检查新论文 · ${checked}/${p.journalTotal} 本期刊${p.journalFailed ? ` · 失败 ${p.journalFailed}` : ""}`;
+    const detail = `正在检查新论文 · ${checked}/${p.journalTotal} 本期刊${p.journalFailed ? ` · 失败 ${p.journalFailed}` : ""}`;
+    el.innerHTML = `<span class="status-dot" aria-hidden="true"></span><span class="toolbar-status-label">同步中</span>`;
+    el.title = `${detail} · 点击查看详情`;
+    el.setAttribute("aria-label", detail);
+    const detailEl = $("work-status-detail");
+    if (detailEl) detailEl.textContent = detail;
     if (p.currentJournal) {
       setStatus(`正在同步 ${p.currentJournal} · ${checked}/${p.journalTotal}`, "running");
     } else {
@@ -2651,6 +3110,8 @@ async function setupListeners() {
     await refreshRecommendations();
   });
 
+  installLibraryInteractions();
+
   // Catalog 详情 checkbox 选择（change 冒泡 → 委托处理）
   document.addEventListener("input", (ev) => {
     const el = ev.target as HTMLInputElement;
@@ -2662,6 +3123,7 @@ async function setupListeners() {
       else tagDraft[i].description = el.value;
       setTagDirty(true);
     }
+    if (el.matches("#set-pdf-library-root, #set-pdf-naming-template")) renderPdfTemplateExample();
   });
   document.addEventListener("change", (ev) => {
     const el = ev.target as HTMLInputElement;
@@ -2674,6 +3136,10 @@ async function setupListeners() {
       if (action === "tag-draft-name") tagDraft[i].name = el.value;
       else tagDraft[i].description = el.value;
       setTagDirty(true);
+      return;
+    }
+    if (el.matches("#set-pdf-file-handling-mode, #set-pdf-library-root, #set-pdf-naming-template, #set-pdf-subfolder-rule")) {
+      renderPdfTemplateExample();
       return;
     }
     if (el.matches("[data-action='tag-draft-toggle']")) {
@@ -2719,6 +3185,20 @@ async function setupListeners() {
     const nav = t.closest(".nav-item") as HTMLElement | null;
     if (nav) {
       switchView(nav.dataset.view!);
+      return;
+    }
+    if (t.closest("[data-action='select-pdf-library-root']")) {
+      await selectPdfLibraryRoot();
+      return;
+    }
+    if (t.closest("[data-action='reset-pdf-library-root']")) {
+      resetPdfLibraryRoot();
+      return;
+    }
+    const pdfToken = t.closest("[data-pdf-token]") as HTMLElement | null;
+    if (pdfToken) {
+      const token = pdfToken.dataset.pdfToken;
+      if (token) insertPdfTemplateToken(token);
       return;
     }
     if (t.closest("[data-action='library-import-pdf']")) {
@@ -2769,27 +3249,23 @@ async function setupListeners() {
       await attachPdfToPaper(Number(attachPdf.dataset.paperId));
       return;
     }
-    const libraryEdit = t.closest("[data-action='library-edit']") as HTMLElement | null;
-    if (libraryEdit) {
-      const paperId = Number(libraryEdit.dataset.paperId);
-      const item = libraryPapers.find((candidate) => candidate.paper.id === paperId);
-      if (item) {
-        libraryInspectorCollapsed = false;
-        libraryEditingPaperId = paperId;
-        renderLibraryInspector(item);
-      }
-      return;
-    }
-    if (t.closest("[data-action='library-edit-cancel']")) {
-      libraryEditingPaperId = null;
-      const item = libraryPapers.find((candidate) => candidate.paper.id === selectedLibraryPaperId);
-      if (item) renderLibraryInspector(item);
+    const inlineEdit = t.closest("[data-action='library-inline-edit']") as HTMLElement | null;
+    if (inlineEdit) {
+      await editLibraryInlineField(Number(inlineEdit.dataset.paperId), inlineEdit.dataset.field as LibraryInlineField);
       return;
     }
     if (t.closest("[data-action='library-close-inspector']")) {
-      libraryEditingPaperId = null;
       libraryInspectorCollapsed = true;
-      selectedLibraryPaperId = null;
+      renderLibrary();
+      return;
+    }
+    if (t.closest("[data-action='library-open-inspector']")) {
+      libraryInspectorCollapsed = false;
+      renderLibrary();
+      return;
+    }
+    if (t.closest("[data-action='library-toggle-inspector']")) {
+      libraryInspectorCollapsed = !libraryInspectorCollapsed;
       renderLibrary();
       return;
     }
@@ -2804,7 +3280,6 @@ async function setupListeners() {
     if (librarySelect) {
       selectedLibraryPaperId = parseInt(librarySelect.dataset.paperId!, 10);
       libraryInspectorCollapsed = false;
-      libraryEditingPaperId = null;
       libraryInspectorAbstractLang = "zh";
       renderLibrary();
       return;
@@ -2904,59 +3379,6 @@ async function setupListeners() {
       selectedLibraryPaperId = null;
       await Promise.all([loadPapers(), loadLibraryData(libraryView)]);
       setStatus("已移出文献库", "done");
-      return;
-    }
-    const saveMetadata = t.closest("[data-action='library-save-metadata']") as HTMLElement | null;
-    if (saveMetadata) {
-      const value = (field: string) => document.querySelector<HTMLInputElement | HTMLTextAreaElement>(`#library-inspector [data-library-edit-field="${field}"]`)?.value.trim() || "";
-      const yearValue = value("year");
-      const year = yearValue ? Number(yearValue) : null;
-      if (year != null && (!Number.isInteger(year) || year < 0 || year > 9999)) {
-        setStatus("年份必须是有效的整数", "error");
-        return;
-      }
-      const metadata: LibraryItemMetadataInput = {
-        titleOverride: value("title") || null,
-        chineseTitleOverride: value("chineseTitle") || null,
-        sourceOverride: value("source") || null,
-        yearOverride: year,
-        authorsOverride: libraryAuthorsFromInput(value("authors")),
-        abstractOverride: value("abstract") || null,
-        chineseAbstractOverride: value("chineseAbstract") || null,
-        note: value("note") || null,
-      };
-      const saveButton = saveMetadata as HTMLButtonElement;
-      saveButton.disabled = true;
-      saveButton.textContent = "保存中…";
-      try {
-        await invoke("set_library_item_metadata", { paperId: Number(saveMetadata.dataset.paperId), metadata });
-        libraryEditingPaperId = null;
-        await loadLibraryData(libraryView);
-        setStatus("Library metadata 已保存", "done");
-      } catch (error) {
-        setStatus(`Library metadata 保存失败：${String(error)}`, "error");
-        saveButton.disabled = false;
-        saveButton.textContent = "保存";
-      }
-      return;
-    }
-    const clearOverrides = t.closest("[data-action='library-clear-overrides']") as HTMLElement | null;
-    if (clearOverrides) {
-      const confirmed = await showConfirmModal({
-        title: "恢复原始 metadata？",
-        message: "标题、来源、年份、作者和摘要的 Library override 将被清除，并回退到 canonical Paper 字段。Note 会保留。",
-        confirmText: "恢复原始值",
-        cancelText: "取消",
-      });
-      if (!confirmed) return;
-      try {
-        await invoke("clear_library_item_overrides", { paperId: Number(clearOverrides.dataset.paperId) });
-        libraryEditingPaperId = null;
-        await loadLibraryData(libraryView);
-        setStatus("已恢复 canonical metadata", "done");
-      } catch (error) {
-        setStatus(`恢复 metadata 失败：${String(error)}`, "error");
-      }
       return;
     }
     const translateAbstract = t.closest("[data-action='library-translate-abstract']") as HTMLElement | null;
@@ -3387,9 +3809,21 @@ async function setupListeners() {
       await renderCatalogDetail(catalogCol.dataset.catalogCode!);
       return;
     }
-    if (t.closest("#work-status")) {
+    if (t.closest("[data-action='open-activity']")) {
+      $("work-status-popover").classList.add("hidden");
+      $("work-status").setAttribute("aria-expanded", "false");
       switchView("activity");
       return;
+    }
+    if (t.closest("#work-status")) {
+      const popover = $("work-status-popover");
+      const open = popover.classList.toggle("hidden");
+      $("work-status").setAttribute("aria-expanded", String(!open));
+      return;
+    }
+    if (!t.closest(".toolbar-status-wrap")) {
+      $("work-status-popover").classList.add("hidden");
+      $("work-status").setAttribute("aria-expanded", "false");
     }
     if (t.closest("#btn-sync-main")) {
       await startSync(null);

@@ -45,19 +45,20 @@
             </div>
           </div>
           <div class="topbar-actions">
-            <span id="status" class="status idle">就绪</span>
-            <button id="btn-settings-global" class="icon-button" title="设置" aria-label="设置">⚙</button>
+            <span id="status" class="status idle" aria-live="polite">就绪</span>
+            <div class="toolbar-status-wrap">
+              <button type="button" id="work-status" class="work-status idle" title="查看同步与 AI 状态" aria-expanded="false"><span class="status-dot" aria-hidden="true"></span><span class="toolbar-status-label">已更新</span></button>
+              <div id="work-status-popover" class="status-popover hidden" role="status">
+                <div class="status-popover-title">工作状态</div>
+                <div id="work-status-detail" class="status-popover-detail">已更新 · AI 待分析 0</div>
+                <button type="button" class="status-popover-link" data-action="open-activity">查看活动</button>
+              </div>
+            </div>
+            <button type="button" id="btn-sync-main" class="toolbar-action" title="检查新论文"><span class="toolbar-action-icon" aria-hidden="true">↻</span>检查新论文</button>
+            <button type="button" id="btn-ai-main" class="toolbar-action" title="运行 AI 分析"><span class="toolbar-action-icon" aria-hidden="true">✦</span>AI</button>
+            <button type="button" id="btn-settings-global" class="icon-button" title="设置" aria-label="设置">⚙</button>
           </div>
         </header>
-
-        <!-- 工作中心：唯一状态 + 主操作（所有主页面共享） -->
-        <div id="work-center" class="work-center">
-          <div id="work-status" class="work-status idle" title="查看活动中心"></div>
-          <div class="work-actions">
-            <button id="btn-sync-main" class="primary">检查新论文</button>
-            <button id="btn-ai-main" class="ghost">AI 分析</button>
-          </div>
-        </div>
 
         <section id="view-recommend" class="view active">
           <div id="backlog-banner" class="banner hidden"></div>
@@ -111,7 +112,7 @@
         </section>
 
         <section id="view-library-all" class="view library-view">
-          <div class="library-layout">
+          <div id="library-layout" class="library-layout">
             <div class="library-list-pane">
               <div class="library-list-head">
                 <div>
@@ -119,13 +120,20 @@
                   <h2 id="library-view-title">全部文献</h2>
                   <span id="library-count" class="muted small"></span>
                 </div>
-                <div class="library-toolbar-actions"><button class="ghost small" data-action="library-import-pdf">＋ 导入 PDF</button><button class="icon-button" title="刷新文献库" aria-label="刷新文献库" data-action="library-refresh">↻</button></div>
+                <div class="library-toolbar-actions"><button type="button" class="ghost small" data-action="library-import-pdf">＋ 导入 PDF</button><button type="button" class="icon-button" title="刷新文献库" aria-label="刷新文献库" data-action="library-refresh">↻</button><button type="button" class="icon-button" title="切换 Inspector" aria-label="切换 Inspector" data-action="library-toggle-inspector">◧</button></div>
               </div>
-              <div class="library-table-head" aria-hidden="true">
-                <span>标题</span><span>备注</span><span>来源</span><span>年份</span><span>作者</span>
+              <div class="library-table-head" role="row">
+                <span class="library-column-header" data-column="title"><span>标题</span><span class="column-resizer" data-column-resize="title" aria-hidden="true"></span></span>
+                <span class="library-column-header" data-column="note"><span>备注</span><span class="column-resizer" data-column-resize="note" aria-hidden="true"></span></span>
+                <span class="library-column-header" data-column="source"><span>来源</span><span class="column-resizer" data-column-resize="source" aria-hidden="true"></span></span>
+                <span class="library-column-header" data-column="year"><span>年份</span><span class="column-resizer" data-column-resize="year" aria-hidden="true"></span></span>
+                <span class="library-column-header" data-column="authors"><span>作者</span><span class="column-resizer" data-column-resize="authors" aria-hidden="true"></span></span>
               </div>
               <div id="library-list" class="library-list"></div>
+              <div id="library-drop-overlay" class="library-drop-overlay hidden" aria-live="polite"><span class="drop-overlay-icon" aria-hidden="true">＋</span><strong id="library-drop-label">导入为新文献</strong><span class="muted small">释放以继续</span></div>
+              <div id="library-drop-queue" class="library-drop-queue hidden" aria-live="polite"></div>
             </div>
+            <div class="library-inspector-resizer" data-inspector-resize="true" role="separator" aria-label="调整 Inspector 宽度" tabindex="0"></div>
             <aside id="library-inspector" class="library-inspector"><div class="empty">选择一篇文献查看详情</div></aside>
           </div>
         </section>
@@ -235,33 +243,35 @@
               </select>
             </div>
 
-            <h3>PDF 文件管理</h3>
-            <div class="settings-row">
-              <label for="set-pdf-file-handling-mode">PDF file handling mode</label>
-              <select id="set-pdf-file-handling-mode">
-                <option value="none">none · 保持原文件链接</option>
-                <option value="copy">copy · 拷贝到 CowPaper 文件库</option>
-                <option value="move">move · 安全迁移到 CowPaper 文件库</option>
-              </select>
-            </div>
-            <div class="settings-row">
-              <label for="set-pdf-library-root">Library root directory</label>
-              <input id="set-pdf-library-root" type="text" placeholder="/Users/.../CowPaper Library" />
-              <p class="muted small">copy/move 模式需要绝对路径。修改设置不会自动批量移动已有 PDF。</p>
-            </div>
-            <div class="settings-row">
-              <label for="set-pdf-naming-template">命名模板</label>
-              <input id="set-pdf-naming-template" type="text" />
-              <p class="muted small">支持 {title} {journal} {source} {year} {authors} {first_author} {doi}；重命名已有文件需显式执行。</p>
-            </div>
-            <div class="settings-row">
-              <label for="set-pdf-subfolder-rule">子文件夹规则</label>
-              <select id="set-pdf-subfolder-rule">
-                <option value="none">none</option>
-                <option value="year">year</option>
-                <option value="journal/source">journal/source</option>
-              </select>
-            </div>
+            <section class="settings-group pdf-settings-group" aria-labelledby="pdf-settings-title">
+              <div class="settings-group-head">
+                <div><h3 id="pdf-settings-title">PDF 文件库</h3><p class="muted small">新导入或关联的 PDF 使用这些规则；不会自动整理旧文件。</p></div>
+                <span class="settings-group-badge">Library</span>
+              </div>
+              <div class="settings-form-rows">
+                <div class="settings-form-row">
+                  <div class="settings-label"><label for="set-pdf-file-handling-mode">文件处理</label><span>拖入文献库时如何保存原文件</span></div>
+                  <select id="set-pdf-file-handling-mode">
+                    <option value="none">none · 保持原文件链接</option>
+                    <option value="copy">copy · 拷贝到文件库</option>
+                    <option value="move">move · 移动到文件库</option>
+                  </select>
+                </div>
+                <div class="settings-form-row settings-form-row-stacked">
+                  <div class="settings-label"><label for="set-pdf-library-root">Library root directory</label><span>copy / move 模式使用的目标目录</span></div>
+                  <div class="settings-control settings-root-control"><input id="set-pdf-library-root" type="text" placeholder="选择 CowPaper 文件库目录" /><div class="settings-inline-actions"><button type="button" class="ghost small" data-action="select-pdf-library-root">更改</button><button type="button" class="ghost small" data-action="reset-pdf-library-root">重置</button></div></div>
+                </div>
+                <div id="pdf-move-warning" class="settings-warning hidden" role="note">移动模式会在每次新关联/导入时迁移源文件；不会自动整理已有 PDF。请确认目标文件库已备份。</div>
+                <div class="settings-form-row settings-form-row-stacked">
+                  <div class="settings-label"><label for="set-pdf-naming-template">命名模板</label><span>仅影响 managed PDF 的新目标文件名</span></div>
+                  <div class="settings-control"><input id="set-pdf-naming-template" type="text" value="{title} - {journal} - {first_author} - {year}.pdf" spellcheck="false" /><div class="pdf-template-tokens" aria-label="可用命名 token"><button type="button" class="token-chip" data-pdf-token="title">{title}</button><button type="button" class="token-chip" data-pdf-token="journal">{journal}</button><button type="button" class="token-chip" data-pdf-token="source">{source}</button><button type="button" class="token-chip" data-pdf-token="first_author">{first_author}</button><button type="button" class="token-chip" data-pdf-token="authors">{authors}</button><button type="button" class="token-chip" data-pdf-token="year">{year}</button><button type="button" class="token-chip" data-pdf-token="doi">{doi}</button></div><div class="settings-preview"><span>示例预览</span><code id="pdf-template-preview"></code></div><p id="pdf-template-warning" class="settings-inline-warning hidden"></p></div>
+                </div>
+                <div class="settings-form-row">
+                  <div class="settings-label"><label for="set-pdf-subfolder-rule">子文件夹规则</label><span>managed PDF 的目录层级</span></div>
+                  <select id="set-pdf-subfolder-rule"><option value="none">none · 不分文件夹</option><option value="year">year · 按年份</option><option value="journal/source">journal/source · 按期刊 / 来源</option></select>
+                </div>
+              </div>
+            </section>
 
             <h3>同步</h3>
             <div class="settings-row">
