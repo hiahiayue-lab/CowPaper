@@ -1138,14 +1138,15 @@ fn keyword_input_is_allowed(input: &crate::models::PaperKeywordInput) -> bool {
     if !accepted_keyword_kind(&input.kind) || input.source.trim().is_empty() {
         return false;
     }
+    let source = input.source.trim().to_ascii_lowercase();
     // OpenAlex concepts/topics and Crossref subjects are not author keywords.
     // AI output is not a bibliographic source at all.
     if input.kind == "author_keyword"
-        && matches!(input.source.as_str(), "openalex" | "crossref" | "ai" | "ai_suggestion")
+        && matches!(source.as_str(), "openalex" | "crossref" | "ai" | "ai_suggestion")
     {
         return false;
     }
-    !matches!(input.source.as_str(), "ai" | "ai_suggestion")
+    !matches!(source.as_str(), "ai" | "ai_suggestion")
 }
 
 /// Persist provider/PDF keyword evidence without touching any recommendation
@@ -3097,7 +3098,16 @@ fn persist_external_metadata(
         Some(&metadata.filename),
         None,
     )?;
-    insert_keyword_inputs(conn, paper_id, &metadata.keywords, Some(pdf_record_id))?;
+    // `metadata.keywords` also contains provider keywords after exact-DOI
+    // enrichment. Keep the PDF source record limited to PDF Info/XMP evidence;
+    // provider records below own their corresponding provenance instead.
+    let pdf_keywords: Vec<_> = metadata
+        .keywords
+        .iter()
+        .filter(|input| input.source.eq_ignore_ascii_case("pdf_info") || input.source.eq_ignore_ascii_case("pdf_xmp"))
+        .cloned()
+        .collect();
+    insert_keyword_inputs(conn, paper_id, &pdf_keywords, Some(pdf_record_id))?;
     for (source, candidate) in providers {
         insert_source_record(
             conn,

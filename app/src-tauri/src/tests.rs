@@ -5658,6 +5658,14 @@ fn test_v16_keywords_have_fk_dedup_kind_and_provenance() {
         ..Default::default()
     };
     assert_eq!(db::insert_keyword_inputs(&conn, pid, &[concept_disguised_as_author], None).unwrap(), 0);
+    let ai_suggestion = crate::models::PaperKeywordInput {
+        keyword: "Generated topic".into(),
+        kind: "concept".into(),
+        source: "AI_SUGGESTION".into(),
+        confidence: "LOW".into(),
+        ..Default::default()
+    };
+    assert_eq!(db::insert_keyword_inputs(&conn, pid, &[ai_suggestion], None).unwrap(), 0);
     let crossref_raw = r#"{"message":{"DOI":"10.1000/kw","subject":["Operations Research","Decision Science"]}}"#;
     db::insert_source_record(&conn, pid, "crossref", Some("10.1000/kw"), Some(crossref_raw)).unwrap();
     let openalex_raw = r#"{"id":"https://openalex.org/W1","keywords":[{"keyword":"graph learning","score":0.9}],"concepts":[{"display_name":"Machine learning","score":0.8}]}"#;
