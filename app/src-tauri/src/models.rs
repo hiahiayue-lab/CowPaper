@@ -432,9 +432,9 @@ pub struct LibraryMembership {
     pub tag_ids: Vec<i64>,
 }
 
-/// A linked or managed file relation owned by CowPaper.  v15 only creates
-/// `linked` rows; `managed` is retained as a schema-compatible enum value for
-/// a future file-copy implementation.
+/// A linked or managed file relation owned by CowPaper. Managed rows point to
+/// a verified file in the configured library and retain a relative path for
+/// future library portability.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PaperAttachment {
@@ -631,7 +631,25 @@ pub struct Settings {
     pub daily_sync_time: String,
     pub auto_analyze_new: bool,
     pub default_abstract_lang: String,
+    /// How a newly attached/imported external PDF is stored.
+    #[serde(default = "default_pdf_file_handling_mode")]
+    pub pdf_file_handling_mode: String,
+    /// User-selected CowPaper PDF library root. Empty means it has not been configured.
+    #[serde(default)]
+    pub pdf_library_root: String,
+    /// Explicit filename template used by managed-PDF operations.
+    #[serde(default = "default_pdf_naming_template")]
+    pub pdf_naming_template: String,
+    /// Managed-PDF subfolder rule: none, year, or journal/source.
+    #[serde(default = "default_pdf_subfolder_rule")]
+    pub pdf_subfolder_rule: String,
 }
+
+pub fn default_pdf_file_handling_mode() -> String { "none".to_string() }
+pub fn default_pdf_naming_template() -> String {
+    "{title} - {journal} - {first_author} - {year}.pdf".to_string()
+}
+pub fn default_pdf_subfolder_rule() -> String { "none".to_string() }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

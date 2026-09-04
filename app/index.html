@@ -235,6 +235,34 @@
               </select>
             </div>
 
+            <h3>PDF 文件管理</h3>
+            <div class="settings-row">
+              <label for="set-pdf-file-handling-mode">PDF file handling mode</label>
+              <select id="set-pdf-file-handling-mode">
+                <option value="none">none · 保持原文件链接</option>
+                <option value="copy">copy · 拷贝到 CowPaper 文件库</option>
+                <option value="move">move · 安全迁移到 CowPaper 文件库</option>
+              </select>
+            </div>
+            <div class="settings-row">
+              <label for="set-pdf-library-root">Library root directory</label>
+              <input id="set-pdf-library-root" type="text" placeholder="/Users/.../CowPaper Library" />
+              <p class="muted small">copy/move 模式需要绝对路径。修改设置不会自动批量移动已有 PDF。</p>
+            </div>
+            <div class="settings-row">
+              <label for="set-pdf-naming-template">命名模板</label>
+              <input id="set-pdf-naming-template" type="text" />
+              <p class="muted small">支持 {title} {journal} {source} {year} {authors} {first_author} {doi}；重命名已有文件需显式执行。</p>
+            </div>
+            <div class="settings-row">
+              <label for="set-pdf-subfolder-rule">子文件夹规则</label>
+              <select id="set-pdf-subfolder-rule">
+                <option value="none">none</option>
+                <option value="year">year</option>
+                <option value="journal/source">journal/source</option>
+              </select>
+            </div>
+
             <h3>同步</h3>
             <div class="settings-row">
               <label class="check"><input type="checkbox" id="set-startup-sync" /> 启动时自动检查新论文</label>

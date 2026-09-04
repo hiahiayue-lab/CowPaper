@@ -76,6 +76,31 @@ fn test_pdf_path(label: &str, body: &str) -> std::path::PathBuf {
     path
 }
 
+fn test_pdf_library(label: &str) -> std::path::PathBuf {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("cowpaper-library-{label}-{}-{stamp}", std::process::id()));
+    std::fs::create_dir_all(&path).unwrap();
+    path
+}
+
+fn set_pdf_storage_settings(conn: &Connection, mode: &str, root: &std::path::Path, template: &str, rule: &str) {
+    db::set_setting(conn, "settings.pdf_file_handling_mode", mode).unwrap();
+    db::set_setting(conn, "settings.pdf_library_root", root.to_str().unwrap()).unwrap();
+    db::set_setting(conn, "settings.pdf_naming_template", template).unwrap();
+    db::set_setting(conn, "settings.pdf_subfolder_rule", rule).unwrap();
+}
+
+fn test_paper(conn: &Connection, doi: &str, title: &str) -> i64 {
+    let jid = db::insert_journal(conn, "Storage Journal", Some("0025-1909"), None, None, None).unwrap();
+    match db::upsert_paper(conn, jid, &candidate(Some(doi), title, Some("abstract"), Some("crossref"))).unwrap() {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new paper"),
+    }
+}
+
 #[test]
 fn test_normalize_doi() {
     assert_eq!(
@@ -5275,6 +5300,158 @@ fn test_v15_linked_attachment_detach_missing_and_relink() {
 }
 
 #[test]
+fn test_pdf_storage_none_keeps_linked_source() {
+    let conn = mem_db();
+    let pid = test_paper(&conn, "10.1000/storage-none", "None Paper");
+    let source = test_pdf_path("storage-none", "%PDF-1.7\n");
+    db::set_setting(&conn, "settings.pdf_file_handling_mode", "none").unwrap();
+    let attachment = db::attach_pdf_to_paper(&conn, pid, source.to_str().unwrap()).unwrap();
+    assert_eq!(attachment.storage_mode, "linked");
+    assert_eq!(attachment.relative_path, None);
+    let canonical_source = std::fs::canonicalize(&source).unwrap();
+    assert_eq!(std::path::Path::new(&attachment.absolute_path), canonical_source.as_path());
+    assert!(source.exists());
+    let _ = std::fs::remove_file(source);
+}
+
+#[test]
+fn test_pdf_storage_copy_preserves_source_and_verifies_destination() {
+    let conn = mem_db();
+    let pid = test_paper(&conn, "10.1000/storage-copy", "Copy Paper");
+    let source = test_pdf_path("storage-copy", "%PDF-1.7\ncopy body\n");
+    let root = test_pdf_library("copy");
+    set_pdf_storage_settings(&conn, "copy", &root, "{title} - {first_author} - {year}.pdf", "none");
+    let attachment = db::attach_pdf_to_paper(&conn, pid, source.to_str().unwrap()).unwrap();
+    assert_eq!(attachment.storage_mode, "managed");
+    let canonical_root = std::fs::canonicalize(&root).unwrap();
+    assert!(std::path::Path::new(&attachment.absolute_path).starts_with(&canonical_root));
+    assert!(attachment.relative_path.is_some());
+    assert!(std::path::Path::new(&attachment.absolute_path).is_file());
+    assert!(source.is_file(), "copy 必须保留源 PDF");
+    assert_eq!(attachment.sha256, Some(sha256_file_for_test(&source)));
+    let _ = std::fs::remove_file(source);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn test_pdf_storage_move_deletes_source_only_after_verified_destination() {
+    let conn = mem_db();
+    let pid = test_paper(&conn, "10.1000/storage-move", "Move Paper");
+    let source = test_pdf_path("storage-move", "%PDF-1.7\nmove body\n");
+    let root = test_pdf_library("move");
+    set_pdf_storage_settings(&conn, "move", &root, "{title}.pdf", "none");
+    let attachment = db::attach_pdf_to_paper(&conn, pid, source.to_str().unwrap()).unwrap();
+    assert_eq!(attachment.storage_mode, "managed");
+    assert!(!source.exists(), "move 完成后才删除源 PDF");
+    assert!(std::path::Path::new(&attachment.absolute_path).is_file());
+    let _ = std::fs::remove_file(attachment.absolute_path);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn test_pdf_storage_failed_move_preserves_source() {
+    let conn = mem_db();
+    let pid = test_paper(&conn, "10.1000/storage-move-failure", "Move Failure Paper");
+    let source = test_pdf_path("storage-move-failure", "%PDF-1.7\n");
+    let root_file = test_pdf_path("storage-root-file", "not a directory");
+    set_pdf_storage_settings(&conn, "move", &root_file, "{title}.pdf", "none");
+    assert!(db::attach_pdf_to_paper(&conn, pid, source.to_str().unwrap()).is_err());
+    assert!(source.exists(), "目标准备失败时绝不能删除源 PDF");
+    assert_eq!(db::list_paper_attachments(&conn, pid).unwrap().len(), 0);
+    let _ = std::fs::remove_file(source);
+    let _ = std::fs::remove_file(root_file);
+}
+
+fn sha256_file_for_test(path: &std::path::Path) -> String {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path).unwrap();
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+#[test]
+fn test_pdf_filename_sanitization_collision_and_empty_fields() {
+    let conn = mem_db();
+    let pid = test_paper(&conn, "10.1000/storage-sanitize", "Bad / \\ : * ? \" < > | Title");
+    let source = test_pdf_path("storage-sanitize", "%PDF-1.7\n");
+    let root = test_pdf_library("sanitize");
+    set_pdf_storage_settings(&conn, "copy", &root, "{title} - {doi} - {authors} - {year}.pdf", "none");
+    let first = db::attach_pdf_to_paper(&conn, pid, source.to_str().unwrap()).unwrap();
+    let second = db::attach_pdf_to_paper(&conn, pid, source.to_str().unwrap()).unwrap();
+    for attachment in [&first, &second] {
+        let name = std::path::Path::new(&attachment.absolute_path).file_name().unwrap().to_str().unwrap();
+        assert!(name.ends_with(".pdf"));
+        assert!(!name.chars().any(|ch| matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')));
+        assert!(name.len() <= 180);
+    }
+    assert_ne!(first.absolute_path, second.absolute_path, "collision 不得覆盖原文件");
+    assert!(second.filename.contains("(2).pdf"));
+    let _ = std::fs::remove_file(source);
+    let _ = std::fs::remove_file(first.absolute_path);
+    let _ = std::fs::remove_file(second.absolute_path);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn test_pdf_storage_year_subfolder() {
+    let conn = mem_db();
+    let pid = test_paper(&conn, "10.1000/storage-year", "Year Paper");
+    let source = test_pdf_path("storage-year", "%PDF-1.7\n");
+    let root = test_pdf_library("year");
+    set_pdf_storage_settings(&conn, "copy", &root, "{title}.pdf", "year");
+    let attachment = db::attach_pdf_to_paper(&conn, pid, source.to_str().unwrap()).unwrap();
+    assert_eq!(attachment.relative_path.as_deref().unwrap().split(std::path::MAIN_SEPARATOR).next(), Some("2025"));
+    assert!(std::path::Path::new(&attachment.absolute_path).is_file());
+    let _ = std::fs::remove_file(source);
+    let _ = std::fs::remove_file(attachment.absolute_path);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn test_linked_to_managed_copy_and_move_are_explicit() {
+    let conn = mem_db();
+    let pid = test_paper(&conn, "10.1000/storage-reorganize", "Reorganize Paper");
+    let source = test_pdf_path("storage-reorganize", "%PDF-1.7\n");
+    db::set_setting(&conn, "settings.pdf_file_handling_mode", "none").unwrap();
+    let linked = db::attach_pdf_to_paper(&conn, pid, source.to_str().unwrap()).unwrap();
+    let copy_root = test_pdf_library("reorganize-copy");
+    set_pdf_storage_settings(&conn, "none", &copy_root, "{title}.pdf", "none");
+    let copied = db::reorganize_pdf(&conn, linked.id, "copy").unwrap();
+    assert_eq!(copied.storage_mode, "managed");
+    assert!(source.exists());
+    assert!(std::path::Path::new(&copied.absolute_path).exists());
+
+    db::set_setting(&conn, "settings.pdf_file_handling_mode", "none").unwrap();
+    let linked_for_move = db::attach_pdf_to_paper(&conn, pid, source.to_str().unwrap()).unwrap();
+    let move_root = test_pdf_library("reorganize-move");
+    set_pdf_storage_settings(&conn, "none", &move_root, "{title} moved.pdf", "none");
+    let moved = db::reorganize_pdf(&conn, linked_for_move.id, "move").unwrap();
+    assert_eq!(moved.storage_mode, "managed");
+    assert!(!source.exists(), "显式 move 完成后源路径才消失");
+    assert!(std::path::Path::new(&moved.absolute_path).exists());
+    let _ = std::fs::remove_file(copied.absolute_path);
+    let _ = std::fs::remove_file(moved.absolute_path);
+    let _ = std::fs::remove_dir_all(copy_root);
+    let _ = std::fs::remove_dir_all(move_root);
+}
+
+#[test]
+fn test_managed_detach_does_not_delete_file() {
+    let conn = mem_db();
+    let pid = test_paper(&conn, "10.1000/storage-detach", "Detach Managed Paper");
+    let source = test_pdf_path("storage-detach", "%PDF-1.7\n");
+    let root = test_pdf_library("detach");
+    set_pdf_storage_settings(&conn, "copy", &root, "{title}.pdf", "none");
+    let attachment = db::attach_pdf_to_paper(&conn, pid, source.to_str().unwrap()).unwrap();
+    let managed_path = std::path::PathBuf::from(&attachment.absolute_path);
+    assert!(db::detach_pdf(&conn, attachment.id).unwrap());
+    assert!(source.exists(), "detach 不能删除源 PDF");
+    assert!(managed_path.exists(), "detach 不能删除 managed PDF");
+    let _ = std::fs::remove_file(source);
+    let _ = std::fs::remove_file(managed_path);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn test_discovery_attach_pdf_adds_library_and_clears_read_later_atomically() {
     let conn = mem_db();
     let jid = db::insert_journal(&conn, "Discovery J", Some("0025-1909"), None, None, None).unwrap();
@@ -5312,6 +5489,30 @@ fn test_external_pdf_doi_import_does_not_duplicate_canonical_paper() {
     assert!(db::get_library_membership(&conn, pid).unwrap().is_some());
     assert_eq!(db::list_paper_attachments(&conn, pid).unwrap().len(), 1);
     let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn test_external_pdf_import_uses_managed_storage_without_second_canonical_paper() {
+    let conn = mem_db();
+    let root = test_pdf_library("external-copy");
+    set_pdf_storage_settings(&conn, "copy", &root, "{title} - {year}.pdf", "year");
+    let path = test_pdf_path(
+        "external-copy",
+        "%PDF-1.7\n1 0 obj << /Title (External Managed Paper) /Author (External Author) /CreationDate (D:2024) /DOI (10.1000/external-managed) >>\n",
+    );
+    let result = db::import_external_pdf(&conn, path.to_str().unwrap(), None).unwrap();
+    assert_eq!(result.outcome, "createdExternalPaper");
+    let pid = result.paper_id.unwrap();
+    let attachment = result.attachment.unwrap();
+    assert_eq!(attachment.paper_id, pid);
+    assert_eq!(attachment.storage_mode, "managed");
+    assert!(path.exists(), "external import 的 copy 必须保留源 PDF");
+    assert!(std::path::Path::new(&attachment.absolute_path).is_file());
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM papers", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+    assert!(attachment.relative_path.as_deref().unwrap().starts_with("2024/"));
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(attachment.absolute_path);
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
