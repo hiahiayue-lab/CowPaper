@@ -20,12 +20,17 @@
           <button class="nav-item" data-view="activity">活动</button>
         </nav>
         <nav class="nav workspace-nav hidden" data-workspace-nav="library">
-          <button class="nav-item active" data-view="library-all">全部文献</button>
-          <button class="nav-item" data-view="library-recent">最近收录</button>
-          <button class="nav-item" data-view="library-unfiled">未分类</button>
-          <div class="nav-section-label">文献夹 <button class="nav-add" data-action="library-create-collection">＋</button></div>
+          <label class="library-search" title="搜索功能将在 Search backend 接入后启用">
+            <span aria-hidden="true">⌕</span>
+            <input type="search" placeholder="搜索文献" aria-label="搜索文献" disabled />
+          </label>
+          <div class="nav-section-label">文库</div>
+          <button class="nav-item library-nav-item-view active" data-view="library-all"><span class="nav-symbol" aria-hidden="true">▤</span>全部文献</button>
+          <button class="nav-item library-nav-item-view" data-view="library-recent"><span class="nav-symbol" aria-hidden="true">◷</span>最近收录</button>
+          <button class="nav-item library-nav-item-view" data-view="library-unfiled"><span class="nav-symbol" aria-hidden="true">□</span>未分类</button>
+          <div class="nav-section-label">文集 <button class="nav-add" title="新建文集" aria-label="新建文集" data-action="library-create-collection">＋</button></div>
           <div id="library-collection-nav"></div>
-          <div class="nav-section-label">文献标签 <button class="nav-add" data-action="library-create-tag">＋</button></div>
+          <div class="nav-section-label">标签 <span class="nav-section-hint">Library Tags</span><button class="nav-add" title="新建 Library Tag" aria-label="新建 Library Tag" data-action="library-create-tag">＋</button></div>
           <div id="library-tag-nav"></div>
         </nav>
       </aside>
@@ -108,7 +113,17 @@
         <section id="view-library-all" class="view library-view">
           <div class="library-layout">
             <div class="library-list-pane">
-              <div class="library-list-head"><div><h2 id="library-view-title">全部文献</h2><span id="library-count" class="muted small"></span></div><button class="ghost small" data-action="library-refresh">刷新</button></div>
+              <div class="library-list-head">
+                <div>
+                  <div class="eyebrow">文献库</div>
+                  <h2 id="library-view-title">全部文献</h2>
+                  <span id="library-count" class="muted small"></span>
+                </div>
+                <div class="library-toolbar-actions"><button class="ghost small" data-action="library-import-pdf">＋ 导入 PDF</button><button class="icon-button" title="刷新文献库" aria-label="刷新文献库" data-action="library-refresh">↻</button></div>
+              </div>
+              <div class="library-table-head" aria-hidden="true">
+                <span>标题</span><span>备注</span><span>来源</span><span>年份</span><span>作者</span>
+              </div>
               <div id="library-list" class="library-list"></div>
             </div>
             <aside id="library-inspector" class="library-inspector"><div class="empty">选择一篇文献查看详情</div></aside>

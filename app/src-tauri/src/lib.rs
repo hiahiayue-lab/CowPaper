@@ -1600,6 +1600,76 @@ fn translate_missing_titles(
     Ok(scheduled)
 }
 
+/// Translate a real English abstract into the Library-only personal metadata
+/// layer. This deliberately bypasses the analysis queue so it cannot mutate
+/// recommendation scores, tag matches, or analysis state.
+#[tauri::command]
+fn translate_library_abstract(
+    paper_id: i64,
+    model: String,
+    state: State<Db>,
+    store: State<Secure>,
+) -> Result<models::LibraryItemMetadata, String> {
+    let api_key = store
+        .get()
+        .map_err(|e| e.to_string())?
+        .filter(|key| !key.trim().is_empty())
+        .ok_or_else(|| "未保存 API Key，请先在设置中保存".to_string())?;
+
+    let (english_abstract, current_metadata) = {
+        let conn = state.inner().lock().unwrap();
+        let paper = db::get_library_paper(&conn, paper_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "论文不在文献库中".to_string())?;
+        let english = paper
+            .effective_abstract
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "没有可翻译的 English abstract".to_string())?
+            .to_string();
+        if paper
+            .effective_chinese_abstract
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+        {
+            return Err("已有中文摘要，无需重复翻译".to_string());
+        }
+        let metadata = db::get_library_item_metadata(&conn, paper_id)
+            .map_err(|e| e.to_string())?;
+        (english, metadata)
+    };
+
+    let translated = api::deepseek::DeepSeek::new()
+        .translate_abstract(&api_key, &model, &english_abstract)
+        .map_err(|e| e.to_string())?;
+    let existing = current_metadata.unwrap_or_else(|| models::LibraryItemMetadata {
+        paper_id,
+        title_override: None,
+        chinese_title_override: None,
+        source_override: None,
+        year_override: None,
+        authors_override: None,
+        abstract_override: None,
+        chinese_abstract_override: None,
+        note: None,
+        updated_at: String::new(),
+    });
+    let input = models::LibraryItemMetadataInput {
+        title_override: existing.title_override,
+        chinese_title_override: existing.chinese_title_override,
+        source_override: existing.source_override,
+        year_override: existing.year_override,
+        authors_override: existing.authors_override,
+        abstract_override: existing.abstract_override,
+        chinese_abstract_override: Some(translated),
+        note: existing.note,
+    };
+    let conn = state.inner().lock().unwrap();
+    db::set_library_item_metadata(&conn, paper_id, &input).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn pause_ai(queue: State<AiQueue>) -> Result<(), String> {
     queue.cmd_tx.send(QueueCommand::Pause).map_err(|e| e.to_string())
@@ -1864,6 +1934,7 @@ fn restore_main_window<R: Runtime>(app: &AppHandle<R>) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_process::init())
@@ -2044,6 +2115,7 @@ pub fn run() {
             delete_api_key,
             start_ai,
             translate_missing_titles,
+            translate_library_abstract,
             pause_ai,
             resume_ai,
             stop_ai,
