@@ -4235,6 +4235,16 @@ async function setupListeners() {
       return;
     }
   });
+
+  document.addEventListener("dblclick", (ev) => {
+    const target = ev.target as HTMLElement;
+    if (target.closest(".attachment-child-actions")) return;
+    const child = target.closest<HTMLElement>(".library-attachment-child");
+    const openButton = child?.querySelector<HTMLButtonElement>("[data-action='library-open-pdf']");
+    if (!openButton || openButton.disabled) return;
+    ev.preventDefault();
+    openButton.click();
+  });
 }
 
 window.addEventListener("DOMContentLoaded", () => {
