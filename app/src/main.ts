@@ -175,6 +175,9 @@ interface LibraryItemMetadata {
   abstractOverride: string | null;
   chineseAbstractOverride: string | null;
   note: string | null;
+  /** RC5: library-only identity overrides; canonical Paper remains untouched. */
+  doiOverride?: string | null;
+  urlOverride?: string | null;
   updatedAt: string;
 }
 
@@ -193,6 +196,8 @@ interface LibraryItemMetadataInput {
   abstractOverride: string | null;
   chineseAbstractOverride: string | null;
   note: string | null;
+  doiOverride?: string | null;
+  urlOverride?: string | null;
 }
 
 interface LibraryPaper {
@@ -215,11 +220,13 @@ interface LibraryPaper {
   effectiveAuthors: Author[];
   effectiveAbstract: string | null;
   effectiveChineseAbstract: string | null;
+  effectiveDoi?: string | null;
+  effectiveUrl?: string | null;
   note: string | null;
   attachments: PaperAttachment[];
 }
 
-type LibraryInlineField = "title" | "chineseTitle" | "source" | "publisher" | "publicationDate" | "volume" | "issue" | "pages" | "year" | "authors" | "abstract" | "chineseAbstract" | "note";
+type LibraryInlineField = "title" | "chineseTitle" | "source" | "publisher" | "publicationDate" | "volume" | "issue" | "pages" | "year" | "authors" | "abstract" | "chineseAbstract" | "note" | "doi" | "url";
 
 interface LibraryDropItem {
   name: string;
@@ -297,6 +304,8 @@ interface Settings {
   pdfLibraryRoot: string;
   pdfNamingTemplate: string;
   pdfSubfolderRule: "none" | "year" | "journal/source";
+  /** RC5 reader bridge; older backends omit it until the settings bridge is rebased. */
+  preferredReader?: { kind: "system" | "custom"; applicationPath: string | null };
 }
 
 interface SyncProgress {
@@ -459,7 +468,6 @@ let libraryCollections: LibraryCollection[] = [];
 let libraryTags: LibraryTag[] = [];
 let libraryView: "all" | "recent" | "unfiled" = "all";
 let selectedLibraryPaperId: number | null = null;
-let libraryCapturePaperId: number | null = null;
 let libraryScope: { kind: "collection" | "tag"; id: number } | null = null;
 const libraryPaperIds = new Set<number>();
 let activeWorkspace: "discovery" | "library" = "discovery";
@@ -477,12 +485,20 @@ let libraryDropQueue: LibraryDropItem[] = [];
 let libraryInlineCreate: { kind: "collection" | "tag"; parentId: number | null } | null = null;
 let libraryColumnWidths: Record<LibraryColumn, number>;
 let libraryInspectorWidth: number;
-let libraryColumnResize: { column: LibraryColumn; next: LibraryColumn; startX: number; startWidth: number; nextWidth: number } | null = null;
-let libraryPointerDrag: { paperId: number; startX: number; startY: number; active: boolean } | null = null;
 let librarySuppressNextClick = false;
 const expandedLibraryAttachmentPaperIds = new Set<number>();
 let libraryToastTimer = 0;
-let libraryInspectorResize: { startX: number; startWidth: number } | null = null;
+const PREFERRED_READER_STORAGE_KEY = "cowpaper.preferred-reader.v1";
+type PreferredReader = { kind: "system" | "custom"; applicationPath: string | null };
+function loadPreferredReader(): PreferredReader {
+  try {
+    const value = JSON.parse(localStorage.getItem(PREFERRED_READER_STORAGE_KEY) || "null") as Partial<PreferredReader> | null;
+    return value?.kind === "custom" && value.applicationPath ? { kind: "custom", applicationPath: value.applicationPath } : { kind: "system", applicationPath: null };
+  } catch {
+    return { kind: "system", applicationPath: null };
+  }
+}
+let preferredReader: PreferredReader = loadPreferredReader();
 let currentAppVersion = "0.1.4";
 let pendingUpdate: Update | null = null;
 let updateBusy = false;
@@ -624,7 +640,7 @@ const LIBRARY_COLUMN_LABELS: Record<LibraryColumn, string> = { title: "标题", 
 function renderLibraryTableHeader(): void {
   const head = $("library-table-head");
   if (!head) return;
-  head.innerHTML = libraryVisibleColumns().map((column) => `<span class="library-column-header" draggable="true" data-column="${column}" data-column-drag="${column}" title="拖动以重排列"><span>${LIBRARY_COLUMN_LABELS[column]}</span><span class="column-resizer" data-column-resize="${column}" aria-hidden="true"></span></span>`).join("");
+  head.innerHTML = libraryVisibleColumns().map((column) => `<span class="library-column-header" data-column="${column}" data-column-drag="${column}" title="拖动以重排列"><span>${LIBRARY_COLUMN_LABELS[column]}</span><span class="column-resizer" data-column-resize="${column}" aria-hidden="true"></span></span>`).join("");
 }
 
 function renderLibraryColumnMenu(): void {
@@ -790,6 +806,29 @@ function renderPdfTemplateExample(): string {
   return previewPath;
 }
 
+function renderPreferredReader(): void {
+  const mode = $("set-preferred-reader") as HTMLSelectElement | null;
+  const path = $("set-reader-application-path") as HTMLInputElement | null;
+  if (!mode || !path) return;
+  mode.value = preferredReader.kind;
+  path.value = preferredReader.applicationPath || "";
+  path.disabled = preferredReader.kind !== "custom";
+}
+
+async function selectReaderApplication(): Promise<void> {
+  try {
+    const selected = await openFileDialog({ multiple: false });
+    const path = Array.isArray(selected) ? selected[0] : selected;
+    if (path) {
+      preferredReader = { kind: "custom", applicationPath: path };
+      localStorage.setItem(PREFERRED_READER_STORAGE_KEY, JSON.stringify(preferredReader));
+      renderPreferredReader();
+    }
+  } catch (error) {
+    setStatus(`选择 PDF 应用失败：${String(error)}`, "error");
+  }
+}
+
 async function selectPdfLibraryRoot(): Promise<void> {
   try {
     const selected = await openFileDialog({ directory: true, multiple: false });
@@ -836,7 +875,11 @@ async function loadSettings() {
     ($("set-pdf-library-root") as HTMLInputElement).value = settings.pdfLibraryRoot;
     ($("set-pdf-naming-template") as HTMLInputElement).value = settings.pdfNamingTemplate;
     ($("set-pdf-subfolder-rule") as HTMLSelectElement).value = settings.pdfSubfolderRule;
+    preferredReader = settings.preferredReader?.kind === "custom" && settings.preferredReader.applicationPath
+      ? settings.preferredReader
+      : loadPreferredReader();
   }
+  renderPreferredReader();
   const templateInput = $("set-pdf-naming-template") as HTMLInputElement;
   if (!templateInput.value.trim()) templateInput.value = DEFAULT_PDF_NAMING_TEMPLATE;
   renderPdfTemplateExample();
@@ -1733,6 +1776,14 @@ function libraryNote(item: LibraryPaper): string {
   return item.note?.trim() || "";
 }
 
+function libraryDoi(item: LibraryPaper): string {
+  return item.effectiveDoi?.trim() || item.metadata?.doiOverride?.trim() || item.paper.normalizedDoi?.trim() || "";
+}
+
+function libraryUrl(item: LibraryPaper): string {
+  return item.effectiveUrl?.trim() || item.metadata?.urlOverride?.trim() || item.paper.url?.trim() || "";
+}
+
 function libraryAuthorsFromInput(value: string): Author[] | null {
   const names = value.split(/[,;，；\n]/).map((name) => name.trim()).filter(Boolean);
   return names.length ? names.map((name) => ({ given: null, family: null, name })) : null;
@@ -1750,7 +1801,7 @@ function libraryInlineFieldLabel(field: LibraryInlineField): string {
   return ({
     title: "English Title", chineseTitle: "中文标题", source: "期刊", publisher: "出版社",
     publicationDate: "出版日期", volume: "卷", issue: "期", pages: "页码", year: "年份",
-    authors: "作者", abstract: "摘要", chineseAbstract: "中文摘要", note: "备注",
+    authors: "作者", abstract: "摘要", chineseAbstract: "中文摘要", note: "备注", doi: "DOI", url: "URL",
   } as Record<LibraryInlineField, string>)[field];
 }
 
@@ -1769,6 +1820,8 @@ function libraryInlineCurrentValue(item: LibraryPaper, field: LibraryInlineField
     case "abstract": return item.effectiveAbstract || "";
     case "chineseAbstract": return item.effectiveChineseAbstract || "";
     case "note": return libraryNote(item);
+    case "doi": return libraryDoi(item);
+    case "url": return libraryUrl(item);
   }
 }
 
@@ -1789,6 +1842,8 @@ function libraryMetadataInput(item: LibraryPaper): LibraryItemMetadataInput {
     abstractOverride: existing?.abstractOverride ?? null,
     chineseAbstractOverride: existing?.chineseAbstractOverride ?? null,
     note: existing?.note ?? null,
+    doiOverride: existing?.doiOverride ?? null,
+    urlOverride: existing?.urlOverride ?? null,
   };
 }
 
@@ -1845,6 +1900,8 @@ function beginLibraryInlineEdit(paperId: number, field: LibraryInlineField, butt
     if (field === "abstract") metadata.abstractOverride = trimmed || null;
     if (field === "chineseAbstract") metadata.chineseAbstractOverride = trimmed || null;
     if (field === "note") metadata.note = trimmed || null;
+    if (field === "doi") metadata.doiOverride = trimmed || null;
+    if (field === "url") metadata.urlOverride = trimmed || null;
     try {
       await invoke("set_library_item_metadata", { paperId, metadata });
       await loadLibraryData(libraryView);
@@ -1919,11 +1976,20 @@ function renderLibraryNavigation() {
   const collections = $("library-collection-nav");
   const children = (parentId: number | null, depth = 0): string => libraryInlineCreateRow("collection", parentId) + libraryCollections
     .filter((c) => c.parentId === parentId)
-    .map((c) => `<div class="library-nav-item"><button class="library-nav-row${libraryScope?.kind === "collection" && libraryScope.id === c.id ? " active" : ""}" style="padding-left:${12 + depth * 14}px" data-drop-kind="collection" data-action="library-filter-collection" data-collection-id="${c.id}"><span class="nav-symbol folder-symbol" aria-hidden="true"></span><span class="nav-label">${escapeHtml(c.name)}</span><span class="nav-drop-plus" aria-hidden="true">＋</span></button><button class="nav-child" title="在此文集下新建" aria-label="在此文集下新建" data-action="library-create-child" data-parent-id="${c.id}">＋</button><button class="nav-manage" title="重命名文集" aria-label="重命名文集" data-action="library-rename-collection" data-collection-id="${c.id}">✎</button><button class="nav-manage danger" title="删除文集" aria-label="删除文集" data-action="library-delete-collection" data-collection-id="${c.id}">×</button></div>${children(c.id, depth + 1)}`)
+    .map((c) => `<div class="library-nav-item"><button class="library-nav-row${libraryScope?.kind === "collection" && libraryScope.id === c.id ? " active" : ""}" style="padding-left:${12 + depth * 14}px" data-drop-kind="collection" data-action="library-filter-collection" data-collection-id="${c.id}"><span class="nav-symbol folder-symbol" aria-hidden="true"></span><span class="nav-label">${escapeHtml(c.name)}</span></button><button class="nav-child" title="在此文集下新建" aria-label="在此文集下新建" data-action="library-create-child" data-parent-id="${c.id}">新建</button><button class="nav-manage" title="重命名文集" aria-label="重命名文集" data-action="library-rename-collection" data-collection-id="${c.id}">✎</button><button class="nav-manage danger" title="删除文集" aria-label="删除文集" data-action="library-delete-collection" data-collection-id="${c.id}">×</button></div>${children(c.id, depth + 1)}`)
     .join("");
   collections.innerHTML = children(null) || '<span class="muted small nav-empty">暂无文献夹</span>';
-  const tagRows = libraryTags.map((t) => `<div class="library-nav-item"><button class="library-nav-row${libraryScope?.kind === "tag" && libraryScope.id === t.id ? " active" : ""}" data-drop-kind="tag" data-action="library-filter-tag" data-tag-id="${t.id}"><span class="tag-dot" style="background:${escapeHtml(t.color || "#9ca3af")}"></span><span class="nav-label">${escapeHtml(t.name)}</span><span class="nav-drop-plus" aria-hidden="true">＋</span></button><button class="nav-manage" title="重命名 Library Tag" aria-label="重命名 Library Tag" data-action="library-rename-tag" data-tag-id="${t.id}">✎</button><button class="nav-manage danger" title="删除 Library Tag" aria-label="删除 Library Tag" data-action="library-delete-tag" data-tag-id="${t.id}">×</button></div>`).join("");
+  const tagRows = libraryTags.map((t) => `<div class="library-nav-item"><button class="library-nav-row${libraryScope?.kind === "tag" && libraryScope.id === t.id ? " active" : ""}" data-drop-kind="tag" data-action="library-filter-tag" data-tag-id="${t.id}"><span class="tag-dot" style="background:${escapeHtml(t.color || "#9ca3af")}"></span><span class="nav-label">${escapeHtml(t.name)}</span></button><button class="nav-manage" title="重命名 Library Tag" aria-label="重命名 Library Tag" data-action="library-rename-tag" data-tag-id="${t.id}">✎</button><button class="nav-manage danger" title="删除 Library Tag" aria-label="删除 Library Tag" data-action="library-delete-tag" data-tag-id="${t.id}">×</button></div>`).join("");
   $("library-tag-nav").innerHTML = libraryInlineCreateRow("tag", null) + (tagRows || '<span class="muted small nav-empty">暂无文献标签</span>');
+}
+
+function renderLibraryFacets(): void {
+  const box = $("library-facet-bar");
+  if (!box) return;
+  const clear = !libraryScope ? "" : '<button class="library-facet clear" data-action="library-clear-scope">全部</button>';
+  const collections = libraryCollections.map((collection) => `<button class="library-facet${libraryScope?.kind === "collection" && libraryScope.id === collection.id ? " active" : ""}" data-action="library-filter-collection" data-collection-id="${collection.id}"><span class="folder-symbol" aria-hidden="true"></span>${escapeHtml(collection.name)}</button>`).join("");
+  const tags = libraryTags.map((tag) => `<button class="library-facet${libraryScope?.kind === "tag" && libraryScope.id === tag.id ? " active" : ""}" data-action="library-filter-tag" data-tag-id="${tag.id}"><span class="tag-dot" style="background:${escapeHtml(tag.color || "#9ca3af")}" aria-hidden="true"></span>${escapeHtml(tag.name)}</button>`).join("");
+  box.innerHTML = clear + collections + tags;
 }
 
 function renderLibrary() {
@@ -1933,6 +1999,7 @@ function renderLibrary() {
   layout.classList.toggle("inspector-collapsed", libraryInspectorCollapsed);
   renderLibraryTableHeader();
   renderLibraryColumnMenu();
+  renderLibraryFacets();
   applyLibraryLayoutMetrics();
   if (titleEl) titleEl.textContent = libraryScope?.kind === "collection" ? libraryCollections.find(c => c.id === libraryScope?.id)?.name || title : libraryScope?.kind === "tag" ? libraryTags.find(t => t.id === libraryScope?.id)?.name || title : title;
   const count = $("library-count");
@@ -1989,22 +2056,16 @@ function renderLibrary() {
 function renderLibraryRelations(item: LibraryPaper, kind: "collection" | "tag"): string {
   const selected = kind === "collection" ? item.collections : item.tags;
   const all = kind === "collection" ? libraryCollections : libraryTags;
-  const label = kind === "collection" ? "文集" : "Library Tags";
+  const label = kind === "collection" ? "文集" : "Library Tag";
   const chips = selected.map(value => `<span class="relation-chip">${kind === "collection" ? '<span class="folder-symbol" aria-hidden="true"></span>' : '<span class="tag-dot" aria-hidden="true"></span>'}<span>${escapeHtml(value.name)}</span><button title="移除 ${escapeHtml(value.name)} 的论文关系" aria-label="移除 ${escapeHtml(value.name)} 的论文关系" data-action="library-relation-remove" data-kind="${kind}" data-id="${value.id}" data-paper-id="${item.paper.id}">×</button></span>`).join("");
   const options = all.map(value => `<div class="relation-option"><button data-action="library-relation-add" data-kind="${kind}" data-id="${value.id}" data-paper-id="${item.paper.id}" ${selected.some(x => x.id === value.id) ? "disabled" : ""}>${escapeHtml(value.name)} ${selected.some(x => x.id === value.id) ? "✓" : "+"}</button><button class="danger" title="删除${label} ${escapeHtml(value.name)}" aria-label="删除${label} ${escapeHtml(value.name)}" data-action="library-delete-${kind === "collection" ? "collection" : "tag"}" data-${kind === "collection" ? "collection" : "tag"}-id="${value.id}">×</button></div>`).join("");
-  return `<div class="inspector-form-row inspector-form-row-stack"><span class="field-label">${label}</span><div class="relation-controls">${chips}<details class="relation-picker"><summary title="添加或管理${label}" aria-label="添加或管理${label}">＋</summary><div class="relation-menu"><div class="relation-options">${options || '<span class="muted small">暂无可用项目</span>'}</div><label>新建${label}<input id="library-new-${kind}-name" placeholder="名称" maxlength="120" /></label>${kind === "collection" ? `<label>上级文集<select id="library-new-collection-parent"><option value="">无（顶级文集）</option>${libraryCollections.map(c => `<option value="${c.id}">${escapeHtml(c.name)}</option>`).join("")}</select></label>` : ""}<button class="ghost small" data-action="library-relation-create" data-kind="${kind}" data-paper-id="${item.paper.id}">新建并添加</button></div></details></div></div>`;
+  return `<div class="inspector-form-row inspector-form-row-stack"><span class="field-label">${label}</span><div class="relation-controls">${chips}<details class="relation-picker"><summary title="添加或管理${label}" aria-label="添加或管理${label}">＋</summary><div class="relation-menu"><input class="relation-search" type="search" placeholder="搜索…" aria-label="搜索关系" data-action="library-relation-search" data-kind="${kind}" /><div class="relation-options">${options || '<span class="muted small">暂无可用项目</span>'}</div><label>新建${label}<input id="library-new-${kind}-name" placeholder="名称" maxlength="120" /></label>${kind === "collection" ? `<label>上级文集<select id="library-new-collection-parent"><option value="">无（顶级文集）</option>${libraryCollections.map(c => `<option value="${c.id}">${escapeHtml(c.name)}</option>`).join("")}</select></label>` : ""}<button class="ghost small" data-action="library-relation-create" data-kind="${kind}" data-paper-id="${item.paper.id}">新建并添加</button></div></details></div></div>`;
 }
 
 async function addLibraryRelation(paperId: number, kind: "collection" | "tag", id: number): Promise<void> {
   await invoke(kind === "collection" ? "add_paper_to_collection" : "add_paper_library_tag", kind === "collection" ? { paperId, collectionId: id } : { paperId, tagId: id });
   await loadLibraryData(libraryView);
   setStatus(kind === "collection" ? "已添加到文集，原文集归类已保留" : "已添加 Library Tag", "done");
-}
-
-function installLibraryMembershipDrag(): void {
-  // Internal Paper → Collection/Library Tag drag is pointer-managed below.
-  // Do not install HTML5 drag listeners here: WebKit/Tauri can route those
-  // events through the native file-drop path and silently lose the payload.
 }
 
 function renderLibraryInspector(item: LibraryPaper) {
@@ -2025,30 +2086,18 @@ function renderLibraryInspector(item: LibraryPaper) {
   const authors = authorText(libraryAuthors(item));
   const citation = `${authors}${libraryYear(item) !== "—" ? ` (${libraryYear(item)})` : ""}. ${englishTitle}. ${librarySource(item)}.`;
   const chineseTitleValue = chineseTitle ? escapeHtml(chineseTitle) : `<button class="inspector-link" data-action="library-translate-title" data-paper-id="${p.id}">翻译中文标题</button>`;
+  const doi = libraryDoi(item);
+  const url = libraryUrl(item);
+  const doiValue = doi ? `<span>${escapeHtml(doi)}</span>` : '<span class="empty-value">未设置 DOI</span>';
+  const urlValue = url ? `<button class="inspector-link" data-action="open" data-url="${escapeHtml(url)}">${escapeHtml(url)}</button>` : '<span class="empty-value">未设置 URL</span>';
   $("library-inspector").innerHTML = `<div class="inspector-tab">元数据<button class="inspector-mobile-close icon-button" aria-label="收起 Inspector" data-action="library-close-inspector">×</button></div><div class="inspector-head"><span class="muted small">期刊论文</span><button type="button" class="ghost small danger" data-action="library-remove" data-paper-id="${p.id}">移出文献库</button></div>
     <header class="inspector-title-block"><div class="inspector-title-line"><h2 title="${escapeHtml(englishTitle)}">${escapeHtml(englishTitle)}</h2>${libraryInlineEditButton(p.id, "title", "Title")}</div>${libraryInspectorRow("中文标题", chineseTitleValue, libraryInlineEditButton(p.id, "chineseTitle", "中文标题"), "inspector-hero-row")}${libraryInspectorRow("作者", escapeHtml(authors), libraryInlineEditButton(p.id, "authors", "作者"), "inspector-hero-row")}</header>
-    <section class="inspector-group inspector-metadata"><div class="inspector-section-head"><h3>引用</h3><span class="muted small">Library personal override</span></div><div class="inspector-rows">${libraryInspectorRow("期刊", escapeHtml(librarySource(item)), libraryInlineEditButton(p.id, "source", "期刊"))}${libraryInspectorRow("出版社", escapeHtml(item.effectivePublisher || "—"), libraryInlineEditButton(p.id, "publisher", "出版社"))}${libraryInspectorRow("年份", escapeHtml(libraryYear(item)), libraryInlineEditButton(p.id, "year", "年份"))}${libraryInspectorRow("月份日期", escapeHtml(item.effectivePublicationDate || p.publishedDate || "—"), libraryInlineEditButton(p.id, "publicationDate", "出版日期"))}${libraryInspectorRow("卷", escapeHtml(item.effectiveVolume || "—"), libraryInlineEditButton(p.id, "volume", "卷"))}${libraryInspectorRow("期", escapeHtml(item.effectiveIssue || "—"), libraryInlineEditButton(p.id, "issue", "期"))}${libraryInspectorRow("页码", escapeHtml(item.effectivePages || "—"), libraryInlineEditButton(p.id, "pages", "页码"))}${libraryInspectorRow("DOI", escapeHtml(p.normalizedDoi || "—"))}${libraryInspectorRow("URL", p.url ? `<button class="inspector-link" data-action="open" data-url="${escapeHtml(p.url)}">${escapeHtml(p.url)}</button>` : "—")}</div></section>
+    <section class="inspector-group inspector-metadata"><div class="inspector-section-head"><h3>引用</h3><span class="muted small">Library personal override</span></div><div class="inspector-rows">${libraryInspectorRow("期刊", escapeHtml(librarySource(item)), libraryInlineEditButton(p.id, "source", "期刊"))}${libraryInspectorRow("出版社", escapeHtml(item.effectivePublisher || "—"), libraryInlineEditButton(p.id, "publisher", "出版社"))}${libraryInspectorRow("年份", escapeHtml(libraryYear(item)), libraryInlineEditButton(p.id, "year", "年份"))}${libraryInspectorRow("月份日期", escapeHtml(item.effectivePublicationDate || p.publishedDate || "—"), libraryInlineEditButton(p.id, "publicationDate", "出版日期"))}${libraryInspectorRow("卷", escapeHtml(item.effectiveVolume || "—"), libraryInlineEditButton(p.id, "volume", "卷"))}${libraryInspectorRow("期", escapeHtml(item.effectiveIssue || "—"), libraryInlineEditButton(p.id, "issue", "期"))}${libraryInspectorRow("页码", escapeHtml(item.effectivePages || "—"), libraryInlineEditButton(p.id, "pages", "页码"))}${libraryInspectorRow("DOI", doiValue, libraryInlineEditButton(p.id, "doi", "DOI"))}${libraryInspectorRow("URL", urlValue, libraryInlineEditButton(p.id, "url", "URL"))}</div></section>
     <section class="inspector-group inspector-library"><div class="inspector-section-head"><h3>文库</h3></div><div class="inspector-rows">${libraryInspectorRow("备注", `<span class="${note ? "" : "empty-value"}">${escapeHtml(note || "未添加备注")}</span>`, libraryInlineEditButton(p.id, "note", "备注"))}${renderLibraryRelations(item, "collection")}${renderLibraryRelations(item, "tag")}</div></section>
     <section class="inspector-group inspector-abstract"><div class="inspector-section-head"><h3>摘要</h3><div class="inspector-section-actions"><div class="inspector-language-toggle" role="group" aria-label="摘要语言"><button class="seg ${abstractLanguage === "zh" ? "on" : ""}" data-action="library-abstract-lang" data-lang="zh">中文</button><button class="seg ${abstractLanguage === "en" ? "on" : ""}" data-action="library-abstract-lang" data-lang="en">English</button></div>${libraryInlineEditButton(p.id, abstractLanguage === "zh" ? "chineseAbstract" : "abstract", abstractLanguage === "zh" ? "中文摘要" : "摘要")}</div></div><p class="inspector-abstract-text${abstractText ? "" : " empty-value"}">${escapeHtml(abstractText || "暂无摘要")}</p>${abstractTranslate}</section>
     <section class="inspector-group inspector-attachments"><div class="inspector-section-head"><h3>PDF</h3>${attachmentAdd}</div><div class="attachment-list">${attachmentRows}</div></section>
     <section class="inspector-group inspector-citation"><div class="inspector-section-head"><h3>引用格式</h3></div><p>${escapeHtml(citation)}</p></section>`;
 
-}
-
-async function openLibraryCapture(paperId: number) {
-  libraryCapturePaperId = paperId;
-  const membership = await invoke<LibraryMembership | null>("get_library_membership", { paperId });
-  const selectedCollections = new Set(membership?.collectionIds || []);
-  const selectedTags = new Set(membership?.tagIds || []);
-  $("library-capture-body").innerHTML = `<p class="muted small">可不选文献夹或标签，稍后也可以在 Inspector 中调整。</p>
-    <h4>文献夹 <button class="ghost small" data-action="library-capture-create-collection">＋ 新建</button></h4><div class="capture-options">${libraryCollections.map((c) => `<label class="check compact"><input type="checkbox" data-capture-collection-id="${c.id}" ${selectedCollections.has(c.id) ? "checked" : ""}/> ${escapeHtml(c.name)}</label>`).join("") || '<span class="muted small">暂无文献夹</span>'}</div>
-    <h4>文献标签 <button class="ghost small" data-action="library-capture-create-tag">＋ 新建</button></h4><div class="capture-options">${libraryTags.map((t) => `<label class="check compact"><input type="checkbox" data-capture-tag-id="${t.id}" ${selectedTags.has(t.id) ? "checked" : ""}/> ${escapeHtml(t.name)}</label>`).join("") || '<span class="muted small">暂无文献标签</span>'}</div>`;
-  $("library-capture-modal").classList.remove("hidden");
-}
-
-function closeLibraryCapture() {
-  libraryCapturePaperId = null;
-  $("library-capture-modal").classList.add("hidden");
 }
 
 async function pickPdfPath(): Promise<string | null> {
@@ -2098,6 +2147,16 @@ async function refreshLibrarySelection(paperId: number) {
   libraryScope = null;
   libraryView = "all";
   await Promise.all([loadPapers(), loadLibraryData("all")]);
+}
+
+async function openPdfAttachment(attachmentId: number): Promise<void> {
+  if (preferredReader.kind === "custom" && preferredReader.applicationPath) {
+    // This is an explicit backend bridge. The RC5 UI does not launch a local
+    // process itself; the command is supplied by the backend rebase.
+    await invoke("open_pdf_with_reader", { attachmentId, applicationPath: preferredReader.applicationPath });
+    return;
+  }
+  await invoke("open_pdf", { attachmentId });
 }
 
 async function importExternalPdf() {
@@ -2313,214 +2372,358 @@ function setLibraryDropTarget(target: EventTarget | null): void {
   renderLibraryDropState();
 }
 
-function installLibraryInteractions(): void {
-  installLibraryMembershipDrag();
-  const clearMembershipDropHover = () => document.querySelectorAll(".membership-drop-hover").forEach((el) => el.classList.remove("membership-drop-hover"));
-  document.addEventListener("pointerdown", (event) => {
-    if (event.button !== 0) return;
+type ActiveLibraryDrag = "external-pdf" | "paper-row" | "column-header";
+let activeLibraryDrag: ActiveLibraryDrag | null = null;
+
+function claimLibraryDrag(kind: ActiveLibraryDrag): boolean {
+  if (activeLibraryDrag && activeLibraryDrag !== kind) return false;
+  activeLibraryDrag = kind;
+  return true;
+}
+
+function releaseLibraryDrag(kind: ActiveLibraryDrag): void {
+  if (activeLibraryDrag === kind) activeLibraryDrag = null;
+}
+
+function clearLibraryDragFeedback(): void {
+  document.querySelectorAll(".membership-drop-hover, .column-drag-over, .pdf-drop-target").forEach((el) => {
+    el.classList.remove("membership-drop-hover", "column-drag-over", "pdf-drop-target");
+  });
+}
+
+class PaperRowDrag {
+  private state: { paperId: number; startX: number; startY: number; active: boolean } | null = null;
+
+  install(): void {
+    document.addEventListener("pointerdown", this.onDown);
+    window.addEventListener("pointermove", this.onMove);
+    window.addEventListener("pointerup", this.onUp);
+    window.addEventListener("pointercancel", this.onCancel);
+  }
+
+  private onDown = (event: PointerEvent): void => {
+    if (event.button !== 0 || !claimLibraryDrag("paper-row")) return;
     const target = event.target as HTMLElement;
     const row = target.closest<HTMLElement>(".library-paper-row");
     const control = target.closest("[data-action]");
-    if (!row || (control && control !== row)) return;
-    libraryPointerDrag = { paperId: Number(row.dataset.paperId), startX: event.clientX, startY: event.clientY, active: false };
-  });
-  window.addEventListener("pointermove", (event) => {
-    const drag = libraryPointerDrag;
-    if (!drag) return;
-    if (!drag.active && Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) < 6) return;
-    drag.active = true;
+    if (!row || (control && control !== row)) {
+      releaseLibraryDrag("paper-row");
+      return;
+    }
+    this.state = { paperId: Number(row.dataset.paperId), startX: event.clientX, startY: event.clientY, active: false };
+  };
+
+  private onMove = (event: PointerEvent): void => {
+    const state = this.state;
+    if (!state) return;
+    if (!state.active && Math.hypot(event.clientX - state.startX, event.clientY - state.startY) < 6) return;
+    state.active = true;
     document.body.classList.add("is-dragging-library-paper");
-    clearMembershipDropHover();
+    document.querySelectorAll(".membership-drop-hover").forEach((el) => el.classList.remove("membership-drop-hover"));
     const target = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>("[data-drop-kind]");
     if (target) target.classList.add("membership-drop-hover");
     event.preventDefault();
-  });
-  window.addEventListener("pointerup", async (event) => {
-    const drag = libraryPointerDrag;
-    libraryPointerDrag = null;
+  };
+
+  private onUp = (event: PointerEvent): void => {
+    const state = this.state;
+    this.state = null;
     document.body.classList.remove("is-dragging-library-paper");
-    clearMembershipDropHover();
-    if (!drag?.active) return;
+    const target = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>("[data-drop-kind]");
+    clearLibraryDragFeedback();
+    releaseLibraryDrag("paper-row");
+    if (!state?.active) return;
     librarySuppressNextClick = true;
     window.setTimeout(() => { librarySuppressNextClick = false; }, 0);
-    const target = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>("[data-drop-kind]");
     if (!target) return;
-    const kind = target.dataset.dropKind === "collection" ? "collection" : "tag";
-    try {
-      await addLibraryRelation(drag.paperId, kind, Number(kind === "collection" ? target.dataset.collectionId : target.dataset.tagId));
-      setStatus(kind === "collection" ? "已添加到文集，原文集归类已保留" : "已添加 Library Tag", "done");
-    } catch (error) {
-      setStatus(`添加失败：${String(error)}`, "error");
-    }
-  });
-  window.addEventListener("pointercancel", () => {
-    libraryPointerDrag = null;
+    const kind = target.dataset.dropKind === "collection" ? "collection" : target.dataset.dropKind === "tag" ? "tag" : null;
+    const id = Number(kind === "collection" ? target.dataset.collectionId : target.dataset.tagId);
+    if (!kind || !Number.isInteger(id)) return;
+    void addLibraryRelation(state.paperId, kind, id).catch((error) => setStatus("添加关系失败：" + String(error), "error"));
+  };
+
+  private onCancel = (): void => {
+    this.state = null;
     document.body.classList.remove("is-dragging-library-paper");
-    clearMembershipDropHover();
-  });
-  document.addEventListener("dragstart", (event) => {
-    const header = (event.target as HTMLElement).closest<HTMLElement>("[data-column-drag]");
-    if (!header || !event.dataTransfer) return;
-    event.dataTransfer.setData("application/x-cowpaper-column", header.dataset.columnDrag || "");
-    event.dataTransfer.effectAllowed = "move";
-    header.classList.add("column-dragging");
-  });
-  document.addEventListener("dragover", (event) => {
-    if (!event.dataTransfer?.types.includes("application/x-cowpaper-column")) return;
-    const header = (event.target as HTMLElement).closest<HTMLElement>("[data-column-drag]");
+    clearLibraryDragFeedback();
+    releaseLibraryDrag("paper-row");
+  };
+}
+
+class ColumnHeaderDrag {
+  private state: { mode: "reorder" | "resize" | "inspector"; column?: LibraryColumn; next?: LibraryColumn; startX: number; startY: number; startWidth?: number; nextWidth?: number; active: boolean } | null = null;
+
+  install(): void {
+    document.addEventListener("pointerdown", this.onDown);
+    window.addEventListener("pointermove", this.onMove);
+    window.addEventListener("pointerup", this.onUp);
+    window.addEventListener("pointercancel", this.onCancel);
+  }
+
+  private onDown = (event: PointerEvent): void => {
+    if (event.button !== 0 || !claimLibraryDrag("column-header")) return;
+    const target = (event.target as HTMLElement).closest<HTMLElement>("[data-column-resize], [data-inspector-resize], [data-column-drag]");
+    if (!target) {
+      releaseLibraryDrag("column-header");
+      return;
+    }
+    if (target.dataset.inspectorResize) {
+      this.state = { mode: "inspector", startX: event.clientX, startY: event.clientY, startWidth: libraryInspectorWidth, active: true };
+      document.body.classList.add("is-resizing-library");
+      event.preventDefault();
+      return;
+    }
+    if (target.dataset.columnResize) {
+      const column = target.dataset.columnResize as LibraryColumn;
+      const visible = libraryVisibleColumns();
+      const index = visible.indexOf(column);
+      const next = visible[index + 1];
+      if (!next) {
+        releaseLibraryDrag("column-header");
+        return;
+      }
+      const columnEl = document.querySelector<HTMLElement>(".library-column-header[data-column=\"" + column + "\"]");
+      const nextEl = document.querySelector<HTMLElement>(".library-column-header[data-column=\"" + next + "\"]");
+      if (!columnEl || !nextEl) {
+        releaseLibraryDrag("column-header");
+        return;
+      }
+      this.state = { mode: "resize", column, next, startX: event.clientX, startY: event.clientY, startWidth: columnEl.getBoundingClientRect().width, nextWidth: nextEl.getBoundingClientRect().width, active: true };
+      document.body.classList.add("is-resizing-library");
+      event.preventDefault();
+      return;
+    }
+    const header = target.closest<HTMLElement>("[data-column-drag]");
+    if (!header || !LIBRARY_COLUMNS.includes(header.dataset.columnDrag as LibraryColumn)) {
+      releaseLibraryDrag("column-header");
+      return;
+    }
+    this.state = { mode: "reorder", column: header.dataset.columnDrag as LibraryColumn, startX: event.clientX, startY: event.clientY, active: false };
+  };
+
+  private onMove = (event: PointerEvent): void => {
+    const state = this.state;
+    if (!state) return;
+    if (state.mode === "inspector") {
+      const maxWidth = Math.min(560, Math.max(300, Math.round(window.innerWidth * 0.52)));
+      libraryInspectorWidth = Math.min(maxWidth, Math.max(300, Math.round((state.startWidth || 300) - (event.clientX - state.startX))));
+      applyLibraryLayoutMetrics();
+      event.preventDefault();
+      return;
+    }
+    if (state.mode === "resize") {
+      const delta = event.clientX - state.startX;
+      const column = state.column!;
+      const next = state.next!;
+      const minDelta = LIBRARY_COLUMN_MIN[column] - (state.startWidth || 0);
+      const maxDelta = (state.nextWidth || 0) - LIBRARY_COLUMN_MIN[next];
+      const bounded = Math.max(minDelta, Math.min(maxDelta, delta));
+      libraryColumnWidths[column] = Math.max(LIBRARY_COLUMN_MIN[column], Math.round((state.startWidth || 0) + bounded));
+      libraryColumnWidths[next] = Math.max(LIBRARY_COLUMN_MIN[next], Math.round((state.nextWidth || 0) - bounded));
+      applyLibraryLayoutMetrics();
+      event.preventDefault();
+      return;
+    }
+    if (!state.active && Math.hypot(event.clientX - state.startX, event.clientY - state.startY) < 6) return;
+    state.active = true;
+    document.body.classList.add("is-dragging-library-column");
     document.querySelectorAll(".column-drag-over").forEach((el) => el.classList.remove("column-drag-over"));
-    if (!header) return;
+    const target = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>("[data-column-drag]");
+    if (target && target.dataset.columnDrag !== state.column) target.classList.add("column-drag-over");
     event.preventDefault();
-    header.classList.add("column-drag-over");
-  });
-  document.addEventListener("dragend", (event) => {
-    (event.target as HTMLElement).closest<HTMLElement>("[data-column-drag]")?.classList.remove("column-dragging");
-    document.querySelectorAll(".column-drag-over").forEach((el) => el.classList.remove("column-drag-over"));
-  });
-  document.addEventListener("drop", (event) => {
-    if (!event.dataTransfer?.types.includes("application/x-cowpaper-column")) return;
-    const header = (event.target as HTMLElement).closest<HTMLElement>("[data-column-drag]");
-    const dragged = event.dataTransfer.getData("application/x-cowpaper-column") as LibraryColumn;
-    if (!header || !LIBRARY_COLUMNS.includes(dragged)) return;
-    const destination = header.dataset.columnDrag as LibraryColumn;
-    const from = libraryColumnOrder.indexOf(dragged);
+  };
+
+  private onUp = (event: PointerEvent): void => {
+    const state = this.state;
+    this.state = null;
+    document.body.classList.remove("is-resizing-library", "is-dragging-library-column");
+    const target = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>("[data-column-drag]");
+    clearLibraryDragFeedback();
+    releaseLibraryDrag("column-header");
+    if (!state) return;
+    if (state.mode === "inspector" || state.mode === "resize") {
+      persistLibraryLayout();
+      return;
+    }
+    if (!state.active || !state.column || !target) return;
+    const destination = target.dataset.columnDrag as LibraryColumn;
+    const from = libraryColumnOrder.indexOf(state.column);
     const to = libraryColumnOrder.indexOf(destination);
-    event.preventDefault();
-    document.querySelectorAll(".column-drag-over").forEach((el) => el.classList.remove("column-drag-over"));
     if (from < 0 || to < 0 || from === to) return;
     libraryColumnOrder.splice(from, 1);
-    libraryColumnOrder.splice(to, 0, dragged);
+    libraryColumnOrder.splice(to, 0, state.column);
     persistLibraryLayout();
     renderLibrary();
     setStatus("列顺序已保存", "done");
-  });
-  const pane = $("library-list-pane");
-  pane.addEventListener("dragenter", (event) => {
-    if (!event.dataTransfer?.types.includes("Files")) return;
+  };
+
+  private onCancel = (): void => {
+    this.state = null;
+    document.body.classList.remove("is-resizing-library", "is-dragging-library-column");
+    clearLibraryDragFeedback();
+    releaseLibraryDrag("column-header");
+    applyLibraryLayoutMetrics();
+  };
+}
+
+class ExternalPdfDrag {
+  private pane = $("library-list-pane");
+
+  install(): void {
+    this.pane.addEventListener("dragenter", this.onDragEnter);
+    this.pane.addEventListener("dragover", this.onDragOver);
+    this.pane.addEventListener("dragleave", this.onDragLeave);
+    this.pane.addEventListener("drop", this.onDrop);
+    document.addEventListener("dragover", this.onDocumentDragOver);
+    document.addEventListener("drop", this.onDocumentDrop);
+    void listen("tauri://drag-over", (event) => this.onNativeDragOver(event.payload as { position?: { x: number; y: number } }));
+    void listen("tauri://drag-leave", this.onNativeDragLeave);
+    void listen("tauri://drag-drop", (event) => this.onNativeDrop(event.payload as { paths?: string[]; position?: { x: number; y: number } }));
+  }
+
+  private hasFiles(event: DragEvent): boolean {
+    return Boolean(event.dataTransfer?.types.includes("Files"));
+  }
+
+  private onDragEnter = (event: DragEvent): void => {
+    if (!this.hasFiles(event) || !claimLibraryDrag("external-pdf")) return;
     event.preventDefault();
     setLibraryDropTarget(event.target);
-  });
-  pane.addEventListener("dragover", (event) => {
-    if (!event.dataTransfer?.types.includes("Files")) return;
+  };
+
+  private onDragOver = (event: DragEvent): void => {
+    if (!this.hasFiles(event) || (activeLibraryDrag && activeLibraryDrag !== "external-pdf")) return;
+    claimLibraryDrag("external-pdf");
     event.preventDefault();
-    event.dataTransfer.dropEffect = "copy";
-    setLibraryDropTarget(event.target);
-  });
-  pane.addEventListener("dragleave", (event) => {
+    event.dataTransfer!.dropEffect = "copy";
+    if (this.pane.contains(event.target as Node)) setLibraryDropTarget(event.target);
+    this.setDiscoveryTarget(event.target);
+  };
+
+  private onDragLeave = (event: DragEvent): void => {
+    if (!this.hasFiles(event)) return;
     const related = event.relatedTarget as Node | null;
-    if (related && pane.contains(related)) return;
+    if (related && (this.pane.contains(related) || document.querySelector(".paper-card")?.contains(related))) return;
+    clearLibraryDragFeedback();
     libraryDropActive = false;
     libraryDropTargetPaperId = null;
     renderLibraryDropState();
-  });
-  pane.addEventListener("drop", async (event) => {
-    if (!event.dataTransfer?.types.includes("Files")) return;
+    releaseLibraryDrag("external-pdf");
+  };
+
+  private onDrop = (event: DragEvent): void => {
+    if (!this.hasFiles(event)) return;
     event.preventDefault();
-    const targetPaperId = libraryDropTargetFromElement(event.target instanceof Element ? event.target : null);
-    const files = event.dataTransfer ? droppedFilesFromDataTransfer(event.dataTransfer) : [];
+    void this.handleDomDrop(event);
+  };
+
+  private onDocumentDragOver = (event: DragEvent): void => {
+    if (!this.hasFiles(event) || activeWorkspace !== "discovery" || (activeLibraryDrag && activeLibraryDrag !== "external-pdf")) return;
+    claimLibraryDrag("external-pdf");
+    event.preventDefault();
+    event.dataTransfer!.dropEffect = "copy";
+    this.setDiscoveryTarget(event.target);
+  };
+
+  private onDocumentDrop = (event: DragEvent): void => {
+    if (!this.hasFiles(event) || activeWorkspace !== "discovery") return;
+    event.preventDefault();
+    void this.handleDomDrop(event);
+  };
+
+  private setDiscoveryTarget(target: EventTarget | null): void {
+    clearLibraryDragFeedback();
+    const element = target instanceof Element ? target : null;
+    const card = element?.closest<HTMLElement>(".paper-card[data-paper-id]");
+    card?.classList.add("pdf-drop-target");
+  }
+
+  private targetAt(target: EventTarget | null): { kind: "library" | "discovery"; paperId: number | null } {
+    const element = target instanceof Element ? target : null;
+    const libraryRow = element?.closest<HTMLElement>(".library-paper-row");
+    if (libraryRow) return { kind: "library", paperId: Number(libraryRow.dataset.paperId) };
+    const card = element?.closest<HTMLElement>(".paper-card[data-paper-id]");
+    if (card) return { kind: "discovery", paperId: Number(card.dataset.paperId) };
+    return { kind: activeWorkspace === "library" ? "library" : "discovery", paperId: null };
+  }
+
+  private async handleDomDrop(event: DragEvent): Promise<void> {
+    const files = droppedFilesFromDataTransfer(event.dataTransfer!);
+    const target = this.targetAt(event.target);
+    clearLibraryDragFeedback();
     libraryDropActive = false;
-    libraryDropTargetPaperId = targetPaperId;
+    libraryDropTargetPaperId = null;
     renderLibraryDropState();
+    releaseLibraryDrag("external-pdf");
     if (!files.length) {
       setStatus("只支持 PDF 文件", "error");
       return;
     }
-    await processLibraryDrop(files, targetPaperId);
-  });
+    await this.process(files, target);
+  }
 
-  // Tauri desktop drops expose absolute paths through webview drag events;
-  // keep the DOM handlers above for browser/dev-server fallback.
-  void listen("tauri://drag-over", (event) => {
-    const payload = event.payload as { position?: { x: number; y: number } };
+  private async process(files: LibraryDroppedFile[], target: { kind: "library" | "discovery"; paperId: number | null }): Promise<void> {
+    if (target.kind === "library") {
+      await processLibraryDrop(files, target.paperId);
+      return;
+    }
+    setStatus("正在处理 Discovery PDF…", "running");
+    let succeeded = 0;
+    for (const file of files) {
+      try {
+        if (!file.path) throw new Error("当前 WebView 未提供本地文件路径");
+        if (target.paperId != null) {
+          const attachment = await attachPdfPathToPaper(target.paperId, file.path, libraryPaperIds.has(target.paperId));
+          setStatus("Discovery PDF 已关联：" + attachment.filename, "done");
+        } else {
+          const result = await importDroppedPdf(file.path);
+          setStatus("Discovery PDF 已导入：" + (result.attachment?.filename || file.name), "done");
+        }
+        succeeded++;
+      } catch (error) {
+        setStatus("Discovery PDF 失败：" + String(error), "error");
+      }
+    }
+    if (succeeded) {
+      await Promise.all([loadPapers(), loadLibraryData("all")]);
+      renderPapers();
+    }
+  }
+
+  private onNativeDragOver(payload: { position?: { x: number; y: number } }): void {
+    if (activeLibraryDrag && activeLibraryDrag !== "external-pdf") return;
+    if (!claimLibraryDrag("external-pdf")) return;
     const point = payload.position ? document.elementFromPoint(payload.position.x, payload.position.y) : null;
-    if (point && pane.contains(point)) setLibraryDropTarget(point);
-  });
-  void listen("tauri://drag-leave", () => {
+    const target = this.targetAt(point);
+    if (target.kind === "library") setLibraryDropTarget(point);
+    else this.setDiscoveryTarget(point);
+  }
+
+  private onNativeDragLeave = (): void => {
+    clearLibraryDragFeedback();
     libraryDropActive = false;
     libraryDropTargetPaperId = null;
     renderLibraryDropState();
-  });
-  void listen("tauri://drag-drop", (event) => {
-    const payload = event.payload as { paths?: string[]; position?: { x: number; y: number } };
-    const point = payload.position ? document.elementFromPoint(payload.position.x, payload.position.y) : null;
-    const targetPaperId = libraryDropTargetFromElement(point);
-    const files = (payload.paths || [])
-      .filter((path) => path.toLowerCase().endsWith(".pdf"))
-      .map((path) => ({ name: path.split(/[\\/]/).pop() || path, path }));
-    libraryDropActive = false;
-    libraryDropTargetPaperId = targetPaperId;
-    renderLibraryDropState();
-    if (files.length) void processLibraryDrop(files, targetPaperId);
-    else setStatus("只支持 PDF 文件", "error");
-  });
+    releaseLibraryDrag("external-pdf");
+  };
 
-  document.addEventListener("pointerdown", (event) => {
-    const target = (event.target as HTMLElement).closest("[data-column-resize]") as HTMLElement | null;
-    if (target) {
-      const column = target.dataset.columnResize as LibraryColumn;
-      if (!LIBRARY_COLUMNS.includes(column)) return;
-      const visible = LIBRARY_COLUMNS.filter(c => (document.querySelector(`[data-column="${c}"]`) as HTMLElement)?.offsetWidth > 0);
-      const next = visible[visible.indexOf(column) + 1];
-      if (!next) return;
-      visible.forEach(c => { libraryColumnWidths[c] = (document.querySelector(`[data-column="${c}"]`) as HTMLElement).getBoundingClientRect().width; });
-      libraryColumnResize = { column, next, startX: event.clientX, startWidth: libraryColumnWidths[column], nextWidth: libraryColumnWidths[next] };
-      document.body.classList.add("is-resizing-library");
-      event.preventDefault();
-      return;
-    }
-    if ((event.target as HTMLElement).closest("[data-inspector-resize]")) {
-      libraryInspectorResize = { startX: event.clientX, startWidth: libraryInspectorWidth };
-      document.body.classList.add("is-resizing-library");
-      event.preventDefault();
-    }
-  });
-  window.addEventListener("pointermove", (event) => {
-    if (libraryColumnResize) {
-      const { column, next, startX, startWidth, nextWidth } = libraryColumnResize;
-      const minDelta = Math.max(LIBRARY_COLUMN_MIN[column] - startWidth, next === "year" ? nextWidth - 100 : -Infinity);
-      const maxDelta = Math.min(nextWidth - LIBRARY_COLUMN_MIN[next], column === "year" ? 100 - startWidth : Infinity);
-      const delta = Math.max(minDelta, Math.min(maxDelta, event.clientX - startX));
-      libraryColumnWidths[column] = startWidth + delta;
-      libraryColumnWidths[next] = nextWidth - delta;
-      applyLibraryLayoutMetrics();
-      return;
-    }
-    if (libraryInspectorResize) {
-      const { startX, startWidth } = libraryInspectorResize;
-      const maxWidth = Math.min(560, Math.max(300, Math.round(window.innerWidth * 0.52)));
-      libraryInspectorWidth = Math.min(maxWidth, Math.max(300, Math.round(startWidth - (event.clientX - startX))));
-      applyLibraryLayoutMetrics();
-    }
-  });
-  window.addEventListener("pointerup", () => {
-    if (libraryColumnResize || libraryInspectorResize) persistLibraryLayout();
-    libraryColumnResize = null;
-    libraryInspectorResize = null;
-    document.body.classList.remove("is-resizing-library");
-  });
-  window.addEventListener("resize", () => {
-    if (window.innerWidth < 1100 && !libraryInspectorCollapsed && activeWorkspace === "library") {
-      libraryInspectorCollapsed = true;
-      renderLibrary();
-    }
-    applyLibraryLayoutMetrics();
-  });
-  applyLibraryLayoutMetrics();
+  private onNativeDrop(payload: { paths?: string[]; position?: { x: number; y: number } }): void {
+    const target = this.targetAt(payload.position ? document.elementFromPoint(payload.position.x, payload.position.y) : null);
+    const files = (payload.paths || []).filter((path) => path.toLowerCase().endsWith(".pdf")).map((path) => ({ name: path.split(/[\\/]/).pop() || path, path }));
+    clearLibraryDragFeedback();
+    libraryDropActive = false;
+    renderLibraryDropState();
+    releaseLibraryDrag("external-pdf");
+    if (files.length) void this.process(files, target);
+    else setStatus("只支持 PDF 文件", "error");
+  }
 }
 
-async function submitLibraryCapture() {
-  if (libraryCapturePaperId == null) return;
-  const collectionIds = [...document.querySelectorAll<HTMLInputElement>("[data-capture-collection-id]:checked")].map((e) => Number(e.dataset.captureCollectionId));
-  const tagIds = [...document.querySelectorAll<HTMLInputElement>("[data-capture-tag-id]:checked")].map((e) => Number(e.dataset.captureTagId));
-  const paper = papers.find((p) => p.id === libraryCapturePaperId) || recPapers.find((p) => p.id === libraryCapturePaperId);
-  const context = (document.querySelector(`[data-paper-id="${libraryCapturePaperId}"]`) as HTMLElement | null)?.dataset.cardContext || "manual";
-  const addedSource = context.startsWith("today") ? "recommendation" : context.startsWith("history") ? "history" : context === "favorites" ? "read_later" : "manual";
-  await invoke("add_paper_to_library", { paperId: libraryCapturePaperId, collectionIds, tagIds, addedSource });
-  libraryPaperIds.add(libraryCapturePaperId);
-  if (paper) { paper.isFavorite = false; }
-  closeLibraryCapture();
-  setStatus("已收录到文献库", "done");
-  await Promise.all([loadPapers(), loadLibraryData(libraryView)]);
+function installLibraryInteractions(): void {
+  new ExternalPdfDrag().install();
+  new PaperRowDrag().install();
+  new ColumnHeaderDrag().install();
+  applyLibraryLayoutMetrics();
 }
 
 function renderBacklog() {
@@ -3283,6 +3486,7 @@ async function saveSettings() {
     pdfLibraryRoot: ($("set-pdf-library-root") as HTMLInputElement).value.trim(),
     pdfNamingTemplate: ($("set-pdf-naming-template") as HTMLInputElement).value,
     pdfSubfolderRule: ($("set-pdf-subfolder-rule") as HTMLSelectElement).value as "none" | "year" | "journal/source",
+    preferredReader,
   };
   if (s.pdfFileHandlingMode !== "none" && !s.pdfLibraryRoot) {
     $("settings-msg").textContent = "copy / move 模式需要先选择 Library root directory";
@@ -3297,6 +3501,7 @@ async function saveSettings() {
   try {
     await invoke("set_settings", { s });
     settings = s;
+    localStorage.setItem(PREFERRED_READER_STORAGE_KEY, JSON.stringify(preferredReader));
     abstractLang = s.defaultAbstractLang === "en" ? "en" : "zh";
     renderPapers();
     renderNextCheck();
@@ -3446,6 +3651,16 @@ async function setupListeners() {
       else tagDraft[i].description = el.value;
       setTagDirty(true);
     }
+    if (action === "library-relation-search") {
+      const query = el.value.trim().toLowerCase();
+      el.closest(".relation-menu")?.querySelectorAll<HTMLElement>(".relation-option").forEach((option) => {
+        option.classList.toggle("hidden", Boolean(query) && !(option.dataset.relationName || option.textContent || "").toLowerCase().includes(query));
+      });
+    }
+    if (el.matches("#set-reader-application-path")) {
+      preferredReader = { kind: "custom", applicationPath: el.value.trim() || null };
+      renderPreferredReader();
+    }
     if (el.matches("#set-pdf-library-root, #set-pdf-naming-template")) renderPdfTemplateExample();
   });
   document.addEventListener("change", (ev) => {
@@ -3473,6 +3688,11 @@ async function setupListeners() {
     }
     if (el.matches("#set-pdf-file-handling-mode, #set-pdf-library-root, #set-pdf-naming-template, #set-pdf-subfolder-rule")) {
       renderPdfTemplateExample();
+      return;
+    }
+    if (el.matches("#set-preferred-reader")) {
+      preferredReader = el.value === "custom" ? { kind: "custom", applicationPath: preferredReader.applicationPath } : { kind: "system", applicationPath: null };
+      renderPreferredReader();
       return;
     }
     if (el.matches("[data-action='tag-draft-toggle']")) {
@@ -3528,6 +3748,10 @@ async function setupListeners() {
       resetPdfLibraryRoot();
       return;
     }
+    if (t.closest("[data-action='select-reader-application']")) {
+      await selectReaderApplication();
+      return;
+    }
     const pdfToken = t.closest("[data-pdf-token]") as HTMLElement | null;
     if (pdfToken) {
       const token = pdfToken.dataset.pdfToken;
@@ -3574,8 +3798,16 @@ async function setupListeners() {
     }
     const addLibrary = t.closest("[data-action='add-library']") as HTMLElement | null;
     if (addLibrary) {
-      try { await openLibraryCapture(parseInt(addLibrary.dataset.paperId!, 10)); }
-      catch (err) { setStatus(`打开收录面板失败：${String(err)}`, "error"); }
+      const paperId = parseInt(addLibrary.dataset.paperId!, 10);
+      const card = addLibrary.closest<HTMLElement>("[data-card-context]");
+      const context = card?.dataset.cardContext || "manual";
+      const addedSource = context.startsWith("today") ? "recommendation" : context.startsWith("history") ? "history" : context === "favorites" ? "read_later" : "manual";
+      try {
+        await invoke("add_paper_to_library", { paperId, collectionIds: [], tagIds: [], addedSource });
+        libraryPaperIds.add(paperId);
+        await Promise.all([loadPapers(), loadLibraryData("all")]);
+        setStatus("已收录到文献库，可在 Inspector 中添加文集或 Library Tag", "done");
+      } catch (err) { setStatus(`收录失败：${String(err)}`, "error"); }
       return;
     }
     if (t.closest("[data-action='open-library']")) {
@@ -3588,27 +3820,6 @@ async function setupListeners() {
         selectedLibraryPaperId = parseInt(card.dataset.paperId!, 10);
         renderLibrary();
       }
-      return;
-    }
-    if (t.closest("[data-action='library-capture-create-collection']")) {
-      const name = await showPromptModal("新建文献夹", "名称");
-      if (!name || libraryCapturePaperId == null) return;
-      await invoke("create_library_collection", { name, parentId: null });
-      await loadLibraryData(libraryView);
-      await openLibraryCapture(libraryCapturePaperId);
-      return;
-    }
-    if (t.closest("[data-action='library-capture-create-tag']")) {
-      const name = await showPromptModal("新建文献标签", "名称");
-      if (!name || libraryCapturePaperId == null) return;
-      await invoke("create_library_tag", { name, color: null });
-      await loadLibraryData(libraryView);
-      await openLibraryCapture(libraryCapturePaperId);
-      return;
-    }
-    if (t.closest("[data-action='library-capture-cancel']")) { closeLibraryCapture(); return; }
-    if (t.closest("[data-action='library-capture-submit']")) {
-      try { await submitLibraryCapture(); } catch (err) { setStatus(`收录失败：${String(err)}`, "error"); }
       return;
     }
     const attachPdf = t.closest("[data-action='attach-pdf']") as HTMLElement | null;
@@ -3660,6 +3871,12 @@ async function setupListeners() {
       libraryScope = { kind: "collection", id: parseInt(collectionFilter.dataset.collectionId!, 10) };
       renderLibraryNavigation();
       if (libraryView !== "all") await loadLibraryData("all"); else renderLibrary();
+      return;
+    }
+    if (t.closest("[data-action='library-clear-scope']")) {
+      libraryScope = null;
+      renderLibraryNavigation();
+      renderLibrary();
       return;
     }
     const renameCollection = t.closest("[data-action='library-rename-collection']") as HTMLElement | null;
@@ -3822,7 +4039,7 @@ async function setupListeners() {
       openButton.textContent = "打开中…";
       try {
         setStatus("正在打开 PDF…", "running");
-        await invoke("open_pdf", { attachmentId: Number(openPdf.dataset.attachmentId) });
+        await openPdfAttachment(Number(openPdf.dataset.attachmentId));
         setStatus("PDF 已打开", "done");
       } catch (error) {
         setStatus(`打开 PDF 失败：${String(error)}`, "error");
@@ -4236,14 +4453,29 @@ async function setupListeners() {
     }
   });
 
-  document.addEventListener("dblclick", (ev) => {
+  document.addEventListener("dblclick", async (ev) => {
     const target = ev.target as HTMLElement;
-    if (target.closest(".attachment-child-actions")) return;
+    if (target.closest(".attachment-child-actions, [data-action='library-toggle-attachments']")) return;
     const child = target.closest<HTMLElement>(".library-attachment-child");
     const openButton = child?.querySelector<HTMLButtonElement>("[data-action='library-open-pdf']");
-    if (!openButton || openButton.disabled) return;
+    if (openButton && !openButton.disabled) {
+      ev.preventDefault();
+      openButton.click();
+      return;
+    }
+    const row = target.closest<HTMLElement>(".library-paper-row");
+    if (!row) return;
+    const item = libraryPapers.find((candidate) => candidate.paper.id === Number(row.dataset.paperId));
+    const attachment = item?.attachments[0];
+    if (!attachment || attachment.missing) return;
     ev.preventDefault();
-    openButton.click();
+    try {
+      setStatus("正在打开 PDF…", "running");
+      await openPdfAttachment(attachment.id);
+      setStatus("PDF 已打开", "done");
+    } catch (error) {
+      setStatus(`打开 PDF 失败：${String(error)}`, "error");
+    }
   });
 }
 

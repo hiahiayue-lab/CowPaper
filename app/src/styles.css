@@ -1484,3 +1484,31 @@ body.is-dragging-library-paper, body.is-dragging-library-paper * { cursor: grabb
   .library-attachment-child { grid-template-columns: 30px minmax(0, 1fr); padding-left: 26px; }
   .attachment-child-actions { grid-column: 2; }
 }
+
+/* RC5: all three drag interactions are pointer-owned and visually local. */
+.library-column-header { touch-action: none; cursor: grab; }
+.library-column-header.column-drag-over { background: #f3f6fa; outline: 1px solid #c8d5e5; }
+.is-dragging-library-column .library-column-header { cursor: grabbing; }
+.is-resizing-library, .is-resizing-library * { cursor: col-resize !important; }
+.library-nav-item:hover .nav-child { width: auto; min-width: 28px; padding: 2px 4px; font-size: 10px; }
+.nav-drop-plus, .library-nav-row.membership-drop-hover .nav-drop-plus { display: none !important; }
+.library-nav-row.membership-drop-hover { background: #eef5fd; color: #2469bd; outline: 1px solid #bcd2ee; outline-offset: -1px; }
+.pdf-drop-target { outline: 2px solid #9bbce8; outline-offset: 2px; background: #f7faff; }
+.library-facet-bar { display: flex; align-items: center; gap: 4px; min-width: 0; max-width: min(52vw, 620px); overflow-x: auto; scrollbar-width: none; }
+.library-facet-bar::-webkit-scrollbar { display: none; }
+.library-facet { display: inline-flex; align-items: center; gap: 4px; flex: 0 0 auto; padding: 3px 7px; border: 1px solid #e1e5ea; border-radius: 999px; background: #fff; color: #707985; font-size: 10px; white-space: nowrap; }
+.library-facet:hover, .library-facet.active { border-color: #b9cce4; background: #f1f6fd; color: #2e69b4; }
+.library-facet.clear { color: #4d78aa; }
+.relation-search { width: 100%; margin-bottom: 6px; padding: 5px 7px; border: 1px solid #e1e5ea; border-radius: 5px; outline: 0; font: inherit; font-size: 11px; }
+.relation-option.hidden { display: none; }
+.relation-option { width: 100%; gap: 6px; padding: 5px 4px; border-radius: 4px; text-align: left; }
+.relation-option:hover { background: #f1f5fa; }
+.settings-reader-row > div:first-child { min-width: 180px; }
+.settings-reader-controls { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.settings-reader-controls select { flex: 0 0 150px; }
+.settings-reader-controls input { min-width: 0; flex: 1; }
+@media (max-width: 760px) {
+  .library-facet-bar { max-width: 42vw; }
+  .settings-reader-controls { flex-wrap: wrap; }
+  .settings-reader-controls input { flex-basis: 100%; }
+}
