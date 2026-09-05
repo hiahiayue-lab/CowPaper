@@ -53,10 +53,12 @@
             </div>
             <button type="button" id="btn-sync-main" class="toolbar-action" title="检查新论文"><span class="toolbar-action-icon" aria-hidden="true">↻</span>检查新论文</button>
             <button type="button" id="btn-ai-main" class="toolbar-action" title="运行 AI 分析"><span class="toolbar-action-icon" aria-hidden="true">✦</span>AI</button>
-            <button type="button" class="icon-button library-only" title="Reset column widths" aria-label="Reset column widths" data-action="library-reset-columns">↔</button><button type="button" class="icon-button library-only" title="切换 Inspector" aria-label="切换 Inspector" data-action="library-toggle-inspector">◧</button>
+            <button type="button" class="icon-button library-only" title="管理列" aria-label="管理列" data-action="library-columns">☷</button><button type="button" class="icon-button library-only" title="恢复列设置" aria-label="恢复列设置" data-action="library-reset-columns">↔</button><button type="button" class="icon-button library-only" title="切换 Inspector" aria-label="切换 Inspector" data-action="library-toggle-inspector">◧</button>
+            <div id="library-column-menu" class="library-column-menu hidden" role="menu"></div>
             <button type="button" id="btn-settings-global" class="icon-button" title="设置" aria-label="设置">⚙</button>
           </div>
         </header>
+        <div id="library-inline-action" class="library-inline-action hidden" role="status" aria-live="polite"></div>
 
         <section id="view-recommend" class="view active">
           <div id="backlog-banner" class="banner hidden"></div>
@@ -110,15 +112,9 @@
         </section>
 
         <section id="view-library-all" class="view library-view">
-          <div id="library-layout" class="library-layout">
+            <div id="library-layout" class="library-layout">
             <div id="library-list-pane" class="library-list-pane">
-              <div class="library-table-head" role="row">
-                <span class="library-column-header" data-column="title"><span>标题</span><span class="column-resizer" data-column-resize="title" aria-hidden="true"></span></span>
-                <span class="library-column-header" data-column="note"><span>备注</span><span class="column-resizer" data-column-resize="note" aria-hidden="true"></span></span>
-                <span class="library-column-header" data-column="source"><span>期刊</span><span class="column-resizer" data-column-resize="source" aria-hidden="true"></span></span>
-                <span class="library-column-header" data-column="year"><span>年份</span><span class="column-resizer" data-column-resize="year" aria-hidden="true"></span></span>
-                <span class="library-column-header" data-column="authors"><span>作者</span><span class="column-resizer" data-column-resize="authors" aria-hidden="true"></span></span>
-              </div>
+              <div id="library-table-head" class="library-table-head" role="row"></div>
               <div id="library-list" class="library-list"></div>
               <div id="library-drop-overlay" class="library-drop-overlay hidden" aria-live="polite"><span class="drop-overlay-icon" aria-hidden="true">＋</span><strong id="library-drop-label">导入为新文献</strong><span class="muted small">释放以继续</span></div>
               <div id="library-drop-queue" class="library-drop-queue hidden" aria-live="polite"></div>
