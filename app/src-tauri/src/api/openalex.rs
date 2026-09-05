@@ -115,11 +115,11 @@ impl OpenAlex {
             .send().map_err(|e| format!("OpenAlex DOI 请求失败: {}", e))?;
         if !resp.status().is_success() { return Err(format!("OpenAlex DOI HTTP {}", resp.status().as_u16())); }
         let v: Value = resp.json().map_err(|e| format!("OpenAlex DOI 响应解析失败: {}", e))?;
-        Ok(v.get("results").and_then(|x| x.as_array()).and_then(|x| x.first()).and_then(parse_work))
+        Ok(v.get("results").and_then(|x| x.as_array()).and_then(|x| x.first()).and_then(parse_work).filter(|c| c.normalized_doi == normalize_doi(doi)))
     }
 }
 
-fn parse_work(item: &Value) -> Option<PaperCandidate> {
+pub(crate) fn parse_work(item: &Value) -> Option<PaperCandidate> {
     let original_doi = item.get("doi").and_then(|d| d.as_str()).map(str::to_string);
     let normalized_doi = original_doi.as_deref().and_then(normalize_doi);
     let title = item.get("title").and_then(|t| t.as_str()).map(str::to_string);

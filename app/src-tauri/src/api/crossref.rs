@@ -154,11 +154,11 @@ impl Crossref {
         if resp.status() == reqwest::StatusCode::NOT_FOUND { return Ok(None); }
         if !resp.status().is_success() { return Err(format!("Crossref DOI HTTP {}", resp.status().as_u16())); }
         let v: Value = resp.json().map_err(|e| format!("Crossref DOI 响应解析失败: {}", e))?;
-        Ok(v.get("message").and_then(parse_work))
+        Ok(v.get("message").and_then(parse_work).filter(|c| c.normalized_doi == normalize_doi(doi)))
     }
 }
 
-fn parse_work(item: &Value) -> Option<PaperCandidate> {
+pub(crate) fn parse_work(item: &Value) -> Option<PaperCandidate> {
     let original_doi = item.get("DOI").and_then(|d| d.as_str()).map(str::to_string);
     let normalized_doi = original_doi.as_deref().and_then(normalize_doi);
     let title = item
@@ -233,7 +233,7 @@ fn parse_authors(item: &Value) -> Vec<Author> {
 }
 
 fn parse_date(item: &Value) -> (Option<String>, Option<i32>) {
-    for key in ["published", "issued", "created"] {
+    for key in ["published-print", "published-online", "issued", "published"] {
         if let Some(d) = item.get(key) {
             if let Some(dp) = d
                 .get("date-parts")
@@ -245,7 +245,11 @@ fn parse_date(item: &Value) -> (Option<String>, Option<i32>) {
                     let year = y as i32;
                     let month = dp.get(1).and_then(|m| m.as_i64()).unwrap_or(1);
                     let day = dp.get(2).and_then(|dd| dd.as_i64()).unwrap_or(1);
-                    let date = format!("{:04}-{:02}-{:02}", year, month, day);
+                    let date = match dp.len() {
+                        1 => format!("{year:04}"),
+                        2 => format!("{year:04}-{month:02}"),
+                        _ => format!("{year:04}-{month:02}-{day:02}"),
+                    };
                     return (Some(date), Some(year));
                 }
             } else if let Some(ds) = d.get("date").and_then(|x| x.as_str()) {
