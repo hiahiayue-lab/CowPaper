@@ -5982,7 +5982,7 @@ fn rc3_reimport_same_sha_repairs_doi_and_retries_enrichment_without_duplicate() 
         let result=db::import_external_pdf_with_candidates(&conn,path.to_str().unwrap(),None,vec![("crossref".into(),rc3_crossref())]).unwrap();
         assert_eq!(result.outcome,"existingAttachmentRefreshed");assert_eq!(result.paper_id,Some(id));assert_eq!(result.attachment.unwrap().id,attachment.id);
     }
-    let p=db::get_paper(&conn,id).unwrap().unwrap();assert_eq!(p.normalized_doi.as_deref(),Some("10.5555/rc3"));assert_eq!(p.abstract_provenance,"provider");assert_eq!(p.journal_name.as_deref(),Some("Journal of Evidence"));
+    let p=db::get_paper(&conn,id).unwrap().unwrap();assert_eq!(p.normalized_doi.as_deref(),Some("10.5555/rc3"));assert_eq!(p.url.as_deref(),Some("https://doi.org/10.5555/rc3"));assert_eq!(p.abstract_provenance,"provider");assert_eq!(p.journal_name.as_deref(),Some("Journal of Evidence"));
     assert_eq!(conn.query_row("SELECT count(*) FROM papers",[],|r|r.get::<_,i64>(0)).unwrap(),1);
     assert_eq!(conn.query_row("SELECT count(*) FROM paper_attachments",[],|r|r.get::<_,i64>(0)).unwrap(),1);
     std::fs::remove_file(path).unwrap();

@@ -3236,7 +3236,12 @@ fn import_prepared_external_pdf(conn: &Connection, file: LinkedFile, confirmed_p
             if old_doi.as_deref().is_some_and(|old| old != doi && old != format!("{doi}copyright")) {
                 return Err(rusqlite::Error::InvalidParameterName("pdf_identity_conflict_manual_review_required".into()));
             }
-            conn.execute("UPDATE papers SET normalized_doi=?1,original_doi=?1 WHERE id=?2", params![doi,paper_id])?;
+            // An exact DOI re-import also repairs a stale landing URL that may
+            // have been captured from malformed PDF text (for example a
+            // trailing `copyright` token). The DOI URL is canonical metadata,
+            // so it is safe to refresh alongside the repaired identity.
+            let canonical_url = format!("https://doi.org/{doi}");
+            conn.execute("UPDATE papers SET normalized_doi=?1,original_doi=?1,url=?2 WHERE id=?3", params![doi,canonical_url,paper_id])?;
         }
         for (_, candidate) in &providers { fill_missing_canonical_metadata_from_candidate(conn, paper_id, candidate)?; }
         persist_external_metadata(conn, paper_id, &metadata, &providers)?;
