@@ -1015,7 +1015,7 @@ fn list_library_tags(state: State<Db>) -> Result<Vec<models::LibraryTag>, String
 }
 
 #[tauri::command]
-fn list_library_tag_facets(collection_id: i64, state: State<Db>) -> Result<Vec<models::LibraryTagFacet>, String> {
+fn list_library_tag_facets(collection_id: Option<i64>, state: State<Db>) -> Result<Vec<models::LibraryTagFacet>, String> {
     let conn = state.inner().lock().unwrap();
     db::list_library_tag_facets(&conn, collection_id).map_err(|e| e.to_string())
 }

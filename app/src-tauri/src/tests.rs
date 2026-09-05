@@ -6116,7 +6116,7 @@ fn rc5_collection_scope_facets_global_tags_and_and_filter() {
     let tag_b = db::create_library_tag(&conn, "B", None).unwrap();
     db::add_paper_to_library(&conn, first, &[collection.id], &[tag_a.id, tag_b.id], "manual").unwrap();
     db::add_paper_to_library(&conn, second, &[collection.id], &[tag_a.id], "manual").unwrap();
-    let facets = db::list_library_tag_facets(&conn, collection.id).unwrap();
+    let facets = db::list_library_tag_facets(&conn, Some(collection.id)).unwrap();
     assert_eq!(facets.iter().find(|f| f.tag.id == tag_a.id).unwrap().paper_count, 2);
     assert_eq!(facets.iter().find(|f| f.tag.id == tag_b.id).unwrap().paper_count, 1);
     let both = db::list_library_papers_scoped(&conn, "all", Some(collection.id), &[tag_a.id, tag_b.id], 100).unwrap();

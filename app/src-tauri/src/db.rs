@@ -3828,24 +3828,34 @@ pub fn list_library_tags(conn: &Connection) -> Result<Vec<crate::models::Library
     rows.collect()
 }
 
-pub fn list_library_tag_facets(conn: &Connection, collection_id: i64) -> Result<Vec<crate::models::LibraryTagFacet>> {
-    let exists: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM library_collections WHERE id=?1)",
-        params![collection_id],
-        |r| r.get(0),
-    )?;
-    if !exists { return Err(rusqlite::Error::QueryReturnedNoRows); }
-    let mut stmt = conn.prepare(
-        "SELECT t.*, COUNT(DISTINCT lci.paper_id) AS paper_count
+pub fn list_library_tag_facets(conn: &Connection, collection_id: Option<i64>) -> Result<Vec<crate::models::LibraryTagFacet>> {
+    if let Some(collection_id) = collection_id {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM library_collections WHERE id=?1)",
+            params![collection_id],
+            |r| r.get(0),
+        )?;
+        if !exists { return Err(rusqlite::Error::QueryReturnedNoRows); }
+    }
+    let sql = if collection_id.is_some() {
+        "SELECT t.*, COUNT(DISTINCT li.paper_id) AS paper_count
          FROM library_tags t
-         LEFT JOIN library_item_tags lit ON lit.tag_id=t.id
-         LEFT JOIN library_items li ON li.paper_id=lit.paper_id
+         JOIN library_item_tags lit ON lit.tag_id=t.id
+         JOIN library_items li ON li.paper_id=lit.paper_id
          JOIN library_collection_items lci
            ON lci.paper_id=li.paper_id AND lci.collection_id=?1
          GROUP BY t.id
-         ORDER BY t.name, t.id",
-    )?;
-    let rows = stmt.query_map(params![collection_id], |row| {
+         ORDER BY t.name, t.id"
+    } else {
+        "SELECT t.*, COUNT(DISTINCT li.paper_id) AS paper_count
+         FROM library_tags t
+         JOIN library_item_tags lit ON lit.tag_id=t.id
+         JOIN library_items li ON li.paper_id=lit.paper_id
+         GROUP BY t.id
+         ORDER BY t.name, t.id"
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(collection_id.into_iter()), |row| {
         Ok(crate::models::LibraryTagFacet {
             tag: library_tag_from_row(row)?,
             paper_count: row.get("paper_count")?,
