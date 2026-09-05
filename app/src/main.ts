@@ -259,6 +259,8 @@ interface ExternalPdfImportResult {
   candidate: ExternalPdfCandidate | null;
   candidates: ExternalPdfCandidate[];
   requiresConfirmation: boolean;
+  enrichmentStatus?: "ready" | "queued" | "running" | "completed" | "failed" | string;
+  enrichmentError?: string | null;
 }
 
 interface AiStatus {
@@ -304,8 +306,8 @@ interface Settings {
   pdfLibraryRoot: string;
   pdfNamingTemplate: string;
   pdfSubfolderRule: "none" | "year" | "journal/source";
-  /** RC5 reader bridge; older backends omit it until the settings bridge is rebased. */
-  preferredReader?: { kind: "system" | "custom"; applicationPath: string | null };
+  /** `system` or an absolute application path; persisted by the Rust settings store. */
+  preferredPdfReader: string;
 }
 
 interface SyncProgress {
@@ -466,9 +468,12 @@ let papers: Paper[] = [];
 let libraryPapers: LibraryPaper[] = [];
 let libraryCollections: LibraryCollection[] = [];
 let libraryTags: LibraryTag[] = [];
+interface LibraryTagFacet { tag: LibraryTag; paperCount: number; }
+let libraryTagFacets: LibraryTagFacet[] = [];
 let libraryView: "all" | "recent" | "unfiled" = "all";
 let selectedLibraryPaperId: number | null = null;
-let libraryScope: { kind: "collection" | "tag"; id: number } | null = null;
+let libraryScope: { kind: "collection"; id: number } | null = null;
+let librarySelectedTagIds: number[] = [];
 const libraryPaperIds = new Set<number>();
 let activeWorkspace: "discovery" | "library" = "discovery";
 let aiStatus: AiStatus = emptyAiStatus();
@@ -483,25 +488,25 @@ let libraryDropTargetPaperId: number | null = null;
 let libraryDropActive = false;
 let libraryDropQueue: LibraryDropItem[] = [];
 let libraryInlineCreate: { kind: "collection" | "tag"; parentId: number | null } | null = null;
+let libraryRelationEditor: { kind: "collection" | "tag"; paperId: number } | null = null;
 let libraryColumnWidths: Record<LibraryColumn, number>;
 let libraryInspectorWidth: number;
 let librarySuppressNextClick = false;
 const expandedLibraryAttachmentPaperIds = new Set<number>();
 let libraryToastTimer = 0;
-const PREFERRED_READER_STORAGE_KEY = "cowpaper.preferred-reader.v1";
-type PreferredReader = { kind: "system" | "custom"; applicationPath: string | null };
-function loadPreferredReader(): PreferredReader {
-  try {
-    const value = JSON.parse(localStorage.getItem(PREFERRED_READER_STORAGE_KEY) || "null") as Partial<PreferredReader> | null;
-    return value?.kind === "custom" && value.applicationPath ? { kind: "custom", applicationPath: value.applicationPath } : { kind: "system", applicationPath: null };
-  } catch {
-    return { kind: "system", applicationPath: null };
-  }
-}
-let preferredReader: PreferredReader = loadPreferredReader();
+let preferredPdfReader = "system";
 let currentAppVersion = "0.1.4";
 let pendingUpdate: Update | null = null;
 let updateBusy = false;
+
+function clearLibraryScope(): void {
+  libraryScope = null;
+  librarySelectedTagIds = [];
+}
+
+function scopedLibraryCollectionId(): number | null {
+  return libraryScope?.kind === "collection" ? libraryScope.id : null;
+}
 /// 纯卡片 UI 状态必须按实例隔离；favorite/ignore 等持久业务状态仍按 paper id。
 const expandedCardInstanceIds = new Set<string>();
 const cardLanguageState = new Map<string, "zh" | "en">();
@@ -738,19 +743,19 @@ async function loadPapers() {
 async function loadLibraryData(view: "all" | "recent" | "unfiled" = libraryView) {
   libraryView = view;
   try {
-    [libraryPapers, libraryCollections, libraryTags] = await Promise.all([
-      invoke<LibraryPaper[]>("list_library_papers", { view }),
+    const collectionId = scopedLibraryCollectionId();
+    const tagIds = [...librarySelectedTagIds];
+    [libraryPapers, libraryCollections, libraryTags, libraryTagFacets] = await Promise.all([
+      invoke<LibraryPaper[]>("list_library_papers", { view, collectionId, tagIds }),
       invoke<LibraryCollection[]>("list_library_collections"),
       invoke<LibraryTag[]>("list_library_tags"),
+      invoke<LibraryTagFacet[]>("list_library_tag_facets", { collectionId }),
     ]);
     libraryPaperIds.clear();
-    // The all view is also the cheap membership index used by Discovery cards.
-    if (view !== "all") {
-      const all = await invoke<LibraryPaper[]>("list_library_papers", { view: "all" });
-      all.forEach((item) => libraryPaperIds.add(item.paper.id));
-    } else {
-      libraryPapers.forEach((item) => libraryPaperIds.add(item.paper.id));
-    }
+    // Keep Discovery's membership index independent from the current Library
+    // Collection/Tag scope.
+    const all = await invoke<LibraryPaper[]>("list_library_papers", { view: "all", collectionId: null, tagIds: [] });
+    all.forEach((item) => libraryPaperIds.add(item.paper.id));
     renderLibraryNavigation();
     renderLibrary();
     renderRecommend();
@@ -810,9 +815,10 @@ function renderPreferredReader(): void {
   const mode = $("set-preferred-reader") as HTMLSelectElement | null;
   const path = $("set-reader-application-path") as HTMLInputElement | null;
   if (!mode || !path) return;
-  mode.value = preferredReader.kind;
-  path.value = preferredReader.applicationPath || "";
-  path.disabled = preferredReader.kind !== "custom";
+  const custom = preferredPdfReader !== "system";
+  mode.value = custom ? "custom" : "system";
+  path.value = custom ? preferredPdfReader : "";
+  path.disabled = !custom;
 }
 
 async function selectReaderApplication(): Promise<void> {
@@ -820,8 +826,7 @@ async function selectReaderApplication(): Promise<void> {
     const selected = await openFileDialog({ multiple: false });
     const path = Array.isArray(selected) ? selected[0] : selected;
     if (path) {
-      preferredReader = { kind: "custom", applicationPath: path };
-      localStorage.setItem(PREFERRED_READER_STORAGE_KEY, JSON.stringify(preferredReader));
+      preferredPdfReader = path;
       renderPreferredReader();
     }
   } catch (error) {
@@ -875,9 +880,7 @@ async function loadSettings() {
     ($("set-pdf-library-root") as HTMLInputElement).value = settings.pdfLibraryRoot;
     ($("set-pdf-naming-template") as HTMLInputElement).value = settings.pdfNamingTemplate;
     ($("set-pdf-subfolder-rule") as HTMLSelectElement).value = settings.pdfSubfolderRule;
-    preferredReader = settings.preferredReader?.kind === "custom" && settings.preferredReader.applicationPath
-      ? settings.preferredReader
-      : loadPreferredReader();
+    preferredPdfReader = settings.preferredPdfReader || "system";
   }
   renderPreferredReader();
   const templateInput = $("set-pdf-naming-template") as HTMLInputElement;
@@ -1756,7 +1759,9 @@ function libraryChineseTitle(item: LibraryPaper): string {
 }
 
 function librarySource(item: LibraryPaper): string {
-  return item.effectiveJournal?.trim() || item.effectiveSource?.trim() || "—";
+  // `effectiveSource` is provenance (Discovery/provider), never the journal
+  // displayed in the Library table or citation inspector.
+  return item.effectiveJournal?.trim() || "—";
 }
 
 function libraryYear(item: LibraryPaper): string {
@@ -1890,7 +1895,7 @@ function beginLibraryInlineEdit(paperId: number, field: LibraryInlineField, butt
     }
     if (field === "title") metadata.titleOverride = trimmed || null;
     if (field === "chineseTitle") metadata.chineseTitleOverride = trimmed || null;
-    if (field === "source") { metadata.journalOverride = trimmed || null; metadata.sourceOverride = trimmed || null; }
+    if (field === "source") metadata.journalOverride = trimmed || null;
     if (field === "publisher") metadata.publisherOverride = trimmed || null;
     if (field === "publicationDate") metadata.publicationDateOverride = trimmed || null;
     if (field === "volume") metadata.volumeOverride = trimmed || null;
@@ -1970,26 +1975,28 @@ async function submitLibraryInlineCreate(): Promise<void> {
 function renderLibraryNavigation() {
   document.querySelectorAll(".library-nav-item-view").forEach((item) => {
     const view = (item as HTMLElement).dataset.view;
-    const active = !libraryScope && ((libraryView === "all" && view === "library-all") || (libraryView === "recent" && view === "library-recent") || (libraryView === "unfiled" && view === "library-unfiled"));
+    const active = !libraryScope && librarySelectedTagIds.length === 0 && ((libraryView === "all" && view === "library-all") || (libraryView === "recent" && view === "library-recent") || (libraryView === "unfiled" && view === "library-unfiled"));
     item.classList.toggle("active", active);
   });
   const collections = $("library-collection-nav");
   const children = (parentId: number | null, depth = 0): string => libraryInlineCreateRow("collection", parentId) + libraryCollections
     .filter((c) => c.parentId === parentId)
-    .map((c) => `<div class="library-nav-item"><button class="library-nav-row${libraryScope?.kind === "collection" && libraryScope.id === c.id ? " active" : ""}" style="padding-left:${12 + depth * 14}px" data-drop-kind="collection" data-action="library-filter-collection" data-collection-id="${c.id}"><span class="nav-symbol folder-symbol" aria-hidden="true"></span><span class="nav-label">${escapeHtml(c.name)}</span></button><button class="nav-child" title="在此文集下新建" aria-label="在此文集下新建" data-action="library-create-child" data-parent-id="${c.id}">新建</button><button class="nav-manage" title="重命名文集" aria-label="重命名文集" data-action="library-rename-collection" data-collection-id="${c.id}">✎</button><button class="nav-manage danger" title="删除文集" aria-label="删除文集" data-action="library-delete-collection" data-collection-id="${c.id}">×</button></div>${children(c.id, depth + 1)}`)
+    .map((c) => `<div class="library-nav-item"><button class="library-nav-row${libraryScope?.kind === "collection" && libraryScope.id === c.id ? " active" : ""}" style="padding-left:${12 + depth * 14}px" data-drop-kind="collection" data-action="library-filter-collection" data-collection-id="${c.id}"><span class="nav-symbol folder-symbol" aria-hidden="true"></span><span class="nav-label">${escapeHtml(c.name)}</span></button><button class="nav-child" title="在此文集下新建子文集" aria-label="在此文集下新建子文集" data-action="library-create-child" data-parent-id="${c.id}">＋</button><button class="nav-manage" title="重命名文集" aria-label="重命名文集" data-action="library-rename-collection" data-collection-id="${c.id}">✎</button><button class="nav-manage danger" title="删除文集" aria-label="删除文集" data-action="library-delete-collection" data-collection-id="${c.id}">×</button></div>${children(c.id, depth + 1)}`)
     .join("");
   collections.innerHTML = children(null) || '<span class="muted small nav-empty">暂无文献夹</span>';
-  const tagRows = libraryTags.map((t) => `<div class="library-nav-item"><button class="library-nav-row${libraryScope?.kind === "tag" && libraryScope.id === t.id ? " active" : ""}" data-drop-kind="tag" data-action="library-filter-tag" data-tag-id="${t.id}"><span class="tag-dot" style="background:${escapeHtml(t.color || "#9ca3af")}"></span><span class="nav-label">${escapeHtml(t.name)}</span></button><button class="nav-manage" title="重命名 Library Tag" aria-label="重命名 Library Tag" data-action="library-rename-tag" data-tag-id="${t.id}">✎</button><button class="nav-manage danger" title="删除 Library Tag" aria-label="删除 Library Tag" data-action="library-delete-tag" data-tag-id="${t.id}">×</button></div>`).join("");
+  const tagRows = libraryTagFacets.map(({ tag, paperCount }) => `<div class="library-nav-item"><button class="library-nav-row${librarySelectedTagIds.includes(tag.id) ? " active" : ""}" data-drop-kind="tag" data-action="library-filter-tag" data-tag-id="${tag.id}"><span class="tag-dot" style="background:${escapeHtml(tag.color || "#9ca3af")}"></span><span class="nav-label">${escapeHtml(tag.name)}</span><span class="nav-count">${paperCount}</span></button><button class="nav-manage" title="重命名 Library Tag" aria-label="重命名 Library Tag" data-action="library-rename-tag" data-tag-id="${tag.id}">✎</button><button class="nav-manage danger" title="删除 Library Tag" aria-label="删除 Library Tag" data-action="library-delete-tag" data-tag-id="${tag.id}">×</button></div>`).join("");
   $("library-tag-nav").innerHTML = libraryInlineCreateRow("tag", null) + (tagRows || '<span class="muted small nav-empty">暂无文献标签</span>');
 }
 
 function renderLibraryFacets(): void {
   const box = $("library-facet-bar");
   if (!box) return;
-  const clear = !libraryScope ? "" : '<button class="library-facet clear" data-action="library-clear-scope">全部</button>';
-  const collections = libraryCollections.map((collection) => `<button class="library-facet${libraryScope?.kind === "collection" && libraryScope.id === collection.id ? " active" : ""}" data-action="library-filter-collection" data-collection-id="${collection.id}"><span class="folder-symbol" aria-hidden="true"></span>${escapeHtml(collection.name)}</button>`).join("");
-  const tags = libraryTags.map((tag) => `<button class="library-facet${libraryScope?.kind === "tag" && libraryScope.id === tag.id ? " active" : ""}" data-action="library-filter-tag" data-tag-id="${tag.id}"><span class="tag-dot" style="background:${escapeHtml(tag.color || "#9ca3af")}" aria-hidden="true"></span>${escapeHtml(tag.name)}</button>`).join("");
-  box.innerHTML = clear + collections + tags;
+  const hasScope = Boolean(libraryScope) || librarySelectedTagIds.length > 0;
+  const clear = hasScope ? '<button class="library-facet clear" data-action="library-clear-scope">全部</button>' : "";
+  const collection = libraryScope ? libraryCollections.find((item) => item.id === libraryScope!.id) : null;
+  const collectionPill = collection ? `<button class="library-facet active" data-action="library-filter-collection" data-collection-id="${collection.id}"><span class="folder-symbol" aria-hidden="true"></span>${escapeHtml(collection.name)}</button>` : "";
+  const tagPills = libraryTagFacets.filter(({ tag }) => librarySelectedTagIds.includes(tag.id)).map(({ tag, paperCount }) => `<button class="library-facet active" data-action="library-filter-tag" data-tag-id="${tag.id}"><span class="tag-dot" style="background:${escapeHtml(tag.color || "#9ca3af")}" aria-hidden="true"></span>${escapeHtml(tag.name)} · ${paperCount}</button>`).join("");
+  box.innerHTML = clear + collectionPill + tagPills;
 }
 
 function renderLibrary() {
@@ -2001,13 +2008,11 @@ function renderLibrary() {
   renderLibraryColumnMenu();
   renderLibraryFacets();
   applyLibraryLayoutMetrics();
-  if (titleEl) titleEl.textContent = libraryScope?.kind === "collection" ? libraryCollections.find(c => c.id === libraryScope?.id)?.name || title : libraryScope?.kind === "tag" ? libraryTags.find(t => t.id === libraryScope?.id)?.name || title : title;
+  if (titleEl) titleEl.textContent = libraryScope?.kind === "collection" ? libraryCollections.find(c => c.id === libraryScope?.id)?.name || title : librarySelectedTagIds.length ? `${title} · ${librarySelectedTagIds.length} 个标签` : title;
   const count = $("library-count");
-  const visiblePapers = libraryScope?.kind === "collection"
-    ? libraryPapers.filter((item) => item.collections.some((c) => c.id === libraryScope!.id))
-    : libraryScope?.kind === "tag"
-      ? libraryPapers.filter((item) => item.tags.some((t) => t.id === libraryScope!.id))
-      : libraryPapers;
+  // Filtering is owned by list_library_papers; do not reimplement scope in
+  // the browser where Collection+Tag could accidentally become OR semantics.
+  const visiblePapers = libraryPapers;
   if (count) count.textContent = `${visiblePapers.length} 篇`;
   const list = $("library-list");
   if (!list) return;
@@ -2058,8 +2063,10 @@ function renderLibraryRelations(item: LibraryPaper, kind: "collection" | "tag"):
   const all = kind === "collection" ? libraryCollections : libraryTags;
   const label = kind === "collection" ? "文集" : "Library Tag";
   const chips = selected.map(value => `<span class="relation-chip">${kind === "collection" ? '<span class="folder-symbol" aria-hidden="true"></span>' : '<span class="tag-dot" aria-hidden="true"></span>'}<span>${escapeHtml(value.name)}</span><button title="移除 ${escapeHtml(value.name)} 的论文关系" aria-label="移除 ${escapeHtml(value.name)} 的论文关系" data-action="library-relation-remove" data-kind="${kind}" data-id="${value.id}" data-paper-id="${item.paper.id}">×</button></span>`).join("");
-  const options = all.map(value => `<div class="relation-option"><button data-action="library-relation-add" data-kind="${kind}" data-id="${value.id}" data-paper-id="${item.paper.id}" ${selected.some(x => x.id === value.id) ? "disabled" : ""}>${escapeHtml(value.name)} ${selected.some(x => x.id === value.id) ? "✓" : "+"}</button><button class="danger" title="删除${label} ${escapeHtml(value.name)}" aria-label="删除${label} ${escapeHtml(value.name)}" data-action="library-delete-${kind === "collection" ? "collection" : "tag"}" data-${kind === "collection" ? "collection" : "tag"}-id="${value.id}">×</button></div>`).join("");
-  return `<div class="inspector-form-row inspector-form-row-stack"><span class="field-label">${label}</span><div class="relation-controls">${chips}<details class="relation-picker"><summary title="添加或管理${label}" aria-label="添加或管理${label}">＋</summary><div class="relation-menu"><input class="relation-search" type="search" placeholder="搜索…" aria-label="搜索关系" data-action="library-relation-search" data-kind="${kind}" /><div class="relation-options">${options || '<span class="muted small">暂无可用项目</span>'}</div><label>新建${label}<input id="library-new-${kind}-name" placeholder="名称" maxlength="120" /></label>${kind === "collection" ? `<label>上级文集<select id="library-new-collection-parent"><option value="">无（顶级文集）</option>${libraryCollections.map(c => `<option value="${c.id}">${escapeHtml(c.name)}</option>`).join("")}</select></label>` : ""}<button class="ghost small" data-action="library-relation-create" data-kind="${kind}" data-paper-id="${item.paper.id}">新建并添加</button></div></details></div></div>`;
+  const editorOpen = libraryRelationEditor?.kind === kind && libraryRelationEditor.paperId === item.paper.id;
+  const options = all.map(value => `<div class="relation-option" data-relation-name="${escapeHtml(value.name.toLowerCase())}"><button data-action="library-relation-add" data-kind="${kind}" data-id="${value.id}" data-paper-id="${item.paper.id}" ${selected.some(x => x.id === value.id) ? "disabled" : ""}>${escapeHtml(value.name)} ${selected.some(x => x.id === value.id) ? "✓" : "+"}</button></div>`).join("");
+  const editor = editorOpen ? `<div class="relation-inline-editor"><input id="library-relation-input" class="relation-search" type="search" placeholder="搜索或新建${label}…" aria-label="搜索或新建${label}" data-action="library-relation-search" data-kind="${kind}" data-paper-id="${item.paper.id}" autocomplete="off" /><div class="relation-options">${options || '<span class="muted small">暂无可用项目</span>'}<button class="relation-create-option hidden" data-action="library-relation-create" data-kind="${kind}" data-paper-id="${item.paper.id}"></button></div></div>` : "";
+  return `<div class="inspector-form-row inspector-form-row-stack"><span class="field-label">${label}</span><div class="relation-controls">${chips}<button class="relation-add" type="button" title="添加${label}" aria-label="添加${label}" data-action="library-relation-toggle" data-kind="${kind}" data-paper-id="${item.paper.id}">＋</button>${editor}</div></div>`;
 }
 
 async function addLibraryRelation(paperId: number, kind: "collection" | "tag", id: number): Promise<void> {
@@ -2144,18 +2151,15 @@ function externalPdfOutcomeLabel(outcome: string): string {
 async function refreshLibrarySelection(paperId: number) {
   selectedLibraryPaperId = paperId;
   libraryInspectorCollapsed = false;
-  libraryScope = null;
+  clearLibraryScope();
   libraryView = "all";
   await Promise.all([loadPapers(), loadLibraryData("all")]);
 }
 
 async function openPdfAttachment(attachmentId: number): Promise<void> {
-  if (preferredReader.kind === "custom" && preferredReader.applicationPath) {
-    // This is an explicit backend bridge. The RC5 UI does not launch a local
-    // process itself; the command is supplied by the backend rebase.
-    await invoke("open_pdf_with_reader", { attachmentId, applicationPath: preferredReader.applicationPath });
-    return;
-  }
+  // The backend owns the persisted reader setting and launches it without a
+  // shell. Keeping this call parameter-free also makes parent/child opening
+  // use exactly the same reader policy.
   await invoke("open_pdf", { attachmentId });
 }
 
@@ -2257,12 +2261,19 @@ function requestLibraryInlineAction(message: string, confirmText: string, cancel
 }
 
 async function attachPdfPathToPaper(paperId: number, path: string, isLibraryPaper: boolean): Promise<PaperAttachment> {
-  const existing = isLibraryPaper
-    ? (libraryPapers.find((item) => item.paper.id === paperId)?.attachments || await invoke<PaperAttachment[]>("list_paper_attachments", { paperId }))
-    : [];
+  const existing = await invoke<PaperAttachment[]>("list_paper_attachments", { paperId });
   if (existing.length) {
     const confirmed = await requestLibraryInlineAction("已有 PDF，替换关联？", "替换", "取消");
     if (!confirmed) throw new Error("已取消替换 PDF");
+    if (!isLibraryPaper) {
+      // Discovery attach also creates Library membership. Attach first and
+      // detach old relations only after the new relation succeeds, preserving
+      // the source file if the replacement fails.
+      const replacement = await invoke<PaperAttachment>("attach_discovery_pdf", { paperId, path });
+      await Promise.all(existing.filter((old) => old.id !== replacement.id).map((old) => invoke("detach_pdf", { attachmentId: old.id })));
+      expandedLibraryAttachmentPaperIds.delete(paperId);
+      return replacement;
+    }
     // A linked attachment can be safely relinked in place, so there is no
     // second relation even transiently. Managed attachments use the existing
     // safe attach/manage path, then old relations are detached without ever
@@ -3055,7 +3066,7 @@ function doSwitch(name: string) {
   if (isLibrary && ["library-all", "library-recent", "library-unfiled"].includes(name)) {
     // Standard Library views own the scope; collection/tag filters are a
     // separate sidebar mode and should not leak into Recent or Unfiled.
-    libraryScope = null;
+    clearLibraryScope();
     libraryInspectorCollapsed = window.innerWidth < 1100;
   }
   activeWorkspace = isLibrary ? "library" : "discovery";
@@ -3486,7 +3497,9 @@ async function saveSettings() {
     pdfLibraryRoot: ($("set-pdf-library-root") as HTMLInputElement).value.trim(),
     pdfNamingTemplate: ($("set-pdf-naming-template") as HTMLInputElement).value,
     pdfSubfolderRule: ($("set-pdf-subfolder-rule") as HTMLSelectElement).value as "none" | "year" | "journal/source",
-    preferredReader,
+    preferredPdfReader: ($("set-preferred-reader") as HTMLSelectElement).value === "system"
+      ? "system"
+      : ($("set-reader-application-path") as HTMLInputElement).value.trim(),
   };
   if (s.pdfFileHandlingMode !== "none" && !s.pdfLibraryRoot) {
     $("settings-msg").textContent = "copy / move 模式需要先选择 Library root directory";
@@ -3501,7 +3514,7 @@ async function saveSettings() {
   try {
     await invoke("set_settings", { s });
     settings = s;
-    localStorage.setItem(PREFERRED_READER_STORAGE_KEY, JSON.stringify(preferredReader));
+    preferredPdfReader = s.preferredPdfReader;
     abstractLang = s.defaultAbstractLang === "en" ? "en" : "zh";
     renderPapers();
     renderNextCheck();
@@ -3638,6 +3651,23 @@ async function setupListeners() {
     await refreshRecommendations();
   });
 
+  await listen("pdf://enrichment-started", (e) => {
+    const payload = e.payload as { paperId?: number };
+    setStatus(payload.paperId ? "PDF 识别中…" : "PDF 后台识别中…", "running");
+  });
+  await listen("pdf://enrichment-progress", () => {
+    setStatus("PDF 后台补全中…", "running");
+  });
+  await listen("pdf://enrichment-completed", async () => {
+    await loadLibraryData(libraryView);
+    setStatus("PDF 元数据已更新", "done");
+  });
+  await listen("pdf://enrichment-failed", async (e) => {
+    await loadLibraryData(libraryView);
+    const payload = e.payload as { error?: string };
+    setStatus(`PDF 后台识别失败：${payload.error || "未知错误"}`, "error");
+  });
+
   installLibraryInteractions();
 
   // Catalog 详情 checkbox 选择（change 冒泡 → 委托处理）
@@ -3653,15 +3683,35 @@ async function setupListeners() {
     }
     if (action === "library-relation-search") {
       const query = el.value.trim().toLowerCase();
-      el.closest(".relation-menu")?.querySelectorAll<HTMLElement>(".relation-option").forEach((option) => {
+      el.closest(".relation-inline-editor")?.querySelectorAll<HTMLElement>(".relation-option").forEach((option) => {
         option.classList.toggle("hidden", Boolean(query) && !(option.dataset.relationName || option.textContent || "").toLowerCase().includes(query));
       });
+      const create = el.closest(".relation-inline-editor")?.querySelector<HTMLButtonElement>(".relation-create-option");
+      if (create) {
+        const exact = [...(el.closest(".relation-inline-editor")?.querySelectorAll<HTMLElement>(".relation-option") || [])]
+          .some((option) => option.dataset.relationName === query);
+        create.textContent = query && !exact ? `创建并添加「${el.value.trim()}」` : "";
+        create.classList.toggle("hidden", !query || exact);
+      }
     }
     if (el.matches("#set-reader-application-path")) {
-      preferredReader = { kind: "custom", applicationPath: el.value.trim() || null };
+      preferredPdfReader = el.value.trim() || "system";
       renderPreferredReader();
     }
     if (el.matches("#set-pdf-library-root, #set-pdf-naming-template")) renderPdfTemplateExample();
+  });
+  document.addEventListener("keydown", (ev) => {
+    const input = ev.target as HTMLInputElement;
+    if (input.dataset.action !== "library-relation-search") return;
+    if (ev.key === "Escape") {
+      ev.preventDefault();
+      libraryRelationEditor = null;
+      renderLibrary();
+    } else if (ev.key === "Enter") {
+      ev.preventDefault();
+      const create = input.closest(".relation-inline-editor")?.querySelector<HTMLButtonElement>(".relation-create-option:not(.hidden)");
+      if (create) void create.click();
+    }
   });
   document.addEventListener("change", (ev) => {
     const el = ev.target as HTMLInputElement;
@@ -3691,7 +3741,7 @@ async function setupListeners() {
       return;
     }
     if (el.matches("#set-preferred-reader")) {
-      preferredReader = el.value === "custom" ? { kind: "custom", applicationPath: preferredReader.applicationPath } : { kind: "system", applicationPath: null };
+      if (el.value === "system") preferredPdfReader = "system";
       renderPreferredReader();
       return;
     }
@@ -3726,7 +3776,7 @@ async function setupListeners() {
     if (workspaceTab) {
       const workspace = workspaceTab.dataset.workspace as "discovery" | "library";
       if (workspace === "library") {
-        libraryScope = null;
+        clearLibraryScope();
         libraryInspectorCollapsed = false;
         doSwitch("library-all");
         await loadLibraryData("all");
@@ -3812,7 +3862,7 @@ async function setupListeners() {
     }
     if (t.closest("[data-action='open-library']")) {
       const card = t.closest("[data-paper-id]") as HTMLElement | null;
-      libraryScope = null;
+      clearLibraryScope();
       libraryInspectorCollapsed = false;
       doSwitch("library-all");
       await loadLibraryData("all");
@@ -3825,6 +3875,13 @@ async function setupListeners() {
     const attachPdf = t.closest("[data-action='attach-pdf']") as HTMLElement | null;
     if (attachPdf) {
       await attachPdfToPaper(Number(attachPdf.dataset.paperId));
+      return;
+    }
+    const inlineValue = t.closest<HTMLElement>(".field-value, .inspector-title-line h2, .inspector-abstract-text");
+    const inlineValueButton = inlineValue?.parentElement?.querySelector<HTMLElement>("[data-action='library-inline-edit']")
+      || inlineValue?.closest<HTMLElement>(".inspector-group")?.querySelector<HTMLElement>("[data-action='library-inline-edit']");
+    if (inlineValueButton) {
+      beginLibraryInlineEdit(Number(inlineValueButton.dataset.paperId), inlineValueButton.dataset.field as LibraryInlineField, inlineValueButton);
       return;
     }
     const inlineEdit = t.closest("[data-action='library-inline-edit']") as HTMLElement | null;
@@ -3869,14 +3926,18 @@ async function setupListeners() {
     const collectionFilter = t.closest("[data-action='library-filter-collection']") as HTMLElement | null;
     if (collectionFilter) {
       libraryScope = { kind: "collection", id: parseInt(collectionFilter.dataset.collectionId!, 10) };
-      renderLibraryNavigation();
-      if (libraryView !== "all") await loadLibraryData("all"); else renderLibrary();
+      await loadLibraryData("all");
+      const allowed = new Set(libraryTagFacets.map(({ tag }) => tag.id));
+      const nextTags = librarySelectedTagIds.filter((id) => allowed.has(id));
+      if (nextTags.length !== librarySelectedTagIds.length) {
+        librarySelectedTagIds = nextTags;
+        await loadLibraryData("all");
+      }
       return;
     }
     if (t.closest("[data-action='library-clear-scope']")) {
-      libraryScope = null;
-      renderLibraryNavigation();
-      renderLibrary();
+      clearLibraryScope();
+      await loadLibraryData("all");
       return;
     }
     const renameCollection = t.closest("[data-action='library-rename-collection']") as HTMLElement | null;
@@ -3906,7 +3967,7 @@ async function setupListeners() {
       if (!ok) return;
       try {
         await invoke("delete_library_collection", { id });
-        if (libraryScope?.kind === "collection" && libraryScope.id === id) libraryScope = null;
+        if (libraryScope?.kind === "collection" && libraryScope.id === id) clearLibraryScope();
         await loadLibraryData(libraryView);
         setStatus("文献夹已删除，文献仍保留", "done");
       } catch (err) {
@@ -3916,9 +3977,11 @@ async function setupListeners() {
     }
     const tagFilter = t.closest("[data-action='library-filter-tag']") as HTMLElement | null;
     if (tagFilter) {
-      libraryScope = { kind: "tag", id: parseInt(tagFilter.dataset.tagId!, 10) };
-      renderLibraryNavigation();
-      if (libraryView !== "all") await loadLibraryData("all"); else renderLibrary();
+      const id = parseInt(tagFilter.dataset.tagId!, 10);
+      librarySelectedTagIds = librarySelectedTagIds.includes(id)
+        ? librarySelectedTagIds.filter((tagId) => tagId !== id)
+        : [...librarySelectedTagIds, id];
+      await loadLibraryData("all");
       return;
     }
     const renameLibraryTag = t.closest("[data-action='library-rename-tag']") as HTMLElement | null;
@@ -3944,12 +4007,23 @@ async function setupListeners() {
       if (!ok) return;
       try {
         await invoke("delete_library_tag", { id });
-        if (libraryScope?.kind === "tag" && libraryScope.id === id) libraryScope = null;
+        librarySelectedTagIds = librarySelectedTagIds.filter((tagId) => tagId !== id);
         await loadLibraryData(libraryView);
         setStatus("文献标签已删除，论文仍保留", "done");
       } catch (err) {
         setStatus(`删除文献标签失败：${String(err)}`, "error");
       }
+      return;
+    }
+    const relationToggle = t.closest<HTMLElement>("[data-action='library-relation-toggle']");
+    if (relationToggle) {
+      const kind = relationToggle.dataset.kind === "collection" ? "collection" : "tag";
+      const paperId = Number(relationToggle.dataset.paperId);
+      libraryRelationEditor = libraryRelationEditor?.kind === kind && libraryRelationEditor.paperId === paperId
+        ? null
+        : { kind, paperId };
+      renderLibrary();
+      if (libraryRelationEditor) window.requestAnimationFrame(() => ($("library-relation-input") as HTMLInputElement | null)?.focus());
       return;
     }
     if (t.closest("[data-action='library-reset-columns']")) {
@@ -3964,11 +4038,11 @@ async function setupListeners() {
       relationAction.setAttribute("disabled", "");
       try {
         if (relationAction.dataset.action === "library-relation-create") {
-          const input = $(`library-new-${kind}-name`) as HTMLInputElement;
-          const name = input.value.trim();
-          if (!name) { input.focus(); return; }
-          const parent = kind === "collection" ? ($("library-new-collection-parent") as HTMLSelectElement).value : "";
-          const created = await invoke<{ id: number }>(kind === "collection" ? "create_library_collection" : "create_library_tag", kind === "collection" ? { name, parentId: parent ? Number(parent) : null } : { name, color: null });
+          const input = relationAction.closest(".relation-inline-editor")?.querySelector<HTMLInputElement>(".relation-search");
+          const name = input?.value.trim() || "";
+          if (!name) { input?.focus(); return; }
+          const created = await invoke<{ id: number }>(kind === "collection" ? "create_library_collection" : "create_library_tag", kind === "collection" ? { name, parentId: null } : { name, color: null });
+          libraryRelationEditor = null;
           await addLibraryRelation(paperId, kind, created.id);
         } else if (relationAction.dataset.action === "library-relation-add") {
           await addLibraryRelation(paperId, kind, Number(relationAction.dataset.id));

@@ -1507,6 +1507,31 @@ body.is-dragging-library-paper, body.is-dragging-library-paper * { cursor: grabb
 .settings-reader-controls { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .settings-reader-controls select { flex: 0 0 150px; }
 .settings-reader-controls input { min-width: 0; flex: 1; }
+.relation-inline-editor { flex-basis: 100%; min-width: 0; padding-top: 2px; }
+.relation-inline-editor .relation-search { margin: 0 0 3px; border: 0; border-bottom: 1px solid #dfe4ea; border-radius: 0; background: transparent; }
+.relation-inline-editor .relation-options { max-height: 150px; overflow-y: auto; }
+.relation-inline-editor .relation-option { padding: 2px 0; }
+.relation-inline-editor .relation-option button { width: 100%; padding: 4px 3px; color: #5f6872; font-size: 11px; text-align: left; }
+.relation-inline-editor .relation-option button:disabled { color: #a0a7af; }
+.relation-create-option { width: 100%; padding: 4px 3px; color: #287cff; font-size: 11px; text-align: left; }
+.relation-add { flex: 0 0 auto; padding: 0 2px; color: #888; font-size: 16px; }
+.relation-add:hover { color: #287cff; background: transparent; }
+.nav-count { flex: 0 0 auto; margin-left: auto; color: #aaa; font-size: 10px; font-variant-numeric: tabular-nums; }
+
+/* RC5 unified Library chrome: one global toolbar, with all three panes
+   beginning below it on the same content baseline. */
+body.library-workspace .app { height: 100vh; padding-top: 46px; }
+body.library-workspace .topbar { position: fixed; inset: 0 0 auto; z-index: 50; height: 46px; min-height: 46px; }
+body.library-workspace .topbar-leading { margin-left: 168px; }
+body.library-workspace .sidebar > .workspace-switcher { height: 46px; margin-top: 0; margin-bottom: 0; }
+body.library-workspace .library-view.active { min-height: 0; }
+body.library-workspace .library-drop-overlay { background: transparent; }
+
+/* The Inspector is a continuous metadata surface rather than a stack of
+   cards; separators provide grouping without heavy borders. */
+body.library-workspace .inspector-group { border: 0; border-top: 1px solid #e9e9e9; border-radius: 0; box-shadow: none; }
+body.library-workspace .attachment-row { border: 0; border-bottom: 1px solid #e9e9e9; border-radius: 0; background: transparent; }
+body.library-workspace .relation-chip { border-color: #e8e8e8; background: #fff; }
 @media (max-width: 760px) {
   .library-facet-bar { max-width: 42vw; }
   .settings-reader-controls { flex-wrap: wrap; }
