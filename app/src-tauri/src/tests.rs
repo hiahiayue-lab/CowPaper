@@ -191,14 +191,14 @@ fn test_paper_flags() {
 }
 
 #[test]
-fn test_title_year_without_exact_identity_does_not_auto_merge() {
+fn test_dedup_by_title_year() {
     let conn = mem_db();
     let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
     let c1 = candidate(None, "Some Paper Title", Some("abs"), Some("crossref"));
     let c2 = candidate(None, "Some Paper Title", None, None);
     db::upsert_paper(&conn, jid, &c1).unwrap();
-    assert!(matches!(db::upsert_paper(&conn, jid, &c2).unwrap(), UpsertOutcome::New(_)));
-    assert_eq!(db::list_papers(&conn, Some(jid), 100).unwrap().len(), 2);
+    assert!(matches!(db::upsert_paper(&conn, jid, &c2).unwrap(), UpsertOutcome::Existing { .. }));
+    assert_eq!(db::list_papers(&conn, Some(jid), 100).unwrap().len(), 1);
 }
 
 /// 联网冒烟测试（需网络，默认跳过）：真实拉取 Management Science 近 30 天并入库。

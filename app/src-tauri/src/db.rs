@@ -693,6 +693,24 @@ pub fn find_paper_id(conn: &Connection, _journal_id: i64, c: &PaperCandidate) ->
             return Ok(id);
         }
     }
+    // Provider sync retains the historical exact normalized title/year
+    // fallback for records with no scholarly identifier. External PDF import
+    // never calls this path: it keeps title/author/year as a manual candidate.
+    if c.publisher_article_id.is_none() && c.openalex_work_id.is_none() {
+        if let (Some(title), Some(year)) = (&c.title, c.year) {
+        let norm = normalize_title(title);
+        let id = conn
+            .query_row(
+                "SELECT id FROM papers WHERE journal_id = ?1 AND year = ?2 AND title_norm = ?3",
+                params![_journal_id, year, norm],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?;
+        if id.is_some() {
+            return Ok(id);
+        }
+        }
+    }
     Ok(None)
 }
 
