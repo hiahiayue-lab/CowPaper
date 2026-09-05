@@ -5387,7 +5387,8 @@ fn test_pdf_filename_sanitization_collision_and_empty_fields() {
         assert!(!name.chars().any(|ch| matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')));
         assert!(name.len() <= 180);
     }
-    assert_eq!(first.id, second.id, "同一 sha 的统一 attachment 关系应幂等");
+    assert_ne!(first.absolute_path, second.absolute_path, "collision 不得覆盖原文件");
+    assert!(second.filename.contains("(2).pdf"));
     let _ = std::fs::remove_file(source);
     let _ = std::fs::remove_file(first.absolute_path);
     let _ = std::fs::remove_file(second.absolute_path);

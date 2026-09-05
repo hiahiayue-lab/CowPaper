@@ -1284,6 +1284,18 @@ pub(crate) fn keyword_inputs_from_provider_json(source: &str, raw_json: &str) ->
     out
 }
 
+fn legacy_bibliographic_source(value: Option<&str>) -> Option<String> {
+    let value = value.map(str::trim).filter(|value| !value.is_empty())?;
+    let lower = value.to_ascii_lowercase();
+    let is_provenance = matches!(
+        lower.as_str(),
+        "external pdf import" | "crossref" | "openalex" | "publisher" | "provider" | "manual" | "sync" | "discovery"
+    ) || ["external ", "external_", "crossref:", "openalex:", "publisher:", "provider:", "source:"]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix));
+    (!is_provenance).then(|| value.to_string())
+}
+
 fn row_to_paper(row: &rusqlite::Row) -> Result<Paper> {
     let authors_json: Option<String> = row.get("authors_json")?;
     let authors: Vec<Author> = authors_json
@@ -1295,12 +1307,14 @@ fn row_to_paper(row: &rusqlite::Row) -> Result<Paper> {
         .as_deref()
         .and_then(|s| serde_json::from_str(s).ok())
         .unwrap_or_default();
+    let legacy_source: Option<String> = row.get("discovery_source")?;
     let journal_name = row
         .get::<_, Option<String>>("journal_name")?
         .and_then(|value| {
             let value = value.trim().to_string();
-            (!value.is_empty() && value != "External PDF Import").then_some(value)
-        });
+            legacy_bibliographic_source(Some(&value))
+        })
+        .or_else(|| legacy_bibliographic_source(legacy_source.as_deref()));
     Ok(Paper {
         id: row.get("id")?,
         journal_id: row.get("journal_id")?,
@@ -1963,7 +1977,7 @@ fn paper_naming_context(conn: &Connection, paper_id: i64) -> Result<PdfNamingCon
                 .map(author_display_name)
                 .filter(|value| !value.is_empty())
                 .collect();
-            let canonical_journal = row.get::<_, Option<String>>(6)?.unwrap_or_default();
+            let canonical_journal = legacy_bibliographic_source(row.get::<_, Option<String>>(6)?.as_deref()).unwrap_or_default();
             let journal = row.get::<_, Option<String>>(7)?.unwrap_or(canonical_journal);
             let source = row.get::<_, Option<String>>(8)?.or_else(|| row.get(5).ok()).unwrap_or_default();
             Ok(PdfNamingContext {
@@ -2390,9 +2404,9 @@ fn insert_file_attachment(
     if !paper_exists(conn, paper_id)? {
         return Err(rusqlite::Error::QueryReturnedNoRows);
     }
-    if let Some(existing) = list_paper_attachments(conn, paper_id)?.into_iter().find(|a| a.sha256.as_deref() == Some(&file.sha256)) {
-        return Ok(existing);
-    }
+    // The v0.2.0 one-PDF rule is a UI policy. Keep the attachment schema and
+    // low-level attach API multi-attachment capable so explicit relink/manage
+    // operations and future versions do not silently collapse relations.
     let prepared = prepare_current_pdf_storage(conn, paper_id, file)?;
     let tx = conn.unchecked_transaction()?;
     let id = match insert_attachment_row(&tx, paper_id, file, prepared.as_ref()) {
@@ -3826,7 +3840,7 @@ pub fn list_library_tag_facets(conn: &Connection, collection_id: i64) -> Result<
          FROM library_tags t
          LEFT JOIN library_item_tags lit ON lit.tag_id=t.id
          LEFT JOIN library_items li ON li.paper_id=lit.paper_id
-         LEFT JOIN library_collection_items lci
+         JOIN library_collection_items lci
            ON lci.paper_id=li.paper_id AND lci.collection_id=?1
          GROUP BY t.id
          ORDER BY t.name, t.id",

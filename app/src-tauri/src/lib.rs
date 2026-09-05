@@ -1189,7 +1189,7 @@ fn import_pdf(
     state: State<Db>,
 ) -> Result<models::ExternalPdfImportResult, String> {
     let conn = state.inner().lock().unwrap();
-    let result = db::import_external_pdf_fast(&conn, &path, confirmed_paper_id).map_err(|e| e.to_string())?;
+    let mut result = db::import_external_pdf_fast(&conn, &path, confirmed_paper_id).map_err(|e| e.to_string())?;
     if result.enrichment_status == "queued" {
         if let (Some(paper_id), Some(attachment), Some(doi)) = (
             result.paper_id,
