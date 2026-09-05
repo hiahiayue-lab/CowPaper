@@ -3316,17 +3316,16 @@ pub fn import_external_pdf_fast(
 ) -> Result<crate::models::ExternalPdfImportResult> {
     let file = linked_file(path)?;
     let mut result = import_prepared_external_pdf(conn, file, confirmed_paper_id, Vec::new())?;
-    if let (Some(paper_id), Some(attachment), Some(doi)) = (
+    if let (Some(paper_id), Some(attachment)) = (
         result.paper_id,
         result.attachment.as_ref(),
-        result.metadata.doi.as_deref(),
     ) {
-        result.enrichment_status = enqueue_pdf_enrichment(conn, paper_id, attachment.id, doi)?;
+        result.enrichment_status = enqueue_pdf_enrichment(conn, paper_id, attachment.id, result.metadata.doi.as_deref())?;
     }
     Ok(result)
 }
 
-fn enqueue_pdf_enrichment(conn: &Connection, paper_id: i64, attachment_id: i64, doi: &str) -> Result<String> {
+fn enqueue_pdf_enrichment(conn: &Connection, paper_id: i64, attachment_id: i64, doi: Option<&str>) -> Result<String> {
     let now = now_utc();
     conn.execute(
         "INSERT INTO pdf_enrichment_jobs(paper_id,attachment_id,doi,status,created_at,updated_at)
@@ -3336,7 +3335,10 @@ fn enqueue_pdf_enrichment(conn: &Connection, paper_id: i64, attachment_id: i64, 
            status=CASE WHEN pdf_enrichment_jobs.status='completed' THEN 'completed' ELSE 'queued' END,
            error=CASE WHEN pdf_enrichment_jobs.status='completed' THEN pdf_enrichment_jobs.error ELSE NULL END,
            updated_at=excluded.updated_at",
-        params![paper_id, attachment_id, doi, now],
+        // v18 initially defined this column as NOT NULL. An empty value is a
+        // durable "DOI not known yet" marker, keeping upgrades additive while
+        // still allowing provisional shells to be enriched later.
+        params![paper_id, attachment_id, doi.unwrap_or(""), now],
     )?;
     conn.query_row(
         "SELECT status FROM pdf_enrichment_jobs WHERE attachment_id=?1",
@@ -3353,7 +3355,7 @@ pub fn run_pdf_enrichment<R: Runtime>(
     app: &AppHandle<R>,
     paper_id: i64,
     attachment_id: i64,
-    doi: &str,
+    requested_doi: Option<&str>,
 ) {
     let emit = |event: &str, payload: serde_json::Value| {
         if let Err(error) = app.emit(event, payload) {
@@ -3369,8 +3371,32 @@ pub fn run_pdf_enrichment<R: Runtime>(
         ).unwrap_or(0);
         if claimed != 1 { return; }
     }
-    emit("pdf://enrichment-started", serde_json::json!({"paperId": paper_id, "attachmentId": attachment_id}));
-    let providers = external_provider_candidates(doi);
+    let local_metadata = (|| -> Result<crate::models::ExternalPdfMetadata> {
+        let conn = db.lock().map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let (path, filename): (String, String) = conn.query_row(
+            "SELECT absolute_path, filename FROM paper_attachments WHERE id=?1 AND paper_id=?2",
+            params![attachment_id, paper_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        parse_external_pdf_metadata(Path::new(&path), &filename)
+    })();
+    let metadata = match local_metadata {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            let message = error.to_string();
+            if let Ok(conn) = db.lock() {
+                let _ = conn.execute(
+                    "UPDATE pdf_enrichment_jobs SET status='failed', error=?1, updated_at=?2 WHERE attachment_id=?3",
+                    params![message, now_utc(), attachment_id],
+                );
+            }
+            emit("pdf://enrichment-failed", serde_json::json!({"paperId": paper_id, "attachmentId": attachment_id, "error": message}));
+            return;
+        }
+    };
+    let doi = requested_doi.map(str::to_string).or(metadata.doi.clone());
+    emit("pdf://enrichment-started", serde_json::json!({"paperId": paper_id, "attachmentId": attachment_id, "hasDoi": doi.is_some()}));
+    let providers = doi.as_deref().filter(|value| !value.trim().is_empty()).map(external_provider_candidates).unwrap_or_default();
     emit("pdf://enrichment-progress", serde_json::json!({"paperId": paper_id, "attachmentId": attachment_id, "stage": "providersFetched", "providerCount": providers.len()}));
     let write_result = (|| -> Result<usize> {
         let conn = db.lock().map_err(|_| rusqlite::Error::InvalidQuery)?;
@@ -3379,12 +3405,49 @@ pub fn run_pdf_enrichment<R: Runtime>(
             params![paper_id, attachment_id],
             |r| r.get(0),
         ).optional()?;
-        if current.as_deref() != Some(doi) {
+        let requested_matches = requested_doi.is_none() || current.as_deref() == requested_doi;
+        if !requested_matches {
             return Err(rusqlite::Error::InvalidParameterName("pdf_enrichment_doi_mismatch".into()));
         }
+        if let Some(doi) = doi.as_deref() {
+            if current.as_deref().is_none() {
+                let owner: Option<i64> = conn.query_row(
+                    "SELECT id FROM papers WHERE normalized_doi=?1 AND id<>?2",
+                    params![doi, paper_id],
+                    |r| r.get(0),
+                ).optional()?;
+                if owner.is_some() {
+                    return Err(rusqlite::Error::InvalidParameterName("exact DOI duplicate requires manual review".into()));
+                }
+                conn.execute(
+                    "UPDATE papers SET normalized_doi=?1, original_doi=COALESCE(original_doi,?1), url=COALESCE(url,?2), updated_at=?3 WHERE id=?4 AND normalized_doi IS NULL",
+                    params![doi, format!("https://doi.org/{doi}"), now_utc(), paper_id],
+                )?;
+            } else if current.as_deref() != Some(doi) {
+                return Err(rusqlite::Error::InvalidParameterName("pdf_enrichment_doi_mismatch".into()));
+            }
+        }
+        let local_candidate = crate::models::PaperCandidate {
+            normalized_doi: doi.clone(),
+            original_doi: doi.clone(),
+            title: metadata.title.clone(),
+            authors: metadata.authors.clone(),
+            published_date: metadata.publication_date.clone(),
+            year: metadata.year,
+            abstract_text: metadata.abstract_text.clone(),
+            abstract_source: (metadata.abstract_text.is_some()).then(|| "pdf_structured".to_string()),
+            abstract_source_url: None,
+            url: doi.as_deref().map(|value| format!("https://doi.org/{value}")),
+            publisher_article_id: metadata.scholarly_id.clone(),
+            openalex_work_id: None,
+            discovery_source: "external_pdf_import".to_string(),
+            source_id: doi.clone(),
+            raw_json: None,
+        };
+        fill_missing_canonical_metadata_from_candidate(&conn, paper_id, &local_candidate)?;
         let mut enriched = 0;
         for (source, candidate) in &providers {
-            if candidate.normalized_doi.as_deref() != Some(doi) { continue; }
+            if candidate.normalized_doi.as_deref() != doi.as_deref() { continue; }
             fill_missing_canonical_metadata_from_candidate(&conn, paper_id, candidate)?;
             insert_source_record(&conn, paper_id, source, candidate.source_id.as_deref(), candidate.raw_json.as_deref())?;
             enriched += 1;

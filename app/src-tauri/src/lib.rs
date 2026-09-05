@@ -1191,17 +1191,17 @@ fn import_pdf(
     let conn = state.inner().lock().unwrap();
     let mut result = db::import_external_pdf_fast(&conn, &path, confirmed_paper_id).map_err(|e| e.to_string())?;
     if result.enrichment_status == "queued" {
-        if let (Some(paper_id), Some(attachment), Some(doi)) = (
+        if let (Some(paper_id), Some(attachment)) = (
             result.paper_id,
             result.attachment.as_ref(),
-            result.metadata.doi.clone(),
         ) {
             let db = state.inner().clone();
             let app2 = app.clone();
             let attachment_id = attachment.id;
+            let doi = result.metadata.doi.clone();
             let worker = std::thread::Builder::new()
                 .name("cowpaper-pdf-enrichment".to_string())
-                .spawn(move || db::run_pdf_enrichment(&db, &app2, paper_id, attachment_id, &doi));
+                .spawn(move || db::run_pdf_enrichment(&db, &app2, paper_id, attachment_id, doi.as_deref()));
             if let Err(error) = worker {
                 let message = format!("PDF enrichment worker 启动失败: {error}");
                 let _ = conn.execute(

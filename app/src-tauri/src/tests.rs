@@ -6073,6 +6073,23 @@ fn rc5_fast_first_commits_attachment_and_queues_exact_doi_enrichment() {
 }
 
 #[test]
+fn rc5_fast_first_queues_provisional_shell_without_doi() {
+    let conn = mem_db();
+    let path = test_pdf_path("rc5-fast-first-no-doi", "%PDF-1.7\n/Title (Provisional shell)\n");
+    let result = db::import_external_pdf_fast(&conn, path.to_str().unwrap(), None).unwrap();
+    assert_eq!(result.outcome, "createdExternalPaper");
+    assert_eq!(result.enrichment_status, "queued");
+    let attachment_id = result.attachment.unwrap().id;
+    let stored_doi: String = conn.query_row(
+        "SELECT doi FROM pdf_enrichment_jobs WHERE attachment_id=?1",
+        params![attachment_id],
+        |r| r.get(0),
+    ).unwrap();
+    assert!(stored_doi.is_empty(), "无 DOI 的 provisional shell 也必须排队后台 enrichment");
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn rc5_doi_url_overrides_are_library_only_and_effective() {
     let conn = mem_db();
     let paper_id = test_paper(&conn, "10.5555/canonical", "Canonical Paper");

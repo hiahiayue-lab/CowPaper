@@ -635,8 +635,9 @@ pub struct ExternalPdfImportResult {
     pub candidate: Option<ExternalPdfCandidate>,
     pub candidates: Vec<ExternalPdfCandidate>,
     pub requires_confirmation: bool,
-    /// `ready` means local PDF work is complete. A DOI-bearing import may be
-    /// enriched asynchronously after this result is returned.
+    /// `ready` means no attachment was created (for example, manual
+    /// confirmation is still required); an attached PDF is queued for
+    /// asynchronous local/provider enrichment after this result returns.
     #[serde(default)]
     pub enrichment_status: String,
     #[serde(default)]
