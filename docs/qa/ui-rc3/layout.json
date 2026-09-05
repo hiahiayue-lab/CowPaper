@@ -1,0 +1,230 @@
+[
+  {
+    "width": 1440,
+    "ready": true,
+    "rows": 27,
+    "documentOverflow": false,
+    "paneWidth": 971,
+    "paneScrollWidth": 971,
+    "sidebar": 168,
+    "inspector": 300,
+    "inspectorDisplay": "block",
+    "columns": [
+      {
+        "name": "title",
+        "width": 290.1875,
+        "visible": true
+      },
+      {
+        "name": "note",
+        "width": 158.28125,
+        "visible": true
+      },
+      {
+        "name": "source",
+        "width": 197.859375,
+        "visible": true
+      },
+      {
+        "name": "year",
+        "width": 68,
+        "visible": true
+      },
+      {
+        "name": "authors",
+        "width": 184.65625,
+        "visible": true
+      }
+    ]
+  },
+  {
+    "width": 1512,
+    "ready": true,
+    "rows": 27,
+    "documentOverflow": false,
+    "paneWidth": 1043,
+    "paneScrollWidth": 1043,
+    "sidebar": 168,
+    "inspector": 300,
+    "inspectorDisplay": "block",
+    "columns": [
+      {
+        "name": "title",
+        "width": 315.328125,
+        "visible": true
+      },
+      {
+        "name": "note",
+        "width": 172,
+        "visible": true
+      },
+      {
+        "name": "source",
+        "width": 215,
+        "visible": true
+      },
+      {
+        "name": "year",
+        "width": 68,
+        "visible": true
+      },
+      {
+        "name": "authors",
+        "width": 200.65625,
+        "visible": true
+      }
+    ]
+  },
+  {
+    "width": 1536,
+    "ready": true,
+    "rows": 27,
+    "documentOverflow": false,
+    "paneWidth": 1067,
+    "paneScrollWidth": 1067,
+    "sidebar": 168,
+    "inspector": 300,
+    "inspectorDisplay": "block",
+    "columns": [
+      {
+        "name": "title",
+        "width": 323.703125,
+        "visible": true
+      },
+      {
+        "name": "note",
+        "width": 176.578125,
+        "visible": true
+      },
+      {
+        "name": "source",
+        "width": 220.703125,
+        "visible": true
+      },
+      {
+        "name": "year",
+        "width": 68,
+        "visible": true
+      },
+      {
+        "name": "authors",
+        "width": 206,
+        "visible": true
+      }
+    ]
+  },
+  {
+    "width": 1000,
+    "ready": true,
+    "rows": 27,
+    "documentOverflow": false,
+    "paneWidth": 832,
+    "paneScrollWidth": 832,
+    "sidebar": 168,
+    "inspector": 0,
+    "inspectorDisplay": "none",
+    "columns": [
+      {
+        "name": "title",
+        "width": 241.640625,
+        "visible": true
+      },
+      {
+        "name": "note",
+        "width": 131.8125,
+        "visible": true
+      },
+      {
+        "name": "source",
+        "width": 164.765625,
+        "visible": true
+      },
+      {
+        "name": "year",
+        "width": 68,
+        "visible": true
+      },
+      {
+        "name": "authors",
+        "width": 153.78125,
+        "visible": true
+      }
+    ]
+  },
+  {
+    "width": 740,
+    "ready": true,
+    "rows": 27,
+    "documentOverflow": false,
+    "paneWidth": 572,
+    "paneScrollWidth": 572,
+    "sidebar": 168,
+    "inspector": 0,
+    "inspectorDisplay": "none",
+    "columns": [
+      {
+        "name": "title",
+        "width": 191.515625,
+        "visible": true
+      },
+      {
+        "name": "note",
+        "width": 0,
+        "visible": false
+      },
+      {
+        "name": "source",
+        "width": 130.59375,
+        "visible": true
+      },
+      {
+        "name": "year",
+        "width": 68,
+        "visible": true
+      },
+      {
+        "name": "authors",
+        "width": 121.890625,
+        "visible": true
+      }
+    ]
+  },
+  {
+    "width": 600,
+    "ready": true,
+    "rows": 27,
+    "documentOverflow": false,
+    "paneWidth": 462,
+    "paneScrollWidth": 462,
+    "sidebar": 138,
+    "inspector": 0,
+    "inspectorDisplay": "none",
+    "columns": [
+      {
+        "name": "title",
+        "width": 227.125,
+        "visible": true
+      },
+      {
+        "name": "note",
+        "width": 0,
+        "visible": false
+      },
+      {
+        "name": "source",
+        "width": 154.875,
+        "visible": true
+      },
+      {
+        "name": "year",
+        "width": 48,
+        "visible": true
+      },
+      {
+        "name": "authors",
+        "width": 0,
+        "visible": false
+      }
+    ]
+  }
+]

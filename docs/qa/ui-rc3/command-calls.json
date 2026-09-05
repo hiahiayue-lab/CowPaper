@@ -1,0 +1,325 @@
+[
+  {
+    "cmd": "list_library_papers",
+    "args": {
+      "view": "all"
+    }
+  },
+  {
+    "cmd": "list_library_collections",
+    "args": {}
+  },
+  {
+    "cmd": "list_library_tags",
+    "args": {}
+  },
+  {
+    "cmd": "get_current_recommendation_run",
+    "args": {}
+  },
+  {
+    "cmd": "list_today_missing_papers",
+    "args": {}
+  },
+  {
+    "cmd": "add_paper_to_collection",
+    "args": {
+      "paperId": 1,
+      "collectionId": 3
+    }
+  },
+  {
+    "cmd": "list_library_papers",
+    "args": {
+      "view": "all"
+    }
+  },
+  {
+    "cmd": "list_library_collections",
+    "args": {}
+  },
+  {
+    "cmd": "list_library_tags",
+    "args": {}
+  },
+  {
+    "cmd": "get_current_recommendation_run",
+    "args": {}
+  },
+  {
+    "cmd": "list_today_missing_papers",
+    "args": {}
+  },
+  {
+    "cmd": "get_library_membership",
+    "args": {
+      "paperId": 1
+    }
+  },
+  {
+    "cmd": "set_paper_collections",
+    "args": {
+      "paperId": 1,
+      "collectionIds": [
+        1
+      ]
+    }
+  },
+  {
+    "cmd": "list_library_papers",
+    "args": {
+      "view": "all"
+    }
+  },
+  {
+    "cmd": "list_library_collections",
+    "args": {}
+  },
+  {
+    "cmd": "list_library_tags",
+    "args": {}
+  },
+  {
+    "cmd": "get_current_recommendation_run",
+    "args": {}
+  },
+  {
+    "cmd": "list_today_missing_papers",
+    "args": {}
+  },
+  {
+    "cmd": "create_library_collection",
+    "args": {
+      "name": "QA child",
+      "parentId": 1
+    }
+  },
+  {
+    "cmd": "add_paper_to_collection",
+    "args": {
+      "paperId": 1,
+      "collectionId": 106
+    }
+  },
+  {
+    "cmd": "list_library_papers",
+    "args": {
+      "view": "all"
+    }
+  },
+  {
+    "cmd": "list_library_collections",
+    "args": {}
+  },
+  {
+    "cmd": "list_library_tags",
+    "args": {}
+  },
+  {
+    "cmd": "get_current_recommendation_run",
+    "args": {}
+  },
+  {
+    "cmd": "list_today_missing_papers",
+    "args": {}
+  },
+  {
+    "cmd": "create_library_tag",
+    "args": {
+      "name": "QA tag",
+      "color": null
+    }
+  },
+  {
+    "cmd": "add_paper_library_tag",
+    "args": {
+      "paperId": 1,
+      "tagId": 107
+    }
+  },
+  {
+    "cmd": "list_library_papers",
+    "args": {
+      "view": "all"
+    }
+  },
+  {
+    "cmd": "list_library_collections",
+    "args": {}
+  },
+  {
+    "cmd": "list_library_tags",
+    "args": {}
+  },
+  {
+    "cmd": "get_current_recommendation_run",
+    "args": {}
+  },
+  {
+    "cmd": "list_today_missing_papers",
+    "args": {}
+  },
+  {
+    "cmd": "get_library_membership",
+    "args": {
+      "paperId": 1
+    }
+  },
+  {
+    "cmd": "set_paper_library_tags",
+    "args": {
+      "paperId": 1,
+      "tagIds": [
+        4,
+        107
+      ]
+    }
+  },
+  {
+    "cmd": "list_library_papers",
+    "args": {
+      "view": "all"
+    }
+  },
+  {
+    "cmd": "list_library_collections",
+    "args": {}
+  },
+  {
+    "cmd": "list_library_tags",
+    "args": {}
+  },
+  {
+    "cmd": "get_current_recommendation_run",
+    "args": {}
+  },
+  {
+    "cmd": "list_today_missing_papers",
+    "args": {}
+  },
+  {
+    "cmd": "delete_library_collection",
+    "args": {
+      "id": 106
+    }
+  },
+  {
+    "cmd": "list_library_papers",
+    "args": {
+      "view": "all"
+    }
+  },
+  {
+    "cmd": "list_library_collections",
+    "args": {}
+  },
+  {
+    "cmd": "list_library_tags",
+    "args": {}
+  },
+  {
+    "cmd": "get_current_recommendation_run",
+    "args": {}
+  },
+  {
+    "cmd": "list_today_missing_papers",
+    "args": {}
+  },
+  {
+    "cmd": "delete_library_tag",
+    "args": {
+      "id": 107
+    }
+  },
+  {
+    "cmd": "list_library_papers",
+    "args": {
+      "view": "all"
+    }
+  },
+  {
+    "cmd": "list_library_collections",
+    "args": {}
+  },
+  {
+    "cmd": "list_library_tags",
+    "args": {}
+  },
+  {
+    "cmd": "get_current_recommendation_run",
+    "args": {}
+  },
+  {
+    "cmd": "list_today_missing_papers",
+    "args": {}
+  },
+  {
+    "cmd": "has_api_key",
+    "args": {}
+  },
+  {
+    "cmd": "translate_library_title",
+    "args": {
+      "paperId": 1,
+      "model": "deepseek-v4-flash"
+    }
+  },
+  {
+    "cmd": "add_paper_to_collection",
+    "args": {
+      "paperId": 1,
+      "collectionId": 4
+    }
+  },
+  {
+    "cmd": "list_library_papers",
+    "args": {
+      "view": "all"
+    }
+  },
+  {
+    "cmd": "list_library_collections",
+    "args": {}
+  },
+  {
+    "cmd": "list_library_tags",
+    "args": {}
+  },
+  {
+    "cmd": "get_current_recommendation_run",
+    "args": {}
+  },
+  {
+    "cmd": "list_today_missing_papers",
+    "args": {}
+  },
+  {
+    "cmd": "add_paper_library_tag",
+    "args": {
+      "paperId": 1,
+      "tagId": 3
+    }
+  },
+  {
+    "cmd": "list_library_papers",
+    "args": {
+      "view": "all"
+    }
+  },
+  {
+    "cmd": "list_library_collections",
+    "args": {}
+  },
+  {
+    "cmd": "list_library_tags",
+    "args": {}
+  },
+  {
+    "cmd": "get_current_recommendation_run",
+    "args": {}
+  },
+  {
+    "cmd": "list_today_missing_papers",
+    "args": {}
+  }
+]
