@@ -1,0 +1,86 @@
+[
+  {
+    "name": "missing chinese title action",
+    "result": true
+  },
+  {
+    "name": "canonical/effective chinese title has no translation action",
+    "result": true
+  },
+  {
+    "name": "missing effective abstract never falls back to canonical/AI summary",
+    "result": true
+  },
+  {
+    "name": "add collection preserves prior membership",
+    "result": true
+  },
+  {
+    "name": "remove one collection relation preserves other",
+    "result": true
+  },
+  {
+    "name": "create child collection and add to paper",
+    "result": true
+  },
+  {
+    "name": "parent with child deletion blocked before command",
+    "result": true
+  },
+  {
+    "name": "create tag then add preserves original tags",
+    "result": true
+  },
+  {
+    "name": "remove tag relation leaves other tag",
+    "result": true
+  },
+  {
+    "name": "delete collection in inspector invokes backend and retains paper",
+    "result": true
+  },
+  {
+    "name": "delete tag in inspector invokes backend and retains paper",
+    "result": true
+  },
+  {
+    "name": "title translation calls real contract and surfaces failure without fake success",
+    "result": true
+  },
+  {
+    "name": "collection drag hover highlight",
+    "result": true
+  },
+  {
+    "name": "drop collection ADD retains original",
+    "result": true
+  },
+  {
+    "name": "tag drag hover highlight",
+    "result": true
+  },
+  {
+    "name": "drop tag ADD retains original",
+    "result": true
+  },
+  {
+    "name": "column resize still fits container",
+    "result": true
+  },
+  {
+    "name": "reset restores default weights",
+    "result": true
+  },
+  {
+    "name": "narrow inspector auto-collapses",
+    "result": true
+  },
+  {
+    "name": "narrow inspector can reopen overlay",
+    "result": true
+  },
+  {
+    "name": "narrow inspector closes",
+    "result": true
+  }
+]

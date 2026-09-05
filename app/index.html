@@ -10,7 +10,10 @@
   <body>
     <div class="app">
       <aside class="sidebar">
-        <div class="brand">CowPaper<span class="muted">论文工作台</span></div>
+        <div class="workspace-switcher" role="tablist" aria-label="工作空间">
+              <button class="workspace-tab active" data-workspace="discovery">发现</button>
+              <button class="workspace-tab" data-workspace="library">文献库</button>
+            </div>
         <nav class="nav workspace-nav" data-workspace-nav="discovery">
           <button class="nav-item active" data-view="recommend">今日</button>
           <button class="nav-item" data-view="recommend-history">历史</button>
@@ -20,10 +23,6 @@
           <button class="nav-item" data-view="activity">活动</button>
         </nav>
         <nav class="nav workspace-nav hidden" data-workspace-nav="library">
-          <label class="library-search" title="搜索功能将在 Search backend 接入后启用">
-            <span aria-hidden="true">⌕</span>
-            <input type="search" placeholder="搜索文献" aria-label="搜索文献" disabled />
-          </label>
           <div class="nav-section-label">文库</div>
           <button class="nav-item library-nav-item-view active" data-view="library-all"><span class="nav-symbol" aria-hidden="true">▤</span>全部文献</button>
           <button class="nav-item library-nav-item-view" data-view="library-recent"><span class="nav-symbol" aria-hidden="true">◷</span>最近收录</button>
@@ -39,13 +38,11 @@
         <header class="topbar">
           <div class="topbar-leading">
             <div class="topbar-title" id="view-title">今日</div>
-            <div class="workspace-switcher" role="tablist" aria-label="工作空间">
-              <button class="workspace-tab active" data-workspace="discovery">发现</button>
-              <button class="workspace-tab" data-workspace="library">文献库</button>
-            </div>
+
           </div>
           <div class="topbar-actions">
-            <span id="status" class="status idle" aria-live="polite">就绪</span>
+            <span id="status" class="status idle" role="status" aria-live="polite">就绪</span>
+            <button type="button" class="toolbar-action library-only" data-action="library-import-pdf">＋ Import PDF</button>
             <div class="toolbar-status-wrap">
               <button type="button" id="work-status" class="work-status idle" title="查看同步与 AI 状态" aria-expanded="false"><span class="status-dot" aria-hidden="true"></span><span class="toolbar-status-label">已更新</span></button>
               <div id="work-status-popover" class="status-popover hidden" role="status">
@@ -56,6 +53,7 @@
             </div>
             <button type="button" id="btn-sync-main" class="toolbar-action" title="检查新论文"><span class="toolbar-action-icon" aria-hidden="true">↻</span>检查新论文</button>
             <button type="button" id="btn-ai-main" class="toolbar-action" title="运行 AI 分析"><span class="toolbar-action-icon" aria-hidden="true">✦</span>AI</button>
+            <button type="button" class="icon-button library-only" title="Reset column widths" aria-label="Reset column widths" data-action="library-reset-columns">↔</button><button type="button" class="icon-button library-only" title="切换 Inspector" aria-label="切换 Inspector" data-action="library-toggle-inspector">◧</button>
             <button type="button" id="btn-settings-global" class="icon-button" title="设置" aria-label="设置">⚙</button>
           </div>
         </header>
@@ -114,18 +112,10 @@
         <section id="view-library-all" class="view library-view">
           <div id="library-layout" class="library-layout">
             <div id="library-list-pane" class="library-list-pane">
-              <div class="library-list-head">
-                <div>
-                  <div class="eyebrow">文献库</div>
-                  <h2 id="library-view-title">全部文献</h2>
-                  <span id="library-count" class="muted small"></span>
-                </div>
-                <div class="library-toolbar-actions"><button type="button" class="ghost small" data-action="library-import-pdf">＋ 导入 PDF</button><button type="button" class="icon-button" title="刷新文献库" aria-label="刷新文献库" data-action="library-refresh">↻</button><button type="button" class="icon-button" title="切换 Inspector" aria-label="切换 Inspector" data-action="library-toggle-inspector">◧</button></div>
-              </div>
               <div class="library-table-head" role="row">
                 <span class="library-column-header" data-column="title"><span>标题</span><span class="column-resizer" data-column-resize="title" aria-hidden="true"></span></span>
                 <span class="library-column-header" data-column="note"><span>备注</span><span class="column-resizer" data-column-resize="note" aria-hidden="true"></span></span>
-                <span class="library-column-header" data-column="source"><span>来源</span><span class="column-resizer" data-column-resize="source" aria-hidden="true"></span></span>
+                <span class="library-column-header" data-column="source"><span>期刊</span><span class="column-resizer" data-column-resize="source" aria-hidden="true"></span></span>
                 <span class="library-column-header" data-column="year"><span>年份</span><span class="column-resizer" data-column-resize="year" aria-hidden="true"></span></span>
                 <span class="library-column-header" data-column="authors"><span>作者</span><span class="column-resizer" data-column-resize="authors" aria-hidden="true"></span></span>
               </div>
