@@ -98,7 +98,7 @@ pub fn open(path: &Path) -> Result<Connection> {
 /// v16 为 canonical bibliographic keywords。
 /// 生产构建中仅由迁移系统隐式使用；测试中直接断言。
 #[allow(dead_code)]
-pub const SCHEMA_VERSION: i64 = 16;
+pub const SCHEMA_VERSION: i64 = 17;
 
 pub fn init(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
@@ -656,7 +656,7 @@ pub fn get_last_successful_sync_at(conn: &Connection, id: i64) -> Result<Option<
 // ---------- Papers ----------
 
 /// 依据需求书 §8.2 的去重优先级查找已有论文。
-pub fn find_paper_id(conn: &Connection, journal_id: i64, c: &PaperCandidate) -> Result<Option<i64>> {
+pub fn find_paper_id(conn: &Connection, _journal_id: i64, c: &PaperCandidate) -> Result<Option<i64>> {
     if let Some(doi) = &c.normalized_doi {
         let id = conn
             .query_row(
@@ -672,8 +672,8 @@ pub fn find_paper_id(conn: &Connection, journal_id: i64, c: &PaperCandidate) -> 
     if let Some(paid) = &c.publisher_article_id {
         let id = conn
             .query_row(
-                "SELECT id FROM papers WHERE publisher_article_id = ?1",
-                params![paid],
+                "SELECT id FROM papers WHERE publisher_article_id = ?1 AND (normalized_doi IS NULL OR ?2 IS NULL OR normalized_doi=?2)",
+                params![paid,c.normalized_doi],
                 |r| r.get::<_, i64>(0),
             )
             .optional()?;
@@ -684,21 +684,8 @@ pub fn find_paper_id(conn: &Connection, journal_id: i64, c: &PaperCandidate) -> 
     if let Some(wid) = &c.openalex_work_id {
         let id = conn
             .query_row(
-                "SELECT id FROM papers WHERE openalex_work_id = ?1",
-                params![wid],
-                |r| r.get::<_, i64>(0),
-            )
-            .optional()?;
-        if id.is_some() {
-            return Ok(id);
-        }
-    }
-    if let (Some(title), Some(year)) = (&c.title, c.year) {
-        let norm = normalize_title(title);
-        let id = conn
-            .query_row(
-                "SELECT id FROM papers WHERE journal_id = ?1 AND year = ?2 AND title_norm = ?3",
-                params![journal_id, year, norm],
+                "SELECT id FROM papers WHERE openalex_work_id = ?1 AND (normalized_doi IS NULL OR ?2 IS NULL OR normalized_doi=?2)",
+                params![wid,c.normalized_doi],
                 |r| r.get::<_, i64>(0),
             )
             .optional()?;
@@ -788,7 +775,8 @@ fn merge_abstract(conn: &Connection, paper_id: i64, c: &PaperCandidate) -> Resul
             });
         }
     }
-    if let Some((t, q, r)) = &new_cand {
+    let protect_provider = cur_source.as_deref().is_some_and(is_provider_abstract_source) && !is_provider_abstract_source(&cand_source);
+    if let Some((t, q, r)) = new_cand.as_ref().filter(|_| !protect_provider) {
         candidates.push(crate::abstract_quality::AbstractCandidate {
             source: cand_source.clone(),
             text: t.clone(),
@@ -861,6 +849,7 @@ fn merge_abstract(conn: &Connection, paper_id: i64, c: &PaperCandidate) -> Resul
     // 摘要被填/升级/清空后，语义状态必须与 content_kind + 摘要有无保持一致。
     fill_content_kind_if_unknown(conn, paper_id, c)?;
     refresh_abstract_status(conn, paper_id)?;
+    update_abstract_provenance(conn, paper_id)?;
 
     Ok((filled, upgraded))
 }
@@ -963,6 +952,7 @@ pub fn mark_abstract_recovery_attempt(conn: &Connection, paper_id: i64) -> Resul
 
 /// 填充非摘要缺失字段（从 fill_missing_fields 拆出，保持原有 §8.3 行为）。
 fn fill_other_fields(conn: &Connection, id: i64, c: &PaperCandidate) -> Result<()> {
+    fill_publication_metadata(conn, id, c)?;
     let authors_json = serde_json::to_string(&c.authors).unwrap_or_else(|_| "[]".to_string());
     conn.execute(
         "UPDATE papers SET
@@ -999,6 +989,7 @@ fn fill_other_fields(conn: &Connection, id: i64, c: &PaperCandidate) -> Result<(
 pub fn upsert_paper(conn: &Connection, journal_id: i64, c: &PaperCandidate) -> Result<UpsertOutcome> {
     if let Some(existing_id) = find_paper_id(conn, journal_id, c)? {
         let (abstract_filled, abstract_upgraded) = merge_abstract(conn, existing_id, c)?;
+        update_abstract_provenance(conn, existing_id)?;
         return Ok(UpsertOutcome::Existing {
             id: existing_id,
             abstract_filled,
@@ -1093,6 +1084,8 @@ fn insert_paper_without_identity_merge(conn: &Connection, journal_id: i64, c: &P
         ],
     )?;
     let id = conn.last_insert_rowid();
+    fill_publication_metadata(conn, id, c)?;
+    update_abstract_provenance(conn, id)?;
     // 记录初始来源候选
     if let (Some(t), Some(src)) = (&abs_norm, &c.abstract_source) {
         let (q, r) = crate::abstract_quality::assess_abstract_quality(t);
@@ -1285,6 +1278,12 @@ fn row_to_paper(row: &rusqlite::Row) -> Result<Paper> {
         id: row.get("id")?,
         journal_id: row.get("journal_id")?,
         journal_name: row.get("journal_name")?,
+        publisher: row.get("publisher")?,
+        volume: row.get("volume")?,
+        issue: row.get("issue")?,
+        pages: row.get("pages")?,
+        abstract_provenance: row.get("abstract_provenance")?,
+
         normalized_doi: row.get("normalized_doi")?,
         original_doi: row.get("original_doi")?,
         title: row.get("title")?,
@@ -1328,7 +1327,7 @@ fn row_to_paper(row: &rusqlite::Row) -> Result<Paper> {
 
 pub fn list_papers(conn: &Connection, journal_id: Option<i64>, limit: i64) -> Result<Vec<Paper>> {
     let sql = format!(
-        "SELECT p.*, j.name AS journal_name FROM papers p
+        "SELECT p.*, COALESCE(p.container_title, j.name) AS journal_name FROM papers p
          JOIN journals j ON j.id = p.journal_id
          {} ORDER BY p.published_date DESC, p.id DESC LIMIT ?1",
         if journal_id.is_some() { "WHERE p.journal_id = ?2" } else { "" }
@@ -1348,9 +1347,9 @@ pub fn list_papers(conn: &Connection, journal_id: Option<i64>, limit: i64) -> Re
 
 pub fn list_papers_for_first_seen_cycle(conn: &Connection, cycle_key: &str, missing_only: bool) -> Result<Vec<Paper>> {
     let sql = if missing_only {
-        "SELECT p.*,j.name AS journal_name FROM papers p JOIN journals j ON j.id=p.journal_id WHERE p.first_seen_cycle=?1 AND p.first_seen_abstract_missing=1 ORDER BY p.id DESC"
+        "SELECT p.*,COALESCE(p.container_title, j.name) AS journal_name FROM papers p JOIN journals j ON j.id=p.journal_id WHERE p.first_seen_cycle=?1 AND p.first_seen_abstract_missing=1 ORDER BY p.id DESC"
     } else {
-        "SELECT p.*,j.name AS journal_name FROM papers p JOIN journals j ON j.id=p.journal_id WHERE p.first_seen_cycle=?1 ORDER BY p.id DESC"
+        "SELECT p.*,COALESCE(p.container_title, j.name) AS journal_name FROM papers p JOIN journals j ON j.id=p.journal_id WHERE p.first_seen_cycle=?1 ORDER BY p.id DESC"
     };
     let mut stmt = conn.prepare(sql)?;
     let rows = stmt.query_map(params![cycle_key], row_to_paper)?;
@@ -1362,7 +1361,7 @@ pub fn list_papers_for_first_seen_cycle(conn: &Connection, cycle_key: &str, miss
 }
 
 pub fn list_current_missing_papers_for_cycle(conn: &Connection, cycle_key: &str) -> Result<Vec<Paper>> {
-    let mut stmt = conn.prepare("SELECT p.*,j.name AS journal_name FROM papers p JOIN journals j ON j.id=p.journal_id WHERE p.first_seen_cycle=?1 AND p.abstract_quality='missing' ORDER BY p.id DESC")?;
+    let mut stmt = conn.prepare("SELECT p.*,COALESCE(p.container_title, j.name) AS journal_name FROM papers p JOIN journals j ON j.id=p.journal_id WHERE p.first_seen_cycle=?1 AND p.abstract_quality='missing' ORDER BY p.id DESC")?;
     let rows = stmt.query_map(params![cycle_key], row_to_paper)?;
     let mut papers: Vec<Paper> = rows.collect::<Result<Vec<_>>>()?;
     enrich_papers_collections(conn, &mut papers)?;
@@ -1447,7 +1446,7 @@ fn enrich_papers_keywords(conn: &Connection, papers: &mut [Paper]) -> Result<()>
 pub fn get_paper(conn: &Connection, id: i64) -> Result<Option<Paper>> {
     let p = conn
         .query_row(
-            "SELECT p.*, j.name AS journal_name FROM papers p LEFT JOIN journals j ON j.id = p.journal_id WHERE p.id = ?1",
+            "SELECT p.*, COALESCE(p.container_title, j.name) AS journal_name FROM papers p LEFT JOIN journals j ON j.id = p.journal_id WHERE p.id = ?1",
             params![id],
             row_to_paper,
         )
@@ -1569,7 +1568,7 @@ fn library_paper(conn: &Connection, paper: Paper) -> Result<crate::models::Libra
         .or_else(|| paper.chinese_title.clone());
     let effective_source = metadata
         .as_ref()
-        .and_then(|m| m.source_override.clone())
+        .and_then(|m| m.journal_override.clone().or_else(|| m.source_override.clone()))
         .or_else(|| paper.journal_name.clone());
     let effective_year = metadata.as_ref().and_then(|m| m.year_override).or(paper.year);
     let effective_authors = metadata
@@ -1579,14 +1578,31 @@ fn library_paper(conn: &Connection, paper: Paper) -> Result<crate::models::Libra
     let effective_abstract = metadata
         .as_ref()
         .and_then(|m| m.abstract_override.clone())
-        .or_else(|| paper.abstract_text.clone());
+        .or_else(|| (paper.abstract_provenance != "legacy_unverified").then(|| paper.abstract_text.clone()).flatten());
+    let (legacy, translation_hash): (bool, Option<String>) = conn.query_row("SELECT p.legacy_abstract_unverified,m.chinese_abstract_source_hash FROM papers p LEFT JOIN library_item_metadata m ON m.paper_id=p.id WHERE p.id=?1", params![paper.id], |r| Ok((r.get(0)?,r.get(1)?)))?;
+    let translation_current = match translation_hash.as_deref() {
+        Some(hash) => effective_abstract.as_deref().is_some_and(|text| hash == abstract_text_hash(text)),
+        None => !legacy,
+    };
     let effective_chinese_abstract = metadata
         .as_ref()
-        .and_then(|m| m.chinese_abstract_override.clone())
-        .or_else(|| paper.chinese_abstract.clone());
+        .and_then(|m| translation_current.then(|| m.chinese_abstract_override.clone()).flatten())
+        .or_else(|| (paper.abstract_provenance != "legacy_unverified" && !legacy).then(|| paper.chinese_abstract.clone()).flatten());
     let note = metadata.as_ref().and_then(|m| m.note.clone());
     let attachments = list_paper_attachments(conn, paper.id)?;
+    let effective_journal = metadata.as_ref().and_then(|m| m.journal_override.clone()).or_else(|| paper.journal_name.clone());
+    let effective_publisher = metadata.as_ref().and_then(|m| m.publisher_override.clone()).or_else(|| paper.publisher.clone());
+    let effective_publication_date = metadata.as_ref().and_then(|m| m.publication_date_override.clone()).or_else(|| paper.published_date.clone());
+    let effective_volume = metadata.as_ref().and_then(|m| m.volume_override.clone()).or_else(|| paper.volume.clone());
+    let effective_issue = metadata.as_ref().and_then(|m| m.issue_override.clone()).or_else(|| paper.issue.clone());
+    let effective_pages = metadata.as_ref().and_then(|m| m.pages_override.clone()).or_else(|| paper.pages.clone());
     Ok(crate::models::LibraryPaper {
+        effective_journal,
+        effective_publisher,
+        effective_publication_date,
+        effective_volume,
+        effective_issue,
+        effective_pages,
         paper,
         added_at,
         added_source,
@@ -1618,6 +1634,13 @@ fn library_item_metadata_from_row(row: &rusqlite::Row) -> Result<crate::models::
         title_override: row.get("title_override")?,
         chinese_title_override: row.get("chinese_title_override")?,
         source_override: row.get("source_override")?,
+        journal_override: row.get("journal_override")?,
+        publisher_override: row.get("publisher_override")?,
+        publication_date_override: row.get("publication_date_override")?,
+        volume_override: row.get("volume_override")?,
+        issue_override: row.get("issue_override")?,
+        pages_override: row.get("pages_override")?,
+
         year_override: row.get("year_override")?,
         authors_override,
         abstract_override: row.get("abstract_override")?,
@@ -1653,6 +1676,7 @@ pub fn set_library_item_metadata(
     if !library_item_exists(&tx, paper_id)? {
         return Err(rusqlite::Error::QueryReturnedNoRows);
     }
+    let old_chinese = get_library_item_metadata(&tx,paper_id)?.and_then(|m| m.chinese_abstract_override);
     let authors_json = input
         .authors_override
         .as_ref()
@@ -1687,6 +1711,12 @@ pub fn set_library_item_metadata(
             now,
         ],
     )?;
+    tx.execute("UPDATE library_item_metadata SET journal_override=?1, publisher_override=?2, publication_date_override=?3, volume_override=?4, issue_override=?5, pages_override=?6 WHERE paper_id=?7",
+        params![clean_optional_text(input.journal_override.as_deref()), clean_optional_text(input.publisher_override.as_deref()), clean_optional_text(input.publication_date_override.as_deref()), clean_optional_text(input.volume_override.as_deref()), clean_optional_text(input.issue_override.as_deref()), clean_optional_text(input.pages_override.as_deref()), paper_id])?;
+    if clean_optional_text(input.chinese_abstract_override.as_deref()) != old_chinese {
+        let source_hash = get_library_paper(&tx,paper_id)?.and_then(|p| p.effective_abstract).map(|s| abstract_text_hash(&s));
+        tx.execute("UPDATE library_item_metadata SET chinese_abstract_source_hash=?1 WHERE paper_id=?2",params![source_hash,paper_id])?;
+    }
     tx.commit()?;
     get_library_item_metadata(conn, paper_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
 }
@@ -1721,6 +1751,7 @@ pub fn clear_library_item_overrides(
     }
     conn.execute(
         "UPDATE library_item_metadata SET
+            journal_override=NULL, publisher_override=NULL, publication_date_override=NULL, volume_override=NULL, issue_override=NULL, pages_override=NULL,
             title_override=NULL, chinese_title_override=NULL, source_override=NULL,
             year_override=NULL, authors_override=NULL, abstract_override=NULL,
             chinese_abstract_override=NULL, updated_at=?1 WHERE paper_id=?2",
@@ -2600,8 +2631,17 @@ fn first_doi(value: Option<&str>) -> Option<String> {
             .chars()
             .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '/' | '-' | '_' | ':' | ';' | '(' | ')'))
             .collect::<String>();
+        // PDF content streams may glue the following Copyright label to DOI.
+        let lower = candidate.to_ascii_lowercase();
+        let boundary = lower.find("copyright").filter(|i| *i > 0 && candidate.as_bytes()[i-1].is_ascii_digit()
+            && value[start + i + "copyright".len()..].trim_start().starts_with([':', '©']));
+        let candidate = &candidate[..boundary.unwrap_or(candidate.len())];
         let candidate = candidate.trim_end_matches(|ch: char| matches!(ch, '.' | ',' | ';' | ':' | ')' | ']'));
-        if candidate.contains('/') {
+        let valid_prefix = candidate.split_once('/').is_some_and(|(prefix,suffix)| {
+            let digits = prefix.strip_prefix("10.").unwrap_or("");
+            (4..=9).contains(&digits.len()) && digits.chars().all(|c| c.is_ascii_digit()) && !suffix.is_empty()
+        });
+        if valid_prefix {
             if let Some(doi) = crate::util::normalize_doi(candidate) {
                 if doi.starts_with("10.") && doi.contains('/') {
                     return Some(doi);
@@ -2833,8 +2873,8 @@ pub fn parse_external_pdf_metadata(path: &Path, filename: &str) -> Result<crate:
         .or_else(|| pdf_info_value(&raw_text, "PMCID"))
         .or_else(|| pdf_info_value(&raw_text, "arXiv"))
         .or_else(|| xml_metadata_value(&xmp, &["openalex", "pmid", "pmcid", "arXiv"]));
-    let abstract_text = pdf_info_value(&raw_text, "Abstract")
-        .or_else(|| xml_metadata_value(&xmp, &["dc:description", "abstract"]));
+    let abstract_text = extract_structured_pdf_abstract(&first_page);
+    let abstract_provenance = if abstract_text.is_some() { "pdf_structured" } else { "missing" }.to_string();
     let year = first_page_year(&first_page).or_else(|| parse_year_metadata(
         pdf_info_value(&raw_text, "Year")
             .or_else(|| pdf_info_value(&raw_text, "PublicationDate"))
@@ -2863,6 +2903,7 @@ pub fn parse_external_pdf_metadata(path: &Path, filename: &str) -> Result<crate:
     let authors = parse_author_metadata(author_value.as_deref());
     Ok(crate::models::ExternalPdfMetadata {
         filename: filename.to_string(),
+        abstract_provenance,
         title,
         authors: if authors.is_empty() { first_page_authors(&first_page) } else { authors },
         year,
@@ -2870,6 +2911,7 @@ pub fn parse_external_pdf_metadata(path: &Path, filename: &str) -> Result<crate:
         scholarly_id: clean_optional_text(scholarly_id.as_deref()),
         abstract_text,
         keywords,
+        ..Default::default()
     })
 }
 
@@ -2954,6 +2996,7 @@ fn add_library_and_attach(
     if !paper_exists(conn, paper_id)? {
         return Err(rusqlite::Error::QueryReturnedNoRows);
     }
+    if let Some(existing) = list_paper_attachments(conn, paper_id)?.into_iter().find(|a| a.sha256.as_deref() == Some(&file.sha256)) { return Ok(existing); }
     let prepared = prepare_current_pdf_storage(conn, paper_id, file)?;
     let tx = conn.unchecked_transaction()?;
     let now = now_utc();
@@ -2988,6 +3031,15 @@ pub(crate) fn merge_external_pdf_metadata_from_candidate(
     candidate: &PaperCandidate,
     source: &str,
 ) {
+    if metadata.doi.as_deref().and_then(crate::util::normalize_doi) != candidate.normalized_doi
+        || candidate.normalized_doi.is_none() { return; }
+    let publication = publication_metadata(candidate);
+    metadata.journal = metadata.journal.take().or(publication.journal);
+    metadata.publisher = metadata.publisher.take().or(publication.publisher);
+    metadata.publication_date = metadata.publication_date.take().or(publication.publication_date);
+    metadata.volume = metadata.volume.take().or(publication.volume);
+    metadata.issue = metadata.issue.take().or(publication.issue);
+    metadata.pages = metadata.pages.take().or(publication.pages);
     if metadata.title.as_deref().map(|v| v.trim().is_empty()).unwrap_or(true) {
         metadata.title = candidate.title.clone();
     }
@@ -3000,8 +3052,11 @@ pub(crate) fn merge_external_pdf_metadata_from_candidate(
     if metadata.doi.is_none() {
         metadata.doi = candidate.normalized_doi.clone();
     }
-    if metadata.abstract_text.as_deref().map(|v| v.trim().is_empty()).unwrap_or(true) {
-        metadata.abstract_text = candidate.abstract_text.clone();
+    if metadata.abstract_provenance != "provider" {
+        if let Some(text) = candidate.abstract_text.as_deref().filter(|s| !s.trim().is_empty()) {
+            metadata.abstract_text = Some(text.to_string());
+            metadata.abstract_provenance = "provider".into();
+        }
     }
     if metadata.scholarly_id.is_none() {
         metadata.scholarly_id = candidate
@@ -3044,6 +3099,8 @@ pub(crate) fn fill_missing_canonical_metadata_from_candidate(
     paper_id: i64,
     candidate: &PaperCandidate,
 ) -> Result<()> {
+    let existing_doi: Option<String> = conn.query_row("SELECT normalized_doi FROM papers WHERE id=?1", params![paper_id], |r| r.get(0))?;
+    if existing_doi.is_some() && candidate.normalized_doi != existing_doi { return Ok(()); }
     // This helper intentionally has no UPDATE path for an already populated
     // title/authors/year/source/DOI. It is a conservative exact-identity fill.
     fill_other_fields(conn, paper_id, candidate)?;
@@ -3052,20 +3109,24 @@ pub(crate) fn fill_missing_canonical_metadata_from_candidate(
         params![paper_id],
         |row| row.get(0),
     )?;
-    let abstract_missing = current_abstract
+    let provenance: String = conn.query_row("SELECT abstract_provenance FROM papers WHERE id=?1", params![paper_id], |r| r.get(0))?;
+    let abstract_missing = provenance == "legacy_unverified" || current_abstract
         .as_deref()
         .map(|value| value.trim().is_empty())
         .unwrap_or(true);
     if abstract_missing {
         if let Some(text) = candidate.abstract_text.as_deref() {
             let normalized = crate::abstract_quality::normalize_abstract_text(text);
-            if !normalized.trim().is_empty() {
+            if !normalized.trim().is_empty() && candidate.abstract_source.as_deref().is_some_and(is_provider_abstract_source) {
+                if let Some(old) = current_abstract.as_deref() {
+                    record_abstract_source(conn, paper_id, "legacy_unverified", old, "partial", "retained_before_exact_provider_refresh")?;
+                }
                 let (quality, _) = crate::abstract_quality::assess_abstract_quality(&normalized);
                 let now = now_utc();
                 conn.execute(
                     "UPDATE papers SET abstract=?1, abstract_source=?2,
                         abstract_quality=?3, abstract_retrieved_at=?4,
-                        abstract_last_checked_at=?4, analysis_status='pendingAnalysis',
+                        abstract_last_checked_at=?4,
                         updated_at=?4 WHERE id=?5",
                     params![normalized, candidate.abstract_source, quality, now, paper_id],
                 )?;
@@ -3080,6 +3141,7 @@ pub(crate) fn fill_missing_canonical_metadata_from_candidate(
             }
         }
     }
+    update_abstract_provenance(conn, paper_id)?;
     refresh_abstract_status(conn, paper_id)?;
     Ok(())
 }
@@ -3090,6 +3152,13 @@ fn persist_external_metadata(
     metadata: &crate::models::ExternalPdfMetadata,
     providers: &[(String, PaperCandidate)],
 ) -> Result<()> {
+    persist_structured_pdf_abstract(conn, paper_id, metadata)?;
+    let doi: Option<String> = conn.query_row("SELECT normalized_doi FROM papers WHERE id=?1",params![paper_id],|r| r.get(0))?;
+    if doi == metadata.doi {
+        if let Some(date) = metadata.publication_date.as_deref() {
+            conn.execute("UPDATE papers SET published_date=?1,year=?2 WHERE id=?3 AND discovery_source='external_pdf_import'", params![date,crate::util::extract_year(date),paper_id])?;
+        }
+    }
     let pdf_record_id = insert_source_record(
         conn,
         paper_id,
@@ -3099,6 +3168,9 @@ fn persist_external_metadata(
     )?;
     insert_keyword_inputs(conn, paper_id, &metadata.keywords, Some(pdf_record_id))?;
     for (source, candidate) in providers {
+        let doi: Option<String> = conn.query_row("SELECT normalized_doi FROM papers WHERE id=?1",params![paper_id],|r| r.get(0))?;
+        if doi != candidate.normalized_doi { continue; }
+        fill_publication_metadata(conn, paper_id, candidate)?;
         insert_source_record(
             conn,
             paper_id,
@@ -3119,14 +3191,40 @@ pub fn import_external_pdf(
     confirmed_paper_id: Option<i64>,
 ) -> Result<crate::models::ExternalPdfImportResult> {
     let file = linked_file(path)?;
+    let providers = file.metadata.doi.as_deref().map(external_provider_candidates).unwrap_or_default();
+    import_prepared_external_pdf(conn, file, confirmed_paper_id, providers)
+}
+
+#[cfg(test)]
+pub(crate) fn import_external_pdf_with_candidates(conn: &Connection, path: &str, confirmed_paper_id: Option<i64>, providers: Vec<(String, PaperCandidate)>) -> Result<crate::models::ExternalPdfImportResult> {
+    import_prepared_external_pdf(conn, linked_file(path)?, confirmed_paper_id, providers)
+}
+
+fn import_prepared_external_pdf(conn: &Connection, file: LinkedFile, confirmed_paper_id: Option<i64>, providers: Vec<(String, PaperCandidate)>) -> Result<crate::models::ExternalPdfImportResult> {
     let mut metadata = file.metadata.clone();
-    let providers = metadata
-        .doi
-        .as_deref()
-        .map(external_provider_candidates)
-        .unwrap_or_default();
+    let mut providers: Vec<_> = providers.into_iter().filter(|(_, c)| c.normalized_doi.is_some() && c.normalized_doi == metadata.doi).collect();
+    providers.sort_by_key(|(source,_)| if source == "crossref" { 0 } else { 1 });
     for (source, candidate) in &providers {
         merge_external_pdf_metadata_from_candidate(&mut metadata, candidate, source);
+    }
+
+    let same_file: Option<(i64, Option<String>)> = conn.query_row(
+        "SELECT p.id,p.normalized_doi FROM paper_attachments a JOIN papers p ON p.id=a.paper_id WHERE a.sha256=?1 ORDER BY a.id LIMIT 1",
+        params![file.sha256], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+    if let Some((paper_id, old_doi)) = same_file {
+        if let Some(doi) = metadata.doi.as_deref() {
+            let owner: Option<i64> = conn.query_row("SELECT id FROM papers WHERE normalized_doi=?1", params![doi], |r| r.get(0)).optional()?;
+            if owner.is_some_and(|id| id != paper_id) { return Err(rusqlite::Error::InvalidParameterName("doi_conflicts_with_existing_paper_manual_review_required".into())); }
+            if old_doi.as_deref().is_some_and(|old| old != doi && old != format!("{doi}copyright")) {
+                return Err(rusqlite::Error::InvalidParameterName("pdf_identity_conflict_manual_review_required".into()));
+            }
+            conn.execute("UPDATE papers SET normalized_doi=?1,original_doi=?1 WHERE id=?2", params![doi,paper_id])?;
+        }
+        for (_, candidate) in &providers { fill_missing_canonical_metadata_from_candidate(conn, paper_id, candidate)?; }
+        persist_external_metadata(conn, paper_id, &metadata, &providers)?;
+        conn.execute("INSERT INTO library_items(paper_id,added_at,added_source) VALUES(?1,?2,'external_pdf_import') ON CONFLICT(paper_id) DO NOTHING",params![paper_id,now_utc()])?;
+        let attachment = list_paper_attachments(conn, paper_id)?.into_iter().find(|a| a.sha256.as_deref() == Some(&file.sha256));
+        return Ok(crate::models::ExternalPdfImportResult { outcome: "existingAttachmentRefreshed".into(), paper_id: Some(paper_id), attachment, metadata, candidate: None, candidates: vec![], requires_confirmation: false });
     }
 
     if let Some(doi) = metadata.doi.as_deref() {
@@ -3204,13 +3302,17 @@ pub fn import_external_pdf(
 
     let journal_id = ensure_external_pdf_journal(conn)?;
     let doi = metadata.doi.clone();
-    let abstract_source = metadata.abstract_text.as_ref().map(|_| "pdf_metadata".to_string());
+    let abstract_source = metadata.abstract_text.as_ref().map(|_| {
+        if metadata.abstract_provenance == "provider" {
+            providers.iter().find_map(|(_, c)| c.abstract_text.as_ref().filter(|t| Some(*t) == metadata.abstract_text.as_ref()).and(c.abstract_source.clone())).unwrap_or_else(|| "provider".into())
+        } else { "pdf_structured".into() }
+    });
     let candidate = crate::models::PaperCandidate {
         normalized_doi: doi.clone(),
         original_doi: doi.clone(),
         title: metadata.title.clone(),
         authors: metadata.authors.clone(),
-        published_date: metadata.year.map(|year| format!("{}-01-01", year)),
+        published_date: metadata.publication_date.clone(),
         year: metadata.year,
         abstract_text: metadata.abstract_text.clone(),
         abstract_source,
@@ -3373,7 +3475,7 @@ pub fn list_library_papers(conn: &Connection, view: &str, limit: i64) -> Result<
         ""
     };
     let sql = format!(
-        "SELECT p.*, j.name AS journal_name FROM papers p
+        "SELECT p.*, COALESCE(p.container_title, j.name) AS journal_name FROM papers p
          JOIN journals j ON j.id = p.journal_id
          JOIN library_items li ON li.paper_id = p.id
          WHERE 1=1 {} ORDER BY {} LIMIT ?1",
@@ -3391,7 +3493,7 @@ pub fn list_library_papers(conn: &Connection, view: &str, limit: i64) -> Result<
 pub fn get_library_paper(conn: &Connection, paper_id: i64) -> Result<Option<crate::models::LibraryPaper>> {
     let paper = conn
         .query_row(
-            "SELECT p.*, j.name AS journal_name FROM papers p
+            "SELECT p.*, COALESCE(p.container_title, j.name) AS journal_name FROM papers p
              JOIN journals j ON j.id = p.journal_id
              JOIN library_items li ON li.paper_id = p.id WHERE p.id = ?1",
             params![paper_id],
@@ -3452,7 +3554,8 @@ pub fn rename_library_collection(conn: &Connection, id: i64, name: &str) -> Resu
 
 pub fn delete_library_collection(conn: &Connection, id: i64) -> Result<bool> {
     let tx = conn.unchecked_transaction()?;
-    tx.execute("UPDATE library_collections SET parent_id = NULL, updated_at = ?1 WHERE parent_id = ?2", params![now_utc(), id])?;
+    let has_children: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM library_collections WHERE parent_id=?1)", params![id], |r| r.get(0))?;
+    if has_children { return Err(rusqlite::Error::InvalidParameterName("collection_has_children".into())); }
     let changed = tx.execute("DELETE FROM library_collections WHERE id = ?1", params![id])?;
     tx.commit()?;
     Ok(changed == 1)
@@ -3567,6 +3670,7 @@ fn migrations() -> Vec<(i64, &'static str, fn(&Connection) -> Result<()>)> {
         (14, "literature-workspace-library", migrate_to_v14),
         (15, "literature-library-attachments-metadata", migrate_to_v15),
         (16, "bibliographic-keywords", migrate_to_v16),
+        (17, "Bibliographic Publication Metadata", migrate_to_v17),
     ]
 }
 
@@ -4316,7 +4420,7 @@ pub fn seed_default_tags(conn: &Connection) -> Result<()> {
 
 pub fn list_pending_papers(conn: &Connection, paper_ids: Option<&[i64]>) -> Result<Vec<Paper>> {
     let mut sql = String::from(
-        "SELECT p.*, j.name AS journal_name FROM papers p JOIN journals j ON j.id = p.journal_id \
+        "SELECT p.*, COALESCE(p.container_title, j.name) AS journal_name FROM papers p JOIN journals j ON j.id = p.journal_id \
          WHERE p.analysis_status IN ('pendingAnalysis','analysisFailed') AND p.abstract IS NOT NULL AND p.abstract != ''",
     );
     if let Some(ids) = paper_ids {
@@ -5478,5 +5582,174 @@ pub fn enqueue_for_tag_update(conn: &Connection, id: i64) -> Result<()> {
 /// 删除 scheduled 配置（激活后消费）。
 pub fn delete_scheduled_tag_config(conn: &Connection) -> Result<()> {
     conn.execute("DELETE FROM tag_config_versions WHERE status = 'scheduled'", [])?;
+    Ok(())
+}
+
+/// v17 adds publication fields without rewriting any earlier migration or
+/// inferring publisher from the journal name. Historical PDF abstracts remain
+/// stored for audit; absence of structured evidence is never treated as trust.
+fn migrate_to_v17(conn: &Connection) -> Result<()> {
+    for field in ["container_title", "publisher", "volume", "issue", "pages"] {
+        if !column_exists(conn,"papers",field) { conn.execute_batch(&format!("ALTER TABLE papers ADD COLUMN {field} TEXT;"))?; }
+    }
+    for (table,field,definition) in [("papers","abstract_provenance","TEXT NOT NULL DEFAULT 'missing'"), ("papers","legacy_abstract_unverified","INTEGER NOT NULL DEFAULT 0"), ("library_item_metadata","chinese_abstract_source_hash","TEXT")] {
+        if !column_exists(conn,table,field) { conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {field} {definition};"))?; }
+    }
+    for field in ["journal", "publisher", "publication_date", "volume", "issue", "pages"] {
+        if !column_exists(conn,"library_item_metadata",&format!("{field}_override")) { conn.execute_batch(&format!("ALTER TABLE library_item_metadata ADD COLUMN {field}_override TEXT;"))?; }
+    }
+    conn.execute_batch("UPDATE papers SET abstract_provenance=CASE
+        WHEN abstract IS NULL OR trim(abstract)='' THEN 'missing'
+        WHEN abstract_source IN ('crossref','openalex','provider') OR abstract_source LIKE 'publisher%' THEN 'provider'
+        WHEN abstract_source='pdf_structured' THEN 'pdf_structured'
+        ELSE 'legacy_unverified' END;
+        UPDATE papers SET legacy_abstract_unverified=1 WHERE abstract_provenance='legacy_unverified';")?;
+    Ok(())
+}
+
+fn update_abstract_provenance(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute("UPDATE papers SET abstract_provenance=CASE
+        WHEN abstract IS NULL OR trim(abstract)='' THEN 'missing'
+        WHEN abstract_source IN ('crossref','openalex','provider') OR abstract_source LIKE 'publisher%' THEN 'provider'
+        WHEN abstract_source='pdf_structured' THEN 'pdf_structured'
+        ELSE 'legacy_unverified' END WHERE id=?1", params![id])?;
+    Ok(())
+}
+
+/// Shared mapping from retained structured provider evidence; journal and
+/// publisher are separate concepts. `published_date` is the existing canonical
+/// publication-date column. Pages deliberately remains a string (e.g. e1234).
+fn publication_metadata(c: &PaperCandidate) -> crate::models::ExternalPdfMetadata {
+    let mut m = crate::models::ExternalPdfMetadata::default();
+    m.publication_date = c.published_date.clone();
+    let Some(v) = c.raw_json.as_deref().and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()) else { return m; };
+    let string = |v: Option<&serde_json::Value>| v.and_then(|v| v.as_str().map(str::to_string).or_else(|| v.as_i64().map(|n| n.to_string()))).and_then(|v| clean_optional_text(Some(&v)));
+    if v.get("DOI").is_some() {
+        m.journal = string(v.get("container-title").and_then(|v| v.as_array()).and_then(|v| v.first()));
+        m.publisher = string(v.get("publisher"));
+        m.volume = string(v.get("volume"));
+        m.issue = string(v.get("issue"));
+        m.pages = string(v.get("page")).or_else(|| string(v.get("article-number")));
+    } else if v.get("primary_location").is_some() || v.get("biblio").is_some() {
+        m.journal = string(v.pointer("/primary_location/source/display_name"));
+        m.publication_date = string(v.get("publication_date")).or(m.publication_date);
+        m.volume = string(v.pointer("/biblio/volume"));
+        m.issue = string(v.pointer("/biblio/issue"));
+        let first = string(v.pointer("/biblio/first_page"));
+        let last = string(v.pointer("/biblio/last_page"));
+        m.pages = match (first, last) {
+            (Some(a), Some(b)) if a != b => Some(format!("{a}-{b}")),
+            (Some(a), _) => Some(a),
+            _ => None,
+        };
+    }
+    m
+}
+
+fn fill_publication_metadata(conn: &Connection, id: i64, c: &PaperCandidate) -> Result<()> {
+    let m = publication_metadata(c);
+    conn.execute("UPDATE papers SET container_title=COALESCE(container_title,?1),
+        publisher=COALESCE(publisher,?2), published_date=COALESCE(published_date,?3),
+        volume=COALESCE(volume,?4), issue=COALESCE(issue,?5), pages=COALESCE(pages,?6)
+        WHERE id=?7", params![m.journal,m.publisher,m.publication_date,m.volume,m.issue,m.pages,id])?;
+    Ok(())
+}
+
+pub fn add_paper_to_collection(conn: &Connection, paper_id: i64, collection_id: i64) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    if !library_item_exists(&tx, paper_id)? { return Err(rusqlite::Error::QueryReturnedNoRows); }
+    validate_collection_ids(&tx, &[collection_id])?;
+    tx.execute("INSERT OR IGNORE INTO library_collection_items(collection_id,paper_id,added_at) VALUES(?1,?2,?3)", params![collection_id,paper_id,now_utc()])?;
+    tx.commit()
+}
+
+pub fn add_paper_library_tag(conn: &Connection, paper_id: i64, tag_id: i64) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    if !library_item_exists(&tx, paper_id)? { return Err(rusqlite::Error::QueryReturnedNoRows); }
+    validate_library_tag_ids(&tx, &[tag_id])?;
+    tx.execute("INSERT OR IGNORE INTO library_item_tags(paper_id,tag_id,added_at) VALUES(?1,?2,?3)", params![paper_id,tag_id,now_utc()])?;
+    tx.commit()
+}
+
+/// Patch only the translated personal field, avoiding lost concurrent edits to
+/// other overrides while an API call is in flight. No canonical/analysis writes.
+pub fn set_library_translation(conn: &Connection, paper_id: i64, translated: &str, title: bool) -> Result<crate::models::LibraryItemMetadata> {
+    let tx = conn.unchecked_transaction()?;
+    if !library_item_exists(&tx, paper_id)? { return Err(rusqlite::Error::QueryReturnedNoRows); }
+    let source_hash = if title { None } else { get_library_paper(&tx,paper_id)?.and_then(|p| p.effective_abstract).map(|s| abstract_text_hash(&s)) };
+    let field = if title { "chinese_title_override" } else { "chinese_abstract_override" };
+    tx.execute(&format!("INSERT INTO library_item_metadata(paper_id,{field},updated_at) VALUES(?1,?2,?3)
+        ON CONFLICT(paper_id) DO UPDATE SET {field}=excluded.{field},updated_at=excluded.updated_at"),
+        params![paper_id,clean_optional_text(Some(translated)),now_utc()])?;
+    if !title { tx.execute("UPDATE library_item_metadata SET chinese_abstract_source_hash=?1 WHERE paper_id=?2",params![source_hash,paper_id])?; }
+    tx.commit()?;
+    get_library_item_metadata(conn, paper_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
+}
+
+fn abstract_text_hash(text: &str) -> String { format!("{:x}", Sha256::digest(text.as_bytes())) }
+fn is_provider_abstract_source(source: &str) -> bool { matches!(source, "crossref" | "openalex" | "provider") || source.starts_with("publisher") }
+
+/// Translation is allowed only for a real English abstract. This is a
+/// conservative language gate; it is never used to create or overwrite a
+/// canonical abstract.
+pub(crate) fn is_english_abstract(text: &str) -> bool {
+    let letters = text.chars().filter(|c| c.is_alphabetic()).count();
+    let ascii = text.chars().filter(|c| c.is_ascii_alphabetic()).count();
+    let words: Vec<String> = text
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphabetic()).to_ascii_lowercase())
+        .collect();
+    let signals = ["the", "we", "this", "that", "with", "from", "and", "of", "in", "to"]
+        .iter()
+        .filter(|word| words.iter().any(|w| w == **word))
+        .count();
+    letters >= 40 && ascii * 10 >= letters * 9 && signals >= 3
+}
+
+/// Accept a labeled, terminated section only. Fail closed for mixed columns,
+/// metadata, first-page paragraphs, incomplete sections, and citation snippets.
+pub(crate) fn extract_structured_pdf_abstract(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    let mut start = None;
+    for (i, _) in lower.match_indices("abstract") {
+        let prefix = &text[..i];
+        if !prefix.rsplit('\n').next().unwrap_or("").trim().is_empty() { continue; }
+        let tail = &text[i + 8..];
+        if tail.starts_with(['.', ':', '\n', '\r']) || (prefix.rsplit('\n').next().unwrap_or("").trim().is_empty() && tail.starts_with(' ')) {
+            start = Some(i + 8); break;
+        }
+    }
+    let start = start?;
+    let body = text[start..].trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '.' | ':' | '—'));
+    let lower = body.to_ascii_lowercase();
+    let end = ["keywords", "key words", "1. introduction", "1 introduction", "\nintroduction", "history:", "funding:", "supplemental material:"]
+        .iter().filter_map(|label| lower.find(label)).min()?;
+    let body = body[..end].trim();
+    let words = body.split_whitespace().count();
+    if !(40..=800).contains(&words) || body.len() > 8000 { return None; }
+    let lower = body.to_ascii_lowercase();
+    if ["copyright", "https://", "received:", "revised:", "accepted:", "issn", "management science 20", "references"].iter().any(|label| lower.contains(label)) { return None; }
+    Some(body.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+fn persist_structured_pdf_abstract(conn: &Connection, id: i64, metadata: &crate::models::ExternalPdfMetadata) -> Result<()> {
+    if metadata.abstract_provenance != "pdf_structured" { return Ok(()); }
+    let Some(text) = metadata.abstract_text.as_deref() else { return Ok(()); };
+    let (old, provenance): (Option<String>, String) = conn.query_row("SELECT abstract,abstract_provenance FROM papers WHERE id=?1",params![id],|r|Ok((r.get(0)?,r.get(1)?)))?;
+    if !matches!(provenance.as_str(), "missing" | "legacy_unverified") { return Ok(()); }
+    if let Some(old) = old { record_abstract_source(conn,id,"legacy_unverified",&old,"partial","retained_before_structured_pdf_refresh")?; }
+    let (quality, reason) = crate::abstract_quality::assess_abstract_quality(text);
+    conn.execute("UPDATE papers SET abstract=?1,abstract_source='pdf_structured',abstract_provenance='pdf_structured',abstract_quality=?2 WHERE id=?3",params![text,quality,id])?;
+    record_abstract_source(conn,id,"pdf_structured",text,quality,reason)?;
+    refresh_abstract_status(conn,id)
+}
+
+#[cfg(test)]
+pub(crate) fn init_test_schema_at_version(conn: &Connection, version: i64) -> Result<()> {
+    conn.execute_batch(SCHEMA)?;
+    for (v, _, up) in migrations().into_iter().filter(|(v,_,_)| *v <= version) {
+        up(conn)?;
+        conn.pragma_update(None,"user_version",v)?;
+    }
     Ok(())
 }

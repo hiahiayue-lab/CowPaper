@@ -382,6 +382,11 @@ pub struct Paper {
     pub id: i64,
     pub journal_id: i64,
     pub journal_name: Option<String>,
+    pub publisher: Option<String>,
+    pub volume: Option<String>,
+    pub issue: Option<String>,
+    pub pages: Option<String>,
+    pub abstract_provenance: String,
     pub normalized_doi: Option<String>,
     pub original_doi: Option<String>,
     pub title: Option<String>,
@@ -500,6 +505,12 @@ pub struct PaperAttachment {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LibraryItemMetadata {
+    pub journal_override: Option<String>,
+    pub publisher_override: Option<String>,
+    pub publication_date_override: Option<String>,
+    pub volume_override: Option<String>,
+    pub issue_override: Option<String>,
+    pub pages_override: Option<String>,
     pub paper_id: i64,
     pub title_override: Option<String>,
     pub chinese_title_override: Option<String>,
@@ -517,6 +528,12 @@ pub struct LibraryItemMetadata {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LibraryItemMetadataInput {
+    pub journal_override: Option<String>,
+    pub publisher_override: Option<String>,
+    pub publication_date_override: Option<String>,
+    pub volume_override: Option<String>,
+    pub issue_override: Option<String>,
+    pub pages_override: Option<String>,
     pub title_override: Option<String>,
     pub chinese_title_override: Option<String>,
     pub source_override: Option<String>,
@@ -532,6 +549,12 @@ pub struct LibraryItemMetadataInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LibraryPaper {
+    pub effective_journal: Option<String>,
+    pub effective_publisher: Option<String>,
+    pub effective_publication_date: Option<String>,
+    pub effective_volume: Option<String>,
+    pub effective_issue: Option<String>,
+    pub effective_pages: Option<String>,
     pub paper: Paper,
     pub added_at: String,
     pub added_source: String,
@@ -555,6 +578,14 @@ pub struct LibraryPaper {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExternalPdfMetadata {
+    pub journal: Option<String>,
+    pub publisher: Option<String>,
+    pub publication_date: Option<String>,
+    pub volume: Option<String>,
+    pub issue: Option<String>,
+    pub pages: Option<String>,
+    #[serde(default = "missing_abstract_provenance")]
+    pub abstract_provenance: String,
     pub filename: String,
     pub title: Option<String>,
     pub authors: Vec<Author>,
@@ -869,3 +900,5 @@ pub struct ActivityState {
     /// 等待摘要数量（waitingForAbstract，不计入 pending_analysis）
     pub waiting_for_abstract: i64,
 }
+
+fn missing_abstract_provenance() -> String { "missing".to_string() }

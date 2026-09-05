@@ -1646,7 +1646,7 @@ fn translate_library_abstract(
         .filter(|key| !key.trim().is_empty())
         .ok_or_else(|| "未保存 API Key，请先在设置中保存".to_string())?;
 
-    let (english_abstract, current_metadata) = {
+    let english_abstract = {
         let conn = state.inner().lock().unwrap();
         let paper = db::get_library_paper(&conn, paper_id)
             .map_err(|e| e.to_string())?
@@ -1666,38 +1666,51 @@ fn translate_library_abstract(
         {
             return Err("已有中文摘要，无需重复翻译".to_string());
         }
-        let metadata = db::get_library_item_metadata(&conn, paper_id)
-            .map_err(|e| e.to_string())?;
-        (english, metadata)
+        if !db::is_english_abstract(&english) {
+            return Err("无法确认这是可翻译的真实英文摘要".to_string());
+        }
+        english
     };
 
     let translated = api::deepseek::DeepSeek::new()
         .translate_abstract(&api_key, &model, &english_abstract)
         .map_err(|e| e.to_string())?;
-    let existing = current_metadata.unwrap_or_else(|| models::LibraryItemMetadata {
-        paper_id,
-        title_override: None,
-        chinese_title_override: None,
-        source_override: None,
-        year_override: None,
-        authors_override: None,
-        abstract_override: None,
-        chinese_abstract_override: None,
-        note: None,
-        updated_at: String::new(),
-    });
-    let input = models::LibraryItemMetadataInput {
-        title_override: existing.title_override,
-        chinese_title_override: existing.chinese_title_override,
-        source_override: existing.source_override,
-        year_override: existing.year_override,
-        authors_override: existing.authors_override,
-        abstract_override: existing.abstract_override,
-        chinese_abstract_override: Some(translated),
-        note: existing.note,
-    };
     let conn = state.inner().lock().unwrap();
-    db::set_library_item_metadata(&conn, paper_id, &input).map_err(|e| e.to_string())
+    if db::get_library_paper(&conn,paper_id).map_err(|e| e.to_string())?.and_then(|p| p.effective_abstract).as_deref() != Some(english_abstract.as_str()) {
+        return Err("英文摘要已更改，请重新翻译".into());
+    }
+    db::set_library_translation(&conn, paper_id, &translated, false).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn translate_library_title(paper_id: i64, model: String, state: State<Db>, store: State<Secure>) -> Result<models::LibraryItemMetadata, String> {
+    let api_key = store.get().map_err(|e| e.to_string())?
+        .filter(|s| !s.trim().is_empty()).ok_or_else(|| "未保存 API Key，请先在设置中保存".to_string())?;
+    let title = {
+        let conn = state.inner().lock().unwrap();
+        let paper = db::get_library_paper(&conn, paper_id).map_err(|e| e.to_string())?
+            .ok_or_else(|| "论文不在文献库中".to_string())?;
+        if paper.effective_chinese_title.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+            return Err("已有中文标题，无需重复翻译".into());
+        }
+        paper.effective_title.filter(|s| !s.trim().is_empty()).ok_or_else(|| "没有可翻译的标题".to_string())?
+    };
+    let translated = api::deepseek::DeepSeek::new().translate_title(&api_key, &model, &title).map_err(|e| e.to_string())?;
+    let conn = state.inner().lock().unwrap();
+    if db::get_library_paper(&conn, paper_id).map_err(|e| e.to_string())?.and_then(|p| p.effective_title).as_deref() != Some(title.as_str()) {
+        return Err("标题已更改，请重新翻译".into());
+    }
+    db::set_library_translation(&conn, paper_id, &translated, true).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn add_paper_to_collection(paper_id: i64, collection_id: i64, state: State<Db>) -> Result<(), String> {
+    db::add_paper_to_collection(&state.inner().lock().unwrap(), paper_id, collection_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn add_paper_library_tag(paper_id: i64, tag_id: i64, state: State<Db>) -> Result<(), String> {
+    db::add_paper_library_tag(&state.inner().lock().unwrap(), paper_id, tag_id).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -2171,6 +2184,9 @@ pub fn run() {
             start_ai,
             translate_missing_titles,
             translate_library_abstract,
+            translate_library_title,
+            add_paper_to_collection,
+            add_paper_library_tag,
             pause_ai,
             resume_ai,
             stop_ai,
