@@ -932,9 +932,14 @@ fn list_papers(journal_id: Option<i64>, state: State<Db>) -> Result<Vec<models::
 }
 
 #[tauri::command]
-fn list_library_papers(view: String, state: State<Db>) -> Result<Vec<models::LibraryPaper>, String> {
+fn list_library_papers(
+    view: String,
+    collection_id: Option<i64>,
+    tag_ids: Option<Vec<i64>>,
+    state: State<Db>,
+) -> Result<Vec<models::LibraryPaper>, String> {
     let conn = state.inner().lock().unwrap();
-    db::list_library_papers(&conn, &view, 1000).map_err(|e| e.to_string())
+    db::list_library_papers_scoped(&conn, &view, collection_id, tag_ids.as_deref().unwrap_or(&[]), 1000).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1007,6 +1012,12 @@ fn delete_library_collection(id: i64, state: State<Db>) -> Result<bool, String> 
 fn list_library_tags(state: State<Db>) -> Result<Vec<models::LibraryTag>, String> {
     let conn = state.inner().lock().unwrap();
     db::list_library_tags(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn list_library_tag_facets(collection_id: i64, state: State<Db>) -> Result<Vec<models::LibraryTagFacet>, String> {
+    let conn = state.inner().lock().unwrap();
+    db::list_library_tag_facets(&conn, collection_id).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1174,10 +1185,36 @@ fn reveal_pdf(
 fn import_pdf(
     path: String,
     confirmed_paper_id: Option<i64>,
+    app: AppHandle,
     state: State<Db>,
 ) -> Result<models::ExternalPdfImportResult, String> {
     let conn = state.inner().lock().unwrap();
-    db::import_external_pdf(&conn, &path, confirmed_paper_id).map_err(|e| e.to_string())
+    let result = db::import_external_pdf_fast(&conn, &path, confirmed_paper_id).map_err(|e| e.to_string())?;
+    if result.enrichment_status == "queued" {
+        if let (Some(paper_id), Some(attachment), Some(doi)) = (
+            result.paper_id,
+            result.attachment.as_ref(),
+            result.metadata.doi.clone(),
+        ) {
+            let db = state.inner().clone();
+            let app2 = app.clone();
+            let attachment_id = attachment.id;
+            let worker = std::thread::Builder::new()
+                .name("cowpaper-pdf-enrichment".to_string())
+                .spawn(move || db::run_pdf_enrichment(&db, &app2, paper_id, attachment_id, &doi));
+            if let Err(error) = worker {
+                let message = format!("PDF enrichment worker 启动失败: {error}");
+                let _ = conn.execute(
+                    "UPDATE pdf_enrichment_jobs SET status='failed', error=?1, updated_at=?2 WHERE attachment_id=?3",
+                    rusqlite::params![message, db::now_utc(), attachment_id],
+                );
+                let _ = app.emit("pdf://enrichment-failed", serde_json::json!({"paperId": paper_id, "attachmentId": attachment_id, "error": message}));
+                result.enrichment_status = "failed".to_string();
+                result.enrichment_error = Some(message);
+            }
+        }
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -1866,6 +1903,8 @@ fn read_settings(conn: &Connection) -> models::Settings {
             .unwrap_or_else(models::default_pdf_naming_template),
         pdf_subfolder_rule: db::get_setting(conn, "settings.pdf_subfolder_rule")
             .unwrap_or_else(models::default_pdf_subfolder_rule),
+        preferred_pdf_reader: db::get_setting(conn, "settings.preferred_pdf_reader")
+            .unwrap_or_else(models::default_preferred_pdf_reader),
     }
 }
 
@@ -1886,6 +1925,7 @@ fn set_settings(s: models::Settings, state: State<Db>) -> Result<(), String> {
         &s.pdf_naming_template,
         &s.pdf_subfolder_rule,
     )?;
+    db::validate_preferred_pdf_reader(&s.preferred_pdf_reader)?;
     let conn = state.inner().lock().unwrap();
     db::set_setting(
         &conn,
@@ -1914,7 +1954,17 @@ fn set_settings(s: models::Settings, state: State<Db>) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     db::set_setting(&conn, "settings.pdf_subfolder_rule", &s.pdf_subfolder_rule)
         .map_err(|e| e.to_string())?;
+    db::set_setting(&conn, "settings.preferred_pdf_reader", &s.preferred_pdf_reader)
+        .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[tauri::command]
+fn set_preferred_pdf_reader(reader: String, state: State<Db>) -> Result<(), String> {
+    db::validate_preferred_pdf_reader(&reader)?;
+    let conn = state.inner().lock().unwrap();
+    db::set_setting(&conn, "settings.preferred_pdf_reader", reader.trim())
+        .map_err(|e| e.to_string())
 }
 
 fn valid_daily_sync_time(value: &str) -> bool {
@@ -2148,6 +2198,7 @@ pub fn run() {
             rename_library_collection,
             delete_library_collection,
             list_library_tags,
+            list_library_tag_facets,
             create_library_tag,
             rename_library_tag,
             delete_library_tag,
@@ -2167,6 +2218,7 @@ pub fn run() {
             open_pdf,
             reveal_pdf,
             import_pdf,
+            set_preferred_pdf_reader,
             list_today_missing_papers,
             list_daily_paper_summaries,
             list_daily_papers,

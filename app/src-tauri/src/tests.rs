@@ -2104,7 +2104,7 @@ fn test_migration_v2_to_v3_preserves_data() {
 
     // 迁移到 v3
     db::init(&conn).unwrap();
-    assert_eq!(db::SCHEMA_VERSION, 17);
+    assert_eq!(db::SCHEMA_VERSION, 18);
 
     // 8) 旧 issn 迁移进 journal_identifiers（类型按列，不猜）
     let ids = db::list_journal_identifiers(&conn, jid).unwrap();
@@ -2145,7 +2145,7 @@ fn test_database_restart_persistence() {
     {
         let conn = db::open(&path).unwrap();
         db::init(&conn).unwrap(); // 幂等：user_version=3 不重复迁移
-        assert_eq!(db::SCHEMA_VERSION, 17);
+        assert_eq!(db::SCHEMA_VERSION, 18);
         let j = db::get_journal(&conn, 1).unwrap().expect("期刊持久化");
         assert_eq!(j.print_issn.as_deref(), Some("0025-1909"));
         assert_eq!(j.identifiers.len(), 1);
@@ -2772,7 +2772,7 @@ fn test_migration_v4_abstract_quality_init() {
     .unwrap();
 
     db::init(&conn).unwrap();
-    assert_eq!(db::SCHEMA_VERSION, 17);
+    assert_eq!(db::SCHEMA_VERSION, 18);
 
     let papers = db::list_papers(&conn, Some(jid), 100).unwrap();
     assert_eq!(papers.len(), 3, "迁移不得丢论文");
@@ -3465,7 +3465,7 @@ fn test_updater_config_requires_signed_cross_platform_artifacts() {
     assert_eq!(endpoints.len(), 1);
     assert!(endpoints[0].as_str().unwrap().starts_with("https://github.com/"));
     assert!(endpoints[0].as_str().unwrap().ends_with("/latest/download/latest.json"));
-    assert_eq!(db::SCHEMA_VERSION, 17, "updater must not claim migration ownership");
+    assert_eq!(db::SCHEMA_VERSION, 18, "updater must not claim migration ownership");
 }
 
 #[test]
@@ -5064,7 +5064,7 @@ fn test_library_migration_v13_to_v16_preserves_existing_data() {
 
     db::init(&conn).unwrap();
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-    assert_eq!(version, 17);
+    assert_eq!(version, 18);
     let paper = db::get_paper(&conn, pid).unwrap().unwrap();
     assert_eq!(paper.abstract_text.as_deref(), Some("preserved abstract"));
     assert_eq!(paper.chinese_title.as_deref(), Some("保留中文标题"));
@@ -5078,7 +5078,7 @@ fn test_library_migration_v13_to_v16_preserves_existing_data() {
 
     db::init(&conn).unwrap();
     let version_again: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-    assert_eq!(version_again, 17);
+    assert_eq!(version_again, 18);
     for table in [
         "library_items",
         "library_collections",
@@ -5113,7 +5113,7 @@ fn test_migration_v14_to_v16_creates_attachment_metadata_and_keyword_tables() {
     conn.execute("DROP TABLE paper_attachments", []).unwrap();
     conn.pragma_update(None, "user_version", 14).unwrap();
     db::init(&conn).unwrap();
-    assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 17);
+    assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 18);
     assert!(db::get_library_membership(&conn, pid).unwrap().is_some(), "v15 不得破坏 v14 Library membership");
     for table in ["paper_attachments", "library_item_metadata", "paper_keywords"] {
         assert!(conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)", params![table], |r| r.get::<_, bool>(0)).unwrap());
@@ -5387,8 +5387,7 @@ fn test_pdf_filename_sanitization_collision_and_empty_fields() {
         assert!(!name.chars().any(|ch| matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')));
         assert!(name.len() <= 180);
     }
-    assert_ne!(first.absolute_path, second.absolute_path, "collision 不得覆盖原文件");
-    assert!(second.filename.contains("(2).pdf"));
+    assert_eq!(first.id, second.id, "同一 sha 的统一 attachment 关系应幂等");
     let _ = std::fs::remove_file(source);
     let _ = std::fs::remove_file(first.absolute_path);
     let _ = std::fs::remove_file(second.absolute_path);
@@ -5956,7 +5955,7 @@ fn rc3_v16_to_v17_preserves_canonical_keywords_library_and_untrusted_history() {
         INSERT INTO library_item_metadata(paper_id,chinese_abstract_override,note,updated_at) VALUES(1,'旧个人翻译','Keep note','now');
         INSERT INTO paper_keywords(paper_id,keyword,normalized_keyword,kind,source,confidence,retrieved_at,created_at) VALUES(1,'Evidence','evidence','subject','crossref','HIGH','now','now');").unwrap();
     db::init(&conn).unwrap();db::init(&conn).unwrap();
-    assert_eq!(conn.query_row("PRAGMA user_version",[],|r|r.get::<_,i64>(0)).unwrap(),17);
+    assert_eq!(conn.query_row("PRAGMA user_version",[],|r|r.get::<_,i64>(0)).unwrap(),18);
     let p=db::get_paper(&conn,1).unwrap().unwrap();
     assert_eq!(p.abstract_text.as_deref(),Some("INFORMS Management Science 2026:1-17"));assert_eq!(p.abstract_provenance,"legacy_unverified");assert_eq!(p.total_score,Some(4.8));assert_eq!(p.keywords.len(),1);
     let library=db::get_library_paper(&conn,1).unwrap().unwrap();
@@ -5972,17 +5971,14 @@ fn rc3_v16_to_v17_preserves_canonical_keywords_library_and_untrusted_history() {
 }
 
 #[test]
-fn rc3_reimport_same_sha_repairs_doi_and_retries_enrichment_without_duplicate() {
+fn rc3_reimport_same_sha_rejects_canonical_doi_mutation_without_duplicate() {
     let conn=mem_db();let id=test_paper(&conn,"10.5555/rc3copyright","Publication metadata test");
     let path=test_pdf_path("rc3-reimport", "%PDF-1.7\nDOI: 10.5555/rc3Copyright: 2026\n");
     db::add_paper_to_library(&conn,id,&[],&[],"manual").unwrap();
     let attachment=db::attach_pdf_to_paper(&conn,id,path.to_str().unwrap()).unwrap();
     conn.execute("UPDATE papers SET abstract='wrong snippet',abstract_source='pdf_metadata',abstract_provenance='legacy_unverified',legacy_abstract_unverified=1,discovery_source='external_pdf_import' WHERE id=?1",params![id]).unwrap();
-    for _ in 0..2 {
-        let result=db::import_external_pdf_with_candidates(&conn,path.to_str().unwrap(),None,vec![("crossref".into(),rc3_crossref())]).unwrap();
-        assert_eq!(result.outcome,"existingAttachmentRefreshed");assert_eq!(result.paper_id,Some(id));assert_eq!(result.attachment.unwrap().id,attachment.id);
-    }
-    let p=db::get_paper(&conn,id).unwrap().unwrap();assert_eq!(p.normalized_doi.as_deref(),Some("10.5555/rc3"));assert_eq!(p.url.as_deref(),Some("https://doi.org/10.5555/rc3"));assert_eq!(p.abstract_provenance,"provider");assert_eq!(p.journal_name.as_deref(),Some("Journal of Evidence"));
+    assert!(db::import_external_pdf_with_candidates(&conn,path.to_str().unwrap(),None,vec![("crossref".into(),rc3_crossref())]).is_err());
+    let p=db::get_paper(&conn,id).unwrap().unwrap();assert_eq!(p.normalized_doi.as_deref(),Some("10.5555/rc3copyright"));assert_eq!(p.url.as_deref(),Some("https://doi.org/10.5555/rc3copyright"));
     assert_eq!(conn.query_row("SELECT count(*) FROM papers",[],|r|r.get::<_,i64>(0)).unwrap(),1);
     assert_eq!(conn.query_row("SELECT count(*) FROM paper_attachments",[],|r|r.get::<_,i64>(0)).unwrap(),1);
     std::fs::remove_file(path).unwrap();
@@ -6054,4 +6050,83 @@ fn rc3_translation_requires_real_english_not_a_citation_or_chinese_text() {
     assert!(!db::is_english_abstract("INFORMS Management Science 2026:1-17"));
     assert!(!db::is_english_abstract("这是用户保存的中文内容，并不是可以翻译的英文摘要。"));
     assert!(!db::is_english_abstract(""));
+}
+
+#[test]
+fn rc5_fast_first_commits_attachment_and_queues_exact_doi_enrichment() {
+    let conn = mem_db();
+    let path = test_pdf_path("rc5-fast-first", "%PDF-1.7\nDOI: 10.5555/fast-first\n");
+    let result = db::import_external_pdf_fast(&conn, path.to_str().unwrap(), None).unwrap();
+    assert_eq!(result.outcome, "createdExternalPaper");
+    assert_eq!(result.enrichment_status, "queued");
+    let paper_id = result.paper_id.unwrap();
+    let attachment_id = result.attachment.unwrap().id;
+    assert!(db::get_library_membership(&conn, paper_id).unwrap().is_some());
+    let job = conn.query_row(
+        "SELECT status,doi FROM pdf_enrichment_jobs WHERE attachment_id=?1",
+        params![attachment_id],
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+    ).unwrap();
+    assert_eq!(job, ("queued".into(), "10.5555/fast-first".into()));
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn rc5_doi_url_overrides_are_library_only_and_effective() {
+    let conn = mem_db();
+    let paper_id = test_paper(&conn, "10.5555/canonical", "Canonical Paper");
+    db::add_paper_to_library(&conn, paper_id, &[], &[], "manual").unwrap();
+    db::set_library_item_metadata(&conn, paper_id, &crate::models::LibraryItemMetadataInput {
+        doi_override: Some("https://doi.org/10.5555/personal".into()),
+        url_override: Some("https://example.test/personal-paper".into()),
+        ..Default::default()
+    }).unwrap();
+    let canonical = db::get_paper(&conn, paper_id).unwrap().unwrap();
+    assert_eq!(canonical.normalized_doi.as_deref(), Some("10.5555/canonical"));
+    assert_eq!(canonical.url.as_deref(), Some("https://doi.org/10.5555/canonical"));
+    let library = db::get_library_paper(&conn, paper_id).unwrap().unwrap();
+    assert_eq!(library.effective_doi.as_deref(), Some("10.5555/personal"));
+    assert_eq!(library.effective_url.as_deref(), Some("https://example.test/personal-paper"));
+}
+
+#[test]
+fn rc5_effective_journal_uses_container_or_journal_and_never_provenance() {
+    let conn = mem_db();
+    let journal_id = db::insert_journal(&conn, "Journal Fallback", None, None, None, None).unwrap();
+    let mut c = candidate(None, "Fallback paper", None, Some("crossref"));
+    c.discovery_source = "publisher:nature".into();
+    let paper_id = match db::upsert_paper(&conn, journal_id, &c).unwrap() {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new paper"),
+    };
+    db::add_paper_to_library(&conn, paper_id, &[], &[], "manual").unwrap();
+    let library = db::get_library_paper(&conn, paper_id).unwrap().unwrap();
+    assert_eq!(library.effective_journal.as_deref(), Some("Journal Fallback"));
+    assert_ne!(library.effective_journal.as_deref(), Some("publisher:nature"));
+}
+
+#[test]
+fn rc5_collection_scope_facets_global_tags_and_and_filter() {
+    let conn = mem_db();
+    let first = test_paper(&conn, "10.5555/rc5-first", "First");
+    let second = test_paper(&conn, "10.5555/rc5-second", "Second");
+    let collection = db::create_library_collection(&conn, "RC5 Collection", None).unwrap();
+    let tag_a = db::create_library_tag(&conn, "A", None).unwrap();
+    let tag_b = db::create_library_tag(&conn, "B", None).unwrap();
+    db::add_paper_to_library(&conn, first, &[collection.id], &[tag_a.id, tag_b.id], "manual").unwrap();
+    db::add_paper_to_library(&conn, second, &[collection.id], &[tag_a.id], "manual").unwrap();
+    let facets = db::list_library_tag_facets(&conn, collection.id).unwrap();
+    assert_eq!(facets.iter().find(|f| f.tag.id == tag_a.id).unwrap().paper_count, 2);
+    assert_eq!(facets.iter().find(|f| f.tag.id == tag_b.id).unwrap().paper_count, 1);
+    let both = db::list_library_papers_scoped(&conn, "all", Some(collection.id), &[tag_a.id, tag_b.id], 100).unwrap();
+    assert_eq!(both.len(), 1);
+    assert_eq!(both[0].paper.id, first);
+}
+
+#[test]
+fn rc5_preferred_reader_validation_is_shell_free() {
+    assert!(db::validate_preferred_pdf_reader("system").is_ok());
+    assert!(db::validate_preferred_pdf_reader("/Applications/Preview.app").is_ok());
+    assert!(db::validate_preferred_pdf_reader("preview; rm -rf /").is_err());
+    assert!(db::validate_preferred_pdf_reader("preview").is_err());
 }

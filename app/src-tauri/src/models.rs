@@ -468,6 +468,14 @@ pub struct LibraryTag {
     pub updated_at: String,
 }
 
+/// Global Library Tag facet for a collection-scoped navigation view.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryTagFacet {
+    pub tag: LibraryTag,
+    pub paper_count: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LibraryMembership {
@@ -511,6 +519,8 @@ pub struct LibraryItemMetadata {
     pub volume_override: Option<String>,
     pub issue_override: Option<String>,
     pub pages_override: Option<String>,
+    pub doi_override: Option<String>,
+    pub url_override: Option<String>,
     pub paper_id: i64,
     pub title_override: Option<String>,
     pub chinese_title_override: Option<String>,
@@ -534,6 +544,8 @@ pub struct LibraryItemMetadataInput {
     pub volume_override: Option<String>,
     pub issue_override: Option<String>,
     pub pages_override: Option<String>,
+    pub doi_override: Option<String>,
+    pub url_override: Option<String>,
     pub title_override: Option<String>,
     pub chinese_title_override: Option<String>,
     pub source_override: Option<String>,
@@ -555,6 +567,8 @@ pub struct LibraryPaper {
     pub effective_volume: Option<String>,
     pub effective_issue: Option<String>,
     pub effective_pages: Option<String>,
+    pub effective_doi: Option<String>,
+    pub effective_url: Option<String>,
     pub paper: Paper,
     pub added_at: String,
     pub added_source: String,
@@ -621,6 +635,12 @@ pub struct ExternalPdfImportResult {
     pub candidate: Option<ExternalPdfCandidate>,
     pub candidates: Vec<ExternalPdfCandidate>,
     pub requires_confirmation: bool,
+    /// `ready` means local PDF work is complete. A DOI-bearing import may be
+    /// enriched asynchronously after this result is returned.
+    #[serde(default)]
+    pub enrichment_status: String,
+    #[serde(default)]
+    pub enrichment_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -720,6 +740,10 @@ pub struct Settings {
     /// Managed-PDF subfolder rule: none, year, or journal/source.
     #[serde(default = "default_pdf_subfolder_rule")]
     pub pdf_subfolder_rule: String,
+    /// `system` uses the platform default; otherwise this is an application
+    /// name/path passed as a process argument, never through a shell.
+    #[serde(default = "default_preferred_pdf_reader")]
+    pub preferred_pdf_reader: String,
 }
 
 pub fn default_pdf_file_handling_mode() -> String { "none".to_string() }
@@ -727,6 +751,7 @@ pub fn default_pdf_naming_template() -> String {
     "{title} - {journal} - {first_author} - {year}.pdf".to_string()
 }
 pub fn default_pdf_subfolder_rule() -> String { "none".to_string() }
+pub fn default_preferred_pdf_reader() -> String { "system".to_string() }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
