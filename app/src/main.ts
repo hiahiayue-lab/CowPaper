@@ -5,6 +5,18 @@ import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
+import {
+  buildLibrarySearchSuggestions,
+  createLibrarySearchState,
+  normalizeLibrarySearchQuery,
+  reduceLibrarySearchKeyboard,
+  reduceLibrarySearchState,
+  type LibrarySearchApi,
+  type LibrarySearchQuery,
+  type LibrarySearchResult,
+  type LibrarySearchState,
+  type SearchPaper,
+} from "./librarySearch";
 
 interface Journal {
   id: number;
@@ -487,6 +499,10 @@ let libraryView: "all" | "recent" | "unfiled" = "all";
 let selectedLibraryPaperId: number | null = null;
 let libraryScope: { kind: "collection"; id: number } | null = null;
 let librarySelectedTagIds: number[] = [];
+let librarySearchState: LibrarySearchState = createLibrarySearchState();
+let librarySearchAppliedQuery: LibrarySearchQuery | null = null;
+let librarySearchResultIds: Set<number> | null = null;
+let librarySearchAdapter: LibrarySearchApi | null = null;
 const libraryPaperIds = new Set<number>();
 let activeWorkspace: "discovery" | "library" = "discovery";
 let aiStatus: AiStatus = emptyAiStatus();
@@ -1987,6 +2003,167 @@ async function submitLibraryInlineCreate(): Promise<void> {
   }
 }
 
+function librarySearchPaper(item: LibraryPaper): SearchPaper {
+  return {
+    id: item.paper.id,
+    title: item.effectiveTitle ?? item.paper.title,
+    chineseTitle: item.effectiveChineseTitle ?? item.paper.chineseTitle,
+    authors: (item.effectiveAuthors || item.paper.authors || []).map((author) => author.name || [author.given, author.family].filter(Boolean).join(" ")),
+    source: item.effectiveSource ?? item.paper.journalName,
+    year: item.effectiveYear,
+    publisher: item.effectivePublisher ?? item.paper.publisher,
+    doi: item.effectiveDoi ?? item.paper.normalizedDoi,
+    url: item.effectiveUrl ?? item.paper.url,
+    volume: item.effectiveVolume ?? item.paper.volume,
+    issue: item.effectiveIssue ?? item.paper.issue,
+    pages: item.effectivePages ?? item.paper.pages,
+    note: item.note,
+    abstract: item.effectiveAbstract ?? item.paper.abstractText,
+    chineseAbstract: item.effectiveChineseAbstract ?? item.paper.chineseAbstract,
+    collectionIds: item.collections.map((collection) => collection.id),
+    tagIds: item.tags.map((tag) => tag.id),
+    tags: item.tags.map((tag) => tag.name),
+  };
+}
+
+function librarySearchQuery(): LibrarySearchQuery {
+  const query = normalizeLibrarySearchQuery(librarySearchState.query);
+  if (!query.collectionIds.length && libraryScope) {
+    query.collectionIds = [libraryScope.id];
+    query.includeDescendants = true;
+  }
+  if (!query.libraryTagIds.length && librarySelectedTagIds.length) {
+    query.libraryTagIds = [...librarySelectedTagIds];
+  }
+  return query;
+}
+
+interface BackendLibrarySearchHit {
+  paperId: number;
+  rank: number;
+  relevance: number;
+}
+
+function getLibrarySearchAdapter(): LibrarySearchApi {
+  if (librarySearchAdapter) return librarySearchAdapter;
+  librarySearchAdapter = {
+    async search(request): Promise<LibrarySearchResult> {
+      const query = normalizeLibrarySearchQuery(request);
+      const hits = await invoke<BackendLibrarySearchHit[]>("search_library", {
+        queryText: query.text,
+        searchScope: query.mode,
+        collectionIds: query.collectionIds,
+        libraryTagIds: query.libraryTagIds,
+        limit: 1000,
+        offset: 0,
+      });
+      // The Rust command owns search identity and scope. Hydrate the existing
+      // LibraryPaper rows so the table/Inspector remain the only render path.
+      const source = request.view === "all"
+        ? await invoke<LibraryPaper[]>("list_library_papers", { view: "all", collectionId: null, tagIds: [] })
+        : libraryPapers;
+      const byId = new Map(source.map((item) => [item.paper.id, item]));
+      const paperIds = hits.map((hit) => hit.paperId).filter((id) => byId.has(id));
+      return {
+        papers: paperIds.map((id) => librarySearchPaper(byId.get(id)!)),
+        paperIds,
+      };
+    },
+    async getSuggestions() {
+      return buildLibrarySearchSuggestions(librarySearchIndex(), librarySearchState.query);
+    },
+  };
+  return librarySearchAdapter;
+}
+
+function librarySearchIndex() {
+  return {
+    collections: libraryCollections.map(({ id, parentId, name }) => ({ id, parentId, name })),
+    tags: libraryTags.map(({ id, name, color }) => ({ id, name, color })),
+    papers: libraryPapers.map(librarySearchPaper),
+    tagCounts: new Map(libraryTagFacets.map(({ tag, paperCount }) => [tag.id, paperCount])),
+  };
+}
+
+function renderLibrarySearchSuggestions(): void {
+  const input = $("library-search-input") as HTMLInputElement | null;
+  const box = $("library-search-suggestions");
+  if (!input || !box) return;
+  const open = librarySearchState.phase !== "closed" && librarySearchState.suggestions.length > 0;
+  box.classList.toggle("hidden", !open);
+  input.setAttribute("aria-expanded", String(open));
+  if (!open) {
+    box.innerHTML = "";
+    return;
+  }
+  const groups: Array<[string, string, typeof librarySearchState.suggestions]> = [
+    ["collection", "Collections", librarySearchState.suggestions.filter((item) => item.kind === "collection")],
+    ["libraryTag", "Library Tags", librarySearchState.suggestions.filter((item) => item.kind === "libraryTag")],
+    ["paper", "Papers", librarySearchState.suggestions.filter((item) => item.kind === "paper")],
+    ["searchAction", "Search Actions", librarySearchState.suggestions.filter((item) => item.kind === "searchAction")],
+  ];
+  box.innerHTML = groups.filter(([, , items]) => items.length).map(([, label, items]) => `<section class="library-search-suggestion-group"><div class="library-search-suggestion-heading">${label}</div>${items.map((suggestion) => {
+    const index = librarySearchState.suggestions.indexOf(suggestion);
+    return `<button type="button" class="library-search-suggestion${suggestion.dimmed ? " dimmed" : ""}" role="option" aria-selected="${index === librarySearchState.activeSuggestionIndex}" draggable="${suggestion.draggable ? "true" : "false"}" data-search-suggestion-id="${escapeHtml(suggestion.id)}"><span class="library-search-suggestion-kind">${suggestion.kind === "collection" ? "文集" : suggestion.kind === "libraryTag" ? "Tag" : suggestion.kind === "paper" ? "Paper" : "Action"}</span><span class="library-search-suggestion-label">${escapeHtml(suggestion.label)}</span><span class="library-search-suggestion-detail">${escapeHtml(suggestion.detail || "")}</span></button>`;
+  }).join("")}</section>`).join("");
+}
+
+function refreshLibrarySearchSuggestions(): void {
+  const query = librarySearchState.query;
+  const suggestions = query.text.trim() ? buildLibrarySearchSuggestions(librarySearchIndex(), query) : [];
+  librarySearchState = reduceLibrarySearchState(librarySearchState, { type: "SUGGESTIONS", suggestions });
+  renderLibrarySearchSuggestions();
+}
+
+async function executeLibrarySearch(): Promise<void> {
+  const query = librarySearchQuery();
+  try {
+    const result = await getLibrarySearchAdapter().search({ ...query, view: libraryView });
+    librarySearchResultIds = new Set(result.paperIds);
+    librarySearchAppliedQuery = query;
+    renderLibrary();
+  } catch (error) {
+    setStatus(`搜索失败：${String(error)}`, "error");
+  }
+}
+
+function clearLibrarySearch(): void {
+  librarySearchState = reduceLibrarySearchState(librarySearchState, { type: "CLEAR" });
+  librarySearchAppliedQuery = null;
+  librarySearchResultIds = null;
+  const input = $("library-search-input") as HTMLInputElement | null;
+  if (input) input.value = "";
+  refreshLibrarySearchSuggestions();
+  renderLibrary();
+}
+
+function renderLibrarySearch(): void {
+  const input = $("library-search-input") as HTMLInputElement | null;
+  const mode = $("library-search-mode") as HTMLSelectElement | null;
+  const clear = $("library-search-clear") as HTMLButtonElement | null;
+  if (!input || !mode || !clear) return;
+  if (document.activeElement !== input) input.value = librarySearchState.query.text;
+  mode.value = librarySearchState.query.mode;
+  clear.classList.toggle("hidden", !librarySearchState.query.text && !librarySearchAppliedQuery);
+  renderLibrarySearchSuggestions();
+}
+
+function handleLibrarySearchKeydown(event: KeyboardEvent): void {
+  const input = event.target as HTMLInputElement;
+  if (input.id !== "library-search-input") return;
+  const activeSuggestion = librarySearchState.suggestions[librarySearchState.activeSuggestionIndex];
+  const next = reduceLibrarySearchKeyboard(librarySearchState, { key: event.key, isComposing: event.isComposing });
+  if (next === librarySearchState) return;
+  event.preventDefault();
+  librarySearchState = next;
+  if (event.key === "Enter") {
+    if (activeSuggestion) applyLocalLibrarySearchResult(librarySearchState.query);
+    void executeLibrarySearch();
+  } else {
+    renderLibrarySearchSuggestions();
+  }
+}
+
 function renderLibraryNavigation() {
   const standardCounts: Record<string, number> = {
     "library-all": librarySidebarCounts.allCount,
@@ -2027,6 +2204,7 @@ function renderLibraryFacets(): void {
 function renderLibrary() {
   const title = libraryView === "recent" ? "最近收录" : libraryView === "unfiled" ? "未分类" : "全部文献";
   const titleEl = activeWorkspace === "library" ? $("view-title") : null;
+  renderLibrarySearch();
   const layout = $("library-layout");
   layout.classList.toggle("inspector-collapsed", libraryInspectorCollapsed);
   renderLibraryTableHeader();
@@ -2037,7 +2215,7 @@ function renderLibrary() {
   const count = $("library-count");
   // Filtering is owned by list_library_papers; do not reimplement scope in
   // the browser where Collection+Tag could accidentally become OR semantics.
-  const visiblePapers = libraryPapers;
+  const visiblePapers = librarySearchResultIds ? libraryPapers.filter((item) => librarySearchResultIds!.has(item.paper.id)) : libraryPapers;
   if (count) count.textContent = `${visiblePapers.length} 篇`;
   const list = $("library-list");
   if (!list) return;
@@ -3706,6 +3884,11 @@ async function setupListeners() {
   // Catalog 详情 checkbox 选择（change 冒泡 → 委托处理）
   document.addEventListener("input", (ev) => {
     const el = ev.target as HTMLInputElement;
+    if (el.id === "library-search-input") {
+      librarySearchState = reduceLibrarySearchState(librarySearchState, { type: "INPUT", text: el.value });
+      if (!librarySearchState.isComposing) refreshLibrarySearchSuggestions();
+      return;
+    }
     const action = el.dataset.action;
     if (action === "tag-draft-name" || action === "tag-draft-desc") {
       const i = parseInt(el.dataset.idx!, 10);
@@ -3733,8 +3916,32 @@ async function setupListeners() {
     }
     if (el.matches("#set-pdf-library-root, #set-pdf-naming-template")) renderPdfTemplateExample();
   });
+  document.addEventListener("compositionstart", (ev) => {
+    if ((ev.target as HTMLElement).id === "library-search-input") librarySearchState = reduceLibrarySearchState(librarySearchState, { type: "START_COMPOSITION" });
+  });
+  document.addEventListener("compositionend", (ev) => {
+    const input = ev.target as HTMLInputElement;
+    if (input.id !== "library-search-input") return;
+    librarySearchState = reduceLibrarySearchState(librarySearchState, { type: "END_COMPOSITION", text: input.value });
+    refreshLibrarySearchSuggestions();
+  });
+  document.addEventListener("focusin", (ev) => {
+    if ((ev.target as HTMLElement).id !== "library-search-input") return;
+    librarySearchState = reduceLibrarySearchState(librarySearchState, { type: "FOCUS" });
+    refreshLibrarySearchSuggestions();
+  });
+  document.addEventListener("dragstart", (ev) => {
+    const suggestion = (ev.target as HTMLElement).closest("[data-search-suggestion-id]") as HTMLElement | null;
+    if (!suggestion || suggestion.getAttribute("draggable") !== "true") return;
+    ev.dataTransfer?.setData("text/plain", suggestion.dataset.searchSuggestionId || "");
+    ev.dataTransfer?.setData("application/x-cowpaper-library-scope", suggestion.dataset.searchSuggestionId || "");
+  });
   document.addEventListener("keydown", (ev) => {
     const input = ev.target as HTMLInputElement;
+    if (input.id === "library-search-input") {
+      handleLibrarySearchKeydown(ev);
+      return;
+    }
     if (input.dataset.action !== "library-relation-search") return;
     if (ev.key === "Escape") {
       ev.preventDefault();
@@ -3748,6 +3955,13 @@ async function setupListeners() {
   });
   document.addEventListener("change", (ev) => {
     const el = ev.target as HTMLInputElement;
+    if (el.id === "library-search-mode") {
+      librarySearchState = reduceLibrarySearchState(librarySearchState, { type: "INPUT", text: (document.getElementById("library-search-input") as HTMLInputElement | null)?.value || "" });
+      librarySearchState.query.mode = el.value === "metadata" || el.value === "content" ? el.value : "quick";
+      refreshLibrarySearchSuggestions();
+      if (librarySearchAppliedQuery) void executeLibrarySearch();
+      return;
+    }
     // 中文 IME 兜底：input 事件在 composition 期间可能延迟/丢失，
     // change 在失焦/回车时可靠触发，确保 draft 始终同步（否则 dirty=false → 按钮 disabled → 点击无反应）
     const action = el.dataset.action;
@@ -3805,6 +4019,20 @@ async function setupListeners() {
 
   document.addEventListener("click", async (ev) => {
     const t = ev.target as HTMLElement;
+    if (t.closest("#library-search-clear")) {
+      clearLibrarySearch();
+      return;
+    }
+    const searchSuggestion = t.closest("[data-search-suggestion-id]") as HTMLElement | null;
+    if (searchSuggestion) {
+      const suggestion = librarySearchState.suggestions.find((item) => item.id === searchSuggestion.dataset.searchSuggestionId);
+      if (suggestion) {
+        librarySearchState = reduceLibrarySearchState(librarySearchState, { type: "SELECT_SUGGESTION", suggestion });
+        renderLibrarySearch();
+        void executeLibrarySearch();
+      }
+      return;
+    }
     const workspaceTab = t.closest("[data-workspace]") as HTMLElement | null;
     if (workspaceTab) {
       const workspace = workspaceTab.dataset.workspace as "discovery" | "library";
