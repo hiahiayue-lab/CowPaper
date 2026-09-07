@@ -1612,6 +1612,24 @@ fn fts_quote(term: &str) -> String {
     format!("\"{}\"", term.replace('"', "\"\""))
 }
 
+fn library_search_group_text(values: &[Option<&str>]) -> String {
+    let raw = values
+        .iter()
+        .copied()
+        .flatten()
+        .filter(|value| !value.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let cjk = library_search_cjk_bigrams(&raw);
+    if cjk.is_empty() {
+        raw
+    } else if raw.is_empty() {
+        cjk
+    } else {
+        format!("{raw} {cjk}")
+    }
+}
+
 /// Convert user text to safe FTS5 terms. Non-Han text is left for the same
 /// unicode61 normalization used by the FTS table; Han runs use the exact same
 /// application-side bigram algorithm as `library_search_cjk_bigrams`.
@@ -1659,11 +1677,12 @@ fn library_search_match_query(input: &str, scope: &str) -> Option<String> {
     }
     let scope = scope.trim().to_ascii_lowercase();
     let column = match scope.as_str() {
-        "all" | "content" => None,
-        "title" => Some("{title chinese_title library_tags cjk_ngrams}"),
-        "abstract" => Some("{abstract chinese_abstract cjk_ngrams}"),
+        "quick" => Some("quick_text"),
+        "metadata" => Some("{quick_text metadata_text}"),
+        "content" | "all" => Some("{quick_text metadata_text content_text}"),
+        "title" => Some("{title chinese_title}"),
+        "abstract" => Some("{abstract chinese_abstract}"),
         "note" => Some("{note cjk_ngrams}"),
-        "metadata" => Some("{override_text cjk_ngrams}"),
         "tags" | "library_tags" => Some("library_tags"),
         _ => return None,
     };
@@ -1844,33 +1863,44 @@ fn refresh_library_search_document(conn: &Connection, paper_id: i64) -> Result<(
     .flatten()
     .collect::<Vec<_>>()
     .join(" ");
-    let cjk_source = [
-        title.as_deref(), chinese_title.as_deref(), effective_abstract.as_deref(),
-        chinese_abstract.as_deref(), Some(note.as_str()), Some(override_text.as_str()),
+    let quick_text = library_search_group_text(&[
+        title.as_deref(), chinese_title.as_deref(), authors.as_deref(), year.as_deref(),
+        journal.as_deref(),
+    ]);
+    let metadata_text = library_search_group_text(&[
+        publisher.as_deref(), doi.as_deref(), url.as_deref(), volume.as_deref(),
+        issue.as_deref(), pages.as_deref(),
+    ]);
+    let content_text = library_search_group_text(&[
+        effective_abstract.as_deref(), chinese_abstract.as_deref(), Some(note.as_str()),
         Some(tags.as_str()),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>()
-    .join(" ");
-    let cjk_ngrams = library_search_cjk_bigrams(&cjk_source);
+    ]);
+    let cjk_ngrams = library_search_cjk_bigrams(
+        &[title.as_deref(), chinese_title.as_deref(), effective_abstract.as_deref(),
+            chinese_abstract.as_deref(), Some(note.as_str()), Some(override_text.as_str()),
+            Some(tags.as_str())]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
 
     conn.execute(
         "INSERT INTO library_search_documents(
             paper_id,title,chinese_title,abstract,chinese_abstract,note,override_text,
-            library_tags,annotation_text,cjk_ngrams
-         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'',?9)",
+            library_tags,annotation_text,cjk_ngrams,quick_text,metadata_text,content_text
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'',?9,?10,?11,?12)",
         params![
             paper_id, title, chinese_title, effective_abstract, chinese_abstract,
-            note, override_text, tags, cjk_ngrams,
+            note, override_text, tags, cjk_ngrams, quick_text, metadata_text, content_text,
         ],
     )?;
     conn.execute(
         "INSERT INTO library_search_fts(
             rowid,title,chinese_title,abstract,chinese_abstract,note,override_text,
-            library_tags,annotation_text,cjk_ngrams
+            library_tags,annotation_text,cjk_ngrams,quick_text,metadata_text,content_text
          ) SELECT paper_id,title,chinese_title,abstract,chinese_abstract,note,override_text,
-                  library_tags,annotation_text,cjk_ngrams
+                  library_tags,annotation_text,cjk_ngrams,quick_text,metadata_text,content_text
            FROM library_search_documents WHERE paper_id=?1",
         params![paper_id],
     )?;
@@ -1908,8 +1938,8 @@ pub fn search_library(
     offset: i64,
     paper_id: Option<i64>,
 ) -> Result<Vec<crate::models::LibrarySearchResult>> {
-    let scope = search_scope.unwrap_or("content").trim().to_ascii_lowercase();
-    if !matches!(scope.as_str(), "all" | "content" | "title" | "abstract" | "note" | "metadata" | "tags" | "library_tags") {
+    let scope = search_scope.unwrap_or("quick").trim().to_ascii_lowercase();
+    if !matches!(scope.as_str(), "quick" | "all" | "content" | "title" | "abstract" | "note" | "metadata" | "tags" | "library_tags") {
         return Err(rusqlite::Error::InvalidParameterName("search_scope".into()));
     }
     let mut collections = collection_ids.to_vec();
@@ -6595,7 +6625,10 @@ fn migrate_to_v19(conn: &Connection) -> Result<()> {
             override_text TEXT,
             library_tags TEXT,
             annotation_text TEXT,
-            cjk_ngrams TEXT
+            cjk_ngrams TEXT,
+            quick_text TEXT,
+            metadata_text TEXT,
+            content_text TEXT
         );
         CREATE VIRTUAL TABLE IF NOT EXISTS library_search_fts USING fts5(
             title,
@@ -6607,6 +6640,9 @@ fn migrate_to_v19(conn: &Connection) -> Result<()> {
             library_tags,
             annotation_text,
             cjk_ngrams,
+            quick_text,
+            metadata_text,
+            content_text,
             content='library_search_documents',
             content_rowid='paper_id',
             tokenize='unicode61 remove_diacritics 1'

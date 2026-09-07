@@ -5324,17 +5324,19 @@ fn test_library_search_v19_fts_filters_effective_values_and_sync() {
         ids.sort_unstable();
         ids
     };
-    assert_eq!(ids("Platform Governance", Some("content"), &[], &[], None), vec![a]);
-    assert_eq!(ids("平台治理", Some("content"), &[], &[], None), vec![a], "Han bigrams must support sub-token search");
-    assert_eq!(ids("平台 Governance", Some("content"), &[], &[], None), vec![a], "mixed query terms must be ANDed");
+    assert_eq!(ids("Platform Governance", Some("quick"), &[], &[], None), vec![a]);
+    assert_eq!(ids("平台治理", Some("quick"), &[], &[], None), vec![a], "Han bigrams must support sub-token search");
+    assert_eq!(ids("平台 Governance", Some("quick"), &[], &[], None), vec![a], "mixed query terms must be ANDed");
     assert_eq!(ids("Network", Some("content"), &[], &[], None), vec![a, b], "non-Library canonical paper must be excluded");
-    assert_eq!(ids("网络方法", Some("content"), &[], &[], None), vec![b]);
+    assert_eq!(ids("网络方法", Some("quick"), &[], &[], None), vec![b]);
+    assert_eq!(ids("platform pricing", Some("content"), &[], &[], None), vec![a]);
+    assert_eq!(ids("10.1000/search-a", Some("metadata"), &[], &[], None), vec![a]);
     assert_eq!(ids("CoreTag", Some("tags"), &[], &[], None), vec![a, b]);
     assert_eq!(ids("", Some("content"), &[root.id], &[], None), vec![a], "parent collection must include descendants");
     assert_eq!(ids("", Some("content"), &[root.id, other.id], &[], None), vec![a, b], "multiple collections are OR and dedup by paper id");
     assert_eq!(ids("", Some("content"), &[], &[core.id, ready.id], None), vec![a], "multiple Library Tags are AND");
-    assert_eq!(ids("Platform", Some("content"), &[], &[], Some(a)), vec![a]);
-    assert!(ids("Platform", Some("content"), &[], &[], Some(outside)).is_empty());
+    assert_eq!(ids("Platform", Some("quick"), &[], &[], Some(a)), vec![a]);
+    assert!(ids("Platform", Some("quick"), &[], &[], Some(outside)).is_empty());
 
     let input = crate::models::LibraryItemMetadataInput {
         title_override: Some("Override Quantum Paper".into()),
@@ -5343,23 +5345,23 @@ fn test_library_search_v19_fts_filters_effective_values_and_sync() {
         ..Default::default()
     };
     db::set_library_item_metadata(&conn, a, &input).unwrap();
-    assert_eq!(ids("Override Quantum", Some("content"), &[], &[], None), vec![a]);
+    assert_eq!(ids("Override Quantum", Some("quick"), &[], &[], None), vec![a]);
     assert_eq!(ids("private note", Some("content"), &[], &[], None), vec![a]);
     assert_eq!(ids("effective abstract", Some("content"), &[], &[], None), vec![a]);
     assert_eq!(conn.query_row("SELECT title FROM papers WHERE id=?1", params![a], |r| r.get::<_, Option<String>>(0)).unwrap().as_deref(), Some("Platform Governance and Network Effects"));
     db::clear_library_item_overrides(&conn, a).unwrap();
-    assert!(ids("Override Quantum", Some("content"), &[], &[], None).is_empty());
-    assert_eq!(ids("Platform Governance", Some("content"), &[], &[], None), vec![a]);
+    assert!(ids("Override Quantum", Some("quick"), &[], &[], None).is_empty());
+    assert_eq!(ids("Platform Governance", Some("quick"), &[], &[], None), vec![a]);
 
     db::rename_library_tag(&conn, core.id, "RenamedTag").unwrap();
     assert!(ids("CoreTag", Some("tags"), &[], &[], None).is_empty());
     assert_eq!(ids("RenamedTag", Some("tags"), &[], &[], None), vec![a, b]);
     db::remove_paper_from_library(&conn, a).unwrap();
-    assert!(ids("Platform Governance", Some("content"), &[], &[], None).is_empty());
+    assert!(ids("Platform Governance", Some("quick"), &[], &[], None).is_empty());
     assert!(db::get_paper(&conn, a).unwrap().is_some(), "search sync must not delete canonical paper");
     db::add_paper_to_library(&conn, a, &[child.id], &[core.id, ready.id], "manual").unwrap();
     db::rebuild_library_search_index(&conn).unwrap();
-    assert_eq!(ids("Platform Governance", Some("content"), &[], &[], None), vec![a]);
+    assert_eq!(ids("Platform Governance", Some("quick"), &[], &[], None), vec![a]);
 
     let score: Option<f64> = conn.query_row("SELECT total_score FROM papers WHERE id=?1", params![a], |r| r.get(0)).unwrap();
     assert_eq!(score, Some(4.2), "Library search/index writes must not alter recommendation semantics");
