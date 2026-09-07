@@ -135,6 +135,18 @@ interface LibraryTag {
   updatedAt: string;
 }
 
+interface LibraryCollectionCount {
+  collectionId: number;
+  paperCount: number;
+}
+
+interface LibrarySidebarCounts {
+  allCount: number;
+  recentCount: number;
+  uncategorizedCount: number;
+  collectionCounts: LibraryCollectionCount[];
+}
+
 interface LibraryMembership {
   paperId: number;
   addedAt: string;
@@ -470,6 +482,7 @@ let libraryCollections: LibraryCollection[] = [];
 let libraryTags: LibraryTag[] = [];
 interface LibraryTagFacet { tag: LibraryTag; paperCount: number; }
 let libraryTagFacets: LibraryTagFacet[] = [];
+let librarySidebarCounts: LibrarySidebarCounts = { allCount: 0, recentCount: 0, uncategorizedCount: 0, collectionCounts: [] };
 let libraryView: "all" | "recent" | "unfiled" = "all";
 let selectedLibraryPaperId: number | null = null;
 let libraryScope: { kind: "collection"; id: number } | null = null;
@@ -751,6 +764,7 @@ async function loadLibraryData(view: "all" | "recent" | "unfiled" = libraryView)
       invoke<LibraryTag[]>("list_library_tags"),
       invoke<LibraryTagFacet[]>("list_library_tag_facets", { collectionId }),
     ]);
+    librarySidebarCounts = await invoke<LibrarySidebarCounts>("get_library_sidebar_counts");
     libraryPaperIds.clear();
     // Keep Discovery's membership index independent from the current Library
     // Collection/Tag scope.
@@ -1974,15 +1988,25 @@ async function submitLibraryInlineCreate(): Promise<void> {
 }
 
 function renderLibraryNavigation() {
+  const standardCounts: Record<string, number> = {
+    "library-all": librarySidebarCounts.allCount,
+    "library-recent": librarySidebarCounts.recentCount,
+    "library-unfiled": librarySidebarCounts.uncategorizedCount,
+  };
+  document.querySelectorAll<HTMLButtonElement>(".library-nav-item-view").forEach((item) => {
+    const count = item.querySelector<HTMLElement>(".nav-count");
+    if (count) count.textContent = String(standardCounts[item.dataset.view || ""] ?? 0);
+  });
   document.querySelectorAll(".library-nav-item-view").forEach((item) => {
     const view = (item as HTMLElement).dataset.view;
     const active = !libraryScope && librarySelectedTagIds.length === 0 && ((libraryView === "all" && view === "library-all") || (libraryView === "recent" && view === "library-recent") || (libraryView === "unfiled" && view === "library-unfiled"));
     item.classList.toggle("active", active);
   });
   const collections = $("library-collection-nav");
+  const collectionCount = (id: number): number => librarySidebarCounts.collectionCounts.find((entry) => entry.collectionId === id)?.paperCount ?? 0;
   const children = (parentId: number | null, depth = 0): string => libraryInlineCreateRow("collection", parentId, depth) + libraryCollections
     .filter((c) => c.parentId === parentId)
-    .map((c) => `<div class="library-nav-item"><button class="library-nav-row${libraryScope?.kind === "collection" && libraryScope.id === c.id ? " active" : ""}" style="padding-left:${12 + depth * 14}px" data-drop-kind="collection" data-action="library-filter-collection" data-collection-id="${c.id}"><span class="nav-symbol folder-symbol" aria-hidden="true"></span><span class="nav-label">${escapeHtml(c.name)}</span></button><button class="nav-child" title="在此文集下新建子文集" aria-label="在此文集下新建子文集" data-action="library-create-child" data-parent-id="${c.id}">＋</button><button class="nav-manage" title="重命名文集" aria-label="重命名文集" data-action="library-rename-collection" data-collection-id="${c.id}">✎</button><button class="nav-manage danger" title="删除文集" aria-label="删除文集" data-action="library-delete-collection" data-collection-id="${c.id}">×</button></div>${children(c.id, depth + 1)}`)
+    .map((c) => `<div class="library-nav-item"><button class="library-nav-row${libraryScope?.kind === "collection" && libraryScope.id === c.id ? " active" : ""}" style="padding-left:${12 + depth * 14}px" data-drop-kind="collection" data-action="library-filter-collection" data-collection-id="${c.id}"><span class="nav-symbol folder-symbol" aria-hidden="true"></span><span class="nav-label">${escapeHtml(c.name)}</span><span class="nav-count">${collectionCount(c.id)}</span></button><button class="nav-child" title="在此文集下新建子文集" aria-label="在此文集下新建子文集" data-action="library-create-child" data-parent-id="${c.id}">＋</button><button class="nav-manage" title="重命名文集" aria-label="重命名文集" data-action="library-rename-collection" data-collection-id="${c.id}">✎</button><button class="nav-manage danger" title="删除文集" aria-label="删除文集" data-action="library-delete-collection" data-collection-id="${c.id}">×</button></div>${children(c.id, depth + 1)}`)
     .join("");
   collections.innerHTML = children(null) || '<span class="muted small nav-empty">暂无文献夹</span>';
   const tagRows = libraryTagFacets.map(({ tag, paperCount }) => `<div class="library-nav-item"><button class="library-nav-row${librarySelectedTagIds.includes(tag.id) ? " active" : ""}" data-drop-kind="tag" data-action="library-filter-tag" data-tag-id="${tag.id}"><span class="tag-dot" style="background:${escapeHtml(tag.color || "#9ca3af")}"></span><span class="nav-label">${escapeHtml(tag.name)}</span><span class="nav-count">${paperCount}</span></button><button class="nav-manage" title="重命名 Library Tag" aria-label="重命名 Library Tag" data-action="library-rename-tag" data-tag-id="${tag.id}">✎</button><button class="nav-manage danger" title="删除 Library Tag" aria-label="删除 Library Tag" data-action="library-delete-tag" data-tag-id="${tag.id}">×</button></div>`).join("");

@@ -3903,6 +3903,55 @@ pub fn list_library_collections(conn: &Connection) -> Result<Vec<crate::models::
     rows.collect()
 }
 
+/// Count the canonical papers represented by each Library sidebar scope.
+/// Collections currently use direct membership, matching
+/// `list_library_papers_scoped`; no hierarchy semantics are introduced here.
+pub fn library_sidebar_counts(conn: &Connection) -> Result<crate::models::LibrarySidebarCounts> {
+    let all_count: i64 = conn.query_row(
+        "SELECT COUNT(DISTINCT li.paper_id) FROM library_items li",
+        [],
+        |row| row.get(0),
+    )?;
+    let recent_count: i64 = conn.query_row(
+        "SELECT COUNT(DISTINCT li.paper_id) FROM library_items li",
+        [],
+        |row| row.get(0),
+    )?;
+    let uncategorized_count: i64 = conn.query_row(
+        "SELECT COUNT(DISTINCT li.paper_id)
+         FROM library_items li
+         WHERE NOT EXISTS (
+             SELECT 1 FROM library_collection_items lci
+             WHERE lci.paper_id = li.paper_id
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+
+    let mut stmt = conn.prepare(
+        "SELECT c.id, COUNT(DISTINCT lci.paper_id) AS paper_count
+         FROM library_collections c
+         LEFT JOIN library_collection_items lci ON lci.collection_id = c.id
+         GROUP BY c.id
+         ORDER BY c.id",
+    )?;
+    let collection_counts = stmt
+        .query_map([], |row| {
+            Ok(crate::models::LibraryCollectionCount {
+                collection_id: row.get(0)?,
+                paper_count: row.get(1)?,
+            })
+        })?
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(crate::models::LibrarySidebarCounts {
+        all_count,
+        recent_count,
+        uncategorized_count,
+        collection_counts,
+    })
+}
+
 pub fn create_library_collection(conn: &Connection, name: &str, parent_id: Option<i64>) -> Result<crate::models::LibraryCollection> {
     let name = name.trim();
     if name.is_empty() {

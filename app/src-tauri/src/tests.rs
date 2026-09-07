@@ -5196,6 +5196,13 @@ fn test_library_collections_tags_views_and_removal_preserve_paper() {
     assert_eq!(db::list_library_papers(&conn, "all", 100).unwrap().len(), 2);
     assert_eq!(db::list_library_papers(&conn, "unfiled", 100).unwrap().len(), 1);
     assert_eq!(db::list_library_papers(&conn, "recent", 100).unwrap().len(), 2);
+    let sidebar_counts = db::library_sidebar_counts(&conn).unwrap();
+    assert_eq!(sidebar_counts.all_count, 2);
+    assert_eq!(sidebar_counts.recent_count, 2);
+    assert_eq!(sidebar_counts.uncategorized_count, 1);
+    assert_eq!(sidebar_counts.collection_counts.iter().find(|x| x.collection_id == root.id).unwrap().paper_count, 1);
+    assert_eq!(sidebar_counts.collection_counts.iter().find(|x| x.collection_id == child.id).unwrap().paper_count, 1);
+    assert_eq!(sidebar_counts.collection_counts.iter().find(|x| x.collection_id == other.id).unwrap().paper_count, 1);
     assert_eq!(db::list_library_tags(&conn).unwrap().len(), 2);
     assert_eq!(db::list_tags(&conn).unwrap().len(), 6, "Library Tags 不得污染 Research Tags");
     db::remove_paper_from_library(&conn, a).unwrap();

@@ -478,6 +478,24 @@ pub struct LibraryTagFacet {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct LibraryCollectionCount {
+    pub collection_id: i64,
+    pub paper_count: i64,
+}
+
+/// Read-only counts for the Library sidebar. All counts are based on the
+/// canonical paper_id and intentionally mirror the existing Library scopes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibrarySidebarCounts {
+    pub all_count: i64,
+    pub recent_count: i64,
+    pub uncategorized_count: i64,
+    pub collection_counts: Vec<LibraryCollectionCount>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LibraryMembership {
     pub paper_id: i64,
     pub added_at: String,

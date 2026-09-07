@@ -991,6 +991,12 @@ fn list_library_collections(state: State<Db>) -> Result<Vec<models::LibraryColle
 }
 
 #[tauri::command]
+fn get_library_sidebar_counts(state: State<Db>) -> Result<models::LibrarySidebarCounts, String> {
+    let conn = state.inner().lock().unwrap();
+    db::library_sidebar_counts(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn create_library_collection(name: String, parent_id: Option<i64>, state: State<Db>) -> Result<models::LibraryCollection, String> {
     let conn = state.inner().lock().unwrap();
     db::create_library_collection(&conn, &name, parent_id).map_err(|e| e.to_string())
@@ -2206,6 +2212,7 @@ pub fn run() {
             set_paper_collections,
             set_paper_library_tags,
             list_library_collections,
+            get_library_sidebar_counts,
             create_library_collection,
             rename_library_collection,
             delete_library_collection,
