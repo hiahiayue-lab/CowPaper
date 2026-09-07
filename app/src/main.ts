@@ -3280,6 +3280,8 @@ function doSwitch(name: string) {
   }
   activeWorkspace = isLibrary ? "library" : "discovery";
   document.body.classList.toggle("library-workspace", isLibrary);
+  const librarySearchToolbar = document.querySelector<HTMLElement>(".library-search-toolbar");
+  if (librarySearchToolbar) librarySearchToolbar.style.display = isLibrary ? "flex" : "none";
   document.querySelectorAll(".workspace-nav").forEach((nav) => nav.classList.toggle("hidden", (nav as HTMLElement).dataset.workspaceNav !== activeWorkspace));
   document.querySelectorAll(".workspace-tab").forEach((tab) => tab.classList.toggle("active", (tab as HTMLElement).dataset.workspace === activeWorkspace));
   document.querySelectorAll(".nav-item").forEach((t) => t.classList.toggle("active", (t as HTMLElement).dataset.view === name));

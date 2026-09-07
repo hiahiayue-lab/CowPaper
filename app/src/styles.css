@@ -1644,8 +1644,8 @@ body.library-workspace .relation-chip { border-color: #e8e8e8; background: #fff;
 }
 
 /* v0.2.1: one unified Library search box in the toolbar. */
-.library-search-toolbar.library-only { position: relative; display: none; align-items: center; gap: 5px; width: min(430px, 42vw); height: 28px; padding: 0 7px; border: 1px solid #dedede; border-radius: 6px; background: #fff; }
-.library-workspace .library-search-toolbar.library-only { display: flex; }
+.library-search-toolbar.library-only { position: relative; display: none; flex: 0 1 min(430px, 42vw); min-width: 250px; align-items: center; gap: 5px; width: min(430px, 42vw); height: 28px; padding: 0 7px; border: 1px solid #dedede; border-radius: 6px; background: #fff; }
+.library-workspace .library-search-toolbar.library-only { display: flex; flex: 0 0 min(430px, 42vw); min-width: 250px; }
 .library-search-icon { color: #999; font-size: 16px; line-height: 1; }
 .library-search-toolbar select { flex: 0 0 auto; border: 0; outline: 0; background: transparent; color: #777; font-size: 10px; }
 .library-search-toolbar input { min-width: 0; flex: 1; border: 0; outline: 0; background: transparent; color: #333; font: inherit; font-size: 12px; }
