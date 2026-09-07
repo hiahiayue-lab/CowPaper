@@ -1523,7 +1523,14 @@ body.is-dragging-library-paper, body.is-dragging-library-paper * { cursor: grabb
 :root {
   --sidebar-shell-width: 168px;
   --sidebar-shell-background: #f6f6f6;
-  --sidebar-shell-switcher-height: 46px;
+  --sidebar-workspace-height: 54px;
+  --sidebar-content-top-gap: 18px;
+  --sidebar-section-gap: 24px;
+  --sidebar-section-item-gap: 6px;
+  --sidebar-item-height: 38px;
+  --sidebar-item-font-size: 15px;
+  --sidebar-section-font-size: 12px;
+  --sidebar-item-radius: 6px;
 }
 
 /* Discovery and Library share one chrome baseline. Library's fixed toolbar
@@ -1534,19 +1541,76 @@ body.is-dragging-library-paper, body.is-dragging-library-paper * { cursor: grabb
   background: var(--sidebar-shell-background);
 }
 .sidebar > .workspace-switcher {
-  height: var(--sidebar-shell-switcher-height);
-  margin: 0 8px 10px;
+  height: var(--sidebar-workspace-height);
+  margin: 0 8px var(--sidebar-content-top-gap);
+  gap: 8px;
+}
+.sidebar > .workspace-switcher .workspace-tab {
+  min-height: 100%;
+  padding: 0 8px;
+  font-size: 15px;
+}
+.sidebar > .workspace-switcher .workspace-tab.active::after {
+  right: 8px;
+  bottom: 6px;
+  left: 8px;
+  height: 1px;
+}
+.workspace-nav {
+  gap: 2px;
+  padding: 0 8px;
+}
+.workspace-nav .nav-item,
+.workspace-nav .library-nav-row {
+  min-height: var(--sidebar-item-height);
+  height: var(--sidebar-item-height);
+  padding: 0 7px;
+  border-radius: var(--sidebar-item-radius);
+  font-size: var(--sidebar-item-font-size);
+  line-height: 1.25;
+}
+.workspace-nav .nav-item {
+  display: flex;
+  align-items: center;
+}
+.workspace-nav .nav-section-label {
+  margin: var(--sidebar-section-gap) 7px var(--sidebar-section-item-gap);
+  color: #888;
+  font-size: var(--sidebar-section-font-size);
+  font-weight: 500;
+  letter-spacing: 0;
+  line-height: 16px;
+}
+.workspace-nav[data-workspace-nav="library"] > .nav-section-label:first-child {
+  margin-top: 0;
+}
+.workspace-nav .nav-symbol {
+  width: 16px;
+  color: #999;
+  font-size: 13px;
+}
+.workspace-nav .nav-count {
+  font-size: 12px;
+}
+.workspace-nav .nav-item.active,
+.workspace-nav .library-nav-row.active {
+  background: #ececec;
+  color: #287cff;
+  font-weight: 600;
+}
+.workspace-nav .nav-item.library-nav-item-view.active .nav-symbol {
+  color: #287cff;
 }
 body.library-workspace .app { height: 100vh; padding-top: 0; }
-body.library-workspace .main { padding-top: var(--sidebar-shell-switcher-height); }
+body.library-workspace .main { padding-top: var(--sidebar-workspace-height); }
 body.library-workspace .topbar {
   position: fixed;
   top: 0;
   right: 0;
   left: var(--sidebar-shell-width);
   z-index: 50;
-  height: var(--sidebar-shell-switcher-height);
-  min-height: var(--sidebar-shell-switcher-height);
+  height: var(--sidebar-workspace-height);
+  min-height: var(--sidebar-workspace-height);
 }
 body.library-workspace .topbar-leading { margin-left: 0; }
 body.library-workspace .library-view.active { min-height: 0; }
