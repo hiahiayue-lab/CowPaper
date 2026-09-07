@@ -5579,15 +5579,37 @@ fn test_external_pdf_title_author_year_is_manual_candidate_only() {
         "candidate",
         "%PDF-1.7\n1 0 obj << /Title (Candidate Paper) /Author (Alice Smith) /Year (2025) /CreationDate (D:2099) >>\n",
     );
-    let pending = db::import_external_pdf(&conn, path.to_str().unwrap(), None).unwrap();
+    let pending = db::import_external_pdf_with_candidates(&conn, path.to_str().unwrap(), None, Vec::new()).unwrap();
     assert_eq!(pending.outcome, "needsManualConfirmation");
     assert!(pending.requires_confirmation);
     assert_eq!(pending.candidate.unwrap().paper_id, pid);
     assert!(db::get_library_membership(&conn, pid).unwrap().is_none());
-    let confirmed = db::import_external_pdf(&conn, path.to_str().unwrap(), Some(pid)).unwrap();
+    let confirmed = db::import_external_pdf_with_candidates(&conn, path.to_str().unwrap(), Some(pid), Vec::new()).unwrap();
     assert_eq!(confirmed.outcome, "manualConfirmation");
     assert_eq!(conn.query_row("SELECT COUNT(*) FROM papers", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
     assert!(db::get_library_membership(&conn, pid).unwrap().is_some());
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn rc5_fast_import_does_not_block_on_title_author_year_candidate() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "Candidate J", Some("0025-1909"), None, None, None).unwrap();
+    let mut existing = candidate(None, "Fast Candidate Paper", None, None);
+    existing.authors = vec![Author { given: None, family: None, name: Some("Alice Smith".into()) }];
+    let existing_id = match db::upsert_paper(&conn, jid, &existing).unwrap() {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new paper"),
+    };
+    let path = test_pdf_path(
+        "fast-candidate",
+        "%PDF-1.7\n1 0 obj << /Title (Fast Candidate Paper) /Author (Alice Smith) /Year (2025) /CreationDate (D:2099) >>\n",
+    );
+    let result = db::import_external_pdf_fast(&conn, path.to_str().unwrap(), None).unwrap();
+    assert_eq!(result.outcome, "createdExternalPaper");
+    assert!(!result.requires_confirmation);
+    assert_ne!(result.paper_id, Some(existing_id), "标题候选不得阻塞或静默合并 fast import");
+    assert!(db::get_library_membership(&conn, result.paper_id.unwrap()).unwrap().is_some());
     let _ = std::fs::remove_file(path);
 }
 

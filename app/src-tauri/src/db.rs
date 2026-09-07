@@ -3315,7 +3315,11 @@ pub fn import_external_pdf_fast(
     confirmed_paper_id: Option<i64>,
 ) -> Result<crate::models::ExternalPdfImportResult> {
     let file = linked_file(path)?;
-    let mut result = import_prepared_external_pdf(conn, file, confirmed_paper_id, Vec::new())?;
+    // Fast import deliberately skips title/author/year candidate gating. A
+    // provisional shell is cheaper and safer than putting the Library row
+    // behind a confirmation dialog; exact DOI identity remains the only
+    // automatic reuse rule.
+    let mut result = import_prepared_external_pdf(conn, file, confirmed_paper_id, Vec::new(), false)?;
     if let (Some(paper_id), Some(attachment)) = (
         result.paper_id,
         result.attachment.as_ref(),
@@ -3475,10 +3479,16 @@ pub fn run_pdf_enrichment<R: Runtime>(
 
 #[cfg(test)]
 pub(crate) fn import_external_pdf_with_candidates(conn: &Connection, path: &str, confirmed_paper_id: Option<i64>, providers: Vec<(String, PaperCandidate)>) -> Result<crate::models::ExternalPdfImportResult> {
-    import_prepared_external_pdf(conn, linked_file(path)?, confirmed_paper_id, providers)
+    import_prepared_external_pdf(conn, linked_file(path)?, confirmed_paper_id, providers, true)
 }
 
-fn import_prepared_external_pdf(conn: &Connection, file: LinkedFile, confirmed_paper_id: Option<i64>, providers: Vec<(String, PaperCandidate)>) -> Result<crate::models::ExternalPdfImportResult> {
+fn import_prepared_external_pdf(
+    conn: &Connection,
+    file: LinkedFile,
+    confirmed_paper_id: Option<i64>,
+    providers: Vec<(String, PaperCandidate)>,
+    allow_title_candidate_confirmation: bool,
+) -> Result<crate::models::ExternalPdfImportResult> {
     let mut metadata = file.metadata.clone();
     let mut providers: Vec<_> = providers.into_iter().filter(|(_, c)| c.normalized_doi.is_some() && c.normalized_doi == metadata.doi).collect();
     providers.sort_by_key(|(source,_)| if source == "crossref" { 0 } else { 1 });
@@ -3552,7 +3562,11 @@ fn import_prepared_external_pdf(conn: &Connection, file: LinkedFile, confirmed_p
         }
     }
 
-    let candidates = title_author_year_candidates(conn, &metadata)?;
+    let candidates = if allow_title_candidate_confirmation {
+        title_author_year_candidates(conn, &metadata)?
+    } else {
+        Vec::new()
+    };
     if let Some(paper_id) = confirmed_paper_id {
         if !paper_exists(conn, paper_id)? {
             return Err(rusqlite::Error::QueryReturnedNoRows);
