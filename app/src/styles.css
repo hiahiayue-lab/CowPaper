@@ -1590,11 +1590,13 @@ body.is-dragging-library-paper, body.is-dragging-library-paper * { cursor: grabb
   font-size: 13px;
 }
 .workspace-nav .nav-label {
+  flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.workspace-nav .library-nav-row .nav-label { flex: 1 1 auto; }
 .workspace-nav .nav-count {
   flex: 0 0 30px;
   min-width: 30px;
@@ -1651,6 +1653,8 @@ body.library-workspace .relation-chip { border-color: #e8e8e8; background: #fff;
 .library-search-clear { padding: 0 2px; color: #999; font-size: 15px; line-height: 1; }
 .library-search-clear:hover { color: #333; background: transparent; }
 .library-search-suggestions { position: absolute; top: calc(100% + 5px); right: 0; left: 0; z-index: 80; max-height: 280px; overflow-y: auto; padding: 4px; border: 1px solid #e1e1e1; border-radius: 7px; background: #fff; box-shadow: 0 8px 24px #00000014; }
+.library-search-suggestion-group + .library-search-suggestion-group { margin-top: 4px; padding-top: 4px; border-top: 1px solid #f0f0f0; }
+.library-search-suggestion-heading { padding: 3px 7px 2px; color: #999; font-size: 10px; font-weight: 600; letter-spacing: .02em; }
 .library-search-suggestion { display: grid; grid-template-columns: 36px minmax(0, 1fr) auto; gap: 7px; align-items: center; width: 100%; padding: 6px 7px; border-radius: 4px; text-align: left; font-size: 11px; }
 .library-search-suggestion:hover, .library-search-suggestion[aria-selected="true"] { background: #f1f5fa; }
 .library-search-suggestion.dimmed { color: #a5a5a5; opacity: .72; }

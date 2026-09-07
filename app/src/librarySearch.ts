@@ -29,7 +29,12 @@ export interface SearchPaper {
   authors?: string | string[] | null;
   source?: string | null;
   year?: number | string | null;
+  publisher?: string | null;
   doi?: string | null;
+  url?: string | null;
+  volume?: string | null;
+  issue?: string | null;
+  pages?: string | null;
   note?: string | null;
   abstract?: string | null;
   chineseAbstract?: string | null;
@@ -144,10 +149,11 @@ function authorText(authors: SearchPaper["authors"]): string {
 }
 
 function searchFields(paper: SearchPaper, mode: LibrarySearchMode): string[] {
-  const quick = [paper.title, paper.chineseTitle, authorText(paper.authors), paper.source, paper.doi, ...(paper.tags || [])];
+  const quick = [paper.title, paper.chineseTitle, authorText(paper.authors), paper.year, paper.source];
+  const metadata = [paper.publisher, paper.doi, paper.url, paper.volume, paper.issue, paper.pages];
   if (mode === "quick") return quick.map(valueText);
-  if (mode === "metadata") return [...quick, paper.year, paper.note].map(valueText);
-  return [paper.abstract, paper.chineseAbstract].map(valueText);
+  if (mode === "metadata") return [...quick, ...metadata].map(valueText);
+  return [...quick, ...metadata, ...(paper.tags || []), paper.note, paper.abstract, paper.chineseAbstract].map(valueText);
 }
 
 export function matchesLibrarySearchText(paper: SearchPaper, text: string, mode: LibrarySearchMode): boolean {

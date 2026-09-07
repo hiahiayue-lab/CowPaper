@@ -7,13 +7,13 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import {
   buildLibrarySearchSuggestions,
-  createLibrarySearchAdapter,
   createLibrarySearchState,
-  filterLibrarySearchPapers,
+  normalizeLibrarySearchQuery,
   reduceLibrarySearchKeyboard,
   reduceLibrarySearchState,
   type LibrarySearchApi,
   type LibrarySearchQuery,
+  type LibrarySearchResult,
   type LibrarySearchState,
   type SearchPaper,
 } from "./librarySearch";
@@ -2011,7 +2011,12 @@ function librarySearchPaper(item: LibraryPaper): SearchPaper {
     authors: (item.effectiveAuthors || item.paper.authors || []).map((author) => author.name || [author.given, author.family].filter(Boolean).join(" ")),
     source: item.effectiveSource ?? item.paper.journalName,
     year: item.effectiveYear,
+    publisher: item.effectivePublisher ?? item.paper.publisher,
     doi: item.effectiveDoi ?? item.paper.normalizedDoi,
+    url: item.effectiveUrl ?? item.paper.url,
+    volume: item.effectiveVolume ?? item.paper.volume,
+    issue: item.effectiveIssue ?? item.paper.issue,
+    pages: item.effectivePages ?? item.paper.pages,
     note: item.note,
     abstract: item.effectiveAbstract ?? item.paper.abstractText,
     chineseAbstract: item.effectiveChineseAbstract ?? item.paper.chineseAbstract,
@@ -2021,26 +2026,53 @@ function librarySearchPaper(item: LibraryPaper): SearchPaper {
   };
 }
 
+function librarySearchQuery(): LibrarySearchQuery {
+  const query = normalizeLibrarySearchQuery(librarySearchState.query);
+  if (!query.collectionIds.length && libraryScope) {
+    query.collectionIds = [libraryScope.id];
+    query.includeDescendants = true;
+  }
+  if (!query.libraryTagIds.length && librarySelectedTagIds.length) {
+    query.libraryTagIds = [...librarySelectedTagIds];
+  }
+  return query;
+}
+
+interface BackendLibrarySearchHit {
+  paperId: number;
+  rank: number;
+  relevance: number;
+}
+
 function getLibrarySearchAdapter(): LibrarySearchApi {
   if (librarySearchAdapter) return librarySearchAdapter;
-  librarySearchAdapter = createLibrarySearchAdapter({
-    listPapers: async ({ view, collectionId, tagIds }) => {
-      const items = await invoke<LibraryPaper[]>("list_library_papers", { view, collectionId, tagIds });
-      return items.map(librarySearchPaper);
+  librarySearchAdapter = {
+    async search(request): Promise<LibrarySearchResult> {
+      const query = normalizeLibrarySearchQuery(request);
+      const hits = await invoke<BackendLibrarySearchHit[]>("search_library", {
+        queryText: query.text,
+        searchScope: query.mode,
+        collectionIds: query.collectionIds,
+        libraryTagIds: query.libraryTagIds,
+        limit: 1000,
+        offset: 0,
+      });
+      // The Rust command owns search identity and scope. Hydrate the existing
+      // LibraryPaper rows so the table/Inspector remain the only render path.
+      const source = request.view === "all"
+        ? await invoke<LibraryPaper[]>("list_library_papers", { view: "all", collectionId: null, tagIds: [] })
+        : libraryPapers;
+      const byId = new Map(source.map((item) => [item.paper.id, item]));
+      const paperIds = hits.map((hit) => hit.paperId).filter((id) => byId.has(id));
+      return {
+        papers: paperIds.map((id) => librarySearchPaper(byId.get(id)!)),
+        paperIds,
+      };
     },
-    listCollections: async () => {
-      const items = await invoke<LibraryCollection[]>("list_library_collections");
-      return items.map(({ id, parentId, name }) => ({ id, parentId, name }));
+    async getSuggestions() {
+      return buildLibrarySearchSuggestions(librarySearchIndex(), librarySearchState.query);
     },
-    listTags: async () => {
-      const items = await invoke<LibraryTag[]>("list_library_tags");
-      return items.map(({ id, name, color }) => ({ id, name, color }));
-    },
-    getTagCounts: async (collectionId) => {
-      const facets = await invoke<LibraryTagFacet[]>("list_library_tag_facets", { collectionId });
-      return new Map(facets.map(({ tag, paperCount }) => [tag.id, paperCount]));
-    },
-  });
+  };
   return librarySearchAdapter;
 }
 
@@ -2060,7 +2092,20 @@ function renderLibrarySearchSuggestions(): void {
   const open = librarySearchState.phase !== "closed" && librarySearchState.suggestions.length > 0;
   box.classList.toggle("hidden", !open);
   input.setAttribute("aria-expanded", String(open));
-  box.innerHTML = open ? librarySearchState.suggestions.map((suggestion, index) => `<button type="button" class="library-search-suggestion${suggestion.dimmed ? " dimmed" : ""}" role="option" aria-selected="${index === librarySearchState.activeSuggestionIndex}" draggable="${suggestion.draggable ? "true" : "false"}" data-search-suggestion-id="${escapeHtml(suggestion.id)}"><span class="library-search-suggestion-kind">${suggestion.kind === "collection" ? "文集" : suggestion.kind === "libraryTag" ? "Tag" : suggestion.kind === "paper" ? "Paper" : "Action"}</span><span class="library-search-suggestion-label">${escapeHtml(suggestion.label)}</span><span class="library-search-suggestion-detail">${escapeHtml(suggestion.detail || "")}</span></button>`).join("") : "";
+  if (!open) {
+    box.innerHTML = "";
+    return;
+  }
+  const groups: Array<[string, string, typeof librarySearchState.suggestions]> = [
+    ["collection", "Collections", librarySearchState.suggestions.filter((item) => item.kind === "collection")],
+    ["libraryTag", "Library Tags", librarySearchState.suggestions.filter((item) => item.kind === "libraryTag")],
+    ["paper", "Papers", librarySearchState.suggestions.filter((item) => item.kind === "paper")],
+    ["searchAction", "Search Actions", librarySearchState.suggestions.filter((item) => item.kind === "searchAction")],
+  ];
+  box.innerHTML = groups.filter(([, , items]) => items.length).map(([, label, items]) => `<section class="library-search-suggestion-group"><div class="library-search-suggestion-heading">${label}</div>${items.map((suggestion) => {
+    const index = librarySearchState.suggestions.indexOf(suggestion);
+    return `<button type="button" class="library-search-suggestion${suggestion.dimmed ? " dimmed" : ""}" role="option" aria-selected="${index === librarySearchState.activeSuggestionIndex}" draggable="${suggestion.draggable ? "true" : "false"}" data-search-suggestion-id="${escapeHtml(suggestion.id)}"><span class="library-search-suggestion-kind">${suggestion.kind === "collection" ? "文集" : suggestion.kind === "libraryTag" ? "Tag" : suggestion.kind === "paper" ? "Paper" : "Action"}</span><span class="library-search-suggestion-label">${escapeHtml(suggestion.label)}</span><span class="library-search-suggestion-detail">${escapeHtml(suggestion.detail || "")}</span></button>`;
+  }).join("")}</section>`).join("");
 }
 
 function refreshLibrarySearchSuggestions(): void {
@@ -2070,15 +2115,8 @@ function refreshLibrarySearchSuggestions(): void {
   renderLibrarySearchSuggestions();
 }
 
-function applyLocalLibrarySearchResult(query: LibrarySearchQuery): void {
-  const papers = libraryPapers.map(librarySearchPaper);
-  librarySearchResultIds = new Set(filterLibrarySearchPapers(papers, query).map((paper) => paper.id));
-  librarySearchAppliedQuery = query;
-  renderLibrary();
-}
-
 async function executeLibrarySearch(): Promise<void> {
-  const query = librarySearchState.query;
+  const query = librarySearchQuery();
   try {
     const result = await getLibrarySearchAdapter().search({ ...query, view: libraryView });
     librarySearchResultIds = new Set(result.paperIds);
@@ -3990,7 +4028,6 @@ async function setupListeners() {
       const suggestion = librarySearchState.suggestions.find((item) => item.id === searchSuggestion.dataset.searchSuggestionId);
       if (suggestion) {
         librarySearchState = reduceLibrarySearchState(librarySearchState, { type: "SELECT_SUGGESTION", suggestion });
-        applyLocalLibrarySearchResult(librarySearchState.query);
         renderLibrarySearch();
         void executeLibrarySearch();
       }
