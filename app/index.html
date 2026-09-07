@@ -38,6 +38,17 @@
         <header class="topbar">
           <div class="topbar-leading">
             <div class="topbar-title" id="view-title">今日</div>
+            <div class="library-search-toolbar library-only" role="search" aria-label="文库搜索">
+              <span class="library-search-icon" aria-hidden="true">⌕</span>
+              <select id="library-search-mode" aria-label="搜索范围">
+                <option value="quick">Quick</option>
+                <option value="metadata">Metadata</option>
+                <option value="content">Content</option>
+              </select>
+              <input id="library-search-input" type="search" placeholder="搜索文库…" autocomplete="off" spellcheck="false" role="combobox" aria-autocomplete="list" aria-controls="library-search-suggestions" aria-expanded="false" />
+              <button type="button" id="library-search-clear" class="library-search-clear hidden" aria-label="清除搜索">×</button>
+              <div id="library-search-suggestions" class="library-search-suggestions hidden" role="listbox"></div>
+            </div>
             <div id="library-facet-bar" class="library-facet-bar library-only" aria-label="文集和标签筛选"></div>
           </div>
           <div class="topbar-actions">
