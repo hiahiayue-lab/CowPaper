@@ -238,7 +238,7 @@ export interface LibrarySearchAdapterDependencies {
   getTagCounts?: (collectionId: number | null) => Promise<Map<number, number> | Record<number, number>>;
 }
 
-/** Adapter over the v0.2.0 commands. A future backend can implement LibrarySearchApi directly. */
+/** Adapter over the existing Library commands. The UI can swap in the native search API. */
 export function createLibrarySearchAdapter(deps: LibrarySearchAdapterDependencies): LibrarySearchApi {
   return {
     async search(request) {

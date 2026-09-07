@@ -524,7 +524,7 @@ let librarySuppressNextClick = false;
 const expandedLibraryAttachmentPaperIds = new Set<number>();
 let libraryToastTimer = 0;
 let preferredPdfReader = "system";
-let currentAppVersion = "0.1.4";
+let currentAppVersion = "0.2.1";
 let pendingUpdate: Update | null = null;
 let updateBusy = false;
 
