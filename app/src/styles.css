@@ -1520,10 +1520,35 @@ body.is-dragging-library-paper, body.is-dragging-library-paper * { cursor: grabb
 
 /* RC5 unified Library chrome: one global toolbar, with all three panes
    beginning below it on the same content baseline. */
-body.library-workspace .app { height: 100vh; padding-top: 46px; }
-body.library-workspace .topbar { position: fixed; inset: 0 0 auto; z-index: 50; height: 46px; min-height: 46px; }
-body.library-workspace .topbar-leading { margin-left: 168px; }
-body.library-workspace .sidebar > .workspace-switcher { height: 46px; margin-top: 0; margin-bottom: 0; }
+:root {
+  --sidebar-shell-width: 168px;
+  --sidebar-shell-background: #f6f6f6;
+  --sidebar-shell-switcher-height: 46px;
+}
+
+/* Discovery and Library share one chrome baseline. Library's fixed toolbar
+   only owns the main pane, so the native title-bar/traffic-light space and
+   the sidebar background remain continuous. */
+.sidebar {
+  width: var(--sidebar-shell-width);
+  background: var(--sidebar-shell-background);
+}
+.sidebar > .workspace-switcher {
+  height: var(--sidebar-shell-switcher-height);
+  margin: 0 8px 10px;
+}
+body.library-workspace .app { height: 100vh; padding-top: 0; }
+body.library-workspace .main { padding-top: var(--sidebar-shell-switcher-height); }
+body.library-workspace .topbar {
+  position: fixed;
+  top: 0;
+  right: 0;
+  left: var(--sidebar-shell-width);
+  z-index: 50;
+  height: var(--sidebar-shell-switcher-height);
+  min-height: var(--sidebar-shell-switcher-height);
+}
+body.library-workspace .topbar-leading { margin-left: 0; }
 body.library-workspace .library-view.active { min-height: 0; }
 body.library-workspace .library-drop-overlay { background: transparent; }
 
