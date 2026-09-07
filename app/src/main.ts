@@ -2151,13 +2151,11 @@ function renderLibrarySearch(): void {
 function handleLibrarySearchKeydown(event: KeyboardEvent): void {
   const input = event.target as HTMLInputElement;
   if (input.id !== "library-search-input") return;
-  const activeSuggestion = librarySearchState.suggestions[librarySearchState.activeSuggestionIndex];
   const next = reduceLibrarySearchKeyboard(librarySearchState, { key: event.key, isComposing: event.isComposing });
   if (next === librarySearchState) return;
   event.preventDefault();
   librarySearchState = next;
   if (event.key === "Enter") {
-    if (activeSuggestion) applyLocalLibrarySearchResult(librarySearchState.query);
     void executeLibrarySearch();
   } else {
     renderLibrarySearchSuggestions();
