@@ -1926,10 +1926,11 @@ function beginLibraryInlineEdit(paperId: number, field: LibraryInlineField, butt
   input.select();
 }
 
-function libraryInlineCreateRow(kind: "collection" | "tag", parentId: number | null): string {
+function libraryInlineCreateRow(kind: "collection" | "tag", parentId: number | null, depth = 0): string {
   if (!libraryInlineCreate || libraryInlineCreate.kind !== kind || libraryInlineCreate.parentId !== parentId) return "";
   const label = kind === "collection" ? "新建文集" : "新建标签";
-  return `<div class="library-inline-create-row" data-inline-create-kind="${kind}"><span class="${kind === "collection" ? "folder-symbol" : "tag-dot"}" aria-hidden="true"></span><input id="library-inline-create-input" type="text" maxlength="120" placeholder="${label}" aria-label="${label}" autofocus /><button type="button" data-action="library-inline-create-submit" title="创建" aria-label="创建">✓</button><button type="button" data-action="library-inline-create-cancel" title="取消" aria-label="取消">×</button></div>`;
+  const indent = kind === "collection" ? 10 + Math.max(0, depth) * 14 : 10;
+  return `<div class="library-inline-create-row" data-inline-create-kind="${kind}" style="padding-left:${indent}px"><span class="${kind === "collection" ? "folder-symbol" : "tag-dot"}" aria-hidden="true"></span><input id="library-inline-create-input" type="text" maxlength="120" placeholder="${label}" aria-label="${label}" autofocus /><button type="button" data-action="library-inline-create-submit" title="创建" aria-label="创建">✓</button><button type="button" data-action="library-inline-create-cancel" title="取消" aria-label="取消">×</button></div>`;
 }
 
 function beginLibraryInlineCreate(kind: "collection" | "tag", parentId: number | null): void {
@@ -1979,7 +1980,7 @@ function renderLibraryNavigation() {
     item.classList.toggle("active", active);
   });
   const collections = $("library-collection-nav");
-  const children = (parentId: number | null, depth = 0): string => libraryInlineCreateRow("collection", parentId) + libraryCollections
+  const children = (parentId: number | null, depth = 0): string => libraryInlineCreateRow("collection", parentId, depth) + libraryCollections
     .filter((c) => c.parentId === parentId)
     .map((c) => `<div class="library-nav-item"><button class="library-nav-row${libraryScope?.kind === "collection" && libraryScope.id === c.id ? " active" : ""}" style="padding-left:${12 + depth * 14}px" data-drop-kind="collection" data-action="library-filter-collection" data-collection-id="${c.id}"><span class="nav-symbol folder-symbol" aria-hidden="true"></span><span class="nav-label">${escapeHtml(c.name)}</span></button><button class="nav-child" title="在此文集下新建子文集" aria-label="在此文集下新建子文集" data-action="library-create-child" data-parent-id="${c.id}">＋</button><button class="nav-manage" title="重命名文集" aria-label="重命名文集" data-action="library-rename-collection" data-collection-id="${c.id}">✎</button><button class="nav-manage danger" title="删除文集" aria-label="删除文集" data-action="library-delete-collection" data-collection-id="${c.id}">×</button></div>${children(c.id, depth + 1)}`)
     .join("");
