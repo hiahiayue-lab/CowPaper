@@ -604,6 +604,19 @@ pub struct LibraryPaper {
     pub attachments: Vec<PaperAttachment>,
 }
 
+/// A relevance-ranked hit from the Library full-text index. The canonical
+/// paper id is the only identity returned by search; callers can load the
+/// existing LibraryPaper projection when they need the full row.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibrarySearchResult {
+    pub paper_id: i64,
+    /// Raw FTS5 BM25 rank (lower is better, matching SQLite's `rank`).
+    pub rank: f64,
+    /// Convenience score with the natural ordering (higher is better).
+    pub relevance: f64,
+}
+
 /// Metadata discovered from a local PDF without making any network or AI
 /// calls. It is returned with an import result so the UI can request manual
 /// confirmation when identity is not exact.

@@ -98,10 +98,11 @@ pub fn open(path: &Path) -> Result<Connection> {
 /// Round 7 Phase 1：content_kind / abstract_status 为 v13；
 /// Literature Workspace 为 v14；v15 为 Library Attachments + User Metadata；
 /// v16 为 canonical bibliographic keywords；v17 为出版字段；v18 为 RC5
-/// Library overrides、collection-scoped tags 与 PDF enrichment jobs。
+/// Library overrides、collection-scoped tags 与 PDF enrichment jobs；v19 为
+/// Library full-text search projection。
 /// 生产构建中仅由迁移系统隐式使用；测试中直接断言。
 #[allow(dead_code)]
-pub const SCHEMA_VERSION: i64 = 18;
+pub const SCHEMA_VERSION: i64 = 19;
 
 pub fn init(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
@@ -871,6 +872,7 @@ fn merge_abstract(conn: &Connection, paper_id: i64, c: &PaperCandidate) -> Resul
     fill_content_kind_if_unknown(conn, paper_id, c)?;
     refresh_abstract_status(conn, paper_id)?;
     update_abstract_provenance(conn, paper_id)?;
+    refresh_library_search_document(conn, paper_id)?;
 
     Ok((filled, upgraded))
 }
@@ -1571,6 +1573,440 @@ fn validate_library_tag_ids(conn: &Connection, ids: &[i64]) -> Result<()> {
     Ok(())
 }
 
+// ---------- v19 Library Full-Text Search ----------
+
+/// SQLite's unicode61 tokenizer handles case-folding and diacritic removal;
+/// it intentionally does not split a continuous Han run. Keep the Han
+/// detection and overlapping-bigram generation in one place so the index and
+/// query paths cannot drift apart.
+fn is_han(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF
+    )
+}
+
+fn library_search_cjk_bigrams(text: &str) -> String {
+    let mut out = Vec::new();
+    let mut run = Vec::new();
+    let flush = |run: &mut Vec<char>, out: &mut Vec<String>| {
+        if run.len() >= 2 {
+            for pair in run.windows(2) {
+                out.push(pair.iter().collect());
+            }
+        }
+        run.clear();
+    };
+    for c in text.chars() {
+        if is_han(c) {
+            run.push(c);
+        } else {
+            flush(&mut run, &mut out);
+        }
+    }
+    flush(&mut run, &mut out);
+    out.join(" ")
+}
+
+fn fts_quote(term: &str) -> String {
+    format!("\"{}\"", term.replace('"', "\"\""))
+}
+
+/// Convert user text to safe FTS5 terms. Non-Han text is left for the same
+/// unicode61 normalization used by the FTS table; Han runs use the exact same
+/// application-side bigram algorithm as `library_search_cjk_bigrams`.
+fn library_search_terms(input: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    for raw in input.split_whitespace() {
+        let mut han_run = String::new();
+        let mut non_han = String::new();
+        for c in raw.chars() {
+            if is_han(c) {
+                if !non_han.is_empty() {
+                    if !han_run.is_empty() {
+                        terms.extend(library_search_cjk_bigrams(&han_run).split_whitespace().map(str::to_string));
+                        han_run.clear();
+                    }
+                    if non_han.chars().any(|c| c.is_alphanumeric()) {
+                        terms.push(std::mem::take(&mut non_han));
+                    } else {
+                        non_han.clear();
+                    }
+                }
+                han_run.push(c);
+            } else {
+                if !han_run.is_empty() {
+                    terms.extend(library_search_cjk_bigrams(&han_run).split_whitespace().map(str::to_string));
+                    han_run.clear();
+                }
+                non_han.push(c);
+            }
+        }
+        if !han_run.is_empty() {
+            terms.extend(library_search_cjk_bigrams(&han_run).split_whitespace().map(str::to_string));
+        }
+        if non_han.chars().any(|c| c.is_alphanumeric()) {
+            terms.push(non_han);
+        }
+    }
+    terms
+}
+
+fn library_search_match_query(input: &str, scope: &str) -> Option<String> {
+    let terms = library_search_terms(input);
+    if terms.is_empty() {
+        return None;
+    }
+    let scope = scope.trim().to_ascii_lowercase();
+    let column = match scope.as_str() {
+        "all" | "content" => None,
+        "title" => Some("{title chinese_title library_tags cjk_ngrams}"),
+        "abstract" => Some("{abstract chinese_abstract cjk_ngrams}"),
+        "note" => Some("{note cjk_ngrams}"),
+        "metadata" => Some("{override_text cjk_ngrams}"),
+        "tags" | "library_tags" => Some("library_tags"),
+        _ => return None,
+    };
+    Some(
+        terms
+            .iter()
+            .map(|term| match column {
+                Some(column) => format!("{column}:{}", fts_quote(term)),
+                None => fts_quote(term),
+            })
+            .collect::<Vec<_>>()
+            .join(" AND "),
+    )
+}
+
+/// A runtime capability probe used by migration/tests and release smoke
+/// checks. Production uses rusqlite's `bundled` feature, so this checks the
+/// actual SQLite compiled into the application rather than a system DLL.
+pub fn fts5_capability(conn: &Connection) -> Result<bool> {
+    let mut stmt = conn.prepare("PRAGMA compile_options")?;
+    let options = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>>>()?;
+    let compile_enabled = options.iter().any(|option| option == "ENABLE_FTS5");
+    let module_enabled: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_module_list WHERE name='fts5')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    Ok(compile_enabled && module_enabled)
+}
+
+fn refresh_library_search_document(conn: &Connection, paper_id: i64) -> Result<()> {
+    // Canonical/PDF migration helpers can run before v14 Library tables exist
+    // (for example while upgrading a v13 database). Search synchronization is
+    // intentionally a no-op until the Library schema is present.
+    let schema_ready: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='library_items')
+                AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='library_search_documents')
+                AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='library_search_fts')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !schema_ready {
+        return Ok(());
+    }
+    // Delete the FTS row before replacing the external-content source row.
+    // Updating only the source table leaves stale FTS terms behind.
+    conn.execute(
+        "DELETE FROM library_search_fts WHERE rowid=?1",
+        params![paper_id],
+    )?;
+    conn.execute(
+        "DELETE FROM library_search_documents WHERE paper_id=?1",
+        params![paper_id],
+    )?;
+    if !library_item_exists(conn, paper_id)? {
+        return Ok(());
+    }
+
+    let row: (
+        Option<String>, // title
+        Option<String>, // chinese title
+        Option<String>, // abstract
+        Option<String>, // chinese abstract
+        Option<String>, // abstract provenance
+        i64,             // legacy abstract flag
+        Option<String>, // container title
+        Option<String>, // publisher
+        Option<String>, // publication date
+        Option<String>, // volume
+        Option<String>, // issue
+        Option<String>, // pages
+        Option<String>, // doi
+        Option<String>, // url
+        Option<String>, // source
+        String,          // journal name
+        Option<String>, // title override
+        Option<String>, // chinese title override
+        Option<String>, // source override
+        Option<i32>,    // year override
+        Option<String>, // authors override
+        Option<String>, // abstract override
+        Option<String>, // chinese abstract override
+        Option<String>, // note
+        Option<String>, // journal override
+        Option<String>, // publisher override
+        Option<String>, // publication date override
+        Option<String>, // volume override
+        Option<String>, // issue override
+        Option<String>, // pages override
+        Option<String>, // doi override
+        Option<String>, // url override
+        Option<String>, // chinese abstract source hash
+        String,          // library tags
+    ) = conn.query_row(
+        "SELECT p.title, p.chinese_title, p.abstract, p.chinese_abstract,
+                p.abstract_provenance, p.legacy_abstract_unverified,
+                p.container_title, p.publisher, p.published_date, p.volume, p.issue,
+                p.pages, p.normalized_doi, p.url, p.discovery_source, j.name,
+                m.title_override, m.chinese_title_override, m.source_override,
+                m.year_override, m.authors_override, m.abstract_override,
+                m.chinese_abstract_override, m.note, m.journal_override,
+                m.publisher_override, m.publication_date_override, m.volume_override,
+                m.issue_override, m.pages_override, m.doi_override, m.url_override,
+                m.chinese_abstract_source_hash,
+                COALESCE((SELECT group_concat(t.name, ' ')
+                          FROM library_item_tags lit
+                          JOIN library_tags t ON t.id=lit.tag_id
+                          WHERE lit.paper_id=p.id), '')
+         FROM papers p
+         JOIN journals j ON j.id=p.journal_id
+         JOIN library_items li ON li.paper_id=p.id
+         LEFT JOIN library_item_metadata m ON m.paper_id=p.id
+         WHERE p.id=?1",
+        params![paper_id],
+        |r| {
+            Ok((
+                r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?,
+                r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?,
+                r.get(12)?, r.get(13)?, r.get(14)?, r.get(15)?,
+                r.get(16)?, r.get(17)?, r.get(18)?, r.get(19)?, r.get(20)?, r.get(21)?,
+                r.get(22)?, r.get(23)?, r.get(24)?, r.get(25)?, r.get(26)?, r.get(27)?,
+                r.get(28)?, r.get(29)?, r.get(30)?, r.get(31)?, r.get(32)?, r.get(33)?,
+            ))
+        },
+    )?;
+
+    let first = |override_value: Option<String>, canonical: Option<String>| {
+        clean_optional_text(override_value.as_deref()).or_else(|| clean_optional_text(canonical.as_deref()))
+    };
+    let title = first(row.16.clone(), row.0.clone());
+    let chinese_title = first(row.17.clone(), row.1.clone());
+    let legacy = row.5 != 0 || row.4.as_deref() == Some("legacy_unverified");
+    let effective_abstract = first(row.21.clone(), if legacy { None } else { row.2.clone() });
+    let translation_current = match row.32.as_deref() {
+        Some(hash) => effective_abstract
+            .as_deref()
+            .is_some_and(|text| hash == abstract_text_hash(text)),
+        None => !legacy,
+    };
+    let chinese_abstract = if translation_current {
+        first(row.22.clone(), if legacy { None } else { row.3.clone() })
+    } else {
+        None
+    };
+    let journal = first(row.24.clone(), row.6.clone().or(Some(row.15.clone())));
+    let publisher = first(row.25.clone(), row.7.clone());
+    let publication_date = first(row.26.clone(), row.8.clone());
+    let volume = first(row.27.clone(), row.9.clone());
+    let issue = first(row.28.clone(), row.10.clone());
+    let pages = first(row.29.clone(), row.11.clone());
+    let doi = first(row.30.clone(), row.12.clone());
+    let url = first(row.31.clone(), row.13.clone());
+    let source = first(row.18.clone(), row.14.clone());
+    let year = row.19.map(|value| value.to_string()).or_else(|| {
+        row.8
+            .as_deref()
+            .and_then(crate::util::extract_year)
+            .map(|value| value.to_string())
+    });
+    let canonical_authors: Option<String> = conn.query_row(
+        "SELECT authors_json FROM papers WHERE id=?1",
+        params![paper_id],
+        |r| r.get(0),
+    )?;
+    let authors = row.20.clone().or(canonical_authors);
+    let note = row.23.clone().unwrap_or_default();
+    let tags = row.33.clone();
+    let override_text = [
+        journal.as_deref(), publisher.as_deref(), publication_date.as_deref(),
+        volume.as_deref(), issue.as_deref(), pages.as_deref(), doi.as_deref(),
+        url.as_deref(), source.as_deref(), year.as_deref(), authors.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" ");
+    let cjk_source = [
+        title.as_deref(), chinese_title.as_deref(), effective_abstract.as_deref(),
+        chinese_abstract.as_deref(), Some(note.as_str()), Some(override_text.as_str()),
+        Some(tags.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" ");
+    let cjk_ngrams = library_search_cjk_bigrams(&cjk_source);
+
+    conn.execute(
+        "INSERT INTO library_search_documents(
+            paper_id,title,chinese_title,abstract,chinese_abstract,note,override_text,
+            library_tags,annotation_text,cjk_ngrams
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'',?9)",
+        params![
+            paper_id, title, chinese_title, effective_abstract, chinese_abstract,
+            note, override_text, tags, cjk_ngrams,
+        ],
+    )?;
+    conn.execute(
+        "INSERT INTO library_search_fts(
+            rowid,title,chinese_title,abstract,chinese_abstract,note,override_text,
+            library_tags,annotation_text,cjk_ngrams
+         ) SELECT paper_id,title,chinese_title,abstract,chinese_abstract,note,override_text,
+                  library_tags,annotation_text,cjk_ngrams
+           FROM library_search_documents WHERE paper_id=?1",
+        params![paper_id],
+    )?;
+    Ok(())
+}
+
+/// Rebuild only the Library search projection. Canonical papers, overrides,
+/// recommendation rows, and other user data are never changed.
+pub fn rebuild_library_search_index(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "INSERT INTO library_search_fts(library_search_fts) VALUES('delete-all')",
+        [],
+    )?;
+    conn.execute("DELETE FROM library_search_documents", [])?;
+    let ids = conn
+        .prepare("SELECT paper_id FROM library_items ORDER BY paper_id")?
+        .query_map([], |row| row.get::<_, i64>(0))?
+        .collect::<Result<Vec<_>>>()?;
+    for paper_id in ids {
+        refresh_library_search_document(conn, paper_id)?;
+    }
+    Ok(())
+}
+
+/// Search Library papers. Collection filters are OR (with recursive
+/// descendants), tag filters are AND, and full-text terms are AND. The query
+/// always joins `library_items` and returns canonical paper ids only.
+pub fn search_library(
+    conn: &Connection,
+    query_text: &str,
+    search_scope: Option<&str>,
+    collection_ids: &[i64],
+    library_tag_ids: &[i64],
+    limit: i64,
+    offset: i64,
+    paper_id: Option<i64>,
+) -> Result<Vec<crate::models::LibrarySearchResult>> {
+    let scope = search_scope.unwrap_or("content").trim().to_ascii_lowercase();
+    if !matches!(scope.as_str(), "all" | "content" | "title" | "abstract" | "note" | "metadata" | "tags" | "library_tags") {
+        return Err(rusqlite::Error::InvalidParameterName("search_scope".into()));
+    }
+    let mut collections = collection_ids.to_vec();
+    collections.sort_unstable();
+    collections.dedup();
+    validate_collection_ids(conn, &collections)?;
+    validate_library_tag_ids(conn, library_tag_ids)?;
+    let limit = limit.clamp(0, 1000);
+    let offset = offset.max(0);
+    let fts_query = if query_text.trim().is_empty() {
+        None
+    } else {
+        library_search_match_query(query_text, &scope)
+    };
+    // A non-empty query made solely of one Han character has no valid bigram;
+    // returning no rows is safer than silently treating it as a filter-only
+    // query and displaying the whole Library.
+    if !query_text.trim().is_empty() && fts_query.is_none() {
+        return Ok(Vec::new());
+    }
+
+    let mut sql = String::new();
+    if !collections.is_empty() {
+        sql.push_str("WITH RECURSIVE descendants(id) AS (SELECT id FROM library_collections WHERE id IN (");
+        sql.push_str(&(0..collections.len()).map(|i| format!("?{}", i + 1)).collect::<Vec<_>>().join(","));
+        sql.push_str(") UNION ALL SELECT c.id FROM library_collections c JOIN descendants d ON c.parent_id=d.id) ");
+    }
+    let rank_expr = if fts_query.is_some() {
+        "bm25(library_search_fts,10.0,10.0,2.0,4.0,6.0,2.0,1.0,1.0,1.0)"
+    } else {
+        "0.0"
+    };
+    if fts_query.is_some() {
+        sql.push_str("SELECT DISTINCT p.id, ");
+        sql.push_str(rank_expr);
+        sql.push_str(" AS rank FROM library_search_fts JOIN papers p ON p.id=library_search_fts.rowid JOIN library_items li ON li.paper_id=p.id WHERE library_search_fts MATCH ?");
+        let mut next = collections.len() + 2;
+        if paper_id.is_some() {
+            sql.push_str(&format!(" AND p.id=?{next}"));
+            next += 1;
+        }
+        if !collections.is_empty() {
+            sql.push_str(&format!(" AND EXISTS (SELECT 1 FROM library_collection_items ci JOIN descendants d ON d.id=ci.collection_id WHERE ci.paper_id=p.id)"));
+        }
+        for _ in library_tag_ids {
+            sql.push_str(&format!(" AND EXISTS (SELECT 1 FROM library_item_tags lit WHERE lit.paper_id=p.id AND lit.tag_id=?{next})"));
+            next += 1;
+        }
+        sql.push_str(&format!(" ORDER BY rank ASC, p.id DESC LIMIT ?{next} OFFSET ?{}", next + 1));
+    } else {
+        sql.push_str("SELECT DISTINCT p.id, 0.0 AS rank FROM papers p JOIN library_items li ON li.paper_id=p.id WHERE 1=1");
+        let mut next = collections.len() + 1;
+        if paper_id.is_some() {
+            sql.push_str(&format!(" AND p.id=?{next}"));
+            next += 1;
+        }
+        if !collections.is_empty() {
+            sql.push_str(" AND EXISTS (SELECT 1 FROM library_collection_items ci JOIN descendants d ON d.id=ci.collection_id WHERE ci.paper_id=p.id)");
+        }
+        for _ in library_tag_ids {
+            sql.push_str(&format!(" AND EXISTS (SELECT 1 FROM library_item_tags lit WHERE lit.paper_id=p.id AND lit.tag_id=?{next})"));
+            next += 1;
+        }
+        sql.push_str(&format!(" ORDER BY p.id DESC LIMIT ?{next} OFFSET ?{}", next + 1));
+    }
+
+    let mut args: Vec<rusqlite::types::Value> = collections
+        .iter()
+        .copied()
+        .map(rusqlite::types::Value::Integer)
+        .collect();
+    if let Some(query) = fts_query {
+        args.push(rusqlite::types::Value::Text(query));
+    }
+    if let Some(paper_id) = paper_id {
+        args.push(rusqlite::types::Value::Integer(paper_id));
+    }
+    args.extend(
+        library_tag_ids
+            .iter()
+            .copied()
+            .map(rusqlite::types::Value::Integer),
+    );
+    args.push(rusqlite::types::Value::Integer(limit));
+    args.push(rusqlite::types::Value::Integer(offset));
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
+        let rank: f64 = row.get(1)?;
+        Ok(crate::models::LibrarySearchResult {
+            paper_id: row.get(0)?,
+            rank,
+            relevance: -rank,
+        })
+    })?;
+    rows.collect()
+}
+
 
 fn library_metadata(
     conn: &Connection,
@@ -1783,6 +2219,7 @@ pub fn set_library_item_metadata(
         tx.execute("UPDATE library_item_metadata SET chinese_abstract_source_hash=?1 WHERE paper_id=?2",params![source_hash,paper_id])?;
     }
     tx.commit()?;
+    refresh_library_search_document(conn, paper_id)?;
     get_library_item_metadata(conn, paper_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
 }
 
@@ -1803,6 +2240,7 @@ pub fn set_library_item_note(
         params![paper_id, clean_optional_text(note), now_utc()],
     )?;
     tx.commit()?;
+    refresh_library_search_document(conn, paper_id)?;
     get_library_item_metadata(conn, paper_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
 }
 
@@ -1823,6 +2261,7 @@ pub fn clear_library_item_overrides(
             chinese_abstract_override=NULL, updated_at=?1 WHERE paper_id=?2",
         params![now_utc(), paper_id],
     )?;
+    refresh_library_search_document(conn, paper_id)?;
     get_library_item_metadata(conn, paper_id)
 }
 
@@ -2455,6 +2894,7 @@ pub fn attach_discovery_pdf(
             "INSERT INTO library_items(paper_id,added_at,added_source) VALUES(?1,?2,'discovery_attach_pdf') ON CONFLICT(paper_id) DO NOTHING",
             params![paper_id, now],
         )?;
+        refresh_library_search_document(conn, paper_id)?;
         return Ok(existing);
     }
     let prepared = prepare_current_pdf_storage(conn, paper_id, &file)?;
@@ -2483,6 +2923,7 @@ pub fn attach_discovery_pdf(
     if let Some(prepared) = prepared.as_ref() {
         finalize_prepared_storage(conn, prepared)?;
     }
+    refresh_library_search_document(conn, paper_id)?;
     get_paper_attachment(conn, id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
 }
 
@@ -3106,6 +3547,7 @@ fn add_library_and_attach(
             "INSERT INTO library_items(paper_id,added_at,added_source) VALUES(?1,?2,?3) ON CONFLICT(paper_id) DO NOTHING",
             params![paper_id, now_utc(), added_source],
         )?;
+        refresh_library_search_document(conn, paper_id)?;
         return Ok(existing);
     }
     let prepared = prepare_current_pdf_storage(conn, paper_id, file)?;
@@ -3131,6 +3573,7 @@ fn add_library_and_attach(
     if let Some(prepared) = prepared.as_ref() {
         finalize_prepared_storage(conn, prepared)?;
     }
+    refresh_library_search_document(conn, paper_id)?;
     get_paper_attachment(conn, id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
 }
 
@@ -3264,6 +3707,7 @@ pub(crate) fn fill_missing_canonical_metadata_from_candidate(
     }
     update_abstract_provenance(conn, paper_id)?;
     refresh_abstract_status(conn, paper_id)?;
+    refresh_library_search_document(conn, paper_id)?;
     Ok(())
 }
 
@@ -3300,6 +3744,7 @@ fn persist_external_metadata(
             candidate.raw_json.as_deref(),
         )?;
     }
+    refresh_library_search_document(conn, paper_id)?;
     Ok(())
 }
 
@@ -3523,6 +3968,7 @@ fn import_prepared_external_pdf(
         for (_, candidate) in &providers { fill_missing_canonical_metadata_from_candidate(conn, paper_id, candidate)?; }
         persist_external_metadata(conn, paper_id, &metadata, &providers)?;
         conn.execute("INSERT INTO library_items(paper_id,added_at,added_source) VALUES(?1,?2,'external_pdf_import') ON CONFLICT(paper_id) DO NOTHING",params![paper_id,now_utc()])?;
+        refresh_library_search_document(conn, paper_id)?;
         let attachment = list_paper_attachments(conn, paper_id)?.into_iter().find(|a| a.sha256.as_deref() == Some(&file.sha256));
         return Ok(crate::models::ExternalPdfImportResult { outcome: "existingAttachmentRefreshed".into(), paper_id: Some(paper_id), attachment, metadata, candidate: None, candidates: vec![], requires_confirmation: false, enrichment_status: "ready".into(), enrichment_error: None });
     }
@@ -3766,6 +4212,7 @@ pub fn add_paper_to_library(
         params![now, paper_id],
     )?;
     tx.commit()?;
+    refresh_library_search_document(conn, paper_id)?;
     get_library_membership(conn, paper_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
 }
 
@@ -3777,6 +4224,7 @@ pub fn remove_paper_from_library(conn: &Connection, paper_id: i64) -> Result<boo
     tx.execute("DELETE FROM library_collection_items WHERE paper_id = ?1", params![paper_id])?;
     tx.execute("DELETE FROM library_item_tags WHERE paper_id = ?1", params![paper_id])?;
     tx.commit()?;
+    refresh_library_search_document(conn, paper_id)?;
     Ok(changed == 1)
 }
 
@@ -3813,7 +4261,8 @@ pub fn set_paper_library_tags(conn: &Connection, paper_id: i64, tag_ids: &[i64])
             params![paper_id, tag_id, now],
         )?;
     }
-    tx.commit()
+    tx.commit()?;
+    refresh_library_search_document(conn, paper_id)
 }
 
 pub fn list_library_papers(conn: &Connection, view: &str, limit: i64) -> Result<Vec<crate::models::LibraryPaper>> {
@@ -4053,12 +4502,31 @@ pub fn create_library_tag(conn: &Connection, name: &str, color: Option<&str>) ->
 pub fn rename_library_tag(conn: &Connection, id: i64, name: &str) -> Result<()> {
     let name = name.trim();
     if name.is_empty() { return Err(rusqlite::Error::InvalidParameterName("name".into())); }
-    conn.execute("UPDATE library_tags SET name = ?1, updated_at = ?2 WHERE id = ?3", params![name, now_utc(), id])?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("UPDATE library_tags SET name = ?1, updated_at = ?2 WHERE id = ?3", params![name, now_utc(), id])?;
+    let paper_ids = tx
+        .prepare("SELECT paper_id FROM library_item_tags WHERE tag_id=?1")?
+        .query_map(params![id], |row| row.get::<_, i64>(0))?
+        .collect::<Result<Vec<_>>>()?;
+    tx.commit()?;
+    for paper_id in paper_ids {
+        refresh_library_search_document(conn, paper_id)?;
+    }
     Ok(())
 }
 
 pub fn delete_library_tag(conn: &Connection, id: i64) -> Result<bool> {
-    Ok(conn.execute("DELETE FROM library_tags WHERE id = ?1", params![id])? == 1)
+    let tx = conn.unchecked_transaction()?;
+    let paper_ids = tx
+        .prepare("SELECT paper_id FROM library_item_tags WHERE tag_id=?1")?
+        .query_map(params![id], |row| row.get::<_, i64>(0))?
+        .collect::<Result<Vec<_>>>()?;
+    let changed = tx.execute("DELETE FROM library_tags WHERE id = ?1", params![id])? == 1;
+    tx.commit()?;
+    for paper_id in paper_ids {
+        refresh_library_search_document(conn, paper_id)?;
+    }
+    Ok(changed)
 }
 
 pub fn count_waiting_for_abstract(conn: &Connection) -> Result<i64> {
@@ -4144,6 +4612,7 @@ fn migrations() -> Vec<(i64, &'static str, fn(&Connection) -> Result<()>)> {
         (16, "bibliographic-keywords", migrate_to_v16),
         (17, "Bibliographic Publication Metadata", migrate_to_v17),
         (18, "library-rc5-overrides-scoped-tags-pdf-enrichment", migrate_to_v18),
+        (19, "library-full-text-search", migrate_to_v19),
     ]
 }
 
@@ -4966,6 +5435,9 @@ pub fn save_title_translation(conn: &Connection, id: i64, chinese_title: &str) -
            AND (chinese_title IS NULL OR TRIM(chinese_title) = '')",
         params![chinese_title, now_utc(), id],
     )?;
+    if changed == 1 {
+        refresh_library_search_document(conn, id)?;
+    }
     Ok(changed == 1)
 }
 
@@ -5000,6 +5472,7 @@ pub fn save_analysis(
             id
         ],
     )?;
+    refresh_library_search_document(conn, id)?;
     Ok(())
 }
 
@@ -6106,6 +6579,48 @@ fn migrate_to_v18(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v19: external-content FTS5 projection for Library papers. The projection
+/// is deliberately not a second paper table: `paper_id` is the canonical
+/// `papers.id`, and collection/tag membership remains relational data.
+fn migrate_to_v19(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS library_search_documents (
+            paper_id INTEGER PRIMARY KEY REFERENCES papers(id) ON DELETE CASCADE,
+            title TEXT,
+            chinese_title TEXT,
+            abstract TEXT,
+            chinese_abstract TEXT,
+            note TEXT,
+            override_text TEXT,
+            library_tags TEXT,
+            annotation_text TEXT,
+            cjk_ngrams TEXT
+        );
+        CREATE VIRTUAL TABLE IF NOT EXISTS library_search_fts USING fts5(
+            title,
+            chinese_title,
+            abstract,
+            chinese_abstract,
+            note,
+            override_text,
+            library_tags,
+            annotation_text,
+            cjk_ngrams,
+            content='library_search_documents',
+            content_rowid='paper_id',
+            tokenize='unicode61 remove_diacritics 1'
+        );
+        CREATE INDEX IF NOT EXISTS idx_library_search_documents_paper
+            ON library_search_documents(paper_id);
+        "#,
+    )?;
+    if !fts5_capability(conn)? {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    rebuild_library_search_index(conn)
+}
+
 fn update_abstract_provenance(conn: &Connection, id: i64) -> Result<()> {
     conn.execute("UPDATE papers SET abstract_provenance=CASE
         WHEN abstract IS NULL OR trim(abstract)='' THEN 'missing'
@@ -6151,6 +6666,7 @@ fn fill_publication_metadata(conn: &Connection, id: i64, c: &PaperCandidate) -> 
         publisher=COALESCE(publisher,?2), published_date=COALESCE(published_date,?3),
         volume=COALESCE(volume,?4), issue=COALESCE(issue,?5), pages=COALESCE(pages,?6)
         WHERE id=?7", params![m.journal,m.publisher,m.publication_date,m.volume,m.issue,m.pages,id])?;
+    refresh_library_search_document(conn, id)?;
     Ok(())
 }
 
@@ -6167,7 +6683,8 @@ pub fn add_paper_library_tag(conn: &Connection, paper_id: i64, tag_id: i64) -> R
     if !library_item_exists(&tx, paper_id)? { return Err(rusqlite::Error::QueryReturnedNoRows); }
     validate_library_tag_ids(&tx, &[tag_id])?;
     tx.execute("INSERT OR IGNORE INTO library_item_tags(paper_id,tag_id,added_at) VALUES(?1,?2,?3)", params![paper_id,tag_id,now_utc()])?;
-    tx.commit()
+    tx.commit()?;
+    refresh_library_search_document(conn, paper_id)
 }
 
 /// Patch only the translated personal field, avoiding lost concurrent edits to
@@ -6182,6 +6699,7 @@ pub fn set_library_translation(conn: &Connection, paper_id: i64, translated: &st
         params![paper_id,clean_optional_text(Some(translated)),now_utc()])?;
     if !title { tx.execute("UPDATE library_item_metadata SET chinese_abstract_source_hash=?1 WHERE paper_id=?2",params![source_hash,paper_id])?; }
     tx.commit()?;
+    refresh_library_search_document(conn, paper_id)?;
     get_library_item_metadata(conn, paper_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
 }
 
@@ -6240,7 +6758,8 @@ fn persist_structured_pdf_abstract(conn: &Connection, id: i64, metadata: &crate:
     let (quality, reason) = crate::abstract_quality::assess_abstract_quality(text);
     conn.execute("UPDATE papers SET abstract=?1,abstract_source='pdf_structured',abstract_provenance='pdf_structured',abstract_quality=?2 WHERE id=?3",params![text,quality,id])?;
     record_abstract_source(conn,id,"pdf_structured",text,quality,reason)?;
-    refresh_abstract_status(conn,id)
+    refresh_abstract_status(conn,id)?;
+    refresh_library_search_document(conn, id)
 }
 
 #[cfg(test)]

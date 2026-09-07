@@ -943,6 +943,37 @@ fn list_library_papers(
 }
 
 #[tauri::command]
+fn search_library(
+    query_text: String,
+    search_scope: Option<String>,
+    collection_ids: Option<Vec<i64>>,
+    library_tag_ids: Option<Vec<i64>>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+    paper_id: Option<i64>,
+    state: State<Db>,
+) -> Result<Vec<models::LibrarySearchResult>, String> {
+    let conn = state.inner().lock().unwrap();
+    db::search_library(
+        &conn,
+        &query_text,
+        search_scope.as_deref(),
+        collection_ids.as_deref().unwrap_or(&[]),
+        library_tag_ids.as_deref().unwrap_or(&[]),
+        limit.unwrap_or(100),
+        offset.unwrap_or(0),
+        paper_id,
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn rebuild_library_search_index(state: State<Db>) -> Result<(), String> {
+    let conn = state.inner().lock().unwrap();
+    db::rebuild_library_search_index(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn get_library_membership(paper_id: i64, state: State<Db>) -> Result<Option<models::LibraryMembership>, String> {
     let conn = state.inner().lock().unwrap();
     db::get_library_membership(&conn, paper_id).map_err(|e| e.to_string())
@@ -2206,6 +2237,8 @@ pub fn run() {
             delete_journal,
             list_papers,
             list_library_papers,
+            search_library,
+            rebuild_library_search_index,
             get_library_membership,
             add_paper_to_library,
             remove_paper_from_library,

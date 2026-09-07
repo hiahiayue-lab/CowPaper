@@ -2104,7 +2104,7 @@ fn test_migration_v2_to_v3_preserves_data() {
 
     // 迁移到 v3
     db::init(&conn).unwrap();
-    assert_eq!(db::SCHEMA_VERSION, 18);
+    assert_eq!(db::SCHEMA_VERSION, 19);
 
     // 8) 旧 issn 迁移进 journal_identifiers（类型按列，不猜）
     let ids = db::list_journal_identifiers(&conn, jid).unwrap();
@@ -2145,7 +2145,7 @@ fn test_database_restart_persistence() {
     {
         let conn = db::open(&path).unwrap();
         db::init(&conn).unwrap(); // 幂等：user_version=3 不重复迁移
-        assert_eq!(db::SCHEMA_VERSION, 18);
+        assert_eq!(db::SCHEMA_VERSION, 19);
         let j = db::get_journal(&conn, 1).unwrap().expect("期刊持久化");
         assert_eq!(j.print_issn.as_deref(), Some("0025-1909"));
         assert_eq!(j.identifiers.len(), 1);
@@ -2772,7 +2772,7 @@ fn test_migration_v4_abstract_quality_init() {
     .unwrap();
 
     db::init(&conn).unwrap();
-    assert_eq!(db::SCHEMA_VERSION, 18);
+    assert_eq!(db::SCHEMA_VERSION, 19);
 
     let papers = db::list_papers(&conn, Some(jid), 100).unwrap();
     assert_eq!(papers.len(), 3, "迁移不得丢论文");
@@ -3465,7 +3465,7 @@ fn test_updater_config_requires_signed_cross_platform_artifacts() {
     assert_eq!(endpoints.len(), 1);
     assert!(endpoints[0].as_str().unwrap().starts_with("https://github.com/"));
     assert!(endpoints[0].as_str().unwrap().ends_with("/latest/download/latest.json"));
-    assert_eq!(db::SCHEMA_VERSION, 18, "updater must not claim migration ownership");
+    assert_eq!(db::SCHEMA_VERSION, 19, "updater must not claim migration ownership");
 }
 
 #[test]
@@ -5032,6 +5032,8 @@ fn test_library_migration_v13_to_v16_preserves_existing_data() {
         "paper_attachments",
         "library_item_metadata",
         "paper_keywords",
+        "library_search_documents",
+        "library_search_fts",
     ] {
         conn.execute(&format!("DROP TABLE {}", table), []).unwrap();
     }
@@ -5064,7 +5066,7 @@ fn test_library_migration_v13_to_v16_preserves_existing_data() {
 
     db::init(&conn).unwrap();
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-    assert_eq!(version, 18);
+    assert_eq!(version, 19);
     let paper = db::get_paper(&conn, pid).unwrap().unwrap();
     assert_eq!(paper.abstract_text.as_deref(), Some("preserved abstract"));
     assert_eq!(paper.chinese_title.as_deref(), Some("保留中文标题"));
@@ -5078,7 +5080,7 @@ fn test_library_migration_v13_to_v16_preserves_existing_data() {
 
     db::init(&conn).unwrap();
     let version_again: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-    assert_eq!(version_again, 18);
+    assert_eq!(version_again, 19);
     for table in [
         "library_items",
         "library_collections",
@@ -5113,7 +5115,7 @@ fn test_migration_v14_to_v16_creates_attachment_metadata_and_keyword_tables() {
     conn.execute("DROP TABLE paper_attachments", []).unwrap();
     conn.pragma_update(None, "user_version", 14).unwrap();
     db::init(&conn).unwrap();
-    assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 18);
+    assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 19);
     assert!(db::get_library_membership(&conn, pid).unwrap().is_some(), "v15 不得破坏 v14 Library membership");
     for table in ["paper_attachments", "library_item_metadata", "paper_keywords"] {
         assert!(conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)", params![table], |r| r.get::<_, bool>(0)).unwrap());
@@ -5134,6 +5136,8 @@ fn test_library_migration_is_empty_and_idempotent() {
         "paper_attachments",
         "library_item_metadata",
         "paper_keywords",
+        "library_search_documents",
+        "library_search_fts",
     ] {
         let exists: bool = conn
             .query_row(
@@ -5281,6 +5285,115 @@ fn test_library_tag_rename_delete_preserves_paper_and_recommendation_fields() {
         )
         .unwrap();
     assert_eq!(recommendation_after, recommendation_before, "Library Tag 管理不得改变推荐分析字段");
+}
+
+#[test]
+fn test_library_search_v19_fts_filters_effective_values_and_sync() {
+    let conn = mem_db();
+    assert!(db::fts5_capability(&conn).unwrap(), "rusqlite bundled SQLite must expose FTS5");
+    let jid = db::insert_journal(&conn, "Search Journal", Some("0025-1909"), None, None, None).unwrap();
+    let a = match db::upsert_paper(&conn, jid, &candidate(Some("10.1000/search-a"), "Platform Governance and Network Effects", Some("This paper studies platform pricing and network effects."), Some("crossref"))).unwrap() {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new paper"),
+    };
+    let b = match db::upsert_paper(&conn, jid, &candidate(Some("10.1000/search-b"), "Methods for Networks", Some("Econometric methods for network data."), Some("crossref"))).unwrap() {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new paper"),
+    };
+    let outside = match db::upsert_paper(&conn, jid, &candidate(Some("10.1000/search-outside"), "Platform Governance Outside Library", Some("This must not be searchable."), Some("crossref"))).unwrap() {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new paper"),
+    };
+    let root = db::create_library_collection(&conn, "Research", None).unwrap();
+    let child = db::create_library_collection(&conn, "Platforms", Some(root.id)).unwrap();
+    let other = db::create_library_collection(&conn, "Methods", None).unwrap();
+    let core = db::create_library_tag(&conn, "CoreTag", None).unwrap();
+    let ready = db::create_library_tag(&conn, "ReadyTag", None).unwrap();
+    db::add_paper_to_library(&conn, a, &[child.id], &[core.id, ready.id], "manual").unwrap();
+    db::add_paper_to_library(&conn, b, &[other.id], &[core.id], "manual").unwrap();
+    db::set_paper_collections(&conn, a, &[child.id, other.id]).unwrap();
+    db::save_analysis(&conn, a, "平台治理与网络效应", "平台经济中的网络效应摘要", "summary", "[]", 4.2, "test", "v1", "search-hash").unwrap();
+    db::save_title_translation(&conn, b, "网络方法研究").unwrap();
+
+    let ids = |query: &str, scope: Option<&str>, collections: &[i64], tags: &[i64], paper_id: Option<i64>| {
+        let mut ids = db::search_library(&conn, query, scope, collections, tags, 100, 0, paper_id)
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.paper_id)
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
+    };
+    assert_eq!(ids("Platform Governance", Some("content"), &[], &[], None), vec![a]);
+    assert_eq!(ids("平台治理", Some("content"), &[], &[], None), vec![a], "Han bigrams must support sub-token search");
+    assert_eq!(ids("平台 Governance", Some("content"), &[], &[], None), vec![a], "mixed query terms must be ANDed");
+    assert_eq!(ids("Network", Some("content"), &[], &[], None), vec![a, b], "non-Library canonical paper must be excluded");
+    assert_eq!(ids("网络方法", Some("content"), &[], &[], None), vec![b]);
+    assert_eq!(ids("CoreTag", Some("tags"), &[], &[], None), vec![a, b]);
+    assert_eq!(ids("", Some("content"), &[root.id], &[], None), vec![a], "parent collection must include descendants");
+    assert_eq!(ids("", Some("content"), &[root.id, other.id], &[], None), vec![a, b], "multiple collections are OR and dedup by paper id");
+    assert_eq!(ids("", Some("content"), &[], &[core.id, ready.id], None), vec![a], "multiple Library Tags are AND");
+    assert_eq!(ids("Platform", Some("content"), &[], &[], Some(a)), vec![a]);
+    assert!(ids("Platform", Some("content"), &[], &[], Some(outside)).is_empty());
+
+    let input = crate::models::LibraryItemMetadataInput {
+        title_override: Some("Override Quantum Paper".into()),
+        abstract_override: Some("effective private abstract".into()),
+        note: Some("private library note".into()),
+        ..Default::default()
+    };
+    db::set_library_item_metadata(&conn, a, &input).unwrap();
+    assert_eq!(ids("Override Quantum", Some("content"), &[], &[], None), vec![a]);
+    assert_eq!(ids("private note", Some("content"), &[], &[], None), vec![a]);
+    assert_eq!(ids("effective abstract", Some("content"), &[], &[], None), vec![a]);
+    assert_eq!(conn.query_row("SELECT title FROM papers WHERE id=?1", params![a], |r| r.get::<_, Option<String>>(0)).unwrap().as_deref(), Some("Platform Governance and Network Effects"));
+    db::clear_library_item_overrides(&conn, a).unwrap();
+    assert!(ids("Override Quantum", Some("content"), &[], &[], None).is_empty());
+    assert_eq!(ids("Platform Governance", Some("content"), &[], &[], None), vec![a]);
+
+    db::rename_library_tag(&conn, core.id, "RenamedTag").unwrap();
+    assert!(ids("CoreTag", Some("tags"), &[], &[], None).is_empty());
+    assert_eq!(ids("RenamedTag", Some("tags"), &[], &[], None), vec![a, b]);
+    db::remove_paper_from_library(&conn, a).unwrap();
+    assert!(ids("Platform Governance", Some("content"), &[], &[], None).is_empty());
+    assert!(db::get_paper(&conn, a).unwrap().is_some(), "search sync must not delete canonical paper");
+    db::add_paper_to_library(&conn, a, &[child.id], &[core.id, ready.id], "manual").unwrap();
+    db::rebuild_library_search_index(&conn).unwrap();
+    assert_eq!(ids("Platform Governance", Some("content"), &[], &[], None), vec![a]);
+
+    let score: Option<f64> = conn.query_row("SELECT total_score FROM papers WHERE id=?1", params![a], |r| r.get(0)).unwrap();
+    assert_eq!(score, Some(4.2), "Library search/index writes must not alter recommendation semantics");
+}
+
+#[test]
+#[ignore = "release benchmark: run explicitly on macOS and Windows bundled builds"]
+fn benchmark_library_search_1k_10k_p50_p95() {
+    use std::time::Instant;
+    for dataset_rows in [1_000_i64, 10_000_i64] {
+        let conn = mem_db();
+        let jid = db::insert_journal(&conn, "Benchmark Journal", Some("0025-1909"), None, None, None).unwrap();
+        for n in 1..=dataset_rows {
+            conn.execute(
+                "INSERT INTO papers (journal_id,title,abstract,analysis_status,created_at,updated_at)
+                 VALUES (?1,?2,?3,'pendingAnalysis',?4,?4)",
+                params![jid, format!("Synthetic Platform Paper {n}"), "Synthetic network effects abstract for benchmark", "2026-09-07T00:00:00Z"],
+            ).unwrap();
+            let paper_id = conn.last_insert_rowid();
+            conn.execute("INSERT INTO library_items(paper_id,added_at,added_source) VALUES(?1,?2,'benchmark')", params![paper_id, "2026-09-07T00:00:00Z"]).unwrap();
+        }
+        db::rebuild_library_search_index(&conn).unwrap();
+        let mut samples = Vec::new();
+        for _ in 0..50 {
+            let started = Instant::now();
+            let hits = db::search_library(&conn, "platform network", Some("content"), &[], &[], 1000, 0, None).unwrap();
+            assert_eq!(hits.len(), dataset_rows.min(1000) as usize);
+            samples.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p50 = samples[samples.len() / 2];
+        let p95 = samples[(samples.len() * 95 / 100).min(samples.len() - 1)];
+        eprintln!("library_search rows={dataset_rows} p50_ms={p50:.3} p95_ms={p95:.3}");
+    }
 }
 
 #[test]
@@ -5478,6 +5591,7 @@ fn test_discovery_attach_pdf_adds_library_and_clears_read_later_atomically() {
     assert_eq!(membership.added_source, "discovery_attach_pdf");
     assert!(!db::get_paper(&conn, pid).unwrap().unwrap().is_favorite);
     assert_eq!(conn.query_row("SELECT COUNT(*) FROM library_items WHERE paper_id=?1", params![pid], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    assert_eq!(db::search_library(&conn, "Discovery", Some("content"), &[], &[], 100, 0, None).unwrap().iter().map(|hit| hit.paper_id).collect::<Vec<_>>(), vec![pid], "Discovery PDF Library add must sync the index");
     let _ = std::fs::remove_file(path);
 }
 
@@ -5563,6 +5677,7 @@ fn test_external_pdf_without_identity_creates_canonical_paper_and_never_generate
     assert!(paper.abstract_text.is_none(), "title 不得生成 abstract");
     assert!(db::get_library_membership(&conn, pid).unwrap().is_some());
     assert!(db::list_paper_attachments(&conn, pid).unwrap()[0].absolute_path.contains("new-external"));
+    assert_eq!(db::search_library(&conn, "A New External", Some("content"), &[], &[], 100, 0, None).unwrap().iter().map(|hit| hit.paper_id).collect::<Vec<_>>(), vec![pid], "external PDF import must index the Library paper");
     for table in ["library_papers", "external_library_papers"] {
         assert!(!conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)", params![table], |r| r.get::<_, bool>(0)).unwrap(), "禁止第二 Paper 表 {table}");
     }
@@ -6006,7 +6121,7 @@ fn rc3_v16_to_v17_preserves_canonical_keywords_library_and_untrusted_history() {
         INSERT INTO library_item_metadata(paper_id,chinese_abstract_override,note,updated_at) VALUES(1,'旧个人翻译','Keep note','now');
         INSERT INTO paper_keywords(paper_id,keyword,normalized_keyword,kind,source,confidence,retrieved_at,created_at) VALUES(1,'Evidence','evidence','subject','crossref','HIGH','now','now');").unwrap();
     db::init(&conn).unwrap();db::init(&conn).unwrap();
-    assert_eq!(conn.query_row("PRAGMA user_version",[],|r|r.get::<_,i64>(0)).unwrap(),18);
+    assert_eq!(conn.query_row("PRAGMA user_version",[],|r|r.get::<_,i64>(0)).unwrap(),19);
     let p=db::get_paper(&conn,1).unwrap().unwrap();
     assert_eq!(p.abstract_text.as_deref(),Some("INFORMS Management Science 2026:1-17"));assert_eq!(p.abstract_provenance,"legacy_unverified");assert_eq!(p.total_score,Some(4.8));assert_eq!(p.keywords.len(),1);
     let library=db::get_library_paper(&conn,1).unwrap().unwrap();
