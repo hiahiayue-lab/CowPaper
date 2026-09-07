@@ -3270,6 +3270,22 @@ function switchView(name: string) {
   doSwitch(name);
 }
 
+function ensureLibrarySearchToolbar(): HTMLElement | null {
+  const existing = document.querySelector<HTMLElement>(".library-search-toolbar");
+  if (existing) return existing;
+  const leading = document.querySelector<HTMLElement>(".topbar-leading");
+  if (!leading) return null;
+  const toolbar = document.createElement("div");
+  toolbar.className = "library-search-toolbar library-only";
+  toolbar.setAttribute("role", "search");
+  toolbar.setAttribute("aria-label", "文库搜索");
+  toolbar.innerHTML = '<span class="library-search-icon" aria-hidden="true">⌕</span><select id="library-search-mode" aria-label="搜索范围"><option value="quick">Quick</option><option value="metadata">Metadata</option><option value="content">Content</option></select><input id="library-search-input" type="search" placeholder="搜索文库…" autocomplete="off" spellcheck="false" role="combobox" aria-autocomplete="list" aria-controls="library-search-suggestions" aria-expanded="false" /><button type="button" id="library-search-clear" class="library-search-clear hidden" aria-label="清除搜索">×</button><div id="library-search-suggestions" class="library-search-suggestions hidden" role="listbox"></div>';
+  const facetBar = document.getElementById("library-facet-bar");
+  if (facetBar) leading.insertBefore(toolbar, facetBar);
+  else leading.append(toolbar);
+  return toolbar;
+}
+
 function doSwitch(name: string) {
   const isLibrary = name.startsWith("library-");
   if (isLibrary && ["library-all", "library-recent", "library-unfiled"].includes(name)) {
@@ -3280,7 +3296,7 @@ function doSwitch(name: string) {
   }
   activeWorkspace = isLibrary ? "library" : "discovery";
   document.body.classList.toggle("library-workspace", isLibrary);
-  const librarySearchToolbar = document.querySelector<HTMLElement>(".library-search-toolbar");
+  const librarySearchToolbar = ensureLibrarySearchToolbar();
   if (librarySearchToolbar) librarySearchToolbar.style.display = isLibrary ? "flex" : "none";
   document.querySelectorAll(".workspace-nav").forEach((nav) => nav.classList.toggle("hidden", (nav as HTMLElement).dataset.workspaceNav !== activeWorkspace));
   document.querySelectorAll(".workspace-tab").forEach((tab) => tab.classList.toggle("active", (tab as HTMLElement).dataset.workspace === activeWorkspace));
