@@ -2160,7 +2160,7 @@ async function openPdfAttachment(attachmentId: number): Promise<void> {
   // The backend owns the persisted reader setting and launches it without a
   // shell. Keeping this call parameter-free also makes parent/child opening
   // use exactly the same reader policy.
-  await invoke("open_pdf", { attachmentId });
+  await invoke("open_pdf_with_preferred_reader", { attachmentId });
 }
 
 async function importExternalPdf() {

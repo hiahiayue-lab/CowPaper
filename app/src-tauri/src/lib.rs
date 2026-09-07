@@ -1172,6 +1172,18 @@ fn open_pdf(
     db::open_pdf(&conn, attachment_id).map_err(|e| e.to_string())
 }
 
+/// Product-facing alias for the preferred-reader aware PDF opener. Keeping
+/// the existing `open_pdf` command preserves compatibility with older UI
+/// callers while making the setting explicit for new integrations.
+#[tauri::command]
+fn open_pdf_with_preferred_reader(
+    attachment_id: i64,
+    state: State<Db>,
+) -> Result<(), String> {
+    let conn = state.inner().lock().unwrap();
+    db::open_pdf(&conn, attachment_id).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn reveal_pdf(
     attachment_id: i64,
@@ -2216,6 +2228,7 @@ pub fn run() {
             manage_pdf_attachment,
             rename_managed_pdf,
             open_pdf,
+            open_pdf_with_preferred_reader,
             reveal_pdf,
             import_pdf,
             set_preferred_pdf_reader,
