@@ -6187,7 +6187,8 @@ fn rc5_collection_scope_facets_global_tags_and_and_filter() {
 #[test]
 fn rc5_preferred_reader_validation_is_shell_free() {
     assert!(db::validate_preferred_pdf_reader("system").is_ok());
-    assert!(db::validate_preferred_pdf_reader("/Applications/Preview.app").is_ok());
+    let custom_reader = std::env::current_dir().unwrap().join("Preview.app");
+    assert!(db::validate_preferred_pdf_reader(custom_reader.to_string_lossy().as_ref()).is_ok());
     assert!(db::validate_preferred_pdf_reader("preview; rm -rf /").is_err());
     assert!(db::validate_preferred_pdf_reader("preview").is_err());
 }
