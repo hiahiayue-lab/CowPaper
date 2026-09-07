@@ -4324,20 +4324,29 @@ pub fn list_library_papers_scoped(
         )?;
         if !exists { return Err(rusqlite::Error::QueryReturnedNoRows); }
     }
-    let mut sql = format!(
+    let mut sql = String::new();
+    if collection_id.is_some() {
+        sql.push_str(
+            "WITH RECURSIVE descendants(id) AS (
+                 SELECT id FROM library_collections WHERE id=?1
+                 UNION ALL
+                 SELECT c.id FROM library_collections c JOIN descendants d ON c.parent_id=d.id
+             ) ",
+        );
+    }
+    sql.push_str(&format!(
         "SELECT p.*, COALESCE(NULLIF(trim(p.container_title), ''), j.name) AS journal_name FROM papers p
          JOIN journals j ON j.id = p.journal_id
          JOIN library_items li ON li.paper_id = p.id
          WHERE 1=1"
-    );
+    ));
     let mut args: Vec<rusqlite::types::Value> = Vec::new();
     if view == "unfiled" {
         sql.push_str(" AND NOT EXISTS (SELECT 1 FROM library_collection_items ci WHERE ci.paper_id=p.id)");
     }
     if let Some(collection_id) = collection_id {
         args.push(rusqlite::types::Value::Integer(collection_id));
-        let n = args.len();
-        sql.push_str(&format!(" AND EXISTS (SELECT 1 FROM library_collection_items ci WHERE ci.paper_id=p.id AND ci.collection_id=?{n})"));
+        sql.push_str(" AND EXISTS (SELECT 1 FROM library_collection_items ci JOIN descendants d ON d.id=ci.collection_id WHERE ci.paper_id=p.id)");
     }
     for tag_id in tag_ids {
         args.push(rusqlite::types::Value::Integer(*tag_id));
@@ -4383,8 +4392,8 @@ pub fn list_library_collections(conn: &Connection) -> Result<Vec<crate::models::
 }
 
 /// Count the canonical papers represented by each Library sidebar scope.
-/// Collections currently use direct membership, matching
-/// `list_library_papers_scoped`; no hierarchy semantics are introduced here.
+/// A parent collection includes all descendants, matching the table/search
+/// scope while DISTINCT keeps a paper with multiple memberships at one.
 pub fn library_sidebar_counts(conn: &Connection) -> Result<crate::models::LibrarySidebarCounts> {
     let all_count: i64 = conn.query_row(
         "SELECT COUNT(DISTINCT li.paper_id) FROM library_items li",
@@ -4408,11 +4417,17 @@ pub fn library_sidebar_counts(conn: &Connection) -> Result<crate::models::Librar
     )?;
 
     let mut stmt = conn.prepare(
-        "SELECT c.id, COUNT(DISTINCT lci.paper_id) AS paper_count
-         FROM library_collections c
-         LEFT JOIN library_collection_items lci ON lci.collection_id = c.id
-         GROUP BY c.id
-         ORDER BY c.id",
+        "WITH RECURSIVE descendants(root_id, id) AS (
+             SELECT id, id FROM library_collections
+             UNION ALL
+             SELECT d.root_id, c.id
+             FROM library_collections c JOIN descendants d ON c.parent_id=d.id
+         )
+         SELECT d.root_id, COUNT(DISTINCT lci.paper_id) AS paper_count
+         FROM descendants d
+         LEFT JOIN library_collection_items lci ON lci.collection_id=d.id
+         GROUP BY d.root_id
+         ORDER BY d.root_id",
     )?;
     let collection_counts = stmt
         .query_map([], |row| {
@@ -4492,19 +4507,24 @@ pub fn list_library_tag_facets(conn: &Connection, collection_id: Option<i64>) ->
         if !exists { return Err(rusqlite::Error::QueryReturnedNoRows); }
     }
     let sql = if collection_id.is_some() {
-        "SELECT t.*, COUNT(DISTINCT li.paper_id) AS paper_count
+        "WITH RECURSIVE descendants(id) AS (
+             SELECT id FROM library_collections WHERE id=?1
+             UNION ALL
+             SELECT c.id FROM library_collections c JOIN descendants d ON c.parent_id=d.id
+         )
+         SELECT t.*, COUNT(DISTINCT CASE WHEN d.id IS NOT NULL THEN li.paper_id END) AS paper_count
          FROM library_tags t
-         JOIN library_item_tags lit ON lit.tag_id=t.id
-         JOIN library_items li ON li.paper_id=lit.paper_id
-         JOIN library_collection_items lci
-           ON lci.paper_id=li.paper_id AND lci.collection_id=?1
+         LEFT JOIN library_item_tags lit ON lit.tag_id=t.id
+         LEFT JOIN library_items li ON li.paper_id=lit.paper_id
+         LEFT JOIN library_collection_items lci ON lci.paper_id=li.paper_id
+         LEFT JOIN descendants d ON d.id=lci.collection_id
          GROUP BY t.id
          ORDER BY t.name, t.id"
     } else {
         "SELECT t.*, COUNT(DISTINCT li.paper_id) AS paper_count
          FROM library_tags t
-         JOIN library_item_tags lit ON lit.tag_id=t.id
-         JOIN library_items li ON li.paper_id=lit.paper_id
+         LEFT JOIN library_item_tags lit ON lit.tag_id=t.id
+         LEFT JOIN library_items li ON li.paper_id=lit.paper_id
          GROUP BY t.id
          ORDER BY t.name, t.id"
     };

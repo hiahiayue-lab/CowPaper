@@ -6296,16 +6296,20 @@ fn rc5_collection_scope_facets_global_tags_and_and_filter() {
     let first = test_paper(&conn, "10.5555/rc5-first", "First");
     let second = test_paper(&conn, "10.5555/rc5-second", "Second");
     let collection = db::create_library_collection(&conn, "RC5 Collection", None).unwrap();
+    let child = db::create_library_collection(&conn, "RC5 Child", Some(collection.id)).unwrap();
     let tag_a = db::create_library_tag(&conn, "A", None).unwrap();
     let tag_b = db::create_library_tag(&conn, "B", None).unwrap();
+    let tag_zero = db::create_library_tag(&conn, "Zero", None).unwrap();
     db::add_paper_to_library(&conn, first, &[collection.id], &[tag_a.id, tag_b.id], "manual").unwrap();
-    db::add_paper_to_library(&conn, second, &[collection.id], &[tag_a.id], "manual").unwrap();
+    db::add_paper_to_library(&conn, second, &[child.id], &[tag_a.id], "manual").unwrap();
     let facets = db::list_library_tag_facets(&conn, Some(collection.id)).unwrap();
     assert_eq!(facets.iter().find(|f| f.tag.id == tag_a.id).unwrap().paper_count, 2);
     assert_eq!(facets.iter().find(|f| f.tag.id == tag_b.id).unwrap().paper_count, 1);
+    assert_eq!(facets.iter().find(|f| f.tag.id == tag_zero.id).unwrap().paper_count, 0, "zero-count tags stay visible in a collection scope");
     let both = db::list_library_papers_scoped(&conn, "all", Some(collection.id), &[tag_a.id, tag_b.id], 100).unwrap();
     assert_eq!(both.len(), 1);
     assert_eq!(both[0].paper.id, first);
+    assert_eq!(db::list_library_papers_scoped(&conn, "all", Some(collection.id), &[], 100).unwrap().len(), 2, "parent scope includes child papers");
 }
 
 #[test]
