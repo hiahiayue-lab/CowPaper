@@ -2179,6 +2179,10 @@ async function importExternalPdf() {
   setStatus("正在读取并导入 PDF…", "running");
   try {
     let result = await invoke<ExternalPdfImportResult>("import_pdf", { path, confirmedPaperId: null });
+    if (result.paperId != null && result.attachment == null && result.outcome.includes("AttachmentConflict")) {
+      const attachment = await attachPdfPathToPaper(result.paperId, path, true);
+      result = { ...result, attachment, requiresConfirmation: false };
+    }
     if (result.requiresConfirmation) {
       const candidate = result.candidate || result.candidates[0];
       if (!candidate) throw new Error("PDF 返回了待确认状态，但没有可确认的论文候选");
@@ -2302,6 +2306,10 @@ interface LibraryDroppedFile {
 
 async function importDroppedPdf(path: string): Promise<ExternalPdfImportResult> {
   let result = await invoke<ExternalPdfImportResult>("import_pdf", { path, confirmedPaperId: null });
+  if (result.paperId != null && result.attachment == null && result.outcome.includes("AttachmentConflict")) {
+    const attachment = await attachPdfPathToPaper(result.paperId, path, true);
+    return { ...result, attachment, requiresConfirmation: false };
+  }
   if (result.requiresConfirmation) {
     const candidate = result.candidate || result.candidates[0];
     if (!candidate) throw new Error("PDF 返回待确认状态，但没有可确认的论文候选");

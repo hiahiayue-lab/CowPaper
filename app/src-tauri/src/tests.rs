@@ -5496,6 +5496,27 @@ fn test_external_pdf_doi_import_does_not_duplicate_canonical_paper() {
 }
 
 #[test]
+fn rc5_exact_doi_second_pdf_returns_inline_replacement_conflict() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "Existing J", Some("0025-1909"), None, None, None).unwrap();
+    let pid = match db::upsert_paper(&conn, jid, &candidate(Some("10.1000/exact-conflict"), "Existing Paper", None, None)).unwrap() {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new paper"),
+    };
+    let first = test_pdf_path("exact-conflict-first", "%PDF-1.7\n/Title (First) /DOI (10.1000/exact-conflict)\n");
+    let second = test_pdf_path("exact-conflict-second", "%PDF-1.7\n/Title (Second) /DOI (10.1000/exact-conflict)\n");
+    db::attach_pdf_to_paper(&conn, pid, first.to_str().unwrap()).unwrap();
+    let result = db::import_external_pdf_fast(&conn, second.to_str().unwrap(), None).unwrap();
+    assert_eq!(result.outcome, "existingDoiAttachmentConflict");
+    assert_eq!(result.paper_id, Some(pid));
+    assert!(result.attachment.is_none());
+    assert!(!result.requires_confirmation, "UI 应走 inline replacement，而不是旧 modal");
+    assert_eq!(db::list_paper_attachments(&conn, pid).unwrap().len(), 1);
+    let _ = std::fs::remove_file(first);
+    let _ = std::fs::remove_file(second);
+}
+
+#[test]
 fn test_external_pdf_import_uses_managed_storage_without_second_canonical_paper() {
     let conn = mem_db();
     let root = test_pdf_library("external-copy");

@@ -3134,6 +3134,16 @@ fn add_library_and_attach(
     get_paper_attachment(conn, id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
 }
 
+fn external_pdf_attachment_conflict(
+    conn: &Connection,
+    paper_id: i64,
+    sha256: &str,
+) -> Result<bool> {
+    Ok(list_paper_attachments(conn, paper_id)?
+        .into_iter()
+        .any(|attachment| attachment.sha256.as_deref() != Some(sha256)))
+}
+
 /// Apply one exact-identity provider result to the local PDF metadata. Every
 /// field is fill-only: an existing value shown to the user is never silently
 /// replaced by a conflicting provider value.
@@ -3522,6 +3532,19 @@ fn import_prepared_external_pdf(
             .query_row("SELECT id FROM papers WHERE normalized_doi=?1", params![doi], |row| row.get(0))
             .optional()?
         {
+            if external_pdf_attachment_conflict(conn, paper_id, &file.sha256)? {
+                return Ok(crate::models::ExternalPdfImportResult {
+                    outcome: "existingDoiAttachmentConflict".to_string(),
+                    paper_id: Some(paper_id),
+                    attachment: None,
+                    metadata,
+                    candidate: None,
+                    candidates: Vec::new(),
+                    requires_confirmation: false,
+                    enrichment_status: "ready".into(),
+                    enrichment_error: None,
+                });
+            }
             for (_, candidate) in &providers {
                 fill_missing_canonical_metadata_from_candidate(conn, paper_id, candidate)?;
             }
@@ -3543,6 +3566,19 @@ fn import_prepared_external_pdf(
 
     if let Some(scholarly_id) = metadata.scholarly_id.as_deref() {
         if let Some(paper_id) = find_paper_by_exact_scholarly_id(conn, scholarly_id)? {
+            if external_pdf_attachment_conflict(conn, paper_id, &file.sha256)? {
+                return Ok(crate::models::ExternalPdfImportResult {
+                    outcome: "existingScholarlyIdAttachmentConflict".to_string(),
+                    paper_id: Some(paper_id),
+                    attachment: None,
+                    metadata,
+                    candidate: None,
+                    candidates: Vec::new(),
+                    requires_confirmation: false,
+                    enrichment_status: "ready".into(),
+                    enrichment_error: None,
+                });
+            }
             for (_, candidate) in &providers {
                 fill_missing_canonical_metadata_from_candidate(conn, paper_id, candidate)?;
             }
@@ -3570,6 +3606,19 @@ fn import_prepared_external_pdf(
     if let Some(paper_id) = confirmed_paper_id {
         if !paper_exists(conn, paper_id)? {
             return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
+        if external_pdf_attachment_conflict(conn, paper_id, &file.sha256)? {
+            return Ok(crate::models::ExternalPdfImportResult {
+                outcome: "confirmedAttachmentConflict".to_string(),
+                paper_id: Some(paper_id),
+                attachment: None,
+                metadata,
+                candidate: candidates.iter().find(|candidate| candidate.paper_id == paper_id).cloned(),
+                candidates,
+                requires_confirmation: false,
+                enrichment_status: "ready".into(),
+                enrichment_error: None,
+            });
         }
         for (_, candidate) in &providers {
             fill_missing_canonical_metadata_from_candidate(conn, paper_id, candidate)?;
