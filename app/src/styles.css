@@ -2139,3 +2139,130 @@ textarea:focus-visible,
     transition: none !important;
   }
 }
+
+/* Library navigation management stays close to the item that owns it. */
+.library-context-menu {
+  position: fixed;
+  z-index: 120;
+  min-width: 190px;
+  max-width: min(280px, calc(100vw - 16px));
+  padding: 4px;
+  border: 1px solid var(--ds-border);
+  border-radius: var(--ds-radius-popover);
+  background: var(--ds-main);
+  box-shadow: 0 8px 24px #00000018;
+}
+.library-context-title {
+  overflow: hidden;
+  padding: 6px 8px 5px;
+  border-bottom: 1px solid var(--ds-divider);
+  color: var(--ds-secondary);
+  font-size: 11px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.library-context-menu > button,
+.library-context-color {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: 29px;
+  padding: 5px 8px;
+  border: 0;
+  border-radius: var(--ds-radius-row);
+  background: transparent;
+  color: var(--ds-text);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+.library-context-menu > button:hover,
+.library-context-color:hover {
+  background: var(--ds-hover);
+}
+.library-context-menu > button.danger { color: var(--danger); }
+.library-context-color { justify-content: space-between; gap: 10px; }
+.library-context-color input { width: 28px; height: 20px; padding: 0; border: 0; background: transparent; cursor: pointer; }
+.library-nav-item.library-nav-dragging > .library-nav-row,
+.library-nav-row.library-nav-dragging { opacity: .5; }
+.library-nav-row[data-library-drag-kind] { cursor: grab; }
+.library-nav-item.library-nav-drop-before > .library-nav-row,
+.library-nav-row.library-nav-drop-before { box-shadow: inset 0 2px 0 var(--ds-accent); }
+.library-nav-item.library-nav-drop-after > .library-nav-row,
+.library-nav-row.library-nav-drop-after { box-shadow: inset 0 -2px 0 var(--ds-accent); }
+.library-nav-item.library-nav-drop-inside > .library-nav-row,
+.library-nav-row.library-nav-drop-inside { background: var(--ds-selected); outline: 1px solid var(--ds-accent); outline-offset: -1px; }
+
+/* Attachment operations are available on hover/focus/selection without
+   reserving a permanent action column in the compact Library list. */
+.library-attachment-child {
+  position: relative;
+  grid-template-columns: 24px minmax(0, 1fr) auto;
+  padding-right: 12px;
+  cursor: pointer;
+}
+.library-attachment-child.selected,
+.library-attachment-child:hover,
+.library-attachment-child:focus-visible {
+  background: var(--ds-hover);
+  outline: 0;
+}
+.attachment-child-hint { color: var(--ds-secondary); font-size: 9px; }
+.library-attachment-child:hover .attachment-child-hint,
+.library-attachment-child:focus-within .attachment-child-hint,
+.library-attachment-child.selected .attachment-child-hint { visibility: hidden; }
+.attachment-child-actions,
+.attachment-row .attachment-actions {
+  position: absolute;
+  right: 8px;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 3px;
+  border: 1px solid var(--ds-border);
+  border-radius: var(--ds-radius-control);
+  background: color-mix(in srgb, var(--ds-main) 94%, transparent);
+  box-shadow: 0 2px 7px #00000012;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+.library-attachment-child:hover .attachment-child-actions,
+.library-attachment-child:focus-within .attachment-child-actions,
+.library-attachment-child.selected .attachment-child-actions,
+.attachment-row:hover .attachment-actions,
+.attachment-row:focus-within .attachment-actions,
+.attachment-row.selected .attachment-actions {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+}
+.attachment-child-actions button,
+.attachment-row .attachment-actions button { padding: 2px 5px; font-size: 9px; white-space: nowrap; }
+.attachment-row { position: relative; cursor: pointer; }
+.attachment-row.selected,
+.attachment-row:hover,
+.attachment-row:focus-visible { background: var(--ds-hover); outline: 0; }
+@media (max-width: 760px) {
+  .attachment-child-actions,
+  .attachment-row .attachment-actions {
+    position: static;
+    grid-column: 2 / -1;
+    justify-content: flex-start;
+    width: max-content;
+    max-width: 100%;
+    overflow-x: auto;
+  }
+  .library-attachment-child:hover .attachment-child-actions,
+  .library-attachment-child:focus-within .attachment-child-actions,
+  .library-attachment-child.selected .attachment-child-actions,
+  .attachment-row:hover .attachment-actions,
+  .attachment-row:focus-within .attachment-actions,
+  .attachment-row.selected .attachment-actions { opacity: 1; visibility: visible; pointer-events: auto; }
+}
+
+.relation-link { display: inline-flex; align-items: center; gap: 5px; padding: 0; border: 0; background: transparent; color: inherit; font: inherit; cursor: pointer; }
+.relation-link:hover { color: var(--ds-accent); }

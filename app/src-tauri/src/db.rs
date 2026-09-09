@@ -1573,6 +1573,118 @@ fn validate_library_tag_ids(conn: &Connection, ids: &[i64]) -> Result<()> {
     Ok(())
 }
 
+// Library navigation order is user UI state, not bibliographic data. Collections
+// already have a durable sort_order column; Library Tags predate that column, so
+// their order is kept in the existing key/value table instead of changing v19.
+const LIBRARY_TAG_ORDER_KEY: &str = "library.navigation.tag_order";
+
+fn invalid_library_value(name: &str) -> rusqlite::Error {
+    rusqlite::Error::InvalidParameterName(name.to_string())
+}
+
+fn stored_library_tag_order(conn: &Connection) -> Vec<i64> {
+    get_setting(conn, LIBRARY_TAG_ORDER_KEY)
+        .and_then(|value| serde_json::from_str::<Vec<i64>>(&value).ok())
+        .unwrap_or_default()
+}
+
+fn library_tag_ids(conn: &Connection) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare("SELECT id FROM library_tags ORDER BY created_at, id")?;
+    let ids = stmt.query_map([], |row| row.get::<_, i64>(0))?.collect();
+    ids
+}
+
+fn normalized_library_tag_order(conn: &Connection) -> Result<Vec<i64>> {
+    let existing = library_tag_ids(conn)?;
+    let known: std::collections::HashSet<i64> = existing.iter().copied().collect();
+    let mut out = Vec::with_capacity(existing.len());
+    let mut seen = std::collections::HashSet::new();
+    for id in stored_library_tag_order(conn) {
+        if known.contains(&id) && seen.insert(id) {
+            out.push(id);
+        }
+    }
+    // Tags created before the order key existed, or after a partial/old write,
+    // are appended deterministically and become part of the next saved order.
+    out.extend(existing.into_iter().filter(|id| seen.insert(*id)));
+    Ok(out)
+}
+
+fn persist_library_tag_order(conn: &Connection, order: &[i64]) -> Result<()> {
+    let value = serde_json::to_string(order).map_err(|_| invalid_library_value("tag_order"))?;
+    set_setting(conn, LIBRARY_TAG_ORDER_KEY, &value)
+}
+
+fn normalize_library_tag_color(color: Option<&str>) -> Result<Option<String>> {
+    let Some(color) = color.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let valid_length = matches!(color.len(), 4 | 7 | 9);
+    let valid_prefix = color.as_bytes().first() == Some(&b'#');
+    let valid_digits = color[1..].bytes().all(|byte| byte.is_ascii_hexdigit());
+    if !valid_length || !valid_prefix || !valid_digits {
+        return Err(invalid_library_value("color"));
+    }
+    Ok(Some(color.to_ascii_lowercase()))
+}
+
+fn collection_parent(conn: &Connection, id: i64) -> Result<Option<i64>> {
+    let parent: Option<Option<i64>> = conn
+        .query_row(
+        "SELECT parent_id FROM library_collections WHERE id=?1",
+        params![id],
+        |row| row.get(0),
+    )
+    .optional()?;
+    Ok(parent.flatten())
+}
+
+fn collection_depth(conn: &Connection, id: i64) -> Result<Option<i64>> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM library_collections WHERE id=?1)",
+        params![id],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Ok(None);
+    }
+    let mut parent = collection_parent(conn, id)?;
+    let mut depth = 0_i64;
+    let mut seen = std::collections::HashSet::from([id]);
+    while let Some(next) = parent {
+        if !seen.insert(next) {
+            return Err(invalid_library_value("collection_cycle"));
+        }
+        parent = collection_parent(conn, next)?;
+        depth += 1;
+        if depth > 32 {
+            return Err(invalid_library_value("collection_depth"));
+        }
+    }
+    Ok(Some(depth))
+}
+
+fn collection_children(conn: &Connection, parent_id: Option<i64>) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT id FROM library_collections WHERE parent_id IS ?1
+         ORDER BY sort_order, name, id",
+    )?;
+    let ids = stmt.query_map(params![parent_id], |row| row.get::<_, i64>(0))?.collect();
+    ids
+}
+
+fn validate_ordered_ids(ordered_ids: &[i64], expected: &[i64], name: &str) -> Result<()> {
+    if ordered_ids.len() != expected.len() {
+        return Err(invalid_library_value(name));
+    }
+    let expected_set: std::collections::HashSet<i64> = expected.iter().copied().collect();
+    let mut seen = std::collections::HashSet::new();
+    if ordered_ids.iter().any(|id| !expected_set.contains(id) || !seen.insert(*id)) {
+        return Err(invalid_library_value(name));
+    }
+    Ok(())
+}
+
 // ---------- v19 Library Full-Text Search ----------
 
 /// SQLite's unicode61 tokenizer handles case-folding and diacritic removal;
@@ -4382,6 +4494,119 @@ pub fn list_library_collections(conn: &Connection) -> Result<Vec<crate::models::
     rows.collect()
 }
 
+/// Persist the order of one Collection sibling group. The complete sibling set
+/// is required so a stale UI cannot accidentally drop a Collection from the
+/// navigation tree.
+pub fn reorder_library_collections(
+    conn: &Connection,
+    parent_id: Option<i64>,
+    ordered_ids: &[i64],
+) -> Result<()> {
+    if let Some(parent_id) = parent_id {
+        if collection_depth(conn, parent_id)? != Some(0) {
+            return Err(invalid_library_value("collection_parent_depth"));
+        }
+    }
+    let expected = collection_children(conn, parent_id)?;
+    validate_ordered_ids(ordered_ids, &expected, "collection_order")?;
+    let tx = conn.unchecked_transaction()?;
+    let now = now_utc();
+    for (sort_order, id) in ordered_ids.iter().copied().enumerate() {
+        tx.execute(
+            "UPDATE library_collections SET sort_order=?1, updated_at=?2 WHERE id=?3 AND parent_id IS ?4",
+            params![sort_order as i64, now, id, parent_id],
+        )?;
+    }
+    tx.commit()
+}
+
+/// Move a Collection to a sibling group and place it at `sort_order`. Only a
+/// two-level hierarchy is supported: roots may have children, but children may
+/// not themselves become parents. Old and new sibling groups are normalized in
+/// one transaction so an interrupted drag cannot leave ambiguous ordering.
+pub fn move_library_collection(
+    conn: &Connection,
+    id: i64,
+    parent_id: Option<i64>,
+    sort_order: i64,
+) -> Result<crate::models::LibraryCollection> {
+    let tx = conn.unchecked_transaction()?;
+    let current_parent: Option<i64> = tx
+        .query_row(
+            "SELECT parent_id FROM library_collections WHERE id=?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| invalid_library_value("collection_id"))?;
+
+    if let Some(parent_id) = parent_id {
+        let parent_depth = collection_depth(&tx, parent_id)?;
+        if parent_depth != Some(0) {
+            return Err(invalid_library_value("collection_parent_depth"));
+        }
+        let mut ancestor = Some(parent_id);
+        while let Some(candidate) = ancestor {
+            if candidate == id {
+                return Err(invalid_library_value("collection_cycle"));
+            }
+            ancestor = collection_parent(&tx, candidate)?;
+        }
+        // A root that owns children cannot be nested: doing so would create a
+        // third level for those children. Moving a leaf into a root is valid.
+        let has_children: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM library_collections WHERE parent_id=?1)",
+            params![id],
+            |row| row.get(0),
+        )?;
+        if has_children && current_parent.is_none() {
+            return Err(invalid_library_value("collection_depth_limit"));
+        }
+    }
+
+    let mut old_siblings = collection_children(&tx, current_parent)?;
+    old_siblings.retain(|candidate| *candidate != id);
+    let mut new_siblings = if current_parent == parent_id {
+        old_siblings.clone()
+    } else {
+        collection_children(&tx, parent_id)?
+    };
+    new_siblings.retain(|candidate| *candidate != id);
+    let insertion = (sort_order.max(0) as usize).min(new_siblings.len());
+    new_siblings.insert(insertion, id);
+
+    let now = now_utc();
+    tx.execute(
+        "UPDATE library_collections SET parent_id=?1, sort_order=?2, updated_at=?3 WHERE id=?4",
+        params![parent_id, insertion as i64, now, id],
+    )?;
+    for (sort_order, sibling_id) in old_siblings.iter().copied().enumerate() {
+        tx.execute(
+            "UPDATE library_collections SET sort_order=?1, updated_at=?2 WHERE id=?3",
+            params![sort_order as i64, now, sibling_id],
+        )?;
+    }
+    for (sort_order, sibling_id) in new_siblings.iter().copied().enumerate() {
+        tx.execute(
+            "UPDATE library_collections SET sort_order=?1, updated_at=?2 WHERE id=?3",
+            params![sort_order as i64, now, sibling_id],
+        )?;
+    }
+    tx.commit()?;
+    conn.query_row(
+        "SELECT * FROM library_collections WHERE id=?1",
+        params![id],
+        library_collection_from_row,
+    )
+}
+
+/// Compatibility wrapper for older callers that only supplied a parent.
+/// Moving to the end preserves the historical command contract while using
+/// the same hierarchy and sibling-order validation as drag-and-drop.
+pub fn set_library_collection_parent(conn: &Connection, id: i64, parent_id: Option<i64>) -> Result<()> {
+    move_library_collection(conn, id, parent_id, i64::MAX).map(|_| ())
+}
+
 /// Count the canonical papers represented by each Library sidebar scope.
 /// A parent collection includes all descendants, matching the table/search
 /// scope while DISTINCT keeps a paper with multiple memberships at one.
@@ -4449,12 +4674,20 @@ pub fn create_library_collection(conn: &Connection, name: &str, parent_id: Optio
             |r| r.get(0),
         )?;
         if !exists { return Err(rusqlite::Error::QueryReturnedNoRows); }
+        if collection_depth(conn, parent_id)? != Some(0) {
+            return Err(invalid_library_value("collection_depth_limit"));
+        }
     }
     let now = now_utc();
+    let sort_order: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(sort_order) + 1, 0) FROM library_collections WHERE parent_id IS ?1",
+        params![parent_id],
+        |row| row.get(0),
+    )?;
     conn.execute(
-        "INSERT INTO library_collections (parent_id, name, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?3)",
-        params![parent_id, name, now],
+        "INSERT INTO library_collections (parent_id, name, sort_order, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?4)",
+        params![parent_id, name, sort_order, now],
     )?;
     conn.query_row(
         "SELECT * FROM library_collections WHERE id = ?1",
@@ -4483,9 +4716,23 @@ pub fn delete_library_collection(conn: &Connection, id: i64) -> Result<bool> {
 }
 
 pub fn list_library_tags(conn: &Connection) -> Result<Vec<crate::models::LibraryTag>> {
-    let mut stmt = conn.prepare("SELECT * FROM library_tags ORDER BY name, id")?;
+    let mut stmt = conn.prepare("SELECT * FROM library_tags ORDER BY created_at, id")?;
     let rows = stmt.query_map([], library_tag_from_row)?;
-    rows.collect()
+    let tags = rows.collect::<Result<Vec<_>>>()?;
+    let order = normalized_library_tag_order(conn)?;
+    let by_id: std::collections::HashMap<i64, crate::models::LibraryTag> = tags
+        .into_iter()
+        .map(|tag| (tag.id, tag))
+        .collect();
+    Ok(order.into_iter().filter_map(|id| by_id.get(&id).cloned()).collect())
+}
+
+/// Persist the flat Library Tag order in app_state. Requiring the complete
+/// existing set protects against stale drag payloads and accidental data loss.
+pub fn reorder_library_tags(conn: &Connection, ordered_ids: &[i64]) -> Result<()> {
+    let expected = library_tag_ids(conn)?;
+    validate_ordered_ids(ordered_ids, &expected, "tag_order")?;
+    persist_library_tag_order(conn, ordered_ids)
 }
 
 pub fn list_library_tag_facets(conn: &Connection, collection_id: Option<i64>) -> Result<Vec<crate::models::LibraryTagFacet>> {
@@ -4526,25 +4773,45 @@ pub fn list_library_tag_facets(conn: &Connection, collection_id: Option<i64>) ->
             paper_count: row.get("paper_count")?,
         })
     })?;
-    rows.collect()
+    let mut facets = rows.collect::<Result<Vec<_>>>()?;
+    let order = normalized_library_tag_order(conn)?;
+    let order_index: std::collections::HashMap<i64, usize> = order
+        .into_iter()
+        .enumerate()
+        .map(|(index, id)| (id, index))
+        .collect();
+    facets.sort_by_key(|facet| order_index.get(&facet.tag.id).copied().unwrap_or(usize::MAX));
+    Ok(facets)
 }
 
 pub fn create_library_tag(conn: &Connection, name: &str, color: Option<&str>) -> Result<crate::models::LibraryTag> {
     let name = name.trim();
     if name.is_empty() { return Err(rusqlite::Error::InvalidParameterName("name".into())); }
+    let color = normalize_library_tag_color(color)?;
     let now = now_utc();
-    conn.execute(
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
         "INSERT INTO library_tags (name, color, created_at, updated_at) VALUES (?1, ?2, ?3, ?3)",
         params![name, color, now],
     )?;
-    conn.query_row("SELECT * FROM library_tags WHERE id = ?1", params![conn.last_insert_rowid()], library_tag_from_row)
+    let id = tx.last_insert_rowid();
+    let mut order = normalized_library_tag_order(&tx)?;
+    if !order.contains(&id) {
+        order.push(id);
+    }
+    persist_library_tag_order(&tx, &order)?;
+    tx.commit()?;
+    conn.query_row("SELECT * FROM library_tags WHERE id = ?1", params![id], library_tag_from_row)
 }
 
 pub fn rename_library_tag(conn: &Connection, id: i64, name: &str) -> Result<()> {
     let name = name.trim();
     if name.is_empty() { return Err(rusqlite::Error::InvalidParameterName("name".into())); }
     let tx = conn.unchecked_transaction()?;
-    tx.execute("UPDATE library_tags SET name = ?1, updated_at = ?2 WHERE id = ?3", params![name, now_utc(), id])?;
+    let changed = tx.execute("UPDATE library_tags SET name = ?1, updated_at = ?2 WHERE id = ?3", params![name, now_utc(), id])?;
+    if changed != 1 {
+        return Err(invalid_library_value("tag_id"));
+    }
     let paper_ids = tx
         .prepare("SELECT paper_id FROM library_item_tags WHERE tag_id=?1")?
         .query_map(params![id], |row| row.get::<_, i64>(0))?
@@ -4556,6 +4823,31 @@ pub fn rename_library_tag(conn: &Connection, id: i64, name: &str) -> Result<()> 
     Ok(())
 }
 
+pub fn set_library_tag_color(
+    conn: &Connection,
+    id: i64,
+    color: Option<&str>,
+) -> Result<crate::models::LibraryTag> {
+    let color = normalize_library_tag_color(color)?;
+    let changed = conn.execute(
+        "UPDATE library_tags SET color=?1, updated_at=?2 WHERE id=?3",
+        params![color, now_utc(), id],
+    )?;
+    if changed != 1 {
+        return Err(invalid_library_value("tag_id"));
+    }
+    conn.query_row("SELECT * FROM library_tags WHERE id=?1", params![id], library_tag_from_row)
+}
+
+/// Product-facing alias retained for callers that describe this as an update.
+pub fn update_library_tag_color(
+    conn: &Connection,
+    id: i64,
+    color: Option<&str>,
+) -> Result<crate::models::LibraryTag> {
+    set_library_tag_color(conn, id, color)
+}
+
 pub fn delete_library_tag(conn: &Connection, id: i64) -> Result<bool> {
     let tx = conn.unchecked_transaction()?;
     let paper_ids = tx
@@ -4563,6 +4855,13 @@ pub fn delete_library_tag(conn: &Connection, id: i64) -> Result<bool> {
         .query_map(params![id], |row| row.get::<_, i64>(0))?
         .collect::<Result<Vec<_>>>()?;
     let changed = tx.execute("DELETE FROM library_tags WHERE id = ?1", params![id])? == 1;
+    if changed {
+        let order = normalized_library_tag_order(&tx)?
+            .into_iter()
+            .filter(|tag_id| *tag_id != id)
+            .collect::<Vec<_>>();
+        persist_library_tag_order(&tx, &order)?;
+    }
     tx.commit()?;
     for paper_id in paper_ids {
         refresh_library_search_document(conn, paper_id)?;
