@@ -1343,6 +1343,8 @@ button.full {
 .nav-symbol { width: 14px; color: #999; }
 .nav-label { overflow: hidden; text-overflow: ellipsis; }
 .library-nav-item { position: relative; }
+.library-nav-item.dimmed:not(:has(.library-nav-row.active)) .library-nav-row { color: #a5a5a5; opacity: .72; }
+.library-nav-item.dimmed:not(:has(.library-nav-row.active)) .nav-count { color: #b8b8b8; }
 .nav-child, .nav-manage { position: absolute; right: 2px; width: 17px; padding: 1px; background: #f6f6f6; }
 .nav-child { right: 36px; }
 .nav-manage:not(.danger) { right: 19px; }
@@ -1662,6 +1664,12 @@ body.library-workspace .relation-chip { border-color: #e8e8e8; background: #fff;
 .library-workspace .library-search-toolbar.library-only { display: flex; flex: 0 0 min(var(--library-search-width), 42vw); min-width: var(--library-search-min-width); }
 .library-search-toolbar:focus-within { border-color: #9ebff0; box-shadow: var(--library-focus-ring); }
 .library-search-icon { color: #999; font-size: 16px; line-height: 1; }
+.library-search-tokens { display: flex; flex: 0 0 auto; align-items: center; gap: 3px; max-width: 52%; overflow: hidden; }
+.library-search-token { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 3px; max-width: 150px; padding: 2px 4px 2px 5px; border: 1px solid #d8e0e8; border-radius: 4px; background: #f4f7fa; color: #536474; font-size: 10px; line-height: 16px; }
+.library-search-token .folder-symbol, .library-search-token .tag-dot { flex: 0 0 auto; }
+.library-search-token > span:not(.folder-symbol):not(.tag-dot) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.library-search-token-remove { padding: 0 1px; color: #8a96a3; font-size: 13px; line-height: 14px; }
+.library-search-token-remove:hover { background: transparent; color: #354251; }
 .library-search-toolbar input { min-width: 0; flex: 1; border: 0; outline: 0; background: transparent; color: #333; font: inherit; font-size: 12px; }
 .library-search-toolbar input::placeholder { color: #aaa; }
 .library-search-clear { padding: 0 2px; color: #999; font-size: 15px; line-height: 1; }
@@ -1679,6 +1687,7 @@ body.library-workspace .relation-chip { border-color: #e8e8e8; background: #fff;
 .library-nav-row.dimmed:hover { color: #777; }
 @media (max-width: 900px) {
   .library-search-toolbar.library-only { width: min(330px, 35vw); }
+  .library-search-tokens { max-width: 48%; }
 }
 @media (max-width: 620px) {
   :root { --sidebar-shell-width: 138px; }

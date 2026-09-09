@@ -1670,22 +1670,15 @@ fn library_search_terms(input: &str) -> Vec<String> {
     terms
 }
 
-fn library_search_match_query(input: &str, scope: &str) -> Option<String> {
+fn library_search_match_query(input: &str) -> Option<String> {
     let terms = library_search_terms(input);
     if terms.is_empty() {
         return None;
     }
-    let scope = scope.trim().to_ascii_lowercase();
-    let column = match scope.as_str() {
-        "quick" => Some("quick_text"),
-        "metadata" => Some("{quick_text metadata_text}"),
-        "content" | "all" => Some("{quick_text metadata_text content_text}"),
-        "title" => Some("{title chinese_title}"),
-        "abstract" => Some("{abstract chinese_abstract}"),
-        "note" => Some("{note cjk_ngrams}"),
-        "tags" | "library_tags" => Some("library_tags"),
-        _ => return None,
-    };
+    // The unified Search Box deliberately has one text dimension. Scope is
+    // expressed only by collectionIds[] and libraryTagIds[]; queryText spans
+    // the complete effective Library projection.
+    let column = Some("{quick_text metadata_text content_text}");
     Some(
         terms
             .iter()
@@ -1931,17 +1924,12 @@ pub fn rebuild_library_search_index(conn: &Connection) -> Result<()> {
 pub fn search_library(
     conn: &Connection,
     query_text: &str,
-    search_scope: Option<&str>,
     collection_ids: &[i64],
     library_tag_ids: &[i64],
     limit: i64,
     offset: i64,
     paper_id: Option<i64>,
 ) -> Result<Vec<crate::models::LibrarySearchResult>> {
-    let scope = search_scope.unwrap_or("quick").trim().to_ascii_lowercase();
-    if !matches!(scope.as_str(), "quick" | "all" | "content" | "title" | "abstract" | "note" | "metadata" | "tags" | "library_tags") {
-        return Err(rusqlite::Error::InvalidParameterName("search_scope".into()));
-    }
     let mut collections = collection_ids.to_vec();
     collections.sort_unstable();
     collections.dedup();
@@ -1952,7 +1940,7 @@ pub fn search_library(
     let fts_query = if query_text.trim().is_empty() {
         None
     } else {
-        library_search_match_query(query_text, &scope)
+        library_search_match_query(query_text)
     };
     // A non-empty query made solely of one Han character has no valid bigram;
     // returning no rows is safer than silently treating it as a filter-only
@@ -4273,7 +4261,10 @@ pub fn set_paper_collections(conn: &Connection, paper_id: i64, collection_ids: &
             params![collection_id, paper_id, now],
         )?;
     }
-    tx.commit()
+    tx.commit()?;
+    // Collection membership is a search scope, so keep the runtime projection
+    // current even though Collection names themselves are not indexed text.
+    refresh_library_search_document(conn, paper_id)
 }
 
 pub fn set_paper_library_tags(conn: &Connection, paper_id: i64, tag_ids: &[i64]) -> Result<()> {
@@ -6731,7 +6722,8 @@ pub fn add_paper_to_collection(conn: &Connection, paper_id: i64, collection_id: 
     if !library_item_exists(&tx, paper_id)? { return Err(rusqlite::Error::QueryReturnedNoRows); }
     validate_collection_ids(&tx, &[collection_id])?;
     tx.execute("INSERT OR IGNORE INTO library_collection_items(collection_id,paper_id,added_at) VALUES(?1,?2,?3)", params![collection_id,paper_id,now_utc()])?;
-    tx.commit()
+    tx.commit()?;
+    refresh_library_search_document(conn, paper_id)
 }
 
 pub fn add_paper_library_tag(conn: &Connection, paper_id: i64, tag_id: i64) -> Result<()> {

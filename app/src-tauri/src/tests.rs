@@ -5315,8 +5315,8 @@ fn test_library_search_v19_fts_filters_effective_values_and_sync() {
     db::save_analysis(&conn, a, "平台治理与网络效应", "平台经济中的网络效应摘要", "summary", "[]", 4.2, "test", "v1", "search-hash").unwrap();
     db::save_title_translation(&conn, b, "网络方法研究").unwrap();
 
-    let ids = |query: &str, scope: Option<&str>, collections: &[i64], tags: &[i64], paper_id: Option<i64>| {
-        let mut ids = db::search_library(&conn, query, scope, collections, tags, 100, 0, paper_id)
+    let ids = |query: &str, _legacy_scope: Option<&str>, collections: &[i64], tags: &[i64], paper_id: Option<i64>| {
+        let mut ids = db::search_library(&conn, query, collections, tags, 100, 0, paper_id)
             .unwrap()
             .into_iter()
             .map(|hit| hit.paper_id)
@@ -5443,7 +5443,7 @@ fn benchmark_library_search_1k_10k_p50_p95() {
         let mut samples = Vec::new();
         for _ in 0..50 {
             let started = Instant::now();
-            let hits = db::search_library(&conn, "platform network", Some("content"), &[], &[], 1000, 0, None).unwrap();
+            let hits = db::search_library(&conn, "platform network", &[], &[], 1000, 0, None).unwrap();
             assert_eq!(hits.len(), dataset_rows.min(1000) as usize);
             samples.push(started.elapsed().as_secs_f64() * 1000.0);
         }
@@ -5649,7 +5649,7 @@ fn test_discovery_attach_pdf_adds_library_and_clears_read_later_atomically() {
     assert_eq!(membership.added_source, "discovery_attach_pdf");
     assert!(!db::get_paper(&conn, pid).unwrap().unwrap().is_favorite);
     assert_eq!(conn.query_row("SELECT COUNT(*) FROM library_items WHERE paper_id=?1", params![pid], |r| r.get::<_, i64>(0)).unwrap(), 1);
-    assert_eq!(db::search_library(&conn, "Discovery", Some("content"), &[], &[], 100, 0, None).unwrap().iter().map(|hit| hit.paper_id).collect::<Vec<_>>(), vec![pid], "Discovery PDF Library add must sync the index");
+    assert_eq!(db::search_library(&conn, "Discovery", &[], &[], 100, 0, None).unwrap().iter().map(|hit| hit.paper_id).collect::<Vec<_>>(), vec![pid], "Discovery PDF Library add must sync the index");
     let _ = std::fs::remove_file(path);
 }
 
@@ -5735,7 +5735,7 @@ fn test_external_pdf_without_identity_creates_canonical_paper_and_never_generate
     assert!(paper.abstract_text.is_none(), "title 不得生成 abstract");
     assert!(db::get_library_membership(&conn, pid).unwrap().is_some());
     assert!(db::list_paper_attachments(&conn, pid).unwrap()[0].absolute_path.contains("new-external"));
-    assert_eq!(db::search_library(&conn, "A New External", Some("content"), &[], &[], 100, 0, None).unwrap().iter().map(|hit| hit.paper_id).collect::<Vec<_>>(), vec![pid], "external PDF import must index the Library paper");
+    assert_eq!(db::search_library(&conn, "A New External", &[], &[], 100, 0, None).unwrap().iter().map(|hit| hit.paper_id).collect::<Vec<_>>(), vec![pid], "external PDF import must index the Library paper");
     for table in ["library_papers", "external_library_papers"] {
         assert!(!conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)", params![table], |r| r.get::<_, bool>(0)).unwrap(), "禁止第二 Paper 表 {table}");
     }

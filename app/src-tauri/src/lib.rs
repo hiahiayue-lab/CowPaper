@@ -945,7 +945,6 @@ fn list_library_papers(
 #[tauri::command]
 fn search_library(
     query_text: String,
-    search_scope: Option<String>,
     collection_ids: Option<Vec<i64>>,
     library_tag_ids: Option<Vec<i64>>,
     limit: Option<i64>,
@@ -957,7 +956,6 @@ fn search_library(
     db::search_library(
         &conn,
         &query_text,
-        search_scope.as_deref(),
         collection_ids.as_deref().unwrap_or(&[]),
         library_tag_ids.as_deref().unwrap_or(&[]),
         limit.unwrap_or(100),

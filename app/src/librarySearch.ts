@@ -6,10 +6,8 @@
  * keyboard, scope, suggestion, or de-duplication semantics.
  */
 
-/** One Library search contract: title, metadata, tags, notes, and abstracts. */
-export type LibrarySearchMode = "all";
 export type LibrarySearchPhase = "closed" | "open" | "composing";
-export type LibrarySearchSuggestionKind = "collection" | "libraryTag" | "searchAction";
+export type LibrarySearchSuggestionKind = "collection" | "libraryTag" | "paper" | "searchAction";
 
 export interface SearchCollection {
   id: number;
@@ -47,16 +45,13 @@ export interface SearchPaper {
 export interface LibrarySearchScope {
   /** Multiple collections are OR-ed. */
   collectionIds: number[];
-  /** When true, collectionIds includes each selected collection's descendants. */
-  includeDescendants: boolean;
   /** Multiple Library Tags are AND-ed. */
   libraryTagIds: number[];
 }
 
 export interface LibrarySearchQuery extends LibrarySearchScope {
-  mode: LibrarySearchMode;
-  /** Search terms are AND-ed within the selected searchable fields. */
-  text: string;
+  /** Search terms are AND-ed across the complete Library search projection. */
+  queryText: string;
 }
 
 export interface LibrarySearchRequest extends LibrarySearchQuery {
@@ -70,8 +65,7 @@ export interface LibrarySearchResult {
 }
 
 export interface SearchSuggestionScope extends Partial<LibrarySearchScope> {
-  mode?: LibrarySearchMode;
-  text?: string;
+  queryText?: string;
 }
 
 export interface LibrarySearchSuggestion {
@@ -81,6 +75,7 @@ export interface LibrarySearchSuggestion {
   detail?: string;
   scope?: SearchSuggestionScope;
   count?: number;
+  paperId?: number;
   /** Zero-count tags stay visible, dimmed, clickable, and draggable. */
   dimmed?: boolean;
   draggable?: boolean;
@@ -99,11 +94,11 @@ export interface LibrarySearchApi {
 }
 
 export function emptyLibrarySearchScope(): LibrarySearchScope {
-  return { collectionIds: [], includeDescendants: false, libraryTagIds: [] };
+  return { collectionIds: [], libraryTagIds: [] };
 }
 
 export function emptyLibrarySearchQuery(): LibrarySearchQuery {
-  return { ...emptyLibrarySearchScope(), mode: "all", text: "" };
+  return { ...emptyLibrarySearchScope(), queryText: "" };
 }
 
 function uniqueIds(ids: readonly number[]): number[] {
@@ -112,10 +107,8 @@ function uniqueIds(ids: readonly number[]): number[] {
 
 export function normalizeLibrarySearchQuery(query: Partial<LibrarySearchQuery> = {}): LibrarySearchQuery {
   return {
-    mode: "all",
-    text: query.text?.trim() || "",
+    queryText: query.queryText?.trim() || "",
     collectionIds: uniqueIds(query.collectionIds || []),
-    includeDescendants: Boolean(query.includeDescendants),
     libraryTagIds: uniqueIds(query.libraryTagIds || []),
   };
 }
@@ -150,18 +143,14 @@ function authorText(authors: SearchPaper["authors"]): string {
 }
 
 function searchFields(paper: SearchPaper): string[] {
+  // Keep this list identical to the product contract. Publisher, DOI, URL,
+  // volume, issue, and pages remain display metadata but are not searchable.
   return [
     paper.title,
     paper.chineseTitle,
     authorText(paper.authors),
     paper.year,
     paper.source,
-    paper.publisher,
-    paper.doi,
-    paper.url,
-    paper.volume,
-    paper.issue,
-    paper.pages,
     ...(paper.tags || []),
     paper.note,
     paper.abstract,
@@ -169,8 +158,8 @@ function searchFields(paper: SearchPaper): string[] {
   ].map(valueText);
 }
 
-export function matchesLibrarySearchText(paper: SearchPaper, text: string, _mode: LibrarySearchMode = "all"): boolean {
-  const terms = text.toLocaleLowerCase().split(/\s+/u).map((term) => term.trim()).filter(Boolean);
+export function matchesLibrarySearchText(paper: SearchPaper, queryText: string): boolean {
+  const terms = queryText.toLocaleLowerCase().split(/\s+/u).map((term) => term.trim()).filter(Boolean);
   if (!terms.length) return true;
   const haystack = searchFields(paper).join(" ").toLocaleLowerCase();
   return terms.every((term) => haystack.includes(term));
@@ -195,7 +184,7 @@ export function filterLibrarySearchPapers(papers: readonly SearchPaper[], query:
   for (const paper of papers) {
     if (!hasAnyCollection(paper, normalized.collectionIds)) continue;
     if (!hasAllTags(paper, normalized.libraryTagIds)) continue;
-    if (!matchesLibrarySearchText(paper, normalized.text, normalized.mode)) continue;
+    if (!matchesLibrarySearchText(paper, normalized.queryText)) continue;
     byId.set(paper.id, paper);
   }
   return [...byId.values()];
@@ -208,20 +197,25 @@ function tagCount(index: LibrarySearchIndex, id: number): number {
 
 /** Build one flat dropdown list; ordering is stable and category-specific. */
 export function buildLibrarySearchSuggestions(index: LibrarySearchIndex, query: LibrarySearchQuery): LibrarySearchSuggestion[] {
-  const needle = query.text.trim().toLocaleLowerCase();
+  const needle = query.queryText.trim().toLocaleLowerCase();
   const includes = (label: string) => !needle || label.toLocaleLowerCase().includes(needle);
   const suggestions: LibrarySearchSuggestion[] = [];
   for (const collection of index.collections) {
     if (!includes(collection.name)) continue;
-    suggestions.push({ id: `collection:${collection.id}`, kind: "collection", label: collection.name, detail: "文集 · OR", scope: { collectionIds: [collection.id], includeDescendants: true }, draggable: true });
+    suggestions.push({ id: `collection:${collection.id}`, kind: "collection", label: collection.name, detail: "文集 · OR（含子文集）", scope: { collectionIds: [collection.id] }, draggable: true });
   }
   for (const tag of index.tags) {
     if (!includes(tag.name)) continue;
     const count = tagCount(index, tag.id);
     suggestions.push({ id: `libraryTag:${tag.id}`, kind: "libraryTag", label: tag.name, detail: `Library Tag · ${count}`, count, dimmed: count === 0, draggable: true, scope: { libraryTagIds: [tag.id] } });
   }
+  for (const paper of index.papers) {
+    const label = valueText(paper.title || paper.chineseTitle) || `Paper #${paper.id}`;
+    if (!includes(label)) continue;
+    suggestions.push({ id: `paper:${paper.id}`, kind: "paper", label, detail: paper.source || "论文", paperId: paper.id });
+  }
   if (needle) {
-    suggestions.push({ id: "action:search", kind: "searchAction", label: `在当前范围搜索“${query.text.trim()}”`, detail: "Library Search", scope: { mode: "all" } });
+    suggestions.push({ id: "action:search", kind: "searchAction", label: `在当前范围搜索“${query.queryText.trim()}”`, detail: "Library Search" });
   }
   return suggestions;
 }
@@ -230,10 +224,8 @@ export function applyLibrarySearchSuggestion(query: LibrarySearchQuery, suggesti
   const next = normalizeLibrarySearchQuery(query);
   if (suggestion.kind === "collection" && suggestion.scope?.collectionIds) {
     next.collectionIds = uniqueIds([...next.collectionIds, ...suggestion.scope.collectionIds]);
-    next.includeDescendants = suggestion.scope.includeDescendants ?? next.includeDescendants;
   }
   if (suggestion.kind === "libraryTag" && suggestion.scope?.libraryTagIds) next.libraryTagIds = uniqueIds([...next.libraryTagIds, ...suggestion.scope.libraryTagIds]);
-  if (suggestion.scope?.mode) next.mode = suggestion.scope.mode;
   return next;
 }
 
@@ -250,10 +242,8 @@ export function createLibrarySearchAdapter(deps: LibrarySearchAdapterDependencie
     async search(request) {
       const query = normalizeLibrarySearchQuery(request);
       const view = request.view || "all";
-      const collections = query.includeDescendants ? await deps.listCollections() : [];
-      const collectionIds = query.collectionIds.length
-        ? query.includeDescendants ? expandCollectionIds(collections, query.collectionIds) : query.collectionIds
-        : [null];
+      const collections = query.collectionIds.length ? await deps.listCollections() : [];
+      const collectionIds = query.collectionIds.length ? expandCollectionIds(collections, query.collectionIds) : [null];
       const batches = await Promise.all(collectionIds.map((collectionId) => deps.listPapers({ view, collectionId, tagIds: query.libraryTagIds })));
       const papers = filterLibrarySearchPapers(batches.flat(), { ...query, collectionIds: [] });
       const deduped = new Map<number, SearchPaper>();
@@ -302,9 +292,9 @@ export function createLibrarySearchState(query: Partial<LibrarySearchQuery> = {}
 export function reduceLibrarySearchState(state: LibrarySearchState, action: LibrarySearchAction): LibrarySearchState {
   switch (action.type) {
     case "FOCUS": return { ...state, phase: state.isComposing ? "composing" : "open" };
-    case "INPUT": return { ...state, phase: state.isComposing ? "composing" : "open", query: normalizeLibrarySearchQuery({ ...state.query, text: action.text }), activeSuggestionIndex: -1, requestVersion: state.requestVersion + 1 };
+    case "INPUT": return { ...state, phase: state.isComposing ? "composing" : "open", query: normalizeLibrarySearchQuery({ ...state.query, queryText: action.text }), activeSuggestionIndex: -1, requestVersion: state.requestVersion + 1 };
     case "START_COMPOSITION": return { ...state, phase: "composing", isComposing: true };
-    case "END_COMPOSITION": return { ...state, phase: "open", isComposing: false, query: action.text == null ? state.query : normalizeLibrarySearchQuery({ ...state.query, text: action.text }), activeSuggestionIndex: -1, requestVersion: state.requestVersion + 1 };
+    case "END_COMPOSITION": return { ...state, phase: "open", isComposing: false, query: action.text == null ? state.query : normalizeLibrarySearchQuery({ ...state.query, queryText: action.text }), activeSuggestionIndex: -1, requestVersion: state.requestVersion + 1 };
     case "SUGGESTIONS": return { ...state, suggestions: action.suggestions, activeSuggestionIndex: action.suggestions.length ? 0 : -1 };
     case "MOVE_ACTIVE": {
       const count = state.suggestions.length;
