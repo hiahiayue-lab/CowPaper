@@ -1682,9 +1682,9 @@ body.library-workspace .relation-chip { border-color: #e8e8e8; background: #fff;
 .library-search-suggestion.dimmed { color: #a5a5a5; opacity: .72; }
 .library-search-suggestion-kind, .library-search-suggestion-detail { color: #999; font-size: 10px; }
 .library-search-suggestion-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.library-nav-row.dimmed { color: #a5a5a5; }
-.library-nav-row.dimmed .tag-dot, .library-nav-row.dimmed .nav-count { opacity: .62; }
-.library-nav-row.dimmed:hover { color: #777; }
+.library-nav-item.dimmed .library-nav-row { color: #a5a5a5; }
+.library-nav-item.dimmed .library-nav-row .tag-dot, .library-nav-item.dimmed .library-nav-row .nav-count { opacity: .62; }
+.library-nav-item.dimmed .library-nav-row:hover { color: #777; }
 @media (max-width: 900px) {
   .library-search-toolbar.library-only { width: min(330px, 35vw); }
   .library-search-tokens { max-width: 48%; }

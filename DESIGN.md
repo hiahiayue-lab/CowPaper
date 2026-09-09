@@ -64,7 +64,7 @@ spacing:
 search:
   mode: "all"
   placeholder: "搜索文库…"
-  fields: "title, Chinese title, authors, year, journal, publisher, DOI, URL, volume, issue, pages, tags, notes, abstracts"
+  fields: "English title, Chinese title, authors, year, journal, Library Tags, note, English abstract, Chinese abstract"
   resultSemantics: "instant local feedback; commit on Enter or suggestion selection"
 motion:
   librarySearch: "none"
@@ -128,7 +128,7 @@ Workspace tabs sit above the navigation items. Standard views, Collections, and 
 
 ### Toolbar
 
-The Library has one global toolbar. It owns the page title, current Collection/Tag scope pills, the single Library Search box, status, and import/action controls. Do not add a second persistent search field to the sidebar or table header. Toolbar inline controls use `{spacing.toolbar-inline-gap}`; the Search box uses the width/height/radius tokens above and remains the only persistent search surface.
+The Library has one global toolbar. It owns the page title, the single Library Search box, status, and import/action controls. Collection/Tag scope tokens live inside the Search box; do not render a second persistent search field or duplicate scope chips in the toolbar, sidebar, table header, or Inspector. Toolbar inline controls use `{spacing.toolbar-inline-gap}`; the Search box uses the width/height/radius tokens above and remains the only persistent search surface.
 
 ### Table
 
@@ -140,11 +140,11 @@ The Inspector is a continuous metadata surface. Keep the serif paper title promi
 
 ### Search
 
-Use one Search box in the Library toolbar. Search has one mode: `all`, covering title, Chinese title, authors, bibliographic metadata, tags, notes, and abstracts. Suggestions are lightweight and anchored to the box: matching Collection or Tag names, followed by one `在当前范围搜索“…”` action. Do not offer Quick/Metadata/Content mode switching, paper-result rows, or a large command palette. Empty-query focus remains quiet; typed-query filtering and keyboard navigation update without animation. Zero-count Tags remain visible and dimmed.
+Use one Search box in the Library toolbar. Search has one mode: `all`, covering English title, Chinese title, authors, year, journal, Library Tags, note, English abstract, and Chinese abstract. DOI, URL, publisher, volume, issue, and pages remain metadata only and are excluded from full-text matching. Suggestions are lightweight and anchored to the box: matching Collection or Tag names, matching Paper rows, followed by one `在当前范围搜索“…”` action. Do not offer Quick/Metadata/Content mode switching or a large command palette. Empty-query focus remains quiet; typed-query filtering and keyboard navigation update without animation. Zero-count Tags remain visible and dimmed.
 
 ### Suggestion dropdown
 
-The dropdown is a tokenized, trigger-owned surface: `{spacing.search-popover-gap}` below the Search box, `{spacing.search-popover-radius}` radius, and `{spacing.search-item-padding}` item padding. It is limited to Collection, Tag, and action groups, keeps the active row adjacent to the input, closes on outside click or `Escape`, and never changes layout or steals focus. No enter/exit animation is required for this high-frequency control; if a future product surface earns motion, it must use a trigger-aware origin, `transform`/`opacity` only, a sub-300ms ease-out curve, and `prefers-reduced-motion` handling.
+The dropdown is a tokenized, trigger-owned surface: `{spacing.search-popover-gap}` below the Search box, `{spacing.search-popover-radius}` radius, and `{spacing.search-item-padding}` item padding. It is limited to Collection, Tag, Paper, and one action group, keeps the active row adjacent to the input, closes on outside click or `Escape`, and never changes layout or steals focus. No enter/exit animation is required for this high-frequency control; if a future product surface earns motion, it must use a trigger-aware origin, `transform`/`opacity` only, a sub-300ms ease-out curve, and `prefers-reduced-motion` handling.
 
 ### Motion policy
 

@@ -503,7 +503,7 @@ let librarySearchState: LibrarySearchState = createLibrarySearchState();
 let librarySearchAppliedQuery: LibrarySearchQuery | null = null;
 let librarySearchResultIds: Set<number> | null = null;
 let librarySearchAdapter: LibrarySearchApi | null = null;
-let librarySearchSuggestionPointerSelection = false;
+const librarySearchHandledPointerSuggestions = new WeakSet<HTMLElement>();
 const libraryPaperIds = new Set<number>();
 let activeWorkspace: "discovery" | "library" = "discovery";
 let aiStatus: AiStatus = emptyAiStatus();
@@ -789,11 +789,14 @@ async function loadLibraryData(view: "all" | "recent" | "unfiled" = libraryView)
     // singleton scope.
     const collectionId = hasSearchScope ? null : scopedLibraryCollectionId();
     const tagIds = hasSearchScope ? [] : [...librarySelectedTagIds];
+    const facetCollectionId = libraryScope?.kind === "collection"
+      ? libraryScope.id
+      : searchQuery.collectionIds.length === 1 ? searchQuery.collectionIds[0] : null;
     [libraryPapers, libraryCollections, libraryTags, libraryTagFacets] = await Promise.all([
       invoke<LibraryPaper[]>("list_library_papers", { view, collectionId, tagIds }),
       invoke<LibraryCollection[]>("list_library_collections"),
       invoke<LibraryTag[]>("list_library_tags"),
-      invoke<LibraryTagFacet[]>("list_library_tag_facets", { collectionId }),
+      invoke<LibraryTagFacet[]>("list_library_tag_facets", { collectionId: facetCollectionId }),
     ]);
     librarySidebarCounts = await invoke<LibrarySidebarCounts>("get_library_sidebar_counts");
     libraryPaperIds.clear();
@@ -2143,14 +2146,30 @@ async function executeLibrarySearch(): Promise<void> {
 }
 
 async function selectLibrarySearchSuggestion(suggestion: LibrarySearchState["suggestions"][number]): Promise<void> {
+  if (suggestion.kind === "paper" && suggestion.paperId) {
+    // Paper suggestions locate the existing canonical row; they must not turn
+    // the Paper title into a new text query.
+    librarySearchState = { ...librarySearchState, phase: "closed", activeSuggestionIndex: -1 };
+    librarySearchAppliedQuery = null;
+    librarySearchResultIds = null;
+    selectedLibraryPaperId = suggestion.paperId;
+    renderLibrary();
+    document.querySelector<HTMLElement>(`[data-action="library-select-paper"][data-paper-id="${suggestion.paperId}"]`)?.scrollIntoView({ block: "nearest" });
+    return;
+  }
   librarySearchState = reduceLibrarySearchState(librarySearchState, { type: "SELECT_SUGGESTION", suggestion });
   // A token chosen from suggestions is the Search Box scope. Do not leave a
   // stale singleton Sidebar highlight suggesting an additional hidden filter.
   if (suggestion.kind === "collection" || suggestion.kind === "libraryTag") {
     libraryScope = null;
     librarySelectedTagIds = [];
+  } else if (suggestion.kind === "searchAction") {
+    librarySearchState = { ...librarySearchState, phase: "closed", activeSuggestionIndex: -1 };
   }
   renderLibrarySearch();
+  if (suggestion.kind === "collection" || suggestion.kind === "libraryTag") {
+    ($("library-search-input") as HTMLInputElement | null)?.focus({ preventScroll: true });
+  }
   await executeLibrarySearch();
 }
 
@@ -2189,6 +2208,14 @@ function renderLibrarySearch(): void {
 function handleLibrarySearchKeydown(event: KeyboardEvent): void {
   const input = event.target as HTMLInputElement;
   if (input.id !== "library-search-input") return;
+  if (event.key === "Enter" && !librarySearchState.isComposing && !event.isComposing && librarySearchState.activeSuggestionIndex >= 0) {
+    const suggestion = librarySearchState.suggestions[librarySearchState.activeSuggestionIndex];
+    if (suggestion) {
+      event.preventDefault();
+      void selectLibrarySearchSuggestion(suggestion);
+      return;
+    }
+  }
   const next = reduceLibrarySearchKeyboard(librarySearchState, { key: event.key, isComposing: event.isComposing });
   if (next === librarySearchState) return;
   event.preventDefault();
@@ -3993,21 +4020,22 @@ async function setupListeners() {
     refreshLibrarySearchSuggestions();
   });
   // Select on pointerdown so the browser's blur event cannot hide/remove the
-  // suggestion before the delegated click handler sees it. The click handler
-  // below remains a keyboard/accessibility fallback for synthetic clicks.
+  // suggestion before the delegated click handler sees it. A WeakSet marks
+  // this exact pointer sequence, so the later click cannot execute twice.
   document.addEventListener("pointerdown", (ev) => {
     const target = ev.target as HTMLElement;
     const searchSuggestion = target.closest("[data-search-suggestion-id]") as HTMLElement | null;
     if (!searchSuggestion) return;
     const suggestion = librarySearchState.suggestions.find((item) => item.id === searchSuggestion.dataset.searchSuggestionId);
     if (!suggestion) return;
-    // Do not cancel the native pointer sequence: draggable Collection/Tag
-    // suggestions must still be able to reach dragstart. Selection itself is
-    // captured before blur below can rebuild the list.
-    librarySearchSuggestionPointerSelection = true;
-    void selectLibrarySearchSuggestion(suggestion).finally(() => {
-      window.setTimeout(() => { librarySearchSuggestionPointerSelection = false; }, 0);
-    });
+    librarySearchHandledPointerSuggestions.add(searchSuggestion);
+    void selectLibrarySearchSuggestion(suggestion);
+  });
+  document.addEventListener("pointerup", (ev) => {
+    const target = ev.target as HTMLElement;
+    const searchSuggestion = target.closest("[data-search-suggestion-id]") as HTMLElement | null;
+    if (!searchSuggestion || !librarySearchHandledPointerSuggestions.has(searchSuggestion)) return;
+    ($("library-search-input") as HTMLInputElement | null)?.focus({ preventScroll: true });
   });
   document.addEventListener("dragstart", (ev) => {
     const suggestion = (ev.target as HTMLElement).closest("[data-search-suggestion-id]") as HTMLElement | null;
@@ -4097,7 +4125,10 @@ async function setupListeners() {
     }
     const searchSuggestion = t.closest("[data-search-suggestion-id]") as HTMLElement | null;
     if (searchSuggestion) {
-      if (librarySearchSuggestionPointerSelection) return;
+      if (librarySearchHandledPointerSuggestions.has(searchSuggestion)) {
+        librarySearchHandledPointerSuggestions.delete(searchSuggestion);
+        return;
+      }
       const suggestion = librarySearchState.suggestions.find((item) => item.id === searchSuggestion.dataset.searchSuggestionId);
       if (suggestion) {
         void selectLibrarySearchSuggestion(suggestion);

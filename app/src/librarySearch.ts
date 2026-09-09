@@ -224,8 +224,12 @@ export function applyLibrarySearchSuggestion(query: LibrarySearchQuery, suggesti
   const next = normalizeLibrarySearchQuery(query);
   if (suggestion.kind === "collection" && suggestion.scope?.collectionIds) {
     next.collectionIds = uniqueIds([...next.collectionIds, ...suggestion.scope.collectionIds]);
+    next.queryText = "";
   }
-  if (suggestion.kind === "libraryTag" && suggestion.scope?.libraryTagIds) next.libraryTagIds = uniqueIds([...next.libraryTagIds, ...suggestion.scope.libraryTagIds]);
+  if (suggestion.kind === "libraryTag" && suggestion.scope?.libraryTagIds) {
+    next.libraryTagIds = uniqueIds([...next.libraryTagIds, ...suggestion.scope.libraryTagIds]);
+    next.queryText = "";
+  }
   return next;
 }
 

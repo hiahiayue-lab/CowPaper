@@ -81,7 +81,7 @@ Not applicable and intentionally excluded:
 | # | Problem | Evidence | Proposed change | Scope | Confidence |
 | --- | --- | --- | --- | --- | --- |
 | 1 | Library has no implemented Search box even though a `.library-search` style exists. | `app/index.html` contains no `.library-search`; `app/src/main.ts` has no Library query state or render path; the style is only present around `app/src/styles.css:983-986` and later overrides. | Add one query input to the existing unified Library toolbar and make it the sole persistent Library Search surface. | `app/index.html`, `app/src/main.ts`, `app/src/styles.css` | High |
-| 2 | Scope is split across Sidebar rows and toolbar facet pills without a single visible query/scope model. | Sidebar owns standard views, recursive Collections, and flat Tags; `renderLibraryFacets()` only renders active scope pills in the toolbar. The user requirement explicitly calls for Search scopes and Collection/Tag scope. | Make the Search box expose a lightweight scope affordance for `All Library`, current Collection, current Tag(s), and current built-in view while preserving the Sidebar as navigation. | Library toolbar, scope state/rendering, suggestion dropdown | High |
+| 2 | Scope was split across Sidebar rows and toolbar facet pills without a single visible query/scope model. | Sidebar owns standard views, recursive Collections, and flat Tags; the Search box now owns removable Collection/Tag tokens. | Keep scope tokens inside the Search box while preserving the Sidebar as navigation; do not render external duplicate chips. | Library toolbar, scope state/rendering, suggestion dropdown | High |
 | 3 | Zero-count Tags are not guaranteed to remain visible, so hierarchy/selection can jump after filtering. | `renderLibraryNavigation()` renders `libraryTagFacets.map(...)`; facet data is count-driven, while the requested v0.2.1 behavior requires zero-count Tags visible/dimmed. | Render all Library Tags from `libraryTags`, join counts when present, keep zero-count rows visible with muted text/dot and disabled-looking count, while leaving them selectable for future scope changes only if the product state supports it. | Sidebar Tag renderer and its count presentation | High |
 
 ## Improve first
@@ -92,7 +92,7 @@ Implement the single toolbar Search box and its scope model first. It establishe
 
 ### 1. One Search Box
 
-Add a single compact search control inside `.topbar-leading`, next to the current Library title/facet region. It should fit between the title/scope pills and the right-side status/actions at wide widths, and collapse to an icon/short field only under the existing responsive constraints. Do not place a persistent search field in the Sidebar, table header, or Inspector.
+Add a single compact search control inside `.topbar-leading`, next to the current Library title and before the right-side status/actions at wide widths, and collapse under the existing responsive constraints. Do not place a persistent search field in the Sidebar, table header, or Inspector.
 
 Implemented UI contract:
 
@@ -100,32 +100,33 @@ Implemented UI contract:
 - Search icon is a neutral supporting glyph; the clear affordance appears only when the query is non-empty.
 - `⌘F` focuses the same control; `Escape` clears the query when the box is focused and closes the suggestion list when it is open.
 - Query updates are local and immediate for UI feedback; debounce only if the executing agent proves the backend list command needs it.
-- There is one search mode, `all`. The query searches the Library result set across effective English title, Chinese title, authors, journal/source, publisher, year, volume/issue/pages, DOI/URL, tags, notes, and abstracts. Do not search Discovery or mutate canonical Paper identity.
+- There is one search mode, `all`. The query searches the Library result set across effective English title, Chinese title, authors, year, journal/source, Library Tags, notes, and abstracts. Publisher, DOI, URL, volume, issue, and pages remain display metadata only and are excluded from full-text matching. Do not search Discovery or mutate canonical Paper identity.
 - Preserve the existing `libraryView`, Collection scope, Tag scope, selected row, column widths, and Inspector width across query changes.
 
 ### 2. Search scopes
 
-Keep scope explicit in existing Sidebar navigation and facet pills; do not add a mode selector or a second toolbar control. The default is `All Library`. Available scopes:
+Keep scope explicit in Sidebar navigation and inside Search Box tokens; do not add a mode selector, a second toolbar control, or an external duplicate chip row. The default is `All Library`. Available scopes:
 
 1. `All Library`: search all papers in the Library.
 2. `Current view`: search within All / Recent / Unfiled when one of those built-in views is active.
 3. `Current Collection`: search within the selected Collection, including the existing parent/child scope semantics supplied by the backend.
 4. `Current Tag(s)`: search within the active Tag selection. Preserve the current AND semantics for multiple Tags; do not reimplement Collection+Tag filtering in the browser.
 
-When a Collection or Tag is active, keep it visible through the existing `renderLibraryFacets()` pills. Those pills remain the removable summary of active filters; they are not replaced by the dropdown.
+When a Collection or Tag is active, render it as a removable token inside the Search Box. There is no external duplicate Collection/Tag chip row; removing a token changes only that dimension and leaves other tokens and text intact.
 
 ### 3. Light suggestion/dropdown
 
-The dropdown is a small anchored surface below the Search box, not a command palette. It contains at most three groups:
+The dropdown is a small anchored surface below the Search box, not a command palette. It contains at most four groups:
 
 - `文集`: matching Collection names, with folder icon and count where available.
 - `标签`: matching Tag names, with dot and count; zero-count Tags are still listed but muted/dimmed.
-- `操作`: one `在当前范围搜索“…”` action; paper rows and Quick/Metadata/Content mode actions are excluded.
+- `论文`: matching Library Paper rows; selecting one locates the existing canonical row and never copies its title into query text.
+- `操作`: one `在当前范围搜索“…”` action; Quick/Metadata/Content mode actions are excluded.
 
 Behavior:
 
 - Empty query + focus: stay quiet until text is entered; do not dump papers or every Collection/Tag.
-- Non-empty query: show matching Collection/Tag names first, then one small `在当前范围搜索“…”` action. Selecting that action commits the query without changing the scope.
+- Non-empty query: show matching Collection/Tag/Paper names first, then one small `在当前范围搜索“…”` action. Selecting that action commits the query without changing the scope.
 - No matches: show `没有匹配的范围或标签` and one clear `清除搜索`/`返回全部文献` action, matching the baseline empty-state rule.
 - Close on outside click or Escape; preserve focus ring and do not animate the dropdown. Input, IME composition, keyboard navigation, and result/Inspector updates remain instant.
 - Keyboard navigation must use the existing Vanilla TS event delegation pattern; no React/Radix primitive.
@@ -173,7 +174,7 @@ Forbidden:
 - `DESIGN.md`: persistent design contract, updated in RC2 with Search tokens, single-mode semantics, motion policy, and the future Inspector tab contract.
 - `DESIGN PLAN`: this file, `design-plans/library-search-v021.md`.
 - `SIDEBAR FINDINGS`: 168px continuous rail and recursive Collections are sound; zero-count Tag visibility needs the explicit all-tags join/dim treatment.
-- `SEARCH UI FINDINGS`: the toolbar-owned Search box is implemented; RC2 removes mode switching and paper-result suggestions, keeping only light scope suggestions.
+- `SEARCH UI FINDINGS`: the toolbar-owned Search box is implemented; RC2 removes mode switching and keeps light Collection/Tag/Paper suggestions plus one search action.
 - `TOOLBAR FINDINGS`: the single 54px unified toolbar is the correct owner; do not split Search into Sidebar/table.
 - `TYPOGRAPHY FINDINGS`: system UI for chrome/table, serif for Inspector title/abstract, compact 12px/11px table lanes, and tabular counts/years.
 - `READY FOR UI HANDOFF`: yes; RC2 implementation and contract are aligned.
@@ -187,7 +188,7 @@ The RC2 pass re-read `app/index.html`, `app/src/main.ts`, `app/src/librarySearch
 | Before | After | Why |
 | --- | --- | --- |
 | `quick \| metadata \| content` mode selector in the toolbar | One `all` mode covering bibliographic metadata, tags, notes, and abstracts | A single search has one predictable meaning; scope stays in the existing Sidebar/facet contract. |
-| Paper rows plus separate content/metadata actions in the dropdown | Matching Collections, matching Tags, and one `在当前范围搜索“…”` action | The dropdown remains a lightweight scope aid instead of becoming a second result list or command palette. |
+| Paper rows plus separate content/metadata actions in the dropdown | Matching Collections, Tags, Papers, and one `在当前范围搜索“…”` action | Paper selection locates the canonical row; the dropdown remains a lightweight scope aid instead of becoming a command palette. |
 | Hard-coded Search Box/dropdown dimensions in the final CSS overrides | `--library-search-*` and `--library-toolbar-inline-gap` tokens | Search geometry can be tuned without creating a parallel component style system. |
 | `libraryTagFacets.map(...)` for Sidebar Tags | `libraryTags` joined with facet counts; zero-count rows use a muted treatment | Tags are stable navigation objects; filtering must not make the hierarchy jump. |
 | Any implied transition for input, keyboard navigation, dropdown, or result replacement | Explicitly static Search Box/dropdown and instant result/Inspector updates | These actions are frequent and keyboard-driven; motion would add latency without explaining a spatial change. |

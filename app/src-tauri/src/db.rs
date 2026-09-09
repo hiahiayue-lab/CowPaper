@@ -1678,7 +1678,7 @@ fn library_search_match_query(input: &str) -> Option<String> {
     // The unified Search Box deliberately has one text dimension. Scope is
     // expressed only by collectionIds[] and libraryTagIds[]; queryText spans
     // the complete effective Library projection.
-    let column = Some("{quick_text metadata_text content_text}");
+    let column = Some("{quick_text content_text}");
     Some(
         terms
             .iter()

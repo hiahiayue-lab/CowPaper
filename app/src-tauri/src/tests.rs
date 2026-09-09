@@ -5330,7 +5330,7 @@ fn test_library_search_v19_fts_filters_effective_values_and_sync() {
     assert_eq!(ids("Network", Some("content"), &[], &[], None), vec![a, b], "non-Library canonical paper must be excluded");
     assert_eq!(ids("网络方法", Some("quick"), &[], &[], None), vec![b]);
     assert_eq!(ids("platform pricing", Some("content"), &[], &[], None), vec![a]);
-    assert_eq!(ids("10.1000/search-a", Some("metadata"), &[], &[], None), vec![a]);
+    assert!(ids("10.1000/search-a", Some("metadata"), &[], &[], None).is_empty(), "DOI is metadata-only and excluded from unified full-text search");
     assert_eq!(ids("CoreTag", Some("tags"), &[], &[], None), vec![a, b]);
     assert_eq!(ids("", Some("content"), &[root.id], &[], None), vec![a], "parent collection must include descendants");
     assert_eq!(ids("", Some("content"), &[root.id, other.id], &[], None), vec![a, b], "multiple collections are OR and dedup by paper id");
@@ -5387,18 +5387,18 @@ fn rc2_library_search_runtime_mixed_language_and_incremental_index() {
     ).unwrap();
     db::add_paper_to_library(&conn, pid, &[], &[], "rc2").unwrap();
 
-    let ids = |query: &str, scope: &str| {
-        db::search_library(&conn, query, Some(scope), &[], &[], 100, 0, None)
+    let ids = |query: &str| {
+        db::search_library(&conn, query, &[], &[], 100, 0, None)
             .unwrap()
             .into_iter()
             .map(|hit| hit.paper_id)
             .collect::<Vec<_>>()
     };
     for query in ["人工智能", "人工 智能"] {
-        assert_eq!(ids(query, "quick"), vec![pid], "CJK query must normalize symmetrically: {query}");
+        assert_eq!(ids(query), vec![pid], "CJK query must normalize symmetrically: {query}");
     }
     for query in ["AI 治理", "ESG 平台", "人工智能 AI 治理 ESG 平台"] {
-        assert_eq!(ids(query, "content"), vec![pid], "mixed query must be ANDed: {query}");
+        assert_eq!(ids(query), vec![pid], "mixed query must be ANDed: {query}");
     }
 
     let title_override = crate::models::LibraryItemMetadataInput {
@@ -5407,19 +5407,19 @@ fn rc2_library_search_runtime_mixed_language_and_incremental_index() {
         ..Default::default()
     };
     db::set_library_item_metadata(&conn, pid, &title_override).unwrap();
-    assert_eq!(ids("Only Runtime Override", "quick"), vec![pid]);
-    assert_eq!(ids("runtime note token", "content"), vec![pid]);
-    assert!(ids("Canonical Runtime Record", "quick").is_empty(), "old effective title must not remain stale");
+    assert_eq!(ids("Only Runtime Override"), vec![pid]);
+    assert_eq!(ids("runtime note token"), vec![pid]);
+    assert!(ids("Canonical Runtime Record").is_empty(), "old effective title must not remain stale");
 
     let tag = db::create_library_tag(&conn, "RuntimeTag", None).unwrap();
     db::add_paper_library_tag(&conn, pid, tag.id).unwrap();
-    assert_eq!(ids("RuntimeTag", "tags"), vec![pid]);
+    assert_eq!(ids("RuntimeTag"), vec![pid]);
     db::rename_library_tag(&conn, tag.id, "RenamedRuntimeTag").unwrap();
-    assert!(ids("RuntimeTag", "tags").is_empty());
-    assert_eq!(ids("RenamedRuntimeTag", "tags"), vec![pid]);
+    assert!(ids("RuntimeTag").is_empty());
+    assert_eq!(ids("RenamedRuntimeTag"), vec![pid]);
 
     db::remove_paper_from_library(&conn, pid).unwrap();
-    assert!(ids("Only Runtime Override", "quick").is_empty(), "removed Library paper must leave FTS results");
+    assert!(ids("Only Runtime Override").is_empty(), "removed Library paper must leave FTS results");
     assert!(db::get_paper(&conn, pid).unwrap().is_some(), "search sync must preserve canonical Paper");
 }
 
