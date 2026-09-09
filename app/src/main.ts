@@ -7,11 +7,17 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import {
   buildLibrarySearchSuggestions,
+  LIBRARY_SEARCH_FIELDS,
   createLibrarySearchState,
+  hasLibrarySearchInput,
+  matchLibrarySearchPaper,
   normalizeLibrarySearchQuery,
+  parseLibrarySearchInput,
   reduceLibrarySearchKeyboard,
   reduceLibrarySearchState,
   type LibrarySearchApi,
+  type LibrarySearchFieldKey,
+  type LibrarySearchMatch,
   type LibrarySearchQuery,
   type LibrarySearchResult,
   type LibrarySearchState,
@@ -502,6 +508,7 @@ let librarySelectedTagIds: number[] = [];
 let librarySearchState: LibrarySearchState = createLibrarySearchState();
 let librarySearchAppliedQuery: LibrarySearchQuery | null = null;
 let librarySearchResultIds: Set<number> | null = null;
+let librarySearchMatches = new Map<number, LibrarySearchMatch>();
 let librarySearchAdapter: LibrarySearchApi | null = null;
 const librarySearchHandledPointerSuggestions = new WeakSet<HTMLElement>();
 const libraryPaperIds = new Set<number>();
@@ -540,6 +547,7 @@ function clearLibraryScope(): void {
   };
   librarySearchAppliedQuery = null;
   librarySearchResultIds = null;
+  librarySearchMatches.clear();
 }
 
 function scopedLibraryCollectionId(): number | null {
@@ -782,7 +790,7 @@ async function loadLibraryData(view: "all" | "recent" | "unfiled" = libraryView)
   libraryView = view;
   try {
     const searchQuery = normalizeLibrarySearchQuery(librarySearchState.query);
-    const hasSearchScope = Boolean(searchQuery.queryText || searchQuery.collectionIds.length || searchQuery.libraryTagIds.length);
+    const hasSearchScope = Boolean(searchQuery.queryText || searchQuery.fieldClauses?.length || searchQuery.collectionIds.length || searchQuery.libraryTagIds.length);
     // Once the Search Box owns a scope, load the unscoped view and let the
     // canonical search result ids determine the visible rows. This keeps
     // multiple Collection tokens (OR) from being clipped by the old sidebar
@@ -798,6 +806,7 @@ async function loadLibraryData(view: "all" | "recent" | "unfiled" = libraryView)
       invoke<LibraryTag[]>("list_library_tags"),
       invoke<LibraryTagFacet[]>("list_library_tag_facets", { collectionId: facetCollectionId }),
     ]);
+    libraryPapers = canonicalLibraryRows(libraryPapers);
     librarySidebarCounts = await invoke<LibrarySidebarCounts>("get_library_sidebar_counts");
     libraryPaperIds.clear();
     // Keep Discovery's membership index independent from the current Library
@@ -1820,6 +1829,16 @@ function libraryAuthors(item: LibraryPaper): Author[] {
   return item.effectiveAuthors || [];
 }
 
+/** Keep the visible Library projection one row per canonical papers.id. */
+function canonicalLibraryRows(rows: readonly LibraryPaper[]): LibraryPaper[] {
+  const byPaperId = new Map<number, LibraryPaper>();
+  for (const row of rows) {
+    if (!Number.isInteger(row.paper.id) || row.paper.id <= 0 || byPaperId.has(row.paper.id)) continue;
+    byPaperId.set(row.paper.id, row);
+  }
+  return [...byPaperId.values()];
+}
+
 function libraryAbstract(item: LibraryPaper, language: "zh" | "en"): string {
   const value = language === "zh" ? item.effectiveChineseAbstract : item.effectiveAbstract;
   return value?.trim() || "";
@@ -2052,6 +2071,17 @@ interface BackendLibrarySearchHit {
   paperId: number;
   rank: number;
   relevance: number;
+  matchedFields?: LibrarySearchFieldKey[];
+  matched_fields?: LibrarySearchFieldKey[];
+  snippets?: Partial<Record<LibrarySearchFieldKey, string>>;
+}
+
+function backendLibrarySearchText(query: LibrarySearchQuery): string {
+  // The existing v19 FTS command accepts one all-field string. Field clauses
+  // are sent as a conservative superset and then checked exactly against the
+  // hydrated effective values below, so field semantics do not require a DB
+  // schema change or a second index.
+  return [query.queryText, ...(query.fieldClauses || []).map((clause) => clause.text)].filter(Boolean).join(" ");
 }
 
 function getLibrarySearchAdapter(): LibrarySearchApi {
@@ -2060,7 +2090,7 @@ function getLibrarySearchAdapter(): LibrarySearchApi {
     async search(request): Promise<LibrarySearchResult> {
       const query = normalizeLibrarySearchQuery(request);
       const hits = await invoke<BackendLibrarySearchHit[]>("search_library", {
-        queryText: query.queryText,
+        queryText: backendLibrarySearchText(query),
         collectionIds: query.collectionIds,
         libraryTagIds: query.libraryTagIds,
         limit: 1000,
@@ -2068,12 +2098,35 @@ function getLibrarySearchAdapter(): LibrarySearchApi {
       });
       // The Rust command owns search identity and scope. Hydrate the existing
       // LibraryPaper rows so the table/Inspector remain the only render path.
-      const source = libraryPapers;
+      const source = canonicalLibraryRows(libraryPapers);
       const byId = new Map(source.map((item) => [item.paper.id, item]));
-      const paperIds = hits.map((hit) => hit.paperId).filter((id) => byId.has(id));
+      const paperIds: number[] = [];
+      const papers: SearchPaper[] = [];
+      const matches: Record<number, LibrarySearchMatch> = {};
+      const seen = new Set<number>();
+      for (const hit of hits) {
+        if (seen.has(hit.paperId)) continue;
+        const item = byId.get(hit.paperId);
+        if (!item) continue;
+        const paper = librarySearchPaper(item);
+        // The backend returns a safe superset for field clauses. This exact
+        // check is also what keeps title/abstract/tag evidence aligned with
+        // the current effective Library row.
+        const match = matchLibrarySearchPaper(paper, query);
+        if (!match) continue;
+        seen.add(hit.paperId);
+        paperIds.push(hit.paperId);
+        papers.push(paper);
+        const matchedFields = hit.matchedFields || hit.matched_fields;
+        matches[hit.paperId] = {
+          matchedFields: matchedFields?.length ? matchedFields : match.matchedFields,
+          snippets: hit.snippets && Object.keys(hit.snippets).length ? hit.snippets : match.snippets,
+        };
+      }
       return {
-        papers: paperIds.map((id) => librarySearchPaper(byId.get(id)!)),
+        papers,
         paperIds,
+        matches,
       };
     },
     async getSuggestions() {
@@ -2087,7 +2140,7 @@ function librarySearchIndex() {
   return {
     collections: libraryCollections.map(({ id, parentId, name }) => ({ id, parentId, name })),
     tags: libraryTags.map(({ id, name, color }) => ({ id, name, color })),
-    papers: libraryPapers.map(librarySearchPaper),
+    papers: canonicalLibraryRows(libraryPapers).map(librarySearchPaper),
     tagCounts: new Map(libraryTagFacets.map(({ tag, paperCount }) => [tag.id, paperCount])),
   };
 }
@@ -2096,7 +2149,8 @@ function renderLibrarySearchSuggestions(): void {
   const input = $("library-search-input") as HTMLInputElement | null;
   const box = $("library-search-suggestions");
   if (!input || !box) return;
-  const open = librarySearchState.phase !== "closed" && librarySearchState.suggestions.length > 0;
+  const query = librarySearchState.query;
+  const open = librarySearchState.phase !== "closed" && Boolean(query.queryText.trim() || query.fieldClauses?.length);
   box.classList.toggle("hidden", !open);
   input.setAttribute("aria-expanded", String(open));
   if (!open) {
@@ -2107,13 +2161,14 @@ function renderLibrarySearchSuggestions(): void {
     ["collection", "文集", librarySearchState.suggestions.filter((item) => item.kind === "collection")],
     ["libraryTag", "标签", librarySearchState.suggestions.filter((item) => item.kind === "libraryTag")],
     ["paper", "论文", librarySearchState.suggestions.filter((item) => item.kind === "paper")],
-    ["searchAction", "操作", librarySearchState.suggestions.filter((item) => item.kind === "searchAction")],
   ];
-  box.innerHTML = groups.filter(([, , items]) => items.length).map(([, label, items]) => `<section class="library-search-suggestion-group"><div class="library-search-suggestion-heading">${label}</div>${items.map((suggestion) => {
+  const content = groups.filter(([, , items]) => items.length).map(([, label, items]) => `<section class="library-search-suggestion-group"><div class="library-search-suggestion-heading">${label}</div>${items.map((suggestion) => {
     const index = librarySearchState.suggestions.indexOf(suggestion);
-    const kind = suggestion.kind === "collection" ? "文集" : suggestion.kind === "libraryTag" ? "标签" : suggestion.kind === "paper" ? "论文" : "操作";
-    return `<button type="button" class="library-search-suggestion${suggestion.dimmed ? " dimmed" : ""}" role="option" aria-selected="${index === librarySearchState.activeSuggestionIndex}" draggable="${suggestion.draggable ? "true" : "false"}" data-search-suggestion-id="${escapeHtml(suggestion.id)}"><span class="library-search-suggestion-kind">${kind}</span><span class="library-search-suggestion-label">${escapeHtml(suggestion.label)}</span><span class="library-search-suggestion-detail">${escapeHtml(suggestion.detail || "")}</span></button>`;
+    const kind = suggestion.kind === "collection" ? "文集" : suggestion.kind === "libraryTag" ? "标签" : "论文";
+    const evidence = suggestion.snippet ? `<span class="library-search-suggestion-snippet">${escapeHtml(suggestion.snippet)}</span>` : "";
+    return `<button type="button" class="library-search-suggestion${suggestion.dimmed ? " dimmed" : ""}" role="option" aria-selected="${index === librarySearchState.activeSuggestionIndex}" draggable="${suggestion.draggable ? "true" : "false"}" data-search-suggestion-id="${escapeHtml(suggestion.id)}"><span class="library-search-suggestion-kind">${kind}</span><span class="library-search-suggestion-copy"><span class="library-search-suggestion-label">${escapeHtml(suggestion.label)}</span>${evidence}</span><span class="library-search-suggestion-detail">${escapeHtml(suggestion.detail || "")}</span></button>`;
   }).join("")}</section>`).join("");
+  box.innerHTML = content || '<div class="library-search-empty">没有匹配的文集、标签或论文</div>';
 }
 
 function refreshLibrarySearchSuggestions(): void {
@@ -2130,17 +2185,20 @@ async function executeLibrarySearch(): Promise<void> {
     // Search results are hydrated from the current view. Reload it first when
     // the query has scope/text so a previous sidebar-only subset cannot hide
     // valid OR/AND matches.
-    if (query.queryText || query.collectionIds.length || query.libraryTagIds.length) {
+    if (query.queryText || query.fieldClauses?.length || query.collectionIds.length || query.libraryTagIds.length) {
       librarySearchResultIds = null;
+      librarySearchMatches.clear();
       await loadLibraryData(libraryView);
     }
     if (requestVersion !== librarySearchState.requestVersion) return;
     const result = await getLibrarySearchAdapter().search({ ...query, view: libraryView });
     if (requestVersion !== librarySearchState.requestVersion) return;
     librarySearchResultIds = new Set(result.paperIds);
+    librarySearchMatches = new Map(Object.entries(result.matches || {}).map(([id, match]) => [Number(id), match]));
     librarySearchAppliedQuery = query;
     renderLibrary();
   } catch (error) {
+    librarySearchMatches.clear();
     setStatus(`搜索失败：${String(error)}`, "error");
   }
 }
@@ -2152,6 +2210,7 @@ async function selectLibrarySearchSuggestion(suggestion: LibrarySearchState["sug
     librarySearchState = { ...librarySearchState, phase: "closed", activeSuggestionIndex: -1 };
     librarySearchAppliedQuery = null;
     librarySearchResultIds = null;
+    librarySearchMatches.clear();
     selectedLibraryPaperId = suggestion.paperId;
     renderLibrary();
     document.querySelector<HTMLElement>(`[data-action="library-select-paper"][data-paper-id="${suggestion.paperId}"]`)?.scrollIntoView({ block: "nearest" });
@@ -2169,8 +2228,6 @@ async function selectLibrarySearchSuggestion(suggestion: LibrarySearchState["sug
     // user continues composing the next token or text query.
     const input = $("library-search-input") as HTMLInputElement | null;
     if (input) input.value = librarySearchState.query.queryText;
-  } else if (suggestion.kind === "searchAction") {
-    librarySearchState = { ...librarySearchState, phase: "closed", activeSuggestionIndex: -1 };
   }
   renderLibrarySearch();
   if (suggestion.kind === "collection" || suggestion.kind === "libraryTag") {
@@ -2185,10 +2242,30 @@ function clearLibrarySearch(): void {
   librarySelectedTagIds = [];
   librarySearchAppliedQuery = null;
   librarySearchResultIds = null;
+  librarySearchMatches.clear();
   const input = $("library-search-input") as HTMLInputElement | null;
   if (input) input.value = "";
   refreshLibrarySearchSuggestions();
   renderLibrary();
+  void loadLibraryData(libraryView);
+}
+
+/** Commit typed field syntax into removable field tokens before executing. */
+function commitLibrarySearchInput(): void {
+  const input = $("library-search-input") as HTMLInputElement | null;
+  if (!input) return;
+  const raw = input.value;
+  const parsed = parseLibrarySearchInput(raw);
+  const nextClauses = parsed.fieldClauses.length
+    ? normalizeLibrarySearchQuery({ fieldClauses: [...(librarySearchState.query.fieldClauses || []), ...parsed.fieldClauses] }).fieldClauses
+    : librarySearchState.query.fieldClauses;
+  librarySearchState = {
+    ...librarySearchState,
+    query: normalizeLibrarySearchQuery({ ...librarySearchState.query, queryText: parsed.fieldClauses.length ? parsed.queryText : raw, fieldClauses: nextClauses }),
+    rawInput: parsed.fieldClauses.length ? parsed.queryText : raw,
+    requestVersion: librarySearchState.requestVersion + 1,
+  };
+  input.value = librarySearchState.query.queryText;
 }
 
 function renderLibrarySearch(): void {
@@ -2197,6 +2274,10 @@ function renderLibrarySearch(): void {
   const clear = $("library-search-clear") as HTMLButtonElement | null;
   if (!input || !tokens || !clear) return;
   if (document.activeElement !== input) input.value = librarySearchState.query.queryText;
+  const fieldTokens = (librarySearchState.query.fieldClauses || []).map((clause) => {
+    const definition = LIBRARY_SEARCH_FIELDS.find((item) => item.key === clause.field);
+    return `<span class="library-search-token field" data-token-kind="field" data-field="${escapeHtml(clause.field)}" title="${escapeHtml(`${definition?.label || clause.field}: ${clause.text}`)}"><span class="field-token-prefix">${escapeHtml(definition?.label || clause.field)}</span><span>${escapeHtml(clause.text)}</span><button type="button" class="library-search-token-remove" data-action="library-search-remove-token" data-token-kind="field" data-field="${escapeHtml(clause.field)}" data-field-text="${escapeHtml(clause.text)}" aria-label="移除字段 token">×</button></span>`;
+  });
   const collectionTokens = librarySearchState.query.collectionIds.map((id) => {
     const collection = libraryCollections.find((item) => item.id === id);
     return `<span class="library-search-token collection" data-token-kind="collection" data-token-id="${id}"><span class="folder-symbol" aria-hidden="true"></span><span>${escapeHtml(collection?.name || `文集 #${id}`)}</span><button type="button" class="library-search-token-remove" data-action="library-search-remove-token" data-token-kind="collection" data-token-id="${id}" aria-label="移除文集 token">×</button></span>`;
@@ -2205,10 +2286,20 @@ function renderLibrarySearch(): void {
     const tag = libraryTags.find((item) => item.id === id);
     return `<span class="library-search-token tag" data-token-kind="tag" data-token-id="${id}"><span class="tag-dot" style="background:${escapeHtml(tag?.color || "#9ca3af")}" aria-hidden="true"></span><span>${escapeHtml(tag?.name || `Tag #${id}`)}</span><button type="button" class="library-search-token-remove" data-action="library-search-remove-token" data-token-kind="tag" data-token-id="${id}" aria-label="移除标签 token">×</button></span>`;
   });
-  tokens.innerHTML = [...collectionTokens, ...tagTokens].join("");
-  const tokenCount = librarySearchState.query.collectionIds.length + librarySearchState.query.libraryTagIds.length;
+  tokens.innerHTML = [...fieldTokens, ...collectionTokens, ...tagTokens].join("");
+  const tokenCount = (librarySearchState.query.fieldClauses || []).length + librarySearchState.query.collectionIds.length + librarySearchState.query.libraryTagIds.length;
   clear.classList.toggle("hidden", !librarySearchState.query.queryText && !tokenCount && !librarySearchAppliedQuery);
   renderLibrarySearchSuggestions();
+}
+
+function renderLibraryMatchEvidence(paperId: number): string {
+  const match = librarySearchMatches.get(paperId);
+  if (!match?.matchedFields.length) return "";
+  const fields = match.matchedFields
+    .map((field) => LIBRARY_SEARCH_FIELDS.find((definition) => definition.key === field)?.label || field)
+    .join(" · ");
+  const snippet = Object.values(match.snippets)[0] || "";
+  return `<span class="library-match-evidence"><span class="library-match-fields">命中 ${escapeHtml(fields)}</span>${snippet ? `<span class="library-match-snippet">${escapeHtml(snippet)}</span>` : ""}</span>`;
 }
 
 function handleLibrarySearchKeydown(event: KeyboardEvent): void {
@@ -2222,9 +2313,14 @@ function handleLibrarySearchKeydown(event: KeyboardEvent): void {
       return;
     }
   }
+  if (event.key === "Enter") commitLibrarySearchInput();
   const next = reduceLibrarySearchKeyboard(librarySearchState, { key: event.key, isComposing: event.isComposing });
   if (next === librarySearchState) return;
   event.preventDefault();
+  if (event.key === "Escape" && !librarySearchState.isComposing && next.query.queryText === "" && !(next.query.fieldClauses || []).length && hasLibrarySearchInput(librarySearchState.query)) {
+    clearLibrarySearch();
+    return;
+  }
   librarySearchState = next;
   if (event.key === "Enter") {
     void executeLibrarySearch();
@@ -2252,7 +2348,7 @@ function renderLibraryNavigation() {
   const collectionCount = (id: number): number => librarySidebarCounts.collectionCounts.find((entry) => entry.collectionId === id)?.paperCount ?? 0;
   const children = (parentId: number | null, depth = 0): string => libraryInlineCreateRow("collection", parentId, depth) + libraryCollections
     .filter((c) => c.parentId === parentId)
-    .map((c) => `<div class="library-nav-item"><button class="library-nav-row${libraryScope?.kind === "collection" && libraryScope.id === c.id ? " active" : ""}" style="padding-left:${12 + depth * 14}px" data-drop-kind="collection" data-action="library-filter-collection" data-collection-id="${c.id}"><span class="nav-symbol folder-symbol" aria-hidden="true"></span><span class="nav-label">${escapeHtml(c.name)}</span><span class="nav-count">${collectionCount(c.id)}</span></button><button class="nav-child" title="在此文集下新建子文集" aria-label="在此文集下新建子文集" data-action="library-create-child" data-parent-id="${c.id}">＋</button><button class="nav-manage" title="重命名文集" aria-label="重命名文集" data-action="library-rename-collection" data-collection-id="${c.id}">✎</button><button class="nav-manage danger" title="删除文集" aria-label="删除文集" data-action="library-delete-collection" data-collection-id="${c.id}">×</button></div>${children(c.id, depth + 1)}`)
+    .map((c) => `<div class="library-nav-item"><button class="library-nav-row${(libraryScope?.kind === "collection" && libraryScope.id === c.id) || librarySearchState.query.collectionIds?.includes(c.id) ? " active" : ""}" style="padding-left:${12 + depth * 14}px" data-drop-kind="collection" data-action="library-filter-collection" data-collection-id="${c.id}"><span class="nav-symbol folder-symbol" aria-hidden="true"></span><span class="nav-label">${escapeHtml(c.name)}</span><span class="nav-count">${collectionCount(c.id)}</span></button><button class="nav-child" title="在此文集下新建子文集" aria-label="在此文集下新建子文集" data-action="library-create-child" data-parent-id="${c.id}">＋</button><button class="nav-manage" title="重命名文集" aria-label="重命名文集" data-action="library-rename-collection" data-collection-id="${c.id}">✎</button><button class="nav-manage danger" title="删除文集" aria-label="删除文集" data-action="library-delete-collection" data-collection-id="${c.id}">×</button></div>${children(c.id, depth + 1)}`)
     .join("");
   collections.innerHTML = children(null) || '<span class="muted small nav-empty">暂无文献夹</span>';
   const tagCounts = new Map(libraryTagFacets.map(({ tag, paperCount }) => [tag.id, paperCount]));
@@ -2261,7 +2357,8 @@ function renderLibraryNavigation() {
   const tagRows = libraryTags.map((tag) => {
     const paperCount = tagCounts.get(tag.id) ?? 0;
     const dimmed = paperCount === 0 ? " dimmed" : "";
-    return `<div class="library-nav-item${dimmed}"><button class="library-nav-row${librarySelectedTagIds.includes(tag.id) ? " active" : ""}" data-drop-kind="tag" data-action="library-filter-tag" data-tag-id="${tag.id}" aria-label="${escapeHtml(tag.name)}，${paperCount} 篇"><span class="tag-dot" style="background:${escapeHtml(tag.color || "#9ca3af")}"></span><span class="nav-label">${escapeHtml(tag.name)}</span><span class="nav-count">${paperCount}</span></button><button class="nav-manage" title="重命名 Library Tag" aria-label="重命名 Library Tag" data-action="library-rename-tag" data-tag-id="${tag.id}">✎</button><button class="nav-manage danger" title="删除 Library Tag" aria-label="删除 Library Tag" data-action="library-delete-tag" data-tag-id="${tag.id}">×</button></div>`;
+    const active = librarySearchState.query.libraryTagIds?.includes(tag.id) || librarySelectedTagIds.includes(tag.id);
+    return `<div class="library-nav-item${dimmed}"><button class="library-nav-row${active ? " active" : ""}" data-drop-kind="tag" data-action="library-filter-tag" data-tag-id="${tag.id}" aria-label="${escapeHtml(tag.name)}，${paperCount} 篇"><span class="tag-dot" style="background:${escapeHtml(tag.color || "#9ca3af")}"></span><span class="nav-label">${escapeHtml(tag.name)}</span><span class="nav-count">${paperCount}</span></button><button class="nav-manage" title="重命名 Library Tag" aria-label="重命名 Library Tag" data-action="library-rename-tag" data-tag-id="${tag.id}">✎</button><button class="nav-manage danger" title="删除 Library Tag" aria-label="删除 Library Tag" data-action="library-delete-tag" data-tag-id="${tag.id}">×</button></div>`;
   }).join("");
   $("library-tag-nav").innerHTML = libraryInlineCreateRow("tag", null) + (tagRows || '<span class="muted small nav-empty">暂无文献标签</span>');
 }
@@ -2292,7 +2389,8 @@ function renderLibrary() {
   const count = $("library-count");
   // Filtering is owned by list_library_papers; do not reimplement scope in
   // the browser where Collection+Tag could accidentally become OR semantics.
-  const visiblePapers = librarySearchResultIds ? libraryPapers.filter((item) => librarySearchResultIds!.has(item.paper.id)) : libraryPapers;
+  const scopedPapers = librarySearchResultIds ? libraryPapers.filter((item) => librarySearchResultIds!.has(item.paper.id)) : libraryPapers;
+  const visiblePapers = canonicalLibraryRows(scopedPapers);
   if (count) count.textContent = `${visiblePapers.length} 篇`;
   const list = $("library-list");
   if (!list) return;
@@ -2307,7 +2405,7 @@ function renderLibrary() {
     const source = librarySource(item);
     const authors = authorText(libraryAuthors(item));
     const cells: Record<LibraryColumn, string> = {
-      title: `<span class="library-cell library-row-title" data-column="title" title="${escapeHtml(libraryEnglishTitle(item) + (chineseTitle ? ` · ${chineseTitle}` : ""))}"><span class="library-title-en"><span class="paper-symbol" aria-hidden="true"></span>${escapeHtml(libraryEnglishTitle(item))}</span>${chineseTitle ? `<span class="library-title-zh">${escapeHtml(chineseTitle)}</span>` : ""}</span>`,
+      title: `<span class="library-cell library-row-title" data-column="title" title="${escapeHtml(libraryEnglishTitle(item) + (chineseTitle ? ` · ${chineseTitle}` : ""))}"><span class="library-title-en"><span class="paper-symbol" aria-hidden="true"></span>${escapeHtml(libraryEnglishTitle(item))}</span>${chineseTitle ? `<span class="library-title-zh">${escapeHtml(chineseTitle)}</span>` : ""}${renderLibraryMatchEvidence(item.paper.id)}</span>`,
       note: `<span class="library-cell library-row-note" data-column="note" title="${escapeHtml(note || "暂无备注")}">${escapeHtml(note || "—")}</span>`,
       source: `<span class="library-cell library-row-source" data-column="source" title="${escapeHtml(source)}">${escapeHtml(source)}</span>`,
       year: `<span class="library-cell library-row-year" data-column="year" title="${escapeHtml(libraryYear(item))}">${escapeHtml(libraryYear(item))}</span>`,
@@ -2321,7 +2419,9 @@ function renderLibrary() {
       ? cells.title.replace("<span class=\"paper-symbol\"", `<span class="attachment-disclosure" data-action="library-toggle-attachments" data-paper-id="${item.paper.id}" role="button" tabindex="0" aria-label="展开 PDF 附件" title="展开 PDF 附件">${expandedLibraryAttachmentPaperIds.has(item.paper.id) ? "⌄" : "›"}</span><span class="paper-symbol"`)
       : cells.title;
     return `<button type="button" class="library-paper-row${selected}" aria-pressed="${Boolean(selected)}" data-action="library-select-paper" data-paper-id="${item.paper.id}">${libraryVisibleColumns().map((column) => column === "title" ? titleCell : cells[column]).join("")}</button>${child}`;
-  }).join("") : '<div class="empty">文献库还是空的。可以从发现页收录论文。</div>';
+  }).join("") : hasLibrarySearchInput(librarySearchState.query)
+    ? '<div class="empty search-empty"><strong>没有匹配的文献</strong><span>可以清除搜索条件，或按两次 Esc 返回全部文献。</span><button type="button" class="ghost small" data-action="library-search-clear-empty">清除搜索</button></div>'
+    : '<div class="empty"><strong>文献库还是空的</strong><span>可以从发现页收录论文。</span></div>';
   if (libraryInspectorCollapsed) {
     $("library-inspector").innerHTML = '<div class="empty">Inspector 已收起。选择一篇文献查看详情</div>';
     renderLibraryDropState();
@@ -4030,6 +4130,10 @@ async function setupListeners() {
   // this exact pointer sequence, so the later click cannot execute twice.
   document.addEventListener("pointerdown", (ev) => {
     const target = ev.target as HTMLElement;
+    if (!target.closest(".library-search-toolbar") && librarySearchState.phase !== "closed") {
+      librarySearchState = { ...librarySearchState, phase: "closed", activeSuggestionIndex: -1 };
+      renderLibrarySearchSuggestions();
+    }
     const searchSuggestion = target.closest("[data-search-suggestion-id]") as HTMLElement | null;
     if (!searchSuggestion) return;
     const suggestion = librarySearchState.suggestions.find((item) => item.id === searchSuggestion.dataset.searchSuggestionId);
@@ -4050,6 +4154,13 @@ async function setupListeners() {
     ev.dataTransfer?.setData("application/x-cowpaper-library-scope", suggestion.dataset.searchSuggestionId || "");
   });
   document.addEventListener("keydown", (ev) => {
+    if ((ev.metaKey || ev.ctrlKey) && ev.key.toLocaleLowerCase() === "f" && activeWorkspace === "library") {
+      ev.preventDefault();
+      const input = $("library-search-input") as HTMLInputElement | null;
+      input?.focus({ preventScroll: true });
+      input?.select();
+      return;
+    }
     const input = ev.target as HTMLInputElement;
     if (input.id === "library-search-input") {
       handleLibrarySearchKeydown(ev);
@@ -4125,6 +4236,10 @@ async function setupListeners() {
 
   document.addEventListener("click", async (ev) => {
     const t = ev.target as HTMLElement;
+    if (t.closest("[data-action='library-search-clear-empty']")) {
+      clearLibrarySearch();
+      return;
+    }
     if (t.closest("#library-search-clear")) {
       clearLibrarySearch();
       return;
@@ -4145,6 +4260,24 @@ async function setupListeners() {
     if (removeToken) {
       const kind = removeToken.dataset.tokenKind;
       const id = Number(removeToken.dataset.tokenId);
+      if (kind === "field") {
+        const field = removeToken.dataset.field as LibrarySearchFieldKey | undefined;
+        const fieldText = removeToken.dataset.fieldText || "";
+        if (!field) return;
+        librarySearchState = {
+          ...librarySearchState,
+          query: normalizeLibrarySearchQuery({
+            ...librarySearchState.query,
+            fieldClauses: (librarySearchState.query.fieldClauses || []).filter((clause) => !(clause.field === field && clause.text === fieldText)),
+          }),
+          requestVersion: librarySearchState.requestVersion + 1,
+        };
+        librarySearchAppliedQuery = null;
+        librarySearchResultIds = null;
+        librarySearchMatches.clear();
+        void executeLibrarySearch();
+        return;
+      }
       if (!Number.isInteger(id)) return;
       if (kind === "collection" && libraryScope?.id === id) libraryScope = null;
       if (kind === "tag") librarySelectedTagIds = librarySelectedTagIds.filter((value) => value !== id);
@@ -4159,6 +4292,7 @@ async function setupListeners() {
       };
       librarySearchAppliedQuery = null;
       librarySearchResultIds = null;
+      librarySearchMatches.clear();
       void executeLibrarySearch();
       return;
     }
@@ -4319,12 +4453,14 @@ async function setupListeners() {
       libraryScope = { kind: "collection", id };
       librarySearchState = {
         ...librarySearchState,
-        query: normalizeLibrarySearchQuery({ ...librarySearchState.query, collectionIds: [id], libraryTagIds: [...librarySelectedTagIds] }),
+        query: normalizeLibrarySearchQuery({ ...librarySearchState.query, collectionIds: [id], libraryTagIds: [...(librarySearchState.query.libraryTagIds || librarySelectedTagIds)] }),
+        rawInput: librarySearchState.query.queryText,
         activeSuggestionIndex: -1,
         requestVersion: librarySearchState.requestVersion + 1,
       };
       librarySearchAppliedQuery = null;
       librarySearchResultIds = null;
+      librarySearchMatches.clear();
       await executeLibrarySearch();
       return;
     }
@@ -4372,17 +4508,20 @@ async function setupListeners() {
     const tagFilter = t.closest("[data-action='library-filter-tag']") as HTMLElement | null;
     if (tagFilter) {
       const id = parseInt(tagFilter.dataset.tagId!, 10);
-      librarySelectedTagIds = librarySelectedTagIds.includes(id)
-        ? librarySelectedTagIds.filter((tagId) => tagId !== id)
-        : [...librarySelectedTagIds, id];
+      const activeTagIds = librarySearchState.query.libraryTagIds || librarySelectedTagIds;
+      librarySelectedTagIds = activeTagIds.includes(id)
+        ? activeTagIds.filter((tagId) => tagId !== id)
+        : [...activeTagIds, id];
       librarySearchState = {
         ...librarySearchState,
         query: normalizeLibrarySearchQuery({ ...librarySearchState.query, collectionIds: libraryScope ? [libraryScope.id] : librarySearchState.query.collectionIds, libraryTagIds: [...librarySelectedTagIds] }),
+        rawInput: librarySearchState.query.queryText,
         activeSuggestionIndex: -1,
         requestVersion: librarySearchState.requestVersion + 1,
       };
       librarySearchAppliedQuery = null;
       librarySearchResultIds = null;
+      librarySearchMatches.clear();
       await executeLibrarySearch();
       return;
     }
