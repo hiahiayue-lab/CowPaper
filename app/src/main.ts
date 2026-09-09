@@ -2163,6 +2163,12 @@ async function selectLibrarySearchSuggestion(suggestion: LibrarySearchState["sug
   if (suggestion.kind === "collection" || suggestion.kind === "libraryTag") {
     libraryScope = null;
     librarySelectedTagIds = [];
+    // The input remains focused throughout token selection. renderLibrarySearch
+    // normally preserves the active input value, but a selected suggestion is
+    // a deliberate boundary: discard the temporary label query before the
+    // user continues composing the next token or text query.
+    const input = $("library-search-input") as HTMLInputElement | null;
+    if (input) input.value = librarySearchState.query.queryText;
   } else if (suggestion.kind === "searchAction") {
     librarySearchState = { ...librarySearchState, phase: "closed", activeSuggestionIndex: -1 };
   }
