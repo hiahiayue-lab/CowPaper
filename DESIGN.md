@@ -1,5 +1,5 @@
 ---
-version: alpha
+version: rc2
 name: CowPaper Library
 description: Evidence-based design contract for CowPaper's macOS-style Library surface.
 colors:
@@ -50,8 +50,28 @@ spacing:
   sidebar-section-gap: "24px"
   sidebar-section-item-gap: "6px"
   sidebar-item-height: "34px"
+  toolbar-inline-gap: "10px"
+  search-box-width: "430px"
+  search-box-min-width: "250px"
+  search-box-height: "28px"
+  search-box-padding-inline: "7px"
+  search-box-radius: "6px"
+  search-popover-gap: "5px"
+  search-popover-radius: "7px"
+  search-item-padding: "6px 7px"
   table-column-gap: "12px"
   inspector-label-column: "60px"
+search:
+  mode: "all"
+  placeholder: "搜索文库…"
+  fields: "title, Chinese title, authors, year, journal, publisher, DOI, URL, volume, issue, pages, tags, notes, abstracts"
+  resultSemantics: "instant local feedback; commit on Enter or suggestion selection"
+motion:
+  librarySearch: "none"
+  keyboardNavigation: "none"
+  resultUpdate: "none"
+  dropdown: "none"
+  occasionalPanels: "transform and opacity only; 125-250ms ease-out; reduced-motion aware"
 components:
   sidebar:
     background: "{colors.background-sidebar}"
@@ -71,6 +91,9 @@ components:
     labelColumn: "{spacing.inspector-label-column}"
     titleFontSize: "{typography.inspector-title.fontSize}"
     bodyFontSize: "{typography.inspector-body.fontSize}"
+    currentTab: "metadata"
+    futureTabs: "metadata, annotations"
+    annotationStatus: "v0.3.0 direction only; not exposed in v0.2.1"
 ---
 
 ## Overview
@@ -105,7 +128,7 @@ Workspace tabs sit above the navigation items. Standard views, Collections, and 
 
 ### Toolbar
 
-The Library has one global toolbar. It owns the page title, current Collection/Tag scope pills, the single Library Search box, status, and import/action controls. Do not add a second persistent search field to the sidebar or table header.
+The Library has one global toolbar. It owns the page title, current Collection/Tag scope pills, the single Library Search box, status, and import/action controls. Do not add a second persistent search field to the sidebar or table header. Toolbar inline controls use `{spacing.toolbar-inline-gap}`; the Search box uses the width/height/radius tokens above and remains the only persistent search surface.
 
 ### Table
 
@@ -113,11 +136,19 @@ The table header is a low-contrast band with thin separators. Rows are compact, 
 
 ### Inspector
 
-The Inspector is a continuous metadata surface. Keep the serif paper title prominent, use short label/value rows for citation metadata, and group Citation, Library, Abstract, PDF, and Citation Format with thin rules and whitespace. Inline edit affordances stay hidden until row hover/focus, while links use the single accent color.
+The Inspector is a continuous metadata surface. Keep the serif paper title prominent, use short label/value rows for citation metadata, and group Citation, Library, Abstract, PDF, and Citation Format with thin rules and whitespace. Inline edit affordances stay hidden until row hover/focus, while links use the single accent color. The current product contract has one visible `元数据` tab. The v0.3.0 direction reserves a sibling `标注` tab for paper-linked annotations, but v0.2.1 must not expose an empty tab, annotation extraction, or a migration.
 
 ### Search
 
-Use one Search box in the Library toolbar. Suggestions are lightweight and anchored to the box: recent/available scopes and matching Collection or Tag names only. Search must not replace the current sidebar hierarchy or introduce a large command palette.
+Use one Search box in the Library toolbar. Search has one mode: `all`, covering title, Chinese title, authors, bibliographic metadata, tags, notes, and abstracts. Suggestions are lightweight and anchored to the box: matching Collection or Tag names, followed by one `在当前范围搜索“…”` action. Do not offer Quick/Metadata/Content mode switching, paper-result rows, or a large command palette. Empty-query focus remains quiet; typed-query filtering and keyboard navigation update without animation. Zero-count Tags remain visible and dimmed.
+
+### Suggestion dropdown
+
+The dropdown is a tokenized, trigger-owned surface: `{spacing.search-popover-gap}` below the Search box, `{spacing.search-popover-radius}` radius, and `{spacing.search-item-padding}` item padding. It is limited to Collection, Tag, and action groups, keeps the active row adjacent to the input, closes on outside click or `Escape`, and never changes layout or steals focus. No enter/exit animation is required for this high-frequency control; if a future product surface earns motion, it must use a trigger-aware origin, `transform`/`opacity` only, a sub-300ms ease-out curve, and `prefers-reduced-motion` handling.
+
+### Motion policy
+
+Search input, IME composition, `⌘F`, arrow-key navigation, `Enter`, `Escape`, scope changes, and result/Inspector updates are instant. Do not animate filtering, row replacement, dropdown open/close, focus movement, or selection. The Library is a crisp information surface: motion is reserved for occasional, spatially meaningful panels only, with exact-property transitions, no `transition: all`, no layout-property animation, and no keyframe restarts on rapid interactions. Respect reduced motion by removing movement while retaining useful color/opacity feedback.
 
 ### Selection, icons, and density
 
@@ -129,4 +160,6 @@ Use outline/neutral symbols in default states: paper, folder, and tag-dot marker
 - Keep titles, metadata, counts, and Inspector labels aligned to their existing grid owners.
 - Use truncation for dense table cells and retain the full value in the existing title/hover affordance.
 - Give empty search results one clear recovery action: clear the query or scope.
+- Keep the Search contract single-mode and all-field; scope is expressed by Collection/Tag state, not by a mode selector.
 - Do not introduce React, Tailwind, Radix, motion/react, a component framework, or a second design-token system; the surface is Vanilla TypeScript and CSS.
+- Do not expose the future Inspector `标注` tab before annotation data exists; do not implement annotation extraction or migrations as part of v0.2.1.

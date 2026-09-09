@@ -31,14 +31,14 @@ equal(expandCollectionIds([
 ], [10]), [10, 11, 12], "parent descendants");
 
 equal(filterLibrarySearchPapers(papers, {
-  mode: "quick", text: "AI strategy", collectionIds: [10, 12], includeDescendants: false, libraryTagIds: [1, 2],
+  mode: "all", text: "AI strategy", collectionIds: [10, 12], includeDescendants: false, libraryTagIds: [1, 2],
 }).map((paper) => paper.id), [1], "OR collections + AND tags + text");
 
 equal(filterLibrarySearchPapers(papers, {
-  mode: "content", text: "content", collectionIds: [], includeDescendants: false, libraryTagIds: [],
-}).map((paper) => paper.id), [1, 2], "content search");
+  mode: "all", text: "content", collectionIds: [], includeDescendants: false, libraryTagIds: [],
+}).map((paper) => paper.id), [1, 2], "all-field search");
 
-const suggestionQuery = { mode: "quick" as const, text: "", collectionIds: [], includeDescendants: false, libraryTagIds: [] };
+const suggestionQuery = { mode: "all" as const, text: "", collectionIds: [], includeDescendants: false, libraryTagIds: [] };
 const suggestions = buildLibrarySearchSuggestions({
   collections: [{ id: 10, parentId: null, name: "Root" }],
   tags: [{ id: 1, name: "Active" }, { id: 99, name: "Unused" }],
@@ -49,6 +49,10 @@ const unused = suggestions.find((suggestion) => suggestion.id === "libraryTag:99
 assert(unused?.dimmed === true, "zero-count tags are dimmed");
 assert(unused?.draggable === true, "zero-count tags remain draggable");
 equal(applyLibrarySearchSuggestion(suggestionQuery, unused!), { ...suggestionQuery, libraryTagIds: [99] }, "tag suggestion updates scope");
+
+const searchAction = buildLibrarySearchSuggestions({ collections: [], tags: [], papers: [] }, { ...suggestionQuery, text: "network" }).find((suggestion) => suggestion.kind === "searchAction");
+assert(searchAction?.label.includes("当前范围"), "one search action keeps one search mode");
+assert(!suggestions.some((suggestion) => suggestion.id.startsWith("paper:")), "paper rows do not become dropdown suggestions");
 
 let state = createLibrarySearchState();
 state = reduceLibrarySearchState(state, { type: "FOCUS" });

@@ -6,9 +6,10 @@
  * keyboard, scope, suggestion, or de-duplication semantics.
  */
 
-export type LibrarySearchMode = "quick" | "metadata" | "content";
+/** One Library search contract: title, metadata, tags, notes, and abstracts. */
+export type LibrarySearchMode = "all";
 export type LibrarySearchPhase = "closed" | "open" | "composing";
-export type LibrarySearchSuggestionKind = "collection" | "libraryTag" | "paper" | "searchAction";
+export type LibrarySearchSuggestionKind = "collection" | "libraryTag" | "searchAction";
 
 export interface SearchCollection {
   id: number;
@@ -102,7 +103,7 @@ export function emptyLibrarySearchScope(): LibrarySearchScope {
 }
 
 export function emptyLibrarySearchQuery(): LibrarySearchQuery {
-  return { ...emptyLibrarySearchScope(), mode: "quick", text: "" };
+  return { ...emptyLibrarySearchScope(), mode: "all", text: "" };
 }
 
 function uniqueIds(ids: readonly number[]): number[] {
@@ -111,7 +112,7 @@ function uniqueIds(ids: readonly number[]): number[] {
 
 export function normalizeLibrarySearchQuery(query: Partial<LibrarySearchQuery> = {}): LibrarySearchQuery {
   return {
-    mode: query.mode === "metadata" || query.mode === "content" ? query.mode : "quick",
+    mode: "all",
     text: query.text?.trim() || "",
     collectionIds: uniqueIds(query.collectionIds || []),
     includeDescendants: Boolean(query.includeDescendants),
@@ -148,18 +149,30 @@ function authorText(authors: SearchPaper["authors"]): string {
   return Array.isArray(authors) ? authors.join(" ") : valueText(authors);
 }
 
-function searchFields(paper: SearchPaper, mode: LibrarySearchMode): string[] {
-  const quick = [paper.title, paper.chineseTitle, authorText(paper.authors), paper.year, paper.source];
-  const metadata = [paper.publisher, paper.doi, paper.url, paper.volume, paper.issue, paper.pages];
-  if (mode === "quick") return quick.map(valueText);
-  if (mode === "metadata") return [...quick, ...metadata].map(valueText);
-  return [...quick, ...metadata, ...(paper.tags || []), paper.note, paper.abstract, paper.chineseAbstract].map(valueText);
+function searchFields(paper: SearchPaper): string[] {
+  return [
+    paper.title,
+    paper.chineseTitle,
+    authorText(paper.authors),
+    paper.year,
+    paper.source,
+    paper.publisher,
+    paper.doi,
+    paper.url,
+    paper.volume,
+    paper.issue,
+    paper.pages,
+    ...(paper.tags || []),
+    paper.note,
+    paper.abstract,
+    paper.chineseAbstract,
+  ].map(valueText);
 }
 
-export function matchesLibrarySearchText(paper: SearchPaper, text: string, mode: LibrarySearchMode): boolean {
+export function matchesLibrarySearchText(paper: SearchPaper, text: string, _mode: LibrarySearchMode = "all"): boolean {
   const terms = text.toLocaleLowerCase().split(/\s+/u).map((term) => term.trim()).filter(Boolean);
   if (!terms.length) return true;
-  const haystack = searchFields(paper, mode).join(" ").toLocaleLowerCase();
+  const haystack = searchFields(paper).join(" ").toLocaleLowerCase();
   return terms.every((term) => haystack.includes(term));
 }
 
@@ -207,14 +220,8 @@ export function buildLibrarySearchSuggestions(index: LibrarySearchIndex, query: 
     const count = tagCount(index, tag.id);
     suggestions.push({ id: `libraryTag:${tag.id}`, kind: "libraryTag", label: tag.name, detail: `Library Tag · ${count}`, count, dimmed: count === 0, draggable: true, scope: { libraryTagIds: [tag.id] } });
   }
-  for (const paper of index.papers) {
-    const label = valueText(paper.title || paper.chineseTitle) || `Paper #${paper.id}`;
-    if (!includes(label)) continue;
-    suggestions.push({ id: `paper:${paper.id}`, kind: "paper", label, detail: paper.source || "论文", scope: { text: label } });
-  }
   if (needle) {
-    suggestions.push({ id: "action:content", kind: "searchAction", label: `在内容中搜索“${query.text.trim()}”`, detail: "Search Action", scope: { mode: "content" } });
-    suggestions.push({ id: "action:metadata", kind: "searchAction", label: `在元数据中搜索“${query.text.trim()}”`, detail: "Search Action", scope: { mode: "metadata" } });
+    suggestions.push({ id: "action:search", kind: "searchAction", label: `在当前范围搜索“${query.text.trim()}”`, detail: "Library Search", scope: { mode: "all" } });
   }
   return suggestions;
 }
@@ -227,7 +234,6 @@ export function applyLibrarySearchSuggestion(query: LibrarySearchQuery, suggesti
   }
   if (suggestion.kind === "libraryTag" && suggestion.scope?.libraryTagIds) next.libraryTagIds = uniqueIds([...next.libraryTagIds, ...suggestion.scope.libraryTagIds]);
   if (suggestion.scope?.mode) next.mode = suggestion.scope.mode;
-  if (suggestion.kind === "paper" && suggestion.scope?.text) next.text = suggestion.scope.text;
   return next;
 }
 

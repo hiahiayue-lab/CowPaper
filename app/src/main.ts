@@ -2097,19 +2097,18 @@ function renderLibrarySearchSuggestions(): void {
     return;
   }
   const groups: Array<[string, string, typeof librarySearchState.suggestions]> = [
-    ["collection", "Collections", librarySearchState.suggestions.filter((item) => item.kind === "collection")],
-    ["libraryTag", "Library Tags", librarySearchState.suggestions.filter((item) => item.kind === "libraryTag")],
-    ["paper", "Papers", librarySearchState.suggestions.filter((item) => item.kind === "paper")],
-    ["searchAction", "Search Actions", librarySearchState.suggestions.filter((item) => item.kind === "searchAction")],
+    ["collection", "文集", librarySearchState.suggestions.filter((item) => item.kind === "collection")],
+    ["libraryTag", "标签", librarySearchState.suggestions.filter((item) => item.kind === "libraryTag")],
+    ["searchAction", "操作", librarySearchState.suggestions.filter((item) => item.kind === "searchAction")],
   ];
   box.innerHTML = groups.filter(([, , items]) => items.length).map(([, label, items]) => `<section class="library-search-suggestion-group"><div class="library-search-suggestion-heading">${label}</div>${items.map((suggestion) => {
     const index = librarySearchState.suggestions.indexOf(suggestion);
-    return `<button type="button" class="library-search-suggestion${suggestion.dimmed ? " dimmed" : ""}" role="option" aria-selected="${index === librarySearchState.activeSuggestionIndex}" draggable="${suggestion.draggable ? "true" : "false"}" data-search-suggestion-id="${escapeHtml(suggestion.id)}"><span class="library-search-suggestion-kind">${suggestion.kind === "collection" ? "文集" : suggestion.kind === "libraryTag" ? "Tag" : suggestion.kind === "paper" ? "Paper" : "Action"}</span><span class="library-search-suggestion-label">${escapeHtml(suggestion.label)}</span><span class="library-search-suggestion-detail">${escapeHtml(suggestion.detail || "")}</span></button>`;
+    return `<button type="button" class="library-search-suggestion${suggestion.dimmed ? " dimmed" : ""}" role="option" aria-selected="${index === librarySearchState.activeSuggestionIndex}" draggable="${suggestion.draggable ? "true" : "false"}" data-search-suggestion-id="${escapeHtml(suggestion.id)}"><span class="library-search-suggestion-kind">${suggestion.kind === "collection" ? "文集" : suggestion.kind === "libraryTag" ? "标签" : "操作"}</span><span class="library-search-suggestion-label">${escapeHtml(suggestion.label)}</span><span class="library-search-suggestion-detail">${escapeHtml(suggestion.detail || "")}</span></button>`;
   }).join("")}</section>`).join("");
 }
 
 function refreshLibrarySearchSuggestions(): void {
-  const query = librarySearchState.query;
+  const query = librarySearchQuery();
   const suggestions = query.text.trim() ? buildLibrarySearchSuggestions(librarySearchIndex(), query) : [];
   librarySearchState = reduceLibrarySearchState(librarySearchState, { type: "SUGGESTIONS", suggestions });
   renderLibrarySearchSuggestions();
@@ -2139,11 +2138,9 @@ function clearLibrarySearch(): void {
 
 function renderLibrarySearch(): void {
   const input = $("library-search-input") as HTMLInputElement | null;
-  const mode = $("library-search-mode") as HTMLSelectElement | null;
   const clear = $("library-search-clear") as HTMLButtonElement | null;
-  if (!input || !mode || !clear) return;
+  if (!input || !clear) return;
   if (document.activeElement !== input) input.value = librarySearchState.query.text;
-  mode.value = librarySearchState.query.mode;
   clear.classList.toggle("hidden", !librarySearchState.query.text && !librarySearchAppliedQuery);
   renderLibrarySearchSuggestions();
 }
@@ -2184,7 +2181,11 @@ function renderLibraryNavigation() {
     .map((c) => `<div class="library-nav-item"><button class="library-nav-row${libraryScope?.kind === "collection" && libraryScope.id === c.id ? " active" : ""}" style="padding-left:${12 + depth * 14}px" data-drop-kind="collection" data-action="library-filter-collection" data-collection-id="${c.id}"><span class="nav-symbol folder-symbol" aria-hidden="true"></span><span class="nav-label">${escapeHtml(c.name)}</span><span class="nav-count">${collectionCount(c.id)}</span></button><button class="nav-child" title="在此文集下新建子文集" aria-label="在此文集下新建子文集" data-action="library-create-child" data-parent-id="${c.id}">＋</button><button class="nav-manage" title="重命名文集" aria-label="重命名文集" data-action="library-rename-collection" data-collection-id="${c.id}">✎</button><button class="nav-manage danger" title="删除文集" aria-label="删除文集" data-action="library-delete-collection" data-collection-id="${c.id}">×</button></div>${children(c.id, depth + 1)}`)
     .join("");
   collections.innerHTML = children(null) || '<span class="muted small nav-empty">暂无文献夹</span>';
-  const tagRows = libraryTagFacets.map(({ tag, paperCount }) => `<div class="library-nav-item"><button class="library-nav-row${librarySelectedTagIds.includes(tag.id) ? " active" : ""}" data-drop-kind="tag" data-action="library-filter-tag" data-tag-id="${tag.id}"><span class="tag-dot" style="background:${escapeHtml(tag.color || "#9ca3af")}"></span><span class="nav-label">${escapeHtml(tag.name)}</span><span class="nav-count">${paperCount}</span></button><button class="nav-manage" title="重命名 Library Tag" aria-label="重命名 Library Tag" data-action="library-rename-tag" data-tag-id="${tag.id}">✎</button><button class="nav-manage danger" title="删除 Library Tag" aria-label="删除 Library Tag" data-action="library-delete-tag" data-tag-id="${tag.id}">×</button></div>`).join("");
+  const tagRows = libraryTags.map((tag) => {
+    const paperCount = libraryTagFacets.find((facet) => facet.tag.id === tag.id)?.paperCount ?? 0;
+    const dimmed = paperCount === 0 && !librarySelectedTagIds.includes(tag.id);
+    return `<div class="library-nav-item"><button class="library-nav-row${librarySelectedTagIds.includes(tag.id) ? " active" : ""}${dimmed ? " dimmed" : ""}" data-drop-kind="tag" data-action="library-filter-tag" data-tag-id="${tag.id}"><span class="tag-dot" style="background:${escapeHtml(tag.color || "#9ca3af")}"></span><span class="nav-label">${escapeHtml(tag.name)}</span><span class="nav-count">${paperCount}</span></button><button class="nav-manage" title="重命名 Library Tag" aria-label="重命名 Library Tag" data-action="library-rename-tag" data-tag-id="${tag.id}">✎</button><button class="nav-manage danger" title="删除 Library Tag" aria-label="删除 Library Tag" data-action="library-delete-tag" data-tag-id="${tag.id}">×</button></div>`;
+  }).join("");
   $("library-tag-nav").innerHTML = libraryInlineCreateRow("tag", null) + (tagRows || '<span class="muted small nav-empty">暂无文献标签</span>');
 }
 
@@ -3279,7 +3280,7 @@ function ensureLibrarySearchToolbar(): HTMLElement | null {
   toolbar.className = "library-search-toolbar library-only";
   toolbar.setAttribute("role", "search");
   toolbar.setAttribute("aria-label", "文库搜索");
-  toolbar.innerHTML = '<span class="library-search-icon" aria-hidden="true">⌕</span><select id="library-search-mode" aria-label="搜索范围"><option value="quick">Quick</option><option value="metadata">Metadata</option><option value="content">Content</option></select><input id="library-search-input" type="search" placeholder="搜索文库…" autocomplete="off" spellcheck="false" role="combobox" aria-autocomplete="list" aria-controls="library-search-suggestions" aria-expanded="false" /><button type="button" id="library-search-clear" class="library-search-clear hidden" aria-label="清除搜索">×</button><div id="library-search-suggestions" class="library-search-suggestions hidden" role="listbox"></div>';
+  toolbar.innerHTML = '<span class="library-search-icon" aria-hidden="true">⌕</span><input id="library-search-input" type="search" placeholder="搜索文库…" autocomplete="off" spellcheck="false" role="combobox" aria-autocomplete="list" aria-controls="library-search-suggestions" aria-expanded="false" /><button type="button" id="library-search-clear" class="library-search-clear hidden" aria-label="清除搜索">×</button><div id="library-search-suggestions" class="library-search-suggestions hidden" role="listbox"></div>';
   const facetBar = document.getElementById("library-facet-bar");
   if (facetBar) leading.insertBefore(toolbar, facetBar);
   else leading.append(toolbar);
@@ -3971,13 +3972,6 @@ async function setupListeners() {
   });
   document.addEventListener("change", (ev) => {
     const el = ev.target as HTMLInputElement;
-    if (el.id === "library-search-mode") {
-      librarySearchState = reduceLibrarySearchState(librarySearchState, { type: "INPUT", text: (document.getElementById("library-search-input") as HTMLInputElement | null)?.value || "" });
-      librarySearchState.query.mode = el.value === "metadata" || el.value === "content" ? el.value : "quick";
-      refreshLibrarySearchSuggestions();
-      if (librarySearchAppliedQuery) void executeLibrarySearch();
-      return;
-    }
     // 中文 IME 兜底：input 事件在 composition 期间可能延迟/丢失，
     // change 在失焦/回车时可靠触发，确保 draft 始终同步（否则 dirty=false → 按钮 disabled → 点击无反应）
     const action = el.dataset.action;

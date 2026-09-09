@@ -1,19 +1,19 @@
 # CowPaper v0.2.1 Library Search + UI Design System
 
-Status: ready for UI handoff. This is a design-only plan; the executing agent owns implementation and verification.
+Status: RC2 design-engineering audit applied; implementation and design contract are aligned at the commit recorded below.
 
 ## Source and method
 
 - Audited surface: the existing CowPaper Library workspace at `app/index.html`, `app/src/main.ts`, and `app/src/styles.css`.
-- Baseline: `origin/main` / `49ea75fd3002a080ebb3c0e67acf23d11655a7b5` (`v0.2.0`).
-- UI Skills source: `https://github.com/ibelick/ui-skills`.
-- UI Skills source commit: `9f140de767e6e2d4adc3970eb68d24b3ec896f99` (main; commit page exposed the full SHA `9f140de`).
-- UI Skills fetched/read outside CowPaper through browser retrieval of the public GitHub repository, raw `README.md`, raw `skills/*/SKILL.md`, raw `LICENSE`, and `https://www.ui-skills.com` / `/playbook`; no repository, scripts, or skill files were vendored or executed.
-- `UI_SKILLS_SOURCE`: `https://github.com/ibelick/ui-skills` and `https://www.ui-skills.com`.
-- `UI_SKILLS_SOURCE_COMMIT`: `9f140de767e6e2d4adc3970eb68d24b3ec896f99`.
-- `IMPROVE_UI_USED`: yes; used its read-only surface trace, contract/runtime/correction proof gate, three-finding limit, and self-contained handoff structure.
-- `CREATE_DESIGN_MD_USED`: yes; created the root design contract from repository tokens, rendered QA evidence, and final effective CSS rules.
-- `BASELINE_UI_REVIEWED`: yes; applied only the stack-neutral guidance below.
+- Baseline: `8eacbffc5bb12b83fc54a2ccc8b2da3602c6ba97` (`v0.2.1` RC2 worktree).
+- Emil Skills source: `https://github.com/emilkowalski/skills`.
+- Emil Skills source commit: `d23d7f88a2e21c9e4b1418c7abe420f5c1052ba7` (current `main` at audit time).
+- Emil Skills fetched/read outside CowPaper through browser retrieval of the public README, the full `emil-design-eng`, `apple-design`, `review-animations`, and `improve-animations` skill files, plus the referenced `STANDARDS.md`, `AUDIT.md`, and `PLAN-TEMPLATE.md`; no repository, scripts, or skill files were vendored or executed.
+- `EMIL_DESIGN_ENG_USED`: yes; applied frequency-first motion decisions, exact-property transitions, high-frequency keyboard instantness, and token/spacing review.
+- `APPLE_DESIGN_USED`: yes; applied response/latency, spatial ownership, focus continuity, and reduced-motion principles; no spring was introduced because Library search is not a gesture surface.
+- `REVIEW_ANIMATIONS_USED`: yes; reviewed existing transitions for purpose, frequency, origin, performance, and reduced-motion coverage; the Search dropdown is intentionally static.
+- `IMPROVE_ANIMATIONS_USED`: yes; used its read-only recon/audit/vetting method and eight-category motion audit; source changes were limited to the requested implementation and design contract, not a separate animation plan.
+- `BASELINE_UI_REVIEWED`: yes; applied only stack-neutral guidance below and preserved Vanilla TypeScript/CSS.
 
 ## Baseline UI applicability
 
@@ -94,40 +94,40 @@ Implement the single toolbar Search box and its scope model first. It establishe
 
 Add a single compact search control inside `.topbar-leading`, next to the current Library title/facet region. It should fit between the title/scope pills and the right-side status/actions at wide widths, and collapse to an icon/short field only under the existing responsive constraints. Do not place a persistent search field in the Sidebar, table header, or Inspector.
 
-Recommended UI contract:
+Implemented UI contract:
 
-- Placeholder: `搜索文献…`.
+- Placeholder: `搜索文库…`.
 - Search icon is a neutral supporting glyph; the clear affordance appears only when the query is non-empty.
 - `⌘F` focuses the same control; `Escape` clears the query when the box is focused and closes the suggestion list when it is open.
 - Query updates are local and immediate for UI feedback; debounce only if the executing agent proves the backend list command needs it.
-- The query should search the Library result set across effective English title, Chinese title, authors, journal/source, note, DOI, and URL. Do not search Discovery or mutate canonical Paper identity.
+- There is one search mode, `all`. The query searches the Library result set across effective English title, Chinese title, authors, journal/source, publisher, year, volume/issue/pages, DOI/URL, tags, notes, and abstracts. Do not search Discovery or mutate canonical Paper identity.
 - Preserve the existing `libraryView`, Collection scope, Tag scope, selected row, column widths, and Inspector width across query changes.
 
 ### 2. Search scopes
 
-Use an explicit but quiet scope control inside the Search box, not a second toolbar control. The default is `All Library`. Available scopes:
+Keep scope explicit in existing Sidebar navigation and facet pills; do not add a mode selector or a second toolbar control. The default is `All Library`. Available scopes:
 
 1. `All Library`: search all papers in the Library.
 2. `Current view`: search within All / Recent / Unfiled when one of those built-in views is active.
 3. `Current Collection`: search within the selected Collection, including the existing parent/child scope semantics supplied by the backend.
 4. `Current Tag(s)`: search within the active Tag selection. Preserve the current AND semantics for multiple Tags; do not reimplement Collection+Tag filtering in the browser.
 
-When a Collection or Tag is active, show it as the current scope in the Search box or its anchored suggestion header. The existing `renderLibraryFacets()` pills remain the removable summary of active filters; they are not replaced by the dropdown.
+When a Collection or Tag is active, keep it visible through the existing `renderLibraryFacets()` pills. Those pills remain the removable summary of active filters; they are not replaced by the dropdown.
 
 ### 3. Light suggestion/dropdown
 
-The dropdown is a small anchored surface below the Search box, not a command palette. It should contain at most three groups:
+The dropdown is a small anchored surface below the Search box, not a command palette. It contains at most three groups:
 
-- `范围`: the current scope and other available scopes with counts where available.
-- `文集`: matching Collection names, with folder icon and count.
+- `文集`: matching Collection names, with folder icon and count where available.
 - `标签`: matching Tag names, with dot and count; zero-count Tags are still listed but muted/dimmed.
+- `操作`: one `在当前范围搜索“…”` action; paper rows and Quick/Metadata/Content mode actions are excluded.
 
 Behavior:
 
-- Empty query + focus: show only the current scope and a short list of recently used/available scopes if local state exists; do not dump every paper.
-- Non-empty query: show matching scopes/Collection/Tag names first, then an optional small `在当前范围搜索“…”` action. Selecting that action commits the query without changing the scope.
+- Empty query + focus: stay quiet until text is entered; do not dump papers or every Collection/Tag.
+- Non-empty query: show matching Collection/Tag names first, then one small `在当前范围搜索“…”` action. Selecting that action commits the query without changing the scope.
 - No matches: show `没有匹配的范围或标签` and one clear `清除搜索`/`返回全部文献` action, matching the baseline empty-state rule.
-- Close on outside click or Escape; preserve focus ring and do not animate the dropdown.
+- Close on outside click or Escape; preserve focus ring and do not animate the dropdown. Input, IME composition, keyboard navigation, and result/Inspector updates remain instant.
 - Keyboard navigation must use the existing Vanilla TS event delegation pattern; no React/Radix primitive.
 
 ### 4. Collection/Tag scope and zero-count Tags
@@ -159,7 +159,7 @@ Forbidden:
 ### 6. Acceptance evidence for the executing agent
 
 - At 1440/1512/1536px, the unified toolbar still aligns to the 168px sidebar and the table/Inspector split remains within the existing measured bounds.
-- Search field is visible once in Library and no `.library-search` duplicate appears in Sidebar/table/Inspector.
+- Search field is visible once in Library and no persistent duplicate appears in Sidebar/table/Inspector.
 - Search query filters the current Library scope without changing Collection/Tag membership or the selected Inspector paper unexpectedly.
 - Scope changes are visible, reversible, and retain the existing facet-pill summary.
 - Collections remain nested; Tags remain flat; zero-count Tags remain visible and dimmed in both Sidebar and matching suggestions.
@@ -170,10 +170,40 @@ Forbidden:
 
 ## Handoff summary
 
-- `DESIGN.md`: created at repository root as the persistent design contract.
+- `DESIGN.md`: persistent design contract, updated in RC2 with Search tokens, single-mode semantics, motion policy, and the future Inspector tab contract.
 - `DESIGN PLAN`: this file, `design-plans/library-search-v021.md`.
 - `SIDEBAR FINDINGS`: 168px continuous rail and recursive Collections are sound; zero-count Tag visibility needs the explicit all-tags join/dim treatment.
-- `SEARCH UI FINDINGS`: no implemented Library Search exists; add one toolbar-owned Search box with light scope suggestions.
+- `SEARCH UI FINDINGS`: the toolbar-owned Search box is implemented; RC2 removes mode switching and paper-result suggestions, keeping only light scope suggestions.
 - `TOOLBAR FINDINGS`: the single 54px unified toolbar is the correct owner; do not split Search into Sidebar/table.
 - `TYPOGRAPHY FINDINGS`: system UI for chrome/table, serif for Inspector title/abstract, compact 12px/11px table lanes, and tabular counts/years.
-- `READY FOR UI HANDOFF`: yes.
+- `READY FOR UI HANDOFF`: yes; RC2 implementation and contract are aligned.
+
+## RC2 design-engineering addendum
+
+### Audited runtime surface
+
+The RC2 pass re-read `app/index.html`, `app/src/main.ts`, `app/src/librarySearch.ts`, and the effective tail of `app/src/styles.css` at baseline `8eacbffc5bb12b83fc54a2ccc8b2da3602c6ba97`. The app is Vanilla TypeScript/CSS in a Tauri shell. Search input, IME composition, keyboard navigation, result filtering, and Inspector rendering are all high-frequency or direct-response paths.
+
+| Before | After | Why |
+| --- | --- | --- |
+| `quick \| metadata \| content` mode selector in the toolbar | One `all` mode covering bibliographic metadata, tags, notes, and abstracts | A single search has one predictable meaning; scope stays in the existing Sidebar/facet contract. |
+| Paper rows plus separate content/metadata actions in the dropdown | Matching Collections, matching Tags, and one `在当前范围搜索“…”` action | The dropdown remains a lightweight scope aid instead of becoming a second result list or command palette. |
+| Hard-coded Search Box/dropdown dimensions in the final CSS overrides | `--library-search-*` and `--library-toolbar-inline-gap` tokens | Search geometry can be tuned without creating a parallel component style system. |
+| `libraryTagFacets.map(...)` for Sidebar Tags | `libraryTags` joined with facet counts; zero-count rows use a muted treatment | Tags are stable navigation objects; filtering must not make the hierarchy jump. |
+| Any implied transition for input, keyboard navigation, dropdown, or result replacement | Explicitly static Search Box/dropdown and instant result/Inspector updates | These actions are frequent and keyboard-driven; motion would add latency without explaining a spatial change. |
+
+### RC2 design conclusions
+
+- Search owns one persistent toolbar control with a 430px maximum width, 250px minimum at wide layouts, 28px height, 7px inline padding, 6px radius, and a 10px inline gap from neighboring toolbar content. At narrow widths it compresses with the existing 168px/138px sidebar breakpoints without creating horizontal overflow.
+- Search query semantics are all-field and local to the current Library view/scope. Collection membership remains recursive/OR, Library Tags remain flat/AND, and canonical Paper identity remains backend-owned.
+- The suggestion dropdown is anchored to the Search Box, capped at three groups, uses the Search Box spacing/radius/padding tokens, keeps zero-count Tags visible and dimmed, and has no enter/exit animation. It closes on `Escape` or outside click without stealing focus.
+- `⌘F`, IME composition, arrow navigation, `Enter`, `Escape`, query/result replacement, scope changes, and Inspector updates stay instant. No Search path uses `transition: all`, layout-property animation, keyframes, or an animation dependency.
+
+### Inspector contract for v0.3.0
+
+The current RC2 Inspector exposes only the populated `元数据` tab. The future contract is a two-tab shell with stable tab order and labels: `元数据` first, `标注` second. The `标注` tab is reserved for v0.3.0 paper-linked annotation records and future extraction workflows; it is not present in the v0.2.1 product UI. This addendum does not authorize annotation extraction, an annotation data model, persistence changes, migration, or an empty placeholder tab.
+
+### Verification record
+
+- Mechanical checks: `npm run test:search`, `npx --no-install tsc --noEmit`, `npm run build`, and `git diff --check` are the RC2 acceptance commands.
+- Visual/interaction checks: confirm one Search Box in the Library toolbar, no mode selector, no duplicate Search field, stable 168px rail/54px toolbar alignment, nested Collections, flat dimmed zero-count Tags, neutral selected rows, instant keyboard/result updates, and no empty `标注` tab.
