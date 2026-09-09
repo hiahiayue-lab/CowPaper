@@ -1,11 +1,15 @@
 import {
   applyLibrarySearchSuggestion,
+  buildLibrarySearchFieldTokens,
   buildLibrarySearchSuggestions,
   createLibrarySearchState,
+  emptyLibrarySearchQuery,
   expandCollectionIds,
   filterLibrarySearchPapers,
+  matchesLibrarySearchQuery,
   reduceLibrarySearchKeyboard,
   reduceLibrarySearchState,
+  type LibrarySearchSuggestion,
   type SearchPaper,
 } from "./librarySearch.ts";
 
@@ -31,14 +35,14 @@ equal(expandCollectionIds([
 ], [10]), [10, 11, 12], "parent descendants");
 
 equal(filterLibrarySearchPapers(papers, {
-  queryText: "AI strategy", collectionIds: [10, 12], libraryTagIds: [1, 2],
+  freeTextQuery: "AI strategy", fieldClauses: [], collectionIds: [10, 12], libraryTagIds: [1, 2],
 }).map((paper) => paper.id), [1], "OR collections + AND tags + text");
 
 equal(filterLibrarySearchPapers(papers, {
-  queryText: "content", collectionIds: [], libraryTagIds: [],
+  freeTextQuery: "content", fieldClauses: [], collectionIds: [], libraryTagIds: [],
 }).map((paper) => paper.id), [1, 2], "all-field search");
 
-const suggestionQuery = { queryText: "", collectionIds: [], libraryTagIds: [] };
+const suggestionQuery = { freeTextQuery: "", fieldClauses: [], collectionIds: [], libraryTagIds: [] };
 const suggestions = buildLibrarySearchSuggestions({
   collections: [{ id: 10, parentId: null, name: "Root" }],
   tags: [{ id: 1, name: "Active" }, { id: 99, name: "Unused" }],
@@ -48,11 +52,22 @@ const suggestions = buildLibrarySearchSuggestions({
 const unused = suggestions.find((suggestion) => suggestion.id === "libraryTag:99");
 assert(unused?.dimmed === true, "zero-count tags are dimmed");
 assert(unused?.draggable === true, "zero-count tags remain draggable");
-equal(applyLibrarySearchSuggestion(suggestionQuery, unused!), { ...suggestionQuery, libraryTagIds: [99] }, "tag suggestion updates scope");
+equal(applyLibrarySearchSuggestion(suggestionQuery, unused!), { fieldClauses: [], freeTextQuery: "", collectionIds: [], libraryTagIds: [99] }, "tag suggestion updates scope");
 
-const searchAction = buildLibrarySearchSuggestions({ collections: [], tags: [], papers: [] }, { ...suggestionQuery, queryText: "network" }).find((suggestion) => suggestion.kind === "searchAction");
-assert(searchAction?.label.includes("当前范围"), "one search action keeps one search mode");
+const typedSuggestions = buildLibrarySearchSuggestions({ collections: [], tags: [], papers: [] }, { ...suggestionQuery, freeTextQuery: "network" });
+assert(!typedSuggestions.some((suggestion) => suggestion.kind === "field"), "regular suggestions do not dump field actions");
+assert(!typedSuggestions.some((suggestion) => (suggestion as LibrarySearchSuggestion & { kind?: string }).kind === "searchAction"), "Search Action is removed");
 assert(suggestions.some((suggestion) => suggestion.id.startsWith("paper:")), "paper suggestions remain available for direct selection");
+
+const fieldQuery = {
+  ...suggestionQuery,
+  freeTextQuery: "content",
+  fieldClauses: [{ field: "title" as const, query: "AI" }],
+};
+assert(matchesLibrarySearchQuery(papers[0], fieldQuery), "field clause composes with free text");
+assert(!matchesLibrarySearchQuery(papers[1], fieldQuery), "field clause stays in its named field");
+equal(buildLibrarySearchFieldTokens(fieldQuery).map((token) => token.field), ["title"], "field token projection");
+equal(emptyLibrarySearchQuery(), { fieldClauses: [], freeTextQuery: "", collectionIds: [], libraryTagIds: [] }, "empty RC3 query");
 
 let state = createLibrarySearchState();
 state = reduceLibrarySearchState(state, { type: "FOCUS" });
