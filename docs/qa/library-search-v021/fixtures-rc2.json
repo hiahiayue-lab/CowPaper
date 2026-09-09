@@ -1,0 +1,100 @@
+{
+  "name": "CowPaper v0.2.1 RC2 Library Search QA fixtures",
+  "baseline": "8eacbffc5bb12b83fc54a2ccc8b2da3602c6ba97",
+  "source": "fixtures.json records A-L plus the explicit interaction contracts below",
+  "isolation": "Synthetic records only; never seed or overwrite a user's database.",
+  "tests": [
+    {
+      "id": "TEST 1",
+      "name": "Collection/Tag token lock and continued input",
+      "setup": {"collection": "AI", "tag": "Core", "text": ""},
+      "actions": [
+        "Choose the AI Collection suggestion.",
+        "Continue typing治理 without deleting the Collection token.",
+        "Choose the Core Library Tag suggestion while治理 remains in the text field."
+      ],
+      "expected": {
+        "lockedCollectionIds": ["AI"],
+        "lockedTagIds": ["Core"],
+        "text": "治理",
+        "boolean": "Collection scope AND Tag scope AND text"
+      }
+    },
+    {
+      "id": "TEST 2",
+      "name": "Boolean composition",
+      "cases": [
+        {"scope": "AI OR ESG", "expectedIds": ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L"]},
+        {"tags": "Core AND Review", "expectedIds": ["A", "E"]},
+        {"collection": "AI", "tags": "Core AND Review", "text": "governance", "expectedIds": ["A", "E"]}
+      ]
+    },
+    {
+      "id": "TEST 3",
+      "name": "Multiple Collection de-duplication",
+      "setup": {"collections": ["AI", "ESG"], "text": "Multi Collection Identity"},
+      "expected": {"paperIds": ["J"], "visibleRows": 1, "duplicateRows": false}
+    },
+    {
+      "id": "TEST 4",
+      "name": "Parent/Child de-duplication",
+      "setup": {"collection": "AI", "records": ["G", "H"]},
+      "expected": {"canonicalPaperId": "G", "visibleRows": 1, "childIsSeparateRow": false}
+    },
+    {
+      "id": "TEST 5",
+      "name": "Sidebar auto token",
+      "setup": {"sidebarSelection": "AI"},
+      "actions": ["Open the Library search box from the selected sidebar scope.", "Type governance."],
+      "expected": {"autoLockedCollection": "AI", "includeDescendants": true, "text": "governance"}
+    },
+    {
+      "id": "TEST 6",
+      "name": "No external duplicate chips",
+      "expected": {
+        "allowedTokenKinds": ["collection", "libraryTag"],
+        "forbiddenTokenKinds": ["web", "provider", "external", "duplicate"],
+        "oneChipPerLogicalId": true,
+        "paperIdentity": "canonical papers.id"
+      }
+    },
+    {
+      "id": "TEST 7",
+      "name": "Zero-count Tag visibility and drag target",
+      "setup": {"tag": "Zero Count", "anchorRecord": "K"},
+      "expected": {"visible": true, "dimmed": true, "clickable": true, "draggable": true, "count": 0}
+    },
+    {
+      "id": "TEST 8",
+      "name": "Runtime index auto update",
+      "actions": [
+        "Add a synthetic Paper to Library and search its title without rebuilding.",
+        "Change its effective Library title/note and search the new value.",
+        "Rename or remove its Library Tag and verify old terms disappear and new terms appear.",
+        "Remove the Paper from Library and verify all search scopes exclude it."
+      ],
+      "expected": {"manualRebuildRequired": false, "staleHits": false, "canonicalPaperPreserved": true}
+    },
+    {
+      "id": "TEST 9",
+      "name": "Actual runtime mixed-language terms",
+      "queries": ["人工智能", "AI 治理", "ESG 平台", "人工智能 AI 治理 ESG 平台"],
+      "expected": {"allQueriesReturnFixture": true, "cjkNormalizationSymmetric": true, "termsAreAnded": true}
+    },
+    {
+      "id": "TEST 10",
+      "name": "IME composition",
+      "actions": [
+        "Start Chinese IME composition in the Library search box.",
+        "Press Enter, Escape, and arrow keys while composition is active.",
+        "Commit the composition and execute the query."
+      ],
+      "expected": {"prematureExecute": false, "prematureClose": false, "prematureNavigation": false, "committedTextSearches": true}
+    }
+  ],
+  "evidence": {
+    "automated": ["npm run test:search:rc2", "cargo test --locked rc2_library_search_runtime_mixed_language_and_incremental_index"],
+    "manual": ["TEST 1", "TEST 5", "TEST 6", "TEST 7", "TEST 9", "TEST 10"],
+    "record": ["candidate SHA", "fixture database identifier", "query text", "scope tokens", "result paper IDs", "screenshot or screen recording for UI-only assertions"]
+  }
+}

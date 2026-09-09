@@ -5368,6 +5368,62 @@ fn test_library_search_v19_fts_filters_effective_values_and_sync() {
 }
 
 #[test]
+fn rc2_library_search_runtime_mixed_language_and_incremental_index() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "RC2 Runtime Journal", Some("0025-1909"), None, None, None).unwrap();
+    let pid = match db::upsert_paper(
+        &conn,
+        jid,
+        &candidate(Some("10.5555/rc2-runtime"), "Canonical Runtime Record", Some("Canonical abstract"), Some("crossref")),
+    ).unwrap() {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new paper"),
+    };
+    // This is deliberately a single record: each query below must match the
+    // same canonical paper through the actual SQLite/FTS runtime.
+    conn.execute(
+        "UPDATE papers SET title=?1, abstract=?2 WHERE id=?3",
+        params!["人工智能治理平台", "AI 治理与 ESG 平台的实证研究", pid],
+    ).unwrap();
+    db::add_paper_to_library(&conn, pid, &[], &[], "rc2").unwrap();
+
+    let ids = |query: &str, scope: &str| {
+        db::search_library(&conn, query, Some(scope), &[], &[], 100, 0, None)
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.paper_id)
+            .collect::<Vec<_>>()
+    };
+    for query in ["人工智能", "人工 智能"] {
+        assert_eq!(ids(query, "quick"), vec![pid], "CJK query must normalize symmetrically: {query}");
+    }
+    for query in ["AI 治理", "ESG 平台", "人工智能 AI 治理 ESG 平台"] {
+        assert_eq!(ids(query, "content"), vec![pid], "mixed query must be ANDed: {query}");
+    }
+
+    let title_override = crate::models::LibraryItemMetadataInput {
+        title_override: Some("Only Runtime Override".into()),
+        note: Some("runtime note token".into()),
+        ..Default::default()
+    };
+    db::set_library_item_metadata(&conn, pid, &title_override).unwrap();
+    assert_eq!(ids("Only Runtime Override", "quick"), vec![pid]);
+    assert_eq!(ids("runtime note token", "content"), vec![pid]);
+    assert!(ids("Canonical Runtime Record", "quick").is_empty(), "old effective title must not remain stale");
+
+    let tag = db::create_library_tag(&conn, "RuntimeTag", None).unwrap();
+    db::add_paper_library_tag(&conn, pid, tag.id).unwrap();
+    assert_eq!(ids("RuntimeTag", "tags"), vec![pid]);
+    db::rename_library_tag(&conn, tag.id, "RenamedRuntimeTag").unwrap();
+    assert!(ids("RuntimeTag", "tags").is_empty());
+    assert_eq!(ids("RenamedRuntimeTag", "tags"), vec![pid]);
+
+    db::remove_paper_from_library(&conn, pid).unwrap();
+    assert!(ids("Only Runtime Override", "quick").is_empty(), "removed Library paper must leave FTS results");
+    assert!(db::get_paper(&conn, pid).unwrap().is_some(), "search sync must preserve canonical Paper");
+}
+
+#[test]
 #[ignore = "release benchmark: run explicitly on macOS and Windows bundled builds"]
 fn benchmark_library_search_1k_10k_p50_p95() {
     use std::time::Instant;
