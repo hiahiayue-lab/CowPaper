@@ -9,7 +9,6 @@ import {
   matchesLibrarySearchQuery,
   reduceLibrarySearchKeyboard,
   reduceLibrarySearchState,
-  type LibrarySearchSuggestion,
   type SearchPaper,
 } from "./librarySearch.ts";
 
@@ -55,8 +54,8 @@ assert(unused?.draggable === true, "zero-count tags remain draggable");
 equal(applyLibrarySearchSuggestion(suggestionQuery, unused!), { fieldClauses: [], freeTextQuery: "", collectionIds: [], libraryTagIds: [99] }, "tag suggestion updates scope");
 
 const typedSuggestions = buildLibrarySearchSuggestions({ collections: [], tags: [], papers: [] }, { ...suggestionQuery, freeTextQuery: "network" });
-assert(!typedSuggestions.some((suggestion) => suggestion.kind === "field"), "regular suggestions do not dump field actions");
-assert(!typedSuggestions.some((suggestion) => (suggestion as LibrarySearchSuggestion & { kind?: string }).kind === "searchAction"), "Search Action is removed");
+assert(typedSuggestions.some((suggestion) => suggestion.kind === "field" && suggestion.field === "title"), "field intents are available for typed text");
+assert(!typedSuggestions.some((suggestion) => (suggestion.kind as string) === "searchAction"), "Search Action is removed");
 assert(suggestions.some((suggestion) => suggestion.id.startsWith("paper:")), "paper suggestions remain available for direct selection");
 
 const fieldQuery = {

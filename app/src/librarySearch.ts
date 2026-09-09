@@ -222,21 +222,30 @@ function authorText(authors: SearchPaper["authors"]): string {
 const FIELD_ALIASES: Record<string, LibrarySearchField> = {
   title: "title",
   englishTitle: "title",
+  英文标题: "title",
   chineseTitle: "chineseTitle",
   chinese_title: "chineseTitle",
+  中文标题: "chineseTitle",
   authors: "authors",
   author: "authors",
+  作者: "authors",
   year: "year",
+  年份: "year",
   source: "source",
   journal: "source",
+  期刊: "source",
   libraryTags: "libraryTags",
   library_tags: "libraryTags",
   tags: "libraryTags",
+  标签: "libraryTags",
   note: "note",
   notes: "note",
+  备注: "note",
   abstract: "abstract",
+  英文摘要: "abstract",
   chineseAbstract: "chineseAbstract",
   chinese_abstract: "chineseAbstract",
+  中文摘要: "chineseAbstract",
 };
 
 function normalizeField(value: unknown): LibrarySearchField | null {
@@ -269,6 +278,31 @@ export function normalizeLibrarySearchQuery(query: LibrarySearchQueryInput = {})
     collectionIds: uniqueIds(query.collectionIds || []),
     libraryTagIds: uniqueIds(query.libraryTagIds || []),
   };
+}
+
+export interface ParsedLibrarySearchInput {
+  queryText: string;
+  fieldClauses: LibrarySearchFieldClause[];
+}
+
+/**
+ * Support the compact `field:value` keyboard form as a convenience. The
+ * primary UI path is an explicit field suggestion, which is less ambiguous
+ * for Chinese and IME input. Unknown prefixes remain ordinary free text.
+ */
+export function parseLibrarySearchInput(input: string): ParsedLibrarySearchInput {
+  const raw = input.trim();
+  const match = raw.match(/^([^:\s]+)\s*:\s*(?:"([^"]+)"|'([^']+)'|(.+))$/u);
+  if (!match) return { queryText: raw, fieldClauses: [] };
+  const field = normalizeField(match[1]);
+  const query = (match[2] ?? match[3] ?? match[4] ?? "").trim();
+  if (!field || !query) return { queryText: raw, fieldClauses: [] };
+  return { queryText: "", fieldClauses: [{ field, query }] };
+}
+
+export function hasLibrarySearchInput(query: LibrarySearchQueryInput): boolean {
+  const normalized = normalizeLibrarySearchQuery(query);
+  return Boolean(normalized.freeTextQuery || normalized.fieldClauses.length || normalized.collectionIds.length || normalized.libraryTagIds.length);
 }
 
 /** Expand selected parent collections without duplicating papers or looping on malformed trees. */
@@ -379,6 +413,18 @@ function paperSuggestionLabel(paper: SearchPaper): string {
   return valueText(paper.title || paper.chineseTitle) || `Paper #${paper.id}`;
 }
 
+const FIELD_INTENT_LABELS: Record<LibrarySearchField, string> = {
+  title: "英文标题中搜索",
+  chineseTitle: "中文标题中搜索",
+  authors: "作者中搜索",
+  year: "年份中搜索",
+  source: "期刊中搜索",
+  libraryTags: "标签中搜索",
+  note: "备注中搜索",
+  abstract: "英文摘要中搜索",
+  chineseAbstract: "中文摘要中搜索",
+};
+
 /** Build one flat dropdown list; there is deliberately no Search Action item. */
 export function buildLibrarySearchSuggestions(index: LibrarySearchIndex, query: LibrarySearchQueryInput): LibrarySearchSuggestion[] {
   const normalized = normalizeLibrarySearchQuery(query);
@@ -400,6 +446,18 @@ export function buildLibrarySearchSuggestions(index: LibrarySearchIndex, query: 
     if (!includes(tag.name)) continue;
     const count = tagCount(index, tag.id);
     suggestions.push({ id: `libraryTag:${tag.id}`, kind: "libraryTag", label: tag.name, detail: `Library Tag · ${count}`, count, dimmed: count === 0, draggable: true, scope: { libraryTagIds: [tag.id] } });
+  }
+  if (normalized.freeTextQuery) {
+    for (const field of LIBRARY_SEARCH_FIELD_DEFINITIONS) {
+      suggestions.push({
+        id: `field:${field.field}:${encodeURIComponent(normalized.freeTextQuery)}`,
+        kind: "field",
+        field: field.field,
+        label: `${FIELD_INTENT_LABELS[field.field]} “${normalized.freeTextQuery}”`,
+        detail: field.label,
+        scope: { fieldClauses: [{ field: field.field, query: normalized.freeTextQuery }] },
+      });
+    }
   }
   for (const paper of dedupeLibrarySearchPapers(index.papers)) {
     const label = paperSuggestionLabel(paper);

@@ -1,6 +1,7 @@
 import {
   LIBRARY_SEARCH_EXCLUDED_FIELDS,
   LIBRARY_SEARCH_FIELDS,
+  applyLibrarySearchSuggestion,
   applyLibrarySearchFieldClause,
   applyLibrarySearchSidebarScope,
   buildLibrarySearchFieldTokens,
@@ -101,6 +102,15 @@ const collectionSuggestion = buildLibrarySearchSuggestions({
   papers: [paper, duplicatePaper],
   tagCounts: new Map([[1, 1]]),
 }, { ...emptyLibrarySearchQuery(), freeTextQuery: "AI" }).find((item) => item.id === "collection:10")!;
+const chineseTitleSuggestion = buildLibrarySearchSuggestions({
+  collections: [],
+  tags: [],
+  papers: [paper],
+}, { ...emptyLibrarySearchQuery(), freeTextQuery: "AI" }).find((item) => item.kind === "field" && item.field === "chineseTitle")!;
+assert(chineseTitleSuggestion.label.includes("中文标题中搜索"), "field intent names the searched field");
+const fieldTokenQuery = applyLibrarySearchSuggestion({ ...emptyLibrarySearchQuery(), freeTextQuery: "AI" }, chineseTitleSuggestion);
+equal(fieldTokenQuery.fieldClauses, [{ field: "chineseTitle", query: "AI" }], "field suggestion locks a clause");
+equal(fieldTokenQuery.freeTextQuery, "", "field suggestion consumes transient input");
 const tagSuggestion: LibrarySearchSuggestion = { id: "libraryTag:1", kind: "libraryTag", label: "Core", scope: { libraryTagIds: [1] } };
 let state = createLibrarySearchState();
 state = reduceLibrarySearchState(state, { type: "SELECT_SUGGESTION", suggestion: collectionSuggestion });
