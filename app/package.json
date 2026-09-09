@@ -8,6 +8,8 @@
     "build": "tsc && vite build",
     "test:search": "node --experimental-strip-types src/librarySearch.test.ts",
     "test:search:rc2": "node --experimental-strip-types src/librarySearch.rc2.test.ts",
+    "test:search:rc3": "node --experimental-strip-types src/librarySearch.rc3.test.ts",
+    "test:search:rc3:fixtures": "node ../docs/qa/library-search-v021/rc3-fixture.test.mjs",
     "preview": "vite preview",
     "tauri": "tauri"
   },
