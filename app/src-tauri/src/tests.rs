@@ -5232,6 +5232,45 @@ fn test_library_collection_with_children_cannot_be_deleted() {
 }
 
 #[test]
+fn rc3_library_navigation_order_hierarchy_and_tag_color() {
+    let conn = mem_db();
+    let root_a = db::create_library_collection(&conn, "A", None).unwrap();
+    let root_b = db::create_library_collection(&conn, "B", None).unwrap();
+    let root_c = db::create_library_collection(&conn, "C", None).unwrap();
+    db::reorder_library_collections(&conn, None, &[root_c.id, root_a.id, root_b.id]).unwrap();
+    let roots = db::list_library_collections(&conn).unwrap().into_iter().filter(|item| item.parent_id.is_none()).collect::<Vec<_>>();
+    assert_eq!(roots.iter().map(|item| item.id).collect::<Vec<_>>(), vec![root_c.id, root_a.id, root_b.id]);
+    assert!(db::reorder_library_collections(&conn, None, &[root_a.id, root_a.id, root_c.id]).is_err(), "stale or duplicate sibling payloads must be rejected");
+
+    db::set_library_collection_parent(&conn, root_b.id, Some(root_a.id)).unwrap();
+    let moved = db::list_library_collections(&conn).unwrap().into_iter().find(|item| item.id == root_b.id).unwrap();
+    assert_eq!(moved.parent_id, Some(root_a.id));
+    assert!(db::set_library_collection_parent(&conn, root_a.id, Some(root_b.id)).is_err(), "a collection cannot become its own descendant");
+    assert!(db::set_library_collection_parent(&conn, root_c.id, Some(root_b.id)).is_err(), "hierarchy is limited to two levels");
+    assert!(db::create_library_collection(&conn, "Grandchild", Some(root_b.id)).is_err(), "a child cannot gain a third level");
+
+    let paper_id = test_paper(&conn, "10.5555/library-navigation", "Navigation paper");
+    let root_d = db::create_library_collection(&conn, "D", None).unwrap();
+    let child = db::create_library_collection(&conn, "Child", Some(root_a.id)).unwrap();
+    db::add_paper_to_library(&conn, paper_id, &[child.id], &[], "manual").unwrap();
+    db::move_library_collection(&conn, child.id, Some(root_d.id), 0).unwrap();
+    assert_eq!(conn.query_row("SELECT parent_id FROM library_collections WHERE id=?1", params![child.id], |row| row.get::<_, Option<i64>>(0)).unwrap(), Some(root_d.id));
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM library_collection_items WHERE paper_id=?1 AND collection_id=?2", params![paper_id, child.id], |row| row.get::<_, i64>(0)).unwrap(), 1, "reparenting a Collection must preserve paper membership");
+    assert!(db::move_library_collection(&conn, root_a.id, Some(root_d.id), 0).is_err(), "a root with children cannot be nested into a second level");
+
+    let tag = db::create_library_tag(&conn, "Color", None).unwrap();
+    let second_tag = db::create_library_tag(&conn, "Second", None).unwrap();
+    db::reorder_library_tags(&conn, &[second_tag.id, tag.id]).unwrap();
+    assert_eq!(db::list_library_tags(&conn).unwrap().into_iter().map(|item| item.id).collect::<Vec<_>>(), vec![second_tag.id, tag.id]);
+    assert!(db::reorder_library_tags(&conn, &[tag.id, tag.id]).is_err(), "stale or duplicate tag payloads must be rejected");
+    let updated = db::set_library_tag_color(&conn, tag.id, Some("#ABCDEF")).unwrap();
+    assert_eq!(updated.color.as_deref(), Some("#abcdef"));
+    assert_eq!(db::list_library_tags(&conn).unwrap().into_iter().find(|item| item.id == tag.id).unwrap().color.as_deref(), Some("#abcdef"));
+    assert_eq!(db::set_library_tag_color(&conn, tag.id, None).unwrap().color, None);
+    assert!(db::set_library_tag_color(&conn, tag.id, Some("not-a-color")).is_err());
+}
+
+#[test]
 fn test_library_tag_rename_delete_preserves_paper_and_recommendation_fields() {
     let conn = mem_db();
     let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();

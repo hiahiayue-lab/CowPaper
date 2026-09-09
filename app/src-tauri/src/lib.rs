@@ -1020,6 +1020,33 @@ fn list_library_collections(state: State<Db>) -> Result<Vec<models::LibraryColle
 }
 
 #[tauri::command]
+fn reorder_library_collections(
+    parent_id: Option<i64>,
+    ordered_ids: Vec<i64>,
+    state: State<Db>,
+) -> Result<(), String> {
+    let conn = state.inner().lock().unwrap();
+    db::reorder_library_collections(&conn, parent_id, &ordered_ids).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn move_library_collection(
+    id: i64,
+    parent_id: Option<i64>,
+    sort_order: i64,
+    state: State<Db>,
+) -> Result<models::LibraryCollection, String> {
+    let conn = state.inner().lock().unwrap();
+    db::move_library_collection(&conn, id, parent_id, sort_order).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_library_collection_parent(id: i64, parent_id: Option<i64>, state: State<Db>) -> Result<(), String> {
+    let conn = state.inner().lock().unwrap();
+    db::set_library_collection_parent(&conn, id, parent_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn get_library_sidebar_counts(state: State<Db>) -> Result<models::LibrarySidebarCounts, String> {
     let conn = state.inner().lock().unwrap();
     db::library_sidebar_counts(&conn).map_err(|e| e.to_string())
@@ -1050,6 +1077,12 @@ fn list_library_tags(state: State<Db>) -> Result<Vec<models::LibraryTag>, String
 }
 
 #[tauri::command]
+fn reorder_library_tags(ordered_ids: Vec<i64>, state: State<Db>) -> Result<(), String> {
+    let conn = state.inner().lock().unwrap();
+    db::reorder_library_tags(&conn, &ordered_ids).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn list_library_tag_facets(collection_id: Option<i64>, state: State<Db>) -> Result<Vec<models::LibraryTagFacet>, String> {
     let conn = state.inner().lock().unwrap();
     db::list_library_tag_facets(&conn, collection_id).map_err(|e| e.to_string())
@@ -1065,6 +1098,25 @@ fn create_library_tag(name: String, color: Option<String>, state: State<Db>) -> 
 fn rename_library_tag(id: i64, name: String, state: State<Db>) -> Result<(), String> {
     let conn = state.inner().lock().unwrap();
     db::rename_library_tag(&conn, id, &name).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_library_tag_color(
+    id: i64,
+    color: Option<String>,
+    state: State<Db>,
+) -> Result<models::LibraryTag, String> {
+    let conn = state.inner().lock().unwrap();
+    db::set_library_tag_color(&conn, id, color.as_deref()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn update_library_tag_color(
+    id: i64,
+    color: Option<String>,
+    state: State<Db>,
+) -> Result<models::LibraryTag, String> {
+    set_library_tag_color(id, color, state)
 }
 
 #[tauri::command]
@@ -2247,10 +2299,16 @@ pub fn run() {
             create_library_collection,
             rename_library_collection,
             delete_library_collection,
+            reorder_library_collections,
+            move_library_collection,
+            set_library_collection_parent,
             list_library_tags,
+            reorder_library_tags,
             list_library_tag_facets,
             create_library_tag,
             rename_library_tag,
+            set_library_tag_color,
+            update_library_tag_color,
             delete_library_tag,
             get_library_item_metadata,
             set_library_item_metadata,
