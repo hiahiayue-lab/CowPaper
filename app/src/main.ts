@@ -541,7 +541,7 @@ let librarySuppressNextClick = false;
 const expandedLibraryAttachmentPaperIds = new Set<number>();
 let libraryToastTimer = 0;
 let preferredPdfReader = "system";
-let currentAppVersion = "0.2.1";
+let currentAppVersion = "0.2.2";
 let pendingUpdate: Update | null = null;
 let updateBusy = false;
 
@@ -780,7 +780,7 @@ function renderLibraryDropQueue(): void {
   const completed = libraryDropQueue.filter((item) => item.state === "done").length;
   const active = libraryDropQueue.find((item) => item.state === "processing");
   queue.classList.remove("hidden");
-  queue.innerHTML = `<div class="drop-queue-head"><strong>PDF 队列</strong><span>${completed}/${libraryDropQueue.length}</span></div><div class="drop-queue-list">${libraryDropQueue.map((item) => `<div class="drop-queue-item ${item.state}"><span class="drop-queue-icon" aria-hidden="true">${item.state === "done" ? "✓" : item.state === "error" ? "!" : item.state === "processing" ? "…" : "•"}</span><span title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</span><span class="muted small">${escapeHtml(item.message || (item.state === "processing" ? "处理中" : item.state === "done" ? "完成" : item.state === "error" ? "失败" : "排队中"))}</span></div>`).join("")}</div>${active ? `<div class="drop-queue-progress" role="progressbar" aria-label="PDF 处理进度" aria-valuenow="${completed}" aria-valuemin="0" aria-valuemax="${libraryDropQueue.length}"><span style="width:${Math.round((completed / libraryDropQueue.length) * 100)}%"></span></div>` : ""}`;
+  queue.innerHTML = `<div class="drop-queue-head"><strong>PDF 队列</strong><span>${completed}/${libraryDropQueue.length}</span></div><div class="drop-queue-list">${libraryDropQueue.map((item) => `<div class="drop-queue-item ${item.state}"><span class="drop-queue-icon" aria-hidden="true">${item.state === "done" ? "✓" : item.state === "error" ? "!" : item.state === "processing" ? "…" : "•"}</span><span title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</span><span class="muted small">${escapeHtml(item.message || (item.state === "processing" ? "处理中" : item.state === "done" ? "完成" : item.state === "error" ? "失败" : "排队中"))}</span></div>`).join("")}</div>${active ? `<div class="drop-queue-progress" role="progressbar" aria-label="PDF 处理进度" aria-valuenow="${completed}" aria-valuemin="0" aria-valuemax="${libraryDropQueue.length}"><span style="--progress:${Math.round((completed / libraryDropQueue.length) * 100)}%"></span></div>` : ""}`;
 }
 
 function getModel(): string {
@@ -2393,13 +2393,13 @@ function renderLibraryFacets(): void {
   box.classList.add("hidden");
 }
 
-function renderLibraryAttachmentActions(attachment: PaperAttachment, className: "attachment-child-actions" | "attachment-actions"): string {
-  return `<span class="${className}">${attachment.missing ? "" : `<button type="button" class="ghost small" data-action="library-open-pdf" data-attachment-id="${attachment.id}">打开</button><button type="button" class="ghost small" data-action="library-reveal-pdf" data-attachment-id="${attachment.id}">显示位置</button>`}<button type="button" class="ghost small" data-action="library-relink-pdf" data-attachment-id="${attachment.id}">重新链接</button><button type="button" class="ghost small danger" data-action="library-detach-pdf" data-attachment-id="${attachment.id}">解除关联</button></span>`;
+function renderLibraryAttachmentActions(attachment: PaperAttachment): string {
+  return `<span class="attachment-actions">${attachment.missing ? "" : `<button type="button" class="ghost small" data-action="library-open-pdf" data-attachment-id="${attachment.id}">打开</button><button type="button" class="ghost small" data-action="library-reveal-pdf" data-attachment-id="${attachment.id}">显示位置</button>`}<button type="button" class="ghost small" data-action="library-relink-pdf" data-attachment-id="${attachment.id}">重新链接</button><button type="button" class="ghost small danger" data-action="library-detach-pdf" data-attachment-id="${attachment.id}">解除关联</button></span>`;
 }
 
 function renderLibraryAttachmentChild(item: LibraryPaper, attachment: PaperAttachment): string {
   const selected = librarySelectedAttachmentId === attachment.id;
-  return `<div class="library-attachment-child${selected ? " selected" : ""}" data-paper-id="${item.paper.id}" data-attachment-id="${attachment.id}" data-action="library-select-attachment" data-library-context-kind="attachment" data-library-context-id="${attachment.id}" role="button" tabindex="0" aria-selected="${selected}" title="点击选择 PDF；双击打开"><span class="attachment-child-icon">PDF</span><span class="attachment-child-name" title="${escapeHtml(attachment.absolutePath)}">${escapeHtml(attachment.filename)}</span><span class="muted small">${attachment.missing ? "文件缺失" : attachment.storageMode === "managed" ? "已管理" : "已链接"}</span></div>`;
+  return `<div class="library-attachment-child${selected ? " selected" : ""}" data-paper-id="${item.paper.id}" data-attachment-id="${attachment.id}" data-action="library-select-attachment" role="button" tabindex="0" aria-selected="${selected}" aria-label="PDF：${escapeHtml(attachment.filename)}" title="点击选择 PDF；双击打开"><span class="attachment-child-icon" aria-hidden="true">PDF</span><span class="attachment-child-name" title="${escapeHtml(attachment.absolutePath)}">${escapeHtml(attachment.filename)}</span></div>`;
 }
 
 function renderLibrary() {
@@ -2494,7 +2494,7 @@ function renderLibraryInspector(item: LibraryPaper) {
   const attachmentRows = item.attachments.length
     ? item.attachments.map((attachment) => {
       const selected = librarySelectedAttachmentId === attachment.id;
-      return `<div class="attachment-row${attachment.missing ? " missing" : ""}${selected ? " selected" : ""}" data-attachment-id="${attachment.id}" data-action="library-select-attachment" data-paper-id="${item.paper.id}" data-library-context-kind="attachment" data-library-context-id="${attachment.id}" role="button" tabindex="0" aria-selected="${selected}" title="点击选择 PDF；双击打开"><div class="attachment-main"><span class="attachment-icon" aria-hidden="true">PDF</span><div class="attachment-copy"><strong title="${escapeHtml(attachment.absolutePath)}">${escapeHtml(attachment.filename)}</strong><span class="muted small">${attachment.missing ? "PDF 文件已移动 / 找不到文件" : attachment.storageMode === "managed" ? "已纳入 CowPaper 文件库 · managed" : "已链接 · 原文件保留"}</span></div></div>${renderLibraryAttachmentActions(attachment, "attachment-actions")}</div>`;
+      return `<div class="attachment-row${attachment.missing ? " missing" : ""}${selected ? " selected" : ""}" data-attachment-id="${attachment.id}" data-action="library-select-attachment" data-paper-id="${item.paper.id}" data-library-context-kind="attachment" data-library-context-id="${attachment.id}" role="button" tabindex="0" aria-selected="${selected}" title="点击选择 PDF；双击打开"><div class="attachment-main"><span class="attachment-icon" aria-hidden="true">PDF</span><div class="attachment-copy"><strong title="${escapeHtml(attachment.absolutePath)}">${escapeHtml(attachment.filename)}</strong><span class="muted small">${attachment.missing ? "PDF 文件已移动 / 找不到文件" : attachment.storageMode === "managed" ? "已纳入 CowPaper 文件库 · managed" : "已链接 · 原文件保留"}</span></div></div>${renderLibraryAttachmentActions(attachment)}</div>`;
     }).join("")
     : '<div class="inspector-placeholder"><span class="placeholder-icon" aria-hidden="true">⌑</span><span>尚未添加 PDF 附件。</span></div>';
   const attachmentBusy = libraryPdfBusyPaperId === p.id;
@@ -3933,8 +3933,10 @@ function showConfirmModal(opts: ConfirmModalOptions): Promise<boolean> {
   const overlay = $("confirm-modal");
   const titleEl = $("confirm-modal-title");
   const msgEl = $("confirm-modal-message");
+  const modalInput = $("confirm-modal-input") as HTMLInputElement;
   const okBtn = $("confirm-modal-ok") as HTMLButtonElement;
   const cancelBtn = $("confirm-modal-cancel") as HTMLButtonElement;
+  const invoker = document.activeElement instanceof HTMLElement ? document.activeElement : null;
   titleEl.textContent = opts.title;
   msgEl.textContent = opts.message;
   okBtn.textContent = opts.confirmText ?? "确认";
@@ -3945,11 +3947,12 @@ function showConfirmModal(opts: ConfirmModalOptions): Promise<boolean> {
       if (done) return;
       done = true;
       overlay.classList.add("hidden");
-      $("confirm-modal-input").classList.add("hidden");
+      modalInput.classList.add("hidden");
       okBtn.removeEventListener("click", onOk);
       cancelBtn.removeEventListener("click", onCancel);
       overlay.removeEventListener("click", onOverlay);
       window.removeEventListener("keydown", onKey);
+      if (invoker?.isConnected) invoker.focus();
       resolve(result);
     };
     function onOk() {
@@ -3963,13 +3966,22 @@ function showConfirmModal(opts: ConfirmModalOptions): Promise<boolean> {
     }
     function onKey(e: KeyboardEvent) {
       if (e.key === "Escape") finish(false);
+      if (e.key !== "Tab") return;
+      const focusable = [modalInput, cancelBtn, okBtn].filter((element) => !element.classList.contains("hidden") && !element.disabled);
+      if (!focusable.length) return;
+      const index = focusable.findIndex((element) => element === document.activeElement);
+      const next = e.shiftKey
+        ? focusable[(index <= 0 ? focusable.length : index) - 1]
+        : focusable[(index + 1) % focusable.length];
+      e.preventDefault();
+      next.focus();
     }
     okBtn.addEventListener("click", onOk);
     cancelBtn.addEventListener("click", onCancel);
     overlay.addEventListener("click", onOverlay);
     window.addEventListener("keydown", onKey);
     overlay.classList.remove("hidden");
-    cancelBtn.focus();
+    (modalInput.classList.contains("hidden") ? cancelBtn : modalInput).focus();
   });
 }
 
@@ -4437,7 +4449,7 @@ async function setupListeners() {
     const keyboardTarget = ev.target as HTMLElement;
     const activates = ev.key === "Enter" || ev.key === " " || ev.key === "Spacebar";
     const attachmentTarget = keyboardTarget.closest<HTMLElement>("[data-action='library-select-attachment']");
-    if (activates && attachmentTarget && !keyboardTarget.closest(".attachment-child-actions, .attachment-actions")) {
+    if (activates && attachmentTarget && !keyboardTarget.closest(".attachment-actions")) {
       ev.preventDefault();
       attachmentTarget.click();
       return;
@@ -4654,7 +4666,7 @@ async function setupListeners() {
       return;
     }
     const selectAttachment = t.closest("[data-action='library-select-attachment']") as HTMLElement | null;
-    if (selectAttachment && !t.closest(".attachment-child-actions, .attachment-actions")) {
+    if (selectAttachment && !t.closest(".attachment-actions")) {
       librarySelectedAttachmentId = Number(selectAttachment.dataset.attachmentId);
       selectedLibraryPaperId = Number(selectAttachment.dataset.paperId);
       libraryInspectorCollapsed = false;
@@ -5407,7 +5419,7 @@ async function setupListeners() {
 
   document.addEventListener("dblclick", async (ev) => {
     const target = ev.target as HTMLElement;
-    if (target.closest(".attachment-child-actions, .attachment-actions, [data-action='library-toggle-attachments']")) return;
+    if (target.closest(".attachment-actions, [data-action='library-toggle-attachments']")) return;
     const child = target.closest<HTMLElement>(".library-attachment-child");
     if (child) {
       const attachmentId = Number(child.dataset.attachmentId);
