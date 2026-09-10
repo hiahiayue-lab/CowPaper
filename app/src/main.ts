@@ -2388,7 +2388,7 @@ function renderLibraryAttachmentActions(attachment: PaperAttachment, className: 
 
 function renderLibraryAttachmentChild(item: LibraryPaper, attachment: PaperAttachment): string {
   const selected = librarySelectedAttachmentId === attachment.id;
-  return `<div class="library-attachment-child${selected ? " selected" : ""}" data-paper-id="${item.paper.id}" data-attachment-id="${attachment.id}" data-action="library-select-attachment" data-library-context-kind="attachment" data-library-context-id="${attachment.id}" role="button" tabindex="0" aria-selected="${selected}" title="点击选择 PDF；双击打开，右键查看操作"><span class="attachment-child-icon">PDF</span><span class="attachment-child-name" title="${escapeHtml(attachment.absolutePath)}">${escapeHtml(attachment.filename)}</span><span class="muted small">${attachment.missing ? "文件缺失" : attachment.storageMode === "managed" ? "已管理" : "已链接"}</span><span class="attachment-child-hint">右键操作</span></div>`;
+  return `<div class="library-attachment-child${selected ? " selected" : ""}" data-paper-id="${item.paper.id}" data-attachment-id="${attachment.id}" data-action="library-select-attachment" data-library-context-kind="attachment" data-library-context-id="${attachment.id}" role="button" tabindex="0" aria-selected="${selected}" title="点击选择 PDF；双击打开"><span class="attachment-child-icon">PDF</span><span class="attachment-child-name" title="${escapeHtml(attachment.absolutePath)}">${escapeHtml(attachment.filename)}</span><span class="muted small">${attachment.missing ? "文件缺失" : attachment.storageMode === "managed" ? "已管理" : "已链接"}</span></div>`;
 }
 
 function renderLibrary() {
@@ -2436,7 +2436,7 @@ function renderLibrary() {
     const titleCell = hasAttachments
       ? cells.title.replace("<span class=\"paper-symbol\"", `<span class="attachment-disclosure" data-action="library-toggle-attachments" data-paper-id="${item.paper.id}" role="button" tabindex="0" aria-expanded="${expandedLibraryAttachmentPaperIds.has(item.paper.id)}" aria-label="展开 PDF 附件" title="展开 PDF 附件">${expandedLibraryAttachmentPaperIds.has(item.paper.id) ? "⌄" : "›"}</span><span class="paper-symbol"`)
       : cells.title;
-    return `<button type="button" class="library-paper-row${selected}" aria-pressed="${Boolean(selected)}" data-action="library-select-paper" data-paper-id="${item.paper.id}">${libraryVisibleColumns().map((column) => column === "title" ? titleCell : cells[column]).join("")}</button>${child}`;
+    return `<button type="button" class="library-paper-row${selected}" aria-pressed="${Boolean(selected)}" data-action="library-select-paper" data-paper-id="${item.paper.id}" data-library-context-kind="paper" data-library-context-id="${item.paper.id}">${libraryVisibleColumns().map((column) => column === "title" ? titleCell : cells[column]).join("")}</button>${child}`;
   }).join("") : hasLibrarySearchInput(librarySearchState.query)
     ? '<div class="empty search-empty"><strong>没有匹配的文献</strong><span>可以清除搜索条件，或按两次 Esc 返回全部文献。</span><button type="button" class="ghost small" data-action="library-search-clear-empty">清除搜索</button></div>'
     : '<div class="empty"><strong>文献库还是空的</strong><span>可以从发现页收录论文。</span></div>';
@@ -2483,7 +2483,7 @@ function renderLibraryInspector(item: LibraryPaper) {
   const attachmentRows = item.attachments.length
     ? item.attachments.map((attachment) => {
       const selected = librarySelectedAttachmentId === attachment.id;
-      return `<div class="attachment-row${attachment.missing ? " missing" : ""}${selected ? " selected" : ""}" data-attachment-id="${attachment.id}" data-action="library-select-attachment" data-paper-id="${item.paper.id}" data-library-context-kind="attachment" data-library-context-id="${attachment.id}" role="button" tabindex="0" aria-selected="${selected}" title="点击选择 PDF；双击打开，右键查看操作"><div class="attachment-main"><span class="attachment-icon" aria-hidden="true">PDF</span><div class="attachment-copy"><strong title="${escapeHtml(attachment.absolutePath)}">${escapeHtml(attachment.filename)}</strong><span class="muted small">${attachment.missing ? "PDF 文件已移动 / 找不到文件" : attachment.storageMode === "managed" ? "已纳入 CowPaper 文件库 · managed" : "已链接 · 原文件保留"}</span></div></div>${renderLibraryAttachmentActions(attachment, "attachment-actions")}</div>`;
+      return `<div class="attachment-row${attachment.missing ? " missing" : ""}${selected ? " selected" : ""}" data-attachment-id="${attachment.id}" data-action="library-select-attachment" data-paper-id="${item.paper.id}" data-library-context-kind="attachment" data-library-context-id="${attachment.id}" role="button" tabindex="0" aria-selected="${selected}" title="点击选择 PDF；双击打开"><div class="attachment-main"><span class="attachment-icon" aria-hidden="true">PDF</span><div class="attachment-copy"><strong title="${escapeHtml(attachment.absolutePath)}">${escapeHtml(attachment.filename)}</strong><span class="muted small">${attachment.missing ? "PDF 文件已移动 / 找不到文件" : attachment.storageMode === "managed" ? "已纳入 CowPaper 文件库 · managed" : "已链接 · 原文件保留"}</span></div></div>${renderLibraryAttachmentActions(attachment, "attachment-actions")}</div>`;
     }).join("")
     : '<div class="inspector-placeholder"><span class="placeholder-icon" aria-hidden="true">⌑</span><span>尚未添加 PDF 附件。</span></div>';
   const attachmentBusy = libraryPdfBusyPaperId === p.id;
@@ -3147,7 +3147,7 @@ class ExternalPdfDrag {
   }
 }
 
-type LibraryContextTarget = "collection" | "tag" | "attachment";
+type LibraryContextTarget = "collection" | "tag" | "attachment" | "paper";
 let libraryNavigationDrag: { kind: "collection" | "tag"; id: number } | null = null;
 
 function closeLibraryContextMenu(): void {
@@ -3163,12 +3163,15 @@ function openLibraryContextMenu(kind: LibraryContextTarget, id: number, x: numbe
   const collection = kind === "collection" ? libraryCollections.find((item) => item.id === id) : null;
   const tag = kind === "tag" ? libraryTags.find((item) => item.id === id) : null;
   const attachment = kind === "attachment" ? libraryPapers.flatMap((item) => item.attachments).find((item) => item.id === id) : null;
+  const paper = kind === "paper" ? libraryPapers.find((item) => item.paper.id === id) : null;
   if (collection) {
     menu.innerHTML = `<div class="library-context-title">${escapeHtml(collection.name)}</div><button type="button" role="menuitem" data-action="library-filter-collection" data-collection-id="${id}">打开文集</button>${collection.parentId == null ? `<button type="button" role="menuitem" data-action="library-create-child" data-parent-id="${id}">新建子文集</button>` : ""}<button type="button" role="menuitem" data-action="library-rename-collection" data-collection-id="${id}">重命名文集</button><button type="button" role="menuitem" class="danger" data-action="library-delete-collection" data-collection-id="${id}">删除文集</button>`;
   } else if (tag) {
     menu.innerHTML = `<div class="library-context-title">${escapeHtml(tag.name)}</div><button type="button" role="menuitem" data-action="library-filter-tag" data-tag-id="${id}">筛选此标签</button><button type="button" role="menuitem" data-action="library-rename-tag" data-tag-id="${id}">重命名 Library Tag</button><label class="library-context-color" role="menuitem">选择颜色<input type="color" value="${escapeHtml(tag.color || "#9ca3af")}" data-action="library-set-tag-color" data-tag-id="${id}" aria-label="选择 Library Tag 颜色" /></label><button type="button" role="menuitem" class="danger" data-action="library-delete-tag" data-tag-id="${id}">删除标签</button>`;
   } else if (attachment) {
     menu.innerHTML = `<div class="library-context-title">${escapeHtml(attachment.filename)}</div>${attachment.missing ? "" : `<button type="button" role="menuitem" data-action="library-open-pdf" data-attachment-id="${id}">打开</button><button type="button" role="menuitem" data-action="library-reveal-pdf" data-attachment-id="${id}">显示位置</button>`}<button type="button" role="menuitem" data-action="library-relink-pdf" data-attachment-id="${id}">重新链接</button><button type="button" role="menuitem" class="danger" data-action="library-detach-pdf" data-attachment-id="${id}">解除关联</button>`;
+  } else if (paper) {
+    menu.innerHTML = `<div class="library-context-title">${escapeHtml(libraryEnglishTitle(paper))}</div><button type="button" role="menuitem" class="danger" data-action="library-remove" data-paper-id="${id}">移出文献库</button>`;
   } else {
     return;
   }
