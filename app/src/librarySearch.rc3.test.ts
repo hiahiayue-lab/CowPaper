@@ -136,6 +136,11 @@ focused = reduceLibrarySearchState(focused, { type: "SUGGESTIONS", suggestions: 
 const plainEnter = reduceLibrarySearchKeyboard(focused, { key: "Enter" });
 equal(plainEnter.query.collectionIds, state.query.collectionIds, "plain Enter does not auto-select the first suggestion");
 assert(plainEnter.query.freeTextQuery === "治理", "plain Enter preserves the typed query");
+const navigatedEnter = reduceLibrarySearchKeyboard(
+  reduceLibrarySearchState(focused, { type: "MOVE_ACTIVE", delta: 1 }),
+  { key: "Enter" },
+);
+equal(navigatedEnter.query.collectionIds, state.query.collectionIds, "Enter does not convert a highlighted suggestion into a token");
 const queryBeforeDismiss = focused.query;
 const versionBeforeDismiss = focused.requestVersion;
 const outside = reduceLibrarySearchState(focused, { type: "OUTSIDE_CLICK" });

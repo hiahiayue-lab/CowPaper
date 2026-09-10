@@ -760,7 +760,10 @@ export function reduceLibrarySearchKeyboard(state: LibrarySearchState, input: Li
   if (state.isComposing || input.isComposing || input.key === "Process" || input.key === "Unidentified") return state;
   if (input.key === "ArrowDown") return reduceLibrarySearchState(state, { type: "MOVE_ACTIVE", delta: 1 });
   if (input.key === "ArrowUp") return reduceLibrarySearchState(state, { type: "MOVE_ACTIVE", delta: -1 });
-  if (input.key === "Enter") return reduceLibrarySearchState(state, { type: state.activeSuggestionIndex >= 0 ? "SELECT_ACTIVE" : "EXECUTE" });
+  // Enter is reserved for executing the current text query. Suggestions are
+  // selected explicitly with the pointer; they must never become a field or
+  // scope token just because Enter was pressed.
+  if (input.key === "Enter") return reduceLibrarySearchState(state, { type: "EXECUTE" });
   if (input.key === "Escape") return reduceLibrarySearchState(state, { type: "ESCAPE" });
   return state;
 }
