@@ -142,6 +142,6 @@ No schema repair, migration rerun, index rebuild, production DB write, or user-d
 
 Release recommendation: `<ACCEPT / ACCEPT WITH EXPLICIT FINDINGS / DO NOT ACCEPT>`
 
-QA owner: `<name>`  
-Release owner: `<name>`  
+QA owner: `<name>`
+Release owner: `<name>`
 Date: `<date>`
