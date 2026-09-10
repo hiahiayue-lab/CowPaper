@@ -10,6 +10,7 @@ import {
   LIBRARY_SEARCH_FIELD_DEFINITIONS,
   createLibrarySearchState,
   hasLibrarySearchInput,
+  librarySearchFieldLabel,
   matchLibrarySearchPaper,
   matchesLibrarySearchQuery,
   normalizeLibrarySearchQuery,
@@ -2144,7 +2145,7 @@ function renderLibrarySearchSuggestions(): void {
   const box = $("library-search-suggestions");
   if (!input || !box) return;
   const query = librarySearchState.query;
-  const open = librarySearchState.phase !== "closed" && Boolean(query.freeTextQuery.trim() || query.fieldClauses?.length);
+  const open = librarySearchState.phase !== "closed" && Boolean(query.freeTextQuery.trim());
   box.classList.toggle("hidden", !open);
   input.setAttribute("aria-expanded", String(open));
   if (!open) {
@@ -2154,12 +2155,12 @@ function renderLibrarySearchSuggestions(): void {
   const groups: Array<[string, string, typeof librarySearchState.suggestions]> = [
     ["collection", "文集", librarySearchState.suggestions.filter((item) => item.kind === "collection")],
     ["libraryTag", "标签", librarySearchState.suggestions.filter((item) => item.kind === "libraryTag")],
-    ["field", "搜索字段", librarySearchState.suggestions.filter((item) => item.kind === "field")],
     ["paper", "论文", librarySearchState.suggestions.filter((item) => item.kind === "paper")],
+    ["field", "字段筛选", librarySearchState.suggestions.filter((item) => item.kind === "field")],
   ];
   const content = groups.filter(([, , items]) => items.length).map(([, label, items]) => `<section class="library-search-suggestion-group"><div class="library-search-suggestion-heading">${label}</div>${items.map((suggestion) => {
     const index = librarySearchState.suggestions.indexOf(suggestion);
-    const kind = suggestion.kind === "collection" ? "文集" : suggestion.kind === "libraryTag" ? "标签" : suggestion.kind === "field" ? "字段" : "论文";
+    const kind = suggestion.kind === "collection" ? "文集" : suggestion.kind === "libraryTag" ? "标签" : suggestion.kind === "field" ? "字段筛选" : "论文";
     const evidence = "";
     return `<button type="button" class="library-search-suggestion${suggestion.dimmed ? " dimmed" : ""}" role="option" aria-selected="${index === librarySearchState.activeSuggestionIndex}" draggable="${suggestion.draggable ? "true" : "false"}" data-search-suggestion-id="${escapeHtml(suggestion.id)}"><span class="library-search-suggestion-kind">${kind}</span><span class="library-search-suggestion-copy"><span class="library-search-suggestion-label">${escapeHtml(suggestion.label)}</span>${evidence}</span><span class="library-search-suggestion-detail">${escapeHtml(suggestion.detail || "")}</span></button>`;
   }).join("")}</section>`).join("");
@@ -2254,8 +2255,8 @@ function renderLibrarySearch(): void {
   if (!input || !tokens || !clear) return;
   if (document.activeElement !== input) input.value = librarySearchState.query.freeTextQuery;
   const fieldTokens = (librarySearchState.query.fieldClauses || []).map((clause) => {
-    const definition = LIBRARY_SEARCH_FIELD_DEFINITIONS.find((item) => item.field === clause.field);
-    return `<span class="library-search-token field" data-token-kind="field" data-field="${escapeHtml(clause.field)}" title="${escapeHtml(`${definition?.label || clause.field}: ${clause.query}`)}"><span class="field-token-prefix">${escapeHtml(definition?.label || clause.field)}</span><span>${escapeHtml(clause.query)}</span><button type="button" class="library-search-token-remove" data-action="library-search-remove-token" data-token-kind="field" data-field="${escapeHtml(clause.field)}" data-field-text="${escapeHtml(clause.query)}" aria-label="移除字段 token">×</button></span>`;
+    const label = librarySearchFieldLabel(clause.field);
+    return `<span class="library-search-token field" data-token-kind="field" data-field="${escapeHtml(clause.field)}" title="${escapeHtml(`${label}: ${clause.query}`)}"><span class="field-token-bracket" aria-hidden="true">[</span><span class="field-token-prefix">${escapeHtml(label)}:</span><span>${escapeHtml(clause.query)}</span><button type="button" class="library-search-token-remove" data-action="library-search-remove-token" data-token-kind="field" data-field="${escapeHtml(clause.field)}" data-field-text="${escapeHtml(clause.query)}" aria-label="移除字段 token">×</button><span class="field-token-bracket" aria-hidden="true">]</span></span>`;
   });
   const collectionTokens = librarySearchState.query.collectionIds.map((id) => {
     const collection = libraryCollections.find((item) => item.id === id);
@@ -2267,7 +2268,7 @@ function renderLibrarySearch(): void {
   });
   tokens.innerHTML = [...fieldTokens, ...collectionTokens, ...tagTokens].join("");
   const tokenCount = (librarySearchState.query.fieldClauses || []).length + librarySearchState.query.collectionIds.length + librarySearchState.query.libraryTagIds.length;
-  clear.classList.toggle("hidden", !librarySearchState.query.freeTextQuery && !tokenCount && !librarySearchAppliedQuery);
+  clear.classList.toggle("hidden", !librarySearchState.query.freeTextQuery && !tokenCount);
   renderLibrarySearchSuggestions();
 }
 
@@ -2288,13 +2289,11 @@ function handleLibrarySearchKeydown(event: KeyboardEvent): void {
   // preventDefault also lets the active IME finish its composition normally;
   // the resulting text remains available for explicit suggestion selection.
   if (event.key === "Enter") return;
+  const wasClosed = librarySearchState.phase === "closed";
   const next = reduceLibrarySearchKeyboard(librarySearchState, { key: event.key, isComposing: event.isComposing });
   if (next === librarySearchState) return;
   event.preventDefault();
-  if (event.key === "Escape" && !librarySearchState.isComposing && next.query.freeTextQuery === "" && !(next.query.fieldClauses || []).length && hasLibrarySearchInput(librarySearchState.query)) {
-    clearLibrarySearch();
-    return;
-  }
+  if (event.key === "Escape" && wasClosed && next.query.freeTextQuery === "" && !(next.query.fieldClauses || []).length && hasLibrarySearchInput(librarySearchState.query)) return clearLibrarySearch();
   librarySearchState = next;
   renderLibrarySearchSuggestions();
 }
@@ -4285,7 +4284,12 @@ async function setupListeners() {
     const el = ev.target as HTMLInputElement;
     if (el.id === "library-search-input") {
       librarySearchState = reduceLibrarySearchState(librarySearchState, { type: "INPUT", text: el.value });
-      if (!librarySearchState.isComposing) refreshLibrarySearchSuggestions();
+      if (!librarySearchState.isComposing) {
+        refreshLibrarySearchSuggestions();
+        // Search is live; Enter remains completely inert. The version guard
+        // in executeLibrarySearch prevents an older keystroke from winning.
+        void executeLibrarySearch();
+      }
       return;
     }
     const action = el.dataset.action;
@@ -4323,6 +4327,7 @@ async function setupListeners() {
     if (input.id !== "library-search-input") return;
     librarySearchState = reduceLibrarySearchState(librarySearchState, { type: "END_COMPOSITION", text: input.value });
     refreshLibrarySearchSuggestions();
+    void executeLibrarySearch();
   });
   document.addEventListener("focusin", (ev) => {
     if ((ev.target as HTMLElement).id !== "library-search-input") return;
@@ -4331,15 +4336,17 @@ async function setupListeners() {
   });
   // Select on pointerdown so the browser's blur event cannot hide/remove the
   // suggestion before the delegated click handler sees it. A WeakSet marks
-  // this exact pointer sequence, so the later click cannot execute twice.
+  // this exact pointer sequence; keyboard-generated button clicks are not a
+  // selection path.
   document.addEventListener("pointerdown", (ev) => {
     const target = ev.target as HTMLElement;
     if (!target.closest(".library-search-toolbar") && librarySearchState.phase !== "closed") {
-      librarySearchState = { ...librarySearchState, phase: "closed", activeSuggestionIndex: -1 };
+      librarySearchState = reduceLibrarySearchState(librarySearchState, { type: "OUTSIDE_CLICK" });
       renderLibrarySearchSuggestions();
     }
     const searchSuggestion = target.closest("[data-search-suggestion-id]") as HTMLElement | null;
     if (!searchSuggestion) return;
+    if (ev.button !== 0) return;
     const suggestion = librarySearchState.suggestions.find((item) => item.id === searchSuggestion.dataset.searchSuggestionId);
     if (!suggestion) return;
     librarySearchHandledPointerSuggestions.add(searchSuggestion);
@@ -4467,11 +4474,6 @@ async function setupListeners() {
     if (searchSuggestion) {
       if (librarySearchHandledPointerSuggestions.has(searchSuggestion)) {
         librarySearchHandledPointerSuggestions.delete(searchSuggestion);
-        return;
-      }
-      const suggestion = librarySearchState.suggestions.find((item) => item.id === searchSuggestion.dataset.searchSuggestionId);
-      if (suggestion) {
-        void selectLibrarySearchSuggestion(suggestion);
       }
       return;
     }

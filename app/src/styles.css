@@ -2396,6 +2396,17 @@ body.library-workspace .library-search-token {
   line-height: 15px;
 }
 
+/* v0.2.2 Search UX: keep field tokens and match evidence in their own
+   compact lanes so brackets, remove controls, snippets, and paper titles
+   cannot collapse into one another. */
+body.library-workspace .library-search-token.field { gap: 2px; max-width: 180px; }
+body.library-workspace .library-search-token.field .field-token-prefix { color: #596979; }
+body.library-workspace .library-search-token.field .field-token-bracket { color: #8996a3; }
+body.library-workspace .library-match-evidence { display: flex; min-width: 0; max-width: 100%; flex-direction: column; align-items: flex-start; gap: 1px; color: #8a8a8a; font-size: 10px; line-height: 12px; }
+body.library-workspace .library-match-fields,
+body.library-workspace .library-match-snippet { display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+body.library-workspace .library-match-snippet { color: #a0a0a0; }
+
 /* RC4 follow-up: attachment controls stay in document flow. Hovering a PDF
    must never cover its filename or secondary state. */
 body.library-workspace .attachment-row .attachment-actions,

@@ -199,6 +199,22 @@ export interface LibrarySearchFieldToken {
   label: string;
 }
 
+const FIELD_TOKEN_LABELS: Record<LibrarySearchField, string> = {
+  title: "英文标题",
+  chineseTitle: "中文标题",
+  authors: "作者",
+  year: "年份",
+  source: "期刊",
+  libraryTags: "Library Tags",
+  note: "备注",
+  abstract: "英文摘要",
+  chineseAbstract: "中文摘要",
+};
+
+export function librarySearchFieldLabel(field: LibrarySearchField): string {
+  return FIELD_TOKEN_LABELS[field] || field;
+}
+
 export function emptyLibrarySearchScope(): LibrarySearchScope {
   return { collectionIds: [], libraryTagIds: [] };
 }
@@ -493,7 +509,7 @@ export function buildLibrarySearchFieldTokens(query: LibrarySearchQueryInput): L
     kind: "field" as const,
     field: clause.field,
     query: clause.query,
-    label: `${LIBRARY_SEARCH_FIELD_DEFINITIONS.find((definition) => definition.field === clause.field)?.label || clause.field}: ${clause.query}`,
+    label: `${librarySearchFieldLabel(clause.field)}: ${clause.query}`,
   }));
 }
 
@@ -609,7 +625,6 @@ export type LibrarySearchAction =
   | { type: "END_COMPOSITION"; text?: string }
   | { type: "SUGGESTIONS"; suggestions: LibrarySearchSuggestion[] }
   | { type: "MOVE_ACTIVE"; delta: 1 | -1 }
-  | { type: "SELECT_ACTIVE" }
   | { type: "SELECT_SUGGESTION"; suggestion: LibrarySearchSuggestion }
   | { type: "ADD_FIELD_CLAUSE"; clause: LibrarySearchFieldClauseInput }
   | { type: "REMOVE_FIELD_CLAUSE"; index: number }
@@ -617,8 +632,7 @@ export type LibrarySearchAction =
   | { type: "DISMISS_SUGGESTIONS" }
   | { type: "OUTSIDE_CLICK" }
   | { type: "ESCAPE" }
-  | { type: "CLEAR" }
-  | { type: "EXECUTE" };
+  | { type: "CLEAR" };
 
 export function createLibrarySearchState(query: LibrarySearchQueryInput = {}): LibrarySearchState {
   return { phase: "closed", query: normalizeLibrarySearchQuery(query), suggestions: [], activeSuggestionIndex: -1, isComposing: false, requestVersion: 0 };
@@ -658,9 +672,8 @@ export function reduceLibrarySearchState(state: LibrarySearchState, action: Libr
         requestVersion: action.text == null ? state.requestVersion : state.requestVersion + 1,
       };
     case "SUGGESTIONS":
-      // Never preselect the first suggestion. A plain Enter after typing is a
-      // text-search action; a Collection/Tag is added only after an explicit
-      // pointer click or keyboard navigation to a suggestion.
+      // Never preselect the first suggestion. A Collection/Tag/Field is added
+      // only by the explicit pointer selection path.
       return { ...state, suggestions: action.suggestions, activeSuggestionIndex: -1 };
     case "MOVE_ACTIVE": {
       const count = state.suggestions.length;
@@ -669,10 +682,6 @@ export function reduceLibrarySearchState(state: LibrarySearchState, action: Libr
         ? (action.delta > 0 ? 0 : count - 1)
         : (state.activeSuggestionIndex + action.delta + count) % count;
       return { ...state, activeSuggestionIndex: next };
-    }
-    case "SELECT_ACTIVE": {
-      const suggestion = state.suggestions[state.activeSuggestionIndex];
-      return suggestion ? reduceLibrarySearchState(state, { type: "SELECT_SUGGESTION", suggestion }) : state;
     }
     case "SELECT_SUGGESTION":
       return {
@@ -723,8 +732,6 @@ export function reduceLibrarySearchState(state: LibrarySearchState, action: Libr
       return { ...state, phase: "closed", query: emptyLibrarySearchQuery(), suggestions: [], activeSuggestionIndex: -1, requestVersion: state.requestVersion + 1 };
     case "CLEAR":
       return { ...state, phase: "open", query: emptyLibrarySearchQuery(), suggestions: [], activeSuggestionIndex: -1, requestVersion: state.requestVersion + 1 };
-    case "EXECUTE":
-      return { ...state, phase: "closed", suggestions: [], activeSuggestionIndex: -1, requestVersion: state.requestVersion + 1 };
   }
 }
 
@@ -760,8 +767,8 @@ export function reduceLibrarySearchKeyboard(state: LibrarySearchState, input: Li
   if (state.isComposing || input.isComposing || input.key === "Process" || input.key === "Unidentified") return state;
   if (input.key === "ArrowDown") return reduceLibrarySearchState(state, { type: "MOVE_ACTIVE", delta: 1 });
   if (input.key === "ArrowUp") return reduceLibrarySearchState(state, { type: "MOVE_ACTIVE", delta: -1 });
-  // Enter has no Library Search behavior. In particular, it must not execute
-  // text or turn a highlighted suggestion into a field/scope token.
+  // Enter has no Library Search behavior. Suggestions are committed only by
+  // the pointer selection path; keyboard navigation never commits a token.
   if (input.key === "Enter") return state;
   if (input.key === "Escape") return reduceLibrarySearchState(state, { type: "ESCAPE" });
   return state;
