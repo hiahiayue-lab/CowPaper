@@ -76,8 +76,9 @@ state = reduceLibrarySearchKeyboard(state, { key: "ArrowDown" });
 assert(state.activeSuggestionIndex === 0, "ArrowDown explicitly selects the first suggestion");
 state = reduceLibrarySearchKeyboard(state, { key: "ArrowDown" });
 assert(state.activeSuggestionIndex === 1, "a second ArrowDown selects the next suggestion");
-state = reduceLibrarySearchKeyboard(state, { key: "Enter" });
-assert(state.query.libraryTagIds.length === 0, "Enter never applies a suggestion");
+const enterNoOp = reduceLibrarySearchKeyboard(state, { key: "Enter" });
+assert(enterNoOp === state, "Enter is inert in the Search Box");
+assert(enterNoOp.query.libraryTagIds.length === 0, "Enter never applies a suggestion");
 
 const composing = reduceLibrarySearchState(state, { type: "START_COMPOSITION" });
 assert(reduceLibrarySearchKeyboard(composing, { key: "Enter" }).phase === "composing", "IME protects Enter");

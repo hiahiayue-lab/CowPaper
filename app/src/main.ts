@@ -13,7 +13,6 @@ import {
   matchLibrarySearchPaper,
   matchesLibrarySearchQuery,
   normalizeLibrarySearchQuery,
-  parseLibrarySearchInput,
   reduceLibrarySearchKeyboard,
   reduceLibrarySearchState,
   type LibrarySearchApi,
@@ -2248,23 +2247,6 @@ function clearLibrarySearch(): void {
   void loadLibraryData(libraryView);
 }
 
-/** Commit typed field syntax into removable field tokens before executing. */
-function commitLibrarySearchInput(): void {
-  const input = $("library-search-input") as HTMLInputElement | null;
-  if (!input) return;
-  const raw = input.value;
-  const parsed = parseLibrarySearchInput(raw);
-  const nextClauses = parsed.fieldClauses.length
-    ? normalizeLibrarySearchQuery({ fieldClauses: [...(librarySearchState.query.fieldClauses || []), ...parsed.fieldClauses] }).fieldClauses
-    : librarySearchState.query.fieldClauses;
-  librarySearchState = {
-    ...librarySearchState,
-    query: normalizeLibrarySearchQuery({ ...librarySearchState.query, freeTextQuery: parsed.fieldClauses.length ? parsed.queryText : raw, fieldClauses: nextClauses }),
-    requestVersion: librarySearchState.requestVersion + 1,
-  };
-  input.value = librarySearchState.query.freeTextQuery;
-}
-
 function renderLibrarySearch(): void {
   const input = $("library-search-input") as HTMLInputElement | null;
   const tokens = $("library-search-tokens") as HTMLElement | null;
@@ -2302,10 +2284,10 @@ function renderLibraryMatchEvidence(paperId: number): string {
 function handleLibrarySearchKeydown(event: KeyboardEvent): void {
   const input = event.target as HTMLInputElement;
   if (input.id !== "library-search-input") return;
-  // Enter executes text only. Collection, Tag, and field suggestions are
-  // added exclusively by an explicit pointer selection, so IME confirmation
-  // cannot silently turn a plain query such as "AI" into a token.
-  if (event.key === "Enter") commitLibrarySearchInput();
+  // Enter is intentionally inert in the Search Box. Returning without
+  // preventDefault also lets the active IME finish its composition normally;
+  // the resulting text remains available for explicit suggestion selection.
+  if (event.key === "Enter") return;
   const next = reduceLibrarySearchKeyboard(librarySearchState, { key: event.key, isComposing: event.isComposing });
   if (next === librarySearchState) return;
   event.preventDefault();
@@ -2314,11 +2296,7 @@ function handleLibrarySearchKeydown(event: KeyboardEvent): void {
     return;
   }
   librarySearchState = next;
-  if (event.key === "Enter") {
-    void executeLibrarySearch();
-  } else {
-    renderLibrarySearchSuggestions();
-  }
+  renderLibrarySearchSuggestions();
 }
 
 function renderLibraryNavigation() {

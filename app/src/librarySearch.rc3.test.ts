@@ -134,12 +134,14 @@ equal(sidebarQuery, { fieldClauses: [{ field: "title", query: "AI" }], freeTextQ
 let focused = reduceLibrarySearchState(state, { type: "FOCUS" });
 focused = reduceLibrarySearchState(focused, { type: "SUGGESTIONS", suggestions: [collectionSuggestion] });
 const plainEnter = reduceLibrarySearchKeyboard(focused, { key: "Enter" });
+assert(plainEnter === focused, "plain Enter is a no-op");
 equal(plainEnter.query.collectionIds, state.query.collectionIds, "plain Enter does not auto-select the first suggestion");
 assert(plainEnter.query.freeTextQuery === "治理", "plain Enter preserves the typed query");
 const navigatedEnter = reduceLibrarySearchKeyboard(
   reduceLibrarySearchState(focused, { type: "MOVE_ACTIVE", delta: 1 }),
   { key: "Enter" },
 );
+assert(navigatedEnter.query.freeTextQuery === "治理", "Enter remains inert after suggestion navigation");
 equal(navigatedEnter.query.collectionIds, state.query.collectionIds, "Enter does not convert a highlighted suggestion into a token");
 const queryBeforeDismiss = focused.query;
 const versionBeforeDismiss = focused.requestVersion;
