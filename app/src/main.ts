@@ -553,6 +553,32 @@ function clearLibraryScope(): void {
   librarySearchMatches.clear();
 }
 
+/** Remove one deleted Collection/Library Tag from every active search owner.
+ *
+ * The navigation list is refreshed after a management action, but the Search
+ * Box owns its scope tokens independently. Keeping this cleanup in one place
+ * prevents a deleted id from surviving in the query and failing the next
+ * backend search validation after a restart or subsequent edit.
+ */
+function removeLibrarySearchScopeToken(kind: "collection" | "tag", id: number): void {
+  const query = librarySearchState.query;
+  librarySearchState = {
+    ...librarySearchState,
+    query: normalizeLibrarySearchQuery({
+      ...query,
+      collectionIds: kind === "collection" ? query.collectionIds.filter((value) => value !== id) : query.collectionIds,
+      libraryTagIds: kind === "tag" ? query.libraryTagIds.filter((value) => value !== id) : query.libraryTagIds,
+    }),
+    activeSuggestionIndex: -1,
+    requestVersion: librarySearchState.requestVersion + 1,
+  };
+  if (kind === "collection" && libraryScope?.id === id) libraryScope = null;
+  if (kind === "tag") librarySelectedTagIds = librarySelectedTagIds.filter((value) => value !== id);
+  librarySearchAppliedQuery = null;
+  librarySearchResultIds = null;
+  librarySearchMatches.clear();
+}
+
 function scopedLibraryCollectionId(): number | null {
   return libraryScope?.kind === "collection" ? libraryScope.id : null;
 }
@@ -2162,7 +2188,9 @@ function renderLibrarySearchSuggestions(): void {
     const index = librarySearchState.suggestions.indexOf(suggestion);
     const kind = suggestion.kind === "collection" ? "文集" : suggestion.kind === "libraryTag" ? "标签" : suggestion.kind === "field" ? "字段筛选" : "论文";
     const evidence = "";
-    return `<button type="button" class="library-search-suggestion${suggestion.dimmed ? " dimmed" : ""}" role="option" aria-selected="${index === librarySearchState.activeSuggestionIndex}" draggable="${suggestion.draggable ? "true" : "false"}" data-search-suggestion-id="${escapeHtml(suggestion.id)}"><span class="library-search-suggestion-kind">${kind}</span><span class="library-search-suggestion-copy"><span class="library-search-suggestion-label">${escapeHtml(suggestion.label)}</span>${evidence}</span><span class="library-search-suggestion-detail">${escapeHtml(suggestion.detail || "")}</span></button>`;
+    const tag = suggestion.kind === "libraryTag" ? libraryTags.find((item) => item.id === suggestion.scope?.libraryTagIds?.[0]) : null;
+    const tagDot = tag ? `<span class="tag-dot" style="background:${escapeHtml(tag.color || "#9ca3af")}" aria-hidden="true"></span>` : "";
+    return `<button type="button" class="library-search-suggestion${suggestion.dimmed ? " dimmed" : ""}" role="option" aria-selected="${index === librarySearchState.activeSuggestionIndex}" draggable="${suggestion.draggable ? "true" : "false"}" data-search-suggestion-id="${escapeHtml(suggestion.id)}"><span class="library-search-suggestion-kind">${kind}</span><span class="library-search-suggestion-copy"><span class="library-search-suggestion-label">${tagDot}${escapeHtml(suggestion.label)}</span>${evidence}</span><span class="library-search-suggestion-detail">${escapeHtml(suggestion.detail || "")}</span></button>`;
   }).join("")}</section>`).join("");
   box.innerHTML = content || '<div class="library-search-empty">没有匹配的文集、标签、字段或论文</div>';
 }
@@ -4761,8 +4789,9 @@ async function setupListeners() {
       if (!ok) return;
       try {
         await invoke("delete_library_collection", { id });
-        if (libraryScope?.kind === "collection" && libraryScope.id === id) clearLibraryScope();
+        removeLibrarySearchScopeToken("collection", id);
         await loadLibraryData(libraryView);
+        if (hasLibrarySearchInput(librarySearchState.query)) await executeLibrarySearch();
         setStatus("文献夹已删除，文献仍保留", "done");
       } catch (err) {
         setStatus(`删除文献夹失败：${String(err)}`, "error");
@@ -4811,8 +4840,9 @@ async function setupListeners() {
       if (!ok) return;
       try {
         await invoke("delete_library_tag", { id });
-        librarySelectedTagIds = librarySelectedTagIds.filter((tagId) => tagId !== id);
+        removeLibrarySearchScopeToken("tag", id);
         await loadLibraryData(libraryView);
+        if (hasLibrarySearchInput(librarySearchState.query)) await executeLibrarySearch();
         setStatus("文献标签已删除，论文仍保留", "done");
       } catch (err) {
         setStatus(`删除文献标签失败：${String(err)}`, "error");
