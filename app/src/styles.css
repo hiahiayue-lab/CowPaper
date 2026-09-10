@@ -2209,10 +2209,6 @@ textarea:focus-visible,
   background: var(--ds-hover);
   outline: 0;
 }
-.attachment-child-hint { color: var(--ds-secondary); font-size: 9px; }
-.library-attachment-child:hover .attachment-child-hint,
-.library-attachment-child:focus-within .attachment-child-hint,
-.library-attachment-child.selected .attachment-child-hint { visibility: hidden; }
 .attachment-child-actions,
 .attachment-row .attachment-actions {
   position: absolute;
@@ -2269,3 +2265,106 @@ textarea:focus-visible,
 
 .relation-link { display: inline-flex; align-items: center; gap: 5px; padding: 0; border: 0; background: transparent; color: inherit; font: inherit; cursor: pointer; }
 .relation-link:hover { color: var(--ds-accent); }
+
+/* RC4: Library-only information hierarchy. Keep the desktop rail compact while
+   making paper titles, secondary metadata, labels, and utility counts distinct. */
+body.library-workspace .workspace-nav .nav-item,
+body.library-workspace .workspace-nav .library-nav-row {
+  font-size: 13px;
+  line-height: 18px;
+}
+
+body.library-workspace .workspace-nav .nav-section-label {
+  font-size: 11px;
+  line-height: 15px;
+  font-weight: 600;
+}
+
+body.library-workspace .workspace-nav .nav-count {
+  color: var(--ds-secondary);
+  font-size: 11px;
+  line-height: 15px;
+  font-variant-numeric: tabular-nums;
+}
+
+body.library-workspace .library-title-en {
+  color: var(--ds-text);
+  font-size: 13px;
+  line-height: 17px;
+  font-weight: 500;
+}
+
+body.library-workspace .library-title-zh {
+  color: var(--ds-secondary);
+  font-size: 10px;
+  line-height: 13px;
+}
+
+body.library-workspace .library-table-head {
+  color: var(--ds-secondary);
+  font-size: 10px;
+  line-height: 14px;
+  font-weight: 500;
+  letter-spacing: .01em;
+}
+
+body.library-workspace .library-row-note,
+body.library-workspace .library-row-source,
+body.library-workspace .library-row-year,
+body.library-workspace .library-row-authors {
+  color: var(--ds-secondary);
+  font-size: 11px;
+  line-height: 15px;
+}
+
+body.library-workspace .library-attachment-child {
+  color: var(--ds-secondary);
+  font-size: 10px;
+  line-height: 14px;
+}
+
+body.library-workspace .attachment-child-name {
+  color: #686868;
+}
+
+body.library-workspace .library-inspector {
+  padding-top: 6px;
+}
+
+body.library-workspace .inspector-tab {
+  display: flex;
+  align-items: center;
+  min-height: 20px;
+  height: 20px;
+  padding: 0 0 5px;
+  margin: 0 0 6px;
+  border-bottom: 1px solid var(--ds-divider);
+  text-align: left;
+  font-size: 11px;
+  line-height: 15px;
+}
+
+body.library-workspace .inspector-head {
+  min-height: 20px;
+}
+
+body.library-workspace .inspector-title-block {
+  padding-top: 4px;
+}
+
+body.library-workspace .inspector-group .inspector-section-head h3,
+body.library-workspace .inspector-form-row .field-label {
+  font-size: 10px;
+  line-height: 14px;
+}
+
+body.library-workspace .inspector-form-row .field-value,
+body.library-workspace .inspector-link {
+  font-size: 11px;
+  line-height: 16px;
+}
+
+body.library-workspace .library-search-token {
+  font-size: 10px;
+  line-height: 15px;
+}
