@@ -1646,6 +1646,14 @@ body.library-workspace .topbar {
 body.library-workspace .topbar-leading { margin-left: 0; }
 body.library-workspace .topbar-leading { gap: var(--library-toolbar-inline-gap); }
 body.library-workspace .library-view.active { min-height: 0; }
+/* Keep the Library panes flush with the shared toolbar. The later design
+   system .view padding must not reintroduce a top/bottom inset here. */
+body.library-workspace .library-view,
+#view-library-all.library-view,
+#view-library-recent.library-view,
+#view-library-unfiled.library-view {
+  padding: 0 !important;
+}
 body.library-workspace .library-drop-overlay { background: transparent; }
 
 /* The Inspector is a continuous metadata surface rather than a stack of
@@ -2328,8 +2336,14 @@ body.library-workspace .attachment-child-name {
 }
 
 body.library-workspace .library-inspector {
+  position: relative;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding-right: 16px;
+  padding-left: 16px;
   padding-top: 0;
   padding-bottom: 0;
+  scroll-padding-top: 28px;
 }
 
 body.library-workspace .inspector-tab {
@@ -2338,14 +2352,17 @@ body.library-workspace .inspector-tab {
   z-index: 2;
   display: flex;
   align-items: center;
-  min-height: 20px;
-  height: 20px;
-  padding: 0 0 5px;
-  margin: 0 0 6px;
+  min-height: 28px;
+  height: 28px;
+  padding: 0 16px;
+  margin: 0 -16px 8px;
   border-bottom: 1px solid var(--ds-divider);
+  background: var(--ds-inspector);
+  box-shadow: 0 1px 0 var(--ds-inspector);
+  isolation: isolate;
   text-align: left;
   font-size: 11px;
-  line-height: 15px;
+  line-height: 16px;
 }
 
 body.library-workspace .inspector-head {
@@ -2353,7 +2370,7 @@ body.library-workspace .inspector-head {
 }
 
 body.library-workspace .inspector-title-block {
-  padding-top: 2px;
+  padding-top: 0;
 }
 
 body.library-workspace .inspector-group .inspector-section-head h3,
@@ -2381,10 +2398,10 @@ body.library-workspace .library-attachment-child .attachment-child-actions {
   top: auto;
   right: auto;
   z-index: auto;
-  display: inline-flex;
+  display: flex;
   align-items: center;
   justify-content: flex-start;
-  width: auto;
+  width: calc(100% - 36px);
   max-width: 100%;
   min-height: 20px;
   padding: 0;
