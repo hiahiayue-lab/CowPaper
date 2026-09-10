@@ -10,6 +10,7 @@
     "test:search:rc2": "node --experimental-strip-types src/librarySearch.rc2.test.ts",
     "test:search:rc3": "node --experimental-strip-types src/librarySearch.rc3.test.ts",
     "test:search:v022": "node --experimental-strip-types src/librarySearch.v022.test.ts",
+    "test:pdf-reader": "node --experimental-strip-types src/pdfReader.test.ts",
     "test:search:rc3:fixtures": "node ../docs/qa/library-search-v021/rc3-fixture.test.mjs",
     "preview": "vite preview",
     "tauri": "tauri"

@@ -236,7 +236,7 @@
             </div>
             <div class="settings-row settings-reader-row">
               <div><label for="set-preferred-reader">Preferred reader</label><p class="muted small">打开 PDF 时交给系统默认应用，或交给指定的本机 PDF 应用。</p></div>
-              <div class="settings-reader-controls"><select id="set-preferred-reader"><option value="system">System default</option><option value="custom">Custom application</option></select><input id="set-reader-application-path" type="text" placeholder="/Applications/Preview.app" disabled /><button type="button" class="ghost small" data-action="select-reader-application">选择应用</button></div>
+              <div class="settings-reader-controls"><select id="set-preferred-reader"><option value="system">System default</option><option value="custom">Custom application</option></select><span id="set-reader-application-name" class="muted small">System default</span><input id="set-reader-application-path" type="text" placeholder="/Applications/Preview.app" aria-label="指定 PDF 应用路径" disabled /><button type="button" class="ghost small" data-action="select-reader-application">选择应用</button></div>
             </div>
 
             <section class="settings-group pdf-settings-group" aria-labelledby="pdf-settings-title">

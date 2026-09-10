@@ -6,6 +6,12 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import {
+  detectReaderPlatform,
+  isValidReaderApplicationPath,
+  readerApplicationName,
+  readerPickerOptions,
+} from "./pdfReader";
+import {
   buildLibrarySearchSuggestions,
   LIBRARY_SEARCH_FIELD_DEFINITIONS,
   createLibrarySearchState,
@@ -900,20 +906,25 @@ function renderPdfTemplateExample(): string {
 function renderPreferredReader(): void {
   const mode = $("set-preferred-reader") as HTMLSelectElement | null;
   const path = $("set-reader-application-path") as HTMLInputElement | null;
+  const name = $("set-reader-application-name");
   if (!mode || !path) return;
   const custom = preferredPdfReader !== "system";
   mode.value = custom ? "custom" : "system";
   path.value = custom ? preferredPdfReader : "";
   path.disabled = !custom;
+  if (name) name.textContent = custom ? readerApplicationName(preferredPdfReader) : "System default";
 }
 
 async function selectReaderApplication(): Promise<void> {
   try {
-    const selected = await openFileDialog({ multiple: false });
+    const platform = detectReaderPlatform(navigator.userAgent, navigator.platform);
+    const selected = await openFileDialog(readerPickerOptions(platform));
     const path = Array.isArray(selected) ? selected[0] : selected;
-    if (path) {
+    if (path && isValidReaderApplicationPath(path, platform)) {
       preferredPdfReader = path;
       renderPreferredReader();
+    } else if (path) {
+      throw new Error(platform === "macos" ? "请选择 .app 应用" : platform === "windows" ? "请选择 .exe 应用" : "请选择绝对路径的应用");
     }
   } catch (error) {
     setStatus(`选择 PDF 应用失败：${String(error)}`, "error");
@@ -2561,7 +2572,25 @@ async function openPdfAttachment(attachmentId: number): Promise<void> {
   // The backend owns the persisted reader setting and launches it without a
   // shell. Keeping this call parameter-free also makes parent/child opening
   // use exactly the same reader policy.
-  await invoke("open_pdf_with_preferred_reader", { attachmentId });
+  try {
+    await invoke("open_pdf_with_preferred_reader", { attachmentId });
+  } catch (error) {
+    if (String(error).includes("preferred_pdf_reader_unavailable")) {
+      throw new Error("指定的 PDF 应用不可用。请在设置中重新选择应用，或改回系统默认。");
+    }
+    throw error;
+  }
+}
+
+function preferredReaderForSettings(): string {
+  const mode = ($("set-preferred-reader") as HTMLSelectElement).value;
+  if (mode === "system") return "system";
+  const path = ($("set-reader-application-path") as HTMLInputElement).value.trim();
+  const platform = detectReaderPlatform(navigator.userAgent, navigator.platform);
+  if (!isValidReaderApplicationPath(path, platform)) {
+    throw new Error(platform === "macos" ? "请选择有效的 .app 应用" : platform === "windows" ? "请选择有效的 .exe 应用" : "指定应用必须是绝对路径");
+  }
+  return path;
 }
 
 async function importExternalPdf() {
@@ -4134,10 +4163,15 @@ async function saveSettings() {
     pdfLibraryRoot: ($("set-pdf-library-root") as HTMLInputElement).value.trim(),
     pdfNamingTemplate: ($("set-pdf-naming-template") as HTMLInputElement).value,
     pdfSubfolderRule: ($("set-pdf-subfolder-rule") as HTMLSelectElement).value as "none" | "year" | "journal/source",
-    preferredPdfReader: ($("set-preferred-reader") as HTMLSelectElement).value === "system"
-      ? "system"
-      : ($("set-reader-application-path") as HTMLInputElement).value.trim(),
+    preferredPdfReader: "system",
   };
+  try {
+    s.preferredPdfReader = preferredReaderForSettings();
+  } catch (error) {
+    $("settings-msg").textContent = `设置未保存：${String(error)}`;
+    $("settings-msg").className = "error small";
+    return;
+  }
   if (s.pdfFileHandlingMode !== "none" && !s.pdfLibraryRoot) {
     $("settings-msg").textContent = "copy / move 模式需要先选择 Library root directory";
     $("settings-msg").className = "error small";
@@ -4458,8 +4492,17 @@ async function setupListeners() {
       return;
     }
     if (el.matches("#set-preferred-reader")) {
-      if (el.value === "system") preferredPdfReader = "system";
-      renderPreferredReader();
+      if (el.value === "system") {
+        preferredPdfReader = "system";
+        renderPreferredReader();
+      } else {
+        // Selecting Custom must expose the editable path even before an app
+        // has been chosen; the save guard below rejects an empty/invalid path.
+        const path = $("set-reader-application-path") as HTMLInputElement;
+        const name = $("set-reader-application-name");
+        path.disabled = false;
+        if (name) name.textContent = path.value.trim() ? readerApplicationName(path.value) : "Choose an application";
+      }
       return;
     }
     if (el.matches("[data-action='tag-draft-toggle']")) {

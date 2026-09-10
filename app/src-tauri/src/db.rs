@@ -3172,8 +3172,8 @@ fn launch_file_action(path: &Path, reveal: bool, preferred_reader: Option<&str>)
     } else if let Some(reader) = preferred_reader.filter(|v| *v != "system") {
         Command::new(reader).arg(path).status()
     } else {
-        let path_string = path.to_string_lossy().into_owned();
-        Command::new("cmd").args(["/C", "start", ""]).arg(path_string).status()
+        // Explorer uses the registered file association without a shell.
+        Command::new("explorer").arg(path).status()
     };
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     let status = if reveal {
@@ -3185,6 +3185,9 @@ fn launch_file_action(path: &Path, reveal: bool, preferred_reader: Option<&str>)
     };
     match status {
         Ok(status) if status.success() => Ok(()),
+        _ if !reveal && preferred_reader.is_some_and(|reader| reader != "system") => {
+            Err(rusqlite::Error::InvalidParameterName("preferred_pdf_reader_unavailable".into()))
+        }
         _ => Err(rusqlite::Error::InvalidQuery),
     }
 }

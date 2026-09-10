@@ -3407,6 +3407,7 @@ fn test_update_reopen_preserves_user_data_and_settings() {
         db::init(&conn).unwrap();
         db::set_setting(&conn, "settings.daily_sync_time", "07:30").unwrap();
         db::set_setting(&conn, "settings.default_abstract_lang", "en").unwrap();
+        db::set_setting(&conn, "settings.preferred_pdf_reader", "/Applications/Preview.app").unwrap();
         let jid = db::insert_journal(&conn, "Preserved Journal", Some("0025-1909"), None, None, None).unwrap();
         let paper_id = seed_paper_with_score(&conn, jid, "10.1000/update-preserve", "Preserved Paper", 4.2);
         db::save_analysis(
@@ -3441,6 +3442,7 @@ fn test_update_reopen_preserves_user_data_and_settings() {
         db::init(&conn).unwrap();
         assert_eq!(db::get_setting(&conn, "settings.daily_sync_time").as_deref(), Some("07:30"));
         assert_eq!(db::get_setting(&conn, "settings.default_abstract_lang").as_deref(), Some("en"));
+        assert_eq!(db::get_setting(&conn, "settings.preferred_pdf_reader").as_deref(), Some("/Applications/Preview.app"));
         let paper = db::get_paper(&conn, 1).unwrap().unwrap();
         assert_eq!(paper.chinese_title.as_deref(), Some("保留的中文标题"));
         assert_eq!(paper.one_sentence_summary.as_deref(), Some("句"));
