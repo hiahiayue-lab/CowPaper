@@ -71,8 +71,11 @@ equal(emptyLibrarySearchQuery(), { fieldClauses: [], freeTextQuery: "", collecti
 let state = createLibrarySearchState();
 state = reduceLibrarySearchState(state, { type: "FOCUS" });
 state = reduceLibrarySearchState(state, { type: "SUGGESTIONS", suggestions: suggestions.slice(0, 2) });
+assert(state.activeSuggestionIndex === -1, "typed suggestions are not preselected");
 state = reduceLibrarySearchKeyboard(state, { key: "ArrowDown" });
-assert(state.activeSuggestionIndex === 1, "ArrowDown moves active suggestion");
+assert(state.activeSuggestionIndex === 0, "ArrowDown explicitly selects the first suggestion");
+state = reduceLibrarySearchKeyboard(state, { key: "ArrowDown" });
+assert(state.activeSuggestionIndex === 1, "a second ArrowDown selects the next suggestion");
 state = reduceLibrarySearchKeyboard(state, { key: "Enter" });
 assert(state.query.libraryTagIds.length === 1, "Enter applies suggestion");
 

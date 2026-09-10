@@ -658,7 +658,10 @@ export function reduceLibrarySearchState(state: LibrarySearchState, action: Libr
         requestVersion: action.text == null ? state.requestVersion : state.requestVersion + 1,
       };
     case "SUGGESTIONS":
-      return { ...state, suggestions: action.suggestions, activeSuggestionIndex: action.suggestions.length ? 0 : -1 };
+      // Never preselect the first suggestion. A plain Enter after typing is a
+      // text-search action; a Collection/Tag is added only after an explicit
+      // pointer click or keyboard navigation to a suggestion.
+      return { ...state, suggestions: action.suggestions, activeSuggestionIndex: -1 };
     case "MOVE_ACTIVE": {
       const count = state.suggestions.length;
       if (!count || state.phase === "closed") return state;

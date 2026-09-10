@@ -2302,6 +2302,10 @@ function renderLibraryMatchEvidence(paperId: number): string {
 function handleLibrarySearchKeydown(event: KeyboardEvent): void {
   const input = event.target as HTMLInputElement;
   if (input.id !== "library-search-input") return;
+  // activeSuggestionIndex is -1 for freshly refreshed suggestions. Only an
+  // explicit Arrow Up/Down navigation may make Enter select a suggestion;
+  // typing AI and confirming it (including after IME composition) must remain
+  // a normal text query.
   if (event.key === "Enter" && !librarySearchState.isComposing && !event.isComposing && librarySearchState.activeSuggestionIndex >= 0) {
     const suggestion = librarySearchState.suggestions[librarySearchState.activeSuggestionIndex];
     if (suggestion) {
