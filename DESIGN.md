@@ -183,7 +183,8 @@ search:
   placeholder: "搜索文库…"
   fields: "English title, Chinese title, authors, year, journal, Library Tags, note, English abstract, Chinese abstract"
   excludedMetadata: "DOI, URL, publisher, volume, issue, pages"
-  resultSemantics: "instant local feedback; commit on Enter or suggestion selection"
+  suggestions: "Collections, Library Tags, field intents, and canonical Papers; no generic Search Action"
+  resultSemantics: "instant local feedback; explicit Collection/Tag/field/Paper suggestion selection commits; Enter remains inert; Escape closes then clears"
 motion:
   highFrequency: "none"
   librarySearch: "none"
@@ -288,9 +289,9 @@ Toolbar buttons use the shared control height and neutral ghost treatment. Use t
 
 ## Library Search
 
-Library Search has one mode: `all`. It matches English title, Chinese title, authors, year, journal, Library Tags, note, English abstract, and Chinese abstract. DOI, URL, publisher, volume, issue, and pages remain metadata and are not full-text fields. Collection and Tag scope is expressed by removable tokens inside the Search box; do not add a second mode selector or duplicate scope chips elsewhere.
+Library Search has one mode: `all`. It matches English title, Chinese title, authors, year, journal, Library Tags, note, English abstract, and Chinese abstract. DOI, URL, publisher, volume, issue, and pages remain metadata and are not full-text fields. Collection and Tag scope is expressed by removable tokens inside the Search box; optional field-intent tokens narrow the all-field query and do not create a second mode. Do not add a mode selector, a generic Search Action row, or duplicate scope chips elsewhere. Selecting an explicit Collection, Tag, field-intent, or canonical Paper suggestion is the commit boundary; Enter stays inert so keyboard input cannot accidentally select the highlighted suggestion. Escape first closes the suggestion surface and then clears the expression on the next press.
 
-Typing, IME composition, `⌘F`, arrow-key navigation, token changes, `Enter`, `Escape`, and result replacement are instant. Empty-query focus is quiet. The anchored suggestion surface contains Collection, Tag, Paper, and one current-scope search action; zero-count Tags stay visible but dimmed. The dropdown does not animate, steal focus, or change the page layout.
+Typing, IME composition, `⌘F`, arrow-key navigation, token changes, `Enter`, `Escape`, and result replacement are instant. Empty-query focus is quiet. The anchored suggestion surface contains Collection, Tag, field-intent, and Paper suggestions; zero-count Tags stay visible but dimmed. The dropdown does not animate, steal focus, or change the page layout.
 
 ## Paper Table and attachments
 
