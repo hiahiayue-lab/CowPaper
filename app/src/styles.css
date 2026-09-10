@@ -2328,10 +2328,14 @@ body.library-workspace .attachment-child-name {
 }
 
 body.library-workspace .library-inspector {
-  padding-top: 6px;
+  padding-top: 0;
+  padding-bottom: 0;
 }
 
 body.library-workspace .inspector-tab {
+  position: sticky;
+  top: 0;
+  z-index: 2;
   display: flex;
   align-items: center;
   min-height: 20px;
@@ -2349,7 +2353,7 @@ body.library-workspace .inspector-head {
 }
 
 body.library-workspace .inspector-title-block {
-  padding-top: 4px;
+  padding-top: 2px;
 }
 
 body.library-workspace .inspector-group .inspector-section-head h3,
@@ -2367,4 +2371,40 @@ body.library-workspace .inspector-link {
 body.library-workspace .library-search-token {
   font-size: 10px;
   line-height: 15px;
+}
+
+/* RC4 follow-up: attachment controls stay in document flow. Hovering a PDF
+   must never cover its filename or secondary state. */
+body.library-workspace .attachment-row .attachment-actions,
+body.library-workspace .library-attachment-child .attachment-child-actions {
+  position: static;
+  top: auto;
+  right: auto;
+  z-index: auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-start;
+  width: auto;
+  max-width: 100%;
+  min-height: 20px;
+  padding: 0;
+  margin: 6px 0 0 36px;
+  overflow: visible;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  transform: none;
+}
+
+body.library-workspace .attachment-row .attachment-actions button,
+body.library-workspace .library-attachment-child .attachment-child-actions button {
+  padding: 2px 5px;
+}
+
+body.library-workspace .attachment-row .attachment-actions {
+  flex-wrap: wrap;
 }
