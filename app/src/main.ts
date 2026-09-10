@@ -513,7 +513,6 @@ let selectedLibraryPaperId: number | null = null;
 let libraryScope: { kind: "collection"; id: number } | null = null;
 let librarySelectedTagIds: number[] = [];
 let librarySearchState: LibrarySearchState = createLibrarySearchState();
-let librarySearchAppliedQuery: LibrarySearchQuery | null = null;
 let librarySearchResultIds: Set<number> | null = null;
 let librarySearchMatches = new Map<number, LibrarySearchHit>();
 let librarySearchAdapter: LibrarySearchApi | null = null;
@@ -554,7 +553,6 @@ function clearLibraryScope(): void {
     activeSuggestionIndex: -1,
     requestVersion: librarySearchState.requestVersion + 1,
   };
-  librarySearchAppliedQuery = null;
   librarySearchResultIds = null;
   librarySearchMatches.clear();
 }
@@ -580,7 +578,6 @@ function removeLibrarySearchScopeToken(kind: "collection" | "tag", id: number): 
   };
   if (kind === "collection" && libraryScope?.id === id) libraryScope = null;
   if (kind === "tag") librarySelectedTagIds = librarySelectedTagIds.filter((value) => value !== id);
-  librarySearchAppliedQuery = null;
   librarySearchResultIds = null;
   librarySearchMatches.clear();
 }
@@ -2230,7 +2227,6 @@ async function executeLibrarySearch(): Promise<void> {
     if (requestVersion !== librarySearchState.requestVersion) return;
     librarySearchResultIds = new Set(result.paperIds);
     librarySearchMatches = new Map((result.hits || []).map((match) => [match.paperId, match]));
-    librarySearchAppliedQuery = query;
     renderLibrary();
   } catch (error) {
     librarySearchMatches.clear();
@@ -2243,7 +2239,6 @@ async function selectLibrarySearchSuggestion(suggestion: LibrarySearchState["sug
     // Paper suggestions locate the existing canonical row; they must not turn
     // the Paper title into a new text query.
     librarySearchState = { ...librarySearchState, phase: "closed", activeSuggestionIndex: -1 };
-    librarySearchAppliedQuery = null;
     librarySearchResultIds = null;
     librarySearchMatches.clear();
     selectedLibraryPaperId = suggestion.paperId;
@@ -2277,7 +2272,6 @@ function clearLibrarySearch(): void {
   librarySearchState = reduceLibrarySearchState(librarySearchState, { type: "CLEAR" });
   libraryScope = null;
   librarySelectedTagIds = [];
-  librarySearchAppliedQuery = null;
   librarySearchResultIds = null;
   librarySearchMatches.clear();
   const input = $("library-search-input") as HTMLInputElement | null;
@@ -4576,7 +4570,6 @@ async function setupListeners() {
           }),
           requestVersion: librarySearchState.requestVersion + 1,
         };
-        librarySearchAppliedQuery = null;
         librarySearchResultIds = null;
         librarySearchMatches.clear();
         void executeLibrarySearch();
@@ -4594,7 +4587,6 @@ async function setupListeners() {
         }),
         requestVersion: librarySearchState.requestVersion + 1,
       };
-      librarySearchAppliedQuery = null;
       librarySearchResultIds = null;
       librarySearchMatches.clear();
       void executeLibrarySearch();
@@ -4770,7 +4762,6 @@ async function setupListeners() {
         activeSuggestionIndex: -1,
         requestVersion: librarySearchState.requestVersion + 1,
       };
-      librarySearchAppliedQuery = null;
       librarySearchResultIds = null;
       librarySearchMatches.clear();
       await executeLibrarySearch();
@@ -4788,7 +4779,6 @@ async function setupListeners() {
         activeSuggestionIndex: -1,
         requestVersion: librarySearchState.requestVersion + 1,
       };
-      librarySearchAppliedQuery = null;
       librarySearchResultIds = null;
       librarySearchMatches.clear();
       await executeLibrarySearch();
@@ -4805,7 +4795,6 @@ async function setupListeners() {
         activeSuggestionIndex: -1,
         requestVersion: librarySearchState.requestVersion + 1,
       };
-      librarySearchAppliedQuery = null;
       librarySearchResultIds = null;
       librarySearchMatches.clear();
       await executeLibrarySearch();
@@ -4866,7 +4855,6 @@ async function setupListeners() {
         activeSuggestionIndex: -1,
         requestVersion: librarySearchState.requestVersion + 1,
       };
-      librarySearchAppliedQuery = null;
       librarySearchResultIds = null;
       librarySearchMatches.clear();
       await executeLibrarySearch();

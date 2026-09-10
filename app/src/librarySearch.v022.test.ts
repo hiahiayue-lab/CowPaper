@@ -1,7 +1,6 @@
 import {
   LIBRARY_SEARCH_EXCLUDED_FIELDS,
   LIBRARY_SEARCH_FIELDS,
-  applyLibrarySearchSuggestion,
   buildLibrarySearchFieldTokens,
   buildLibrarySearchSuggestions,
   createLibrarySearchState,
