@@ -260,12 +260,13 @@ fn handle_command<R: Runtime>(
                 let c = conn.lock().unwrap();
                 match &paper_ids {
                     Some(ids) => {
-                        for id in ids {
-                            let _ = db::enqueue_paper(&c, *id);
+                        let eligible = db::discovery_eligible_ids(&c, ids).unwrap_or_default();
+                        for id in eligible {
+                            let _ = db::enqueue_paper(&c, id);
                         }
                     }
                     None => {
-                        let pending = db::list_pending_papers(&c, None).unwrap_or_default();
+                        let pending = db::list_pending_discovery_papers(&c).unwrap_or_default();
                         for p in &pending {
                             let _ = db::enqueue_paper(&c, p.id);
                         }
@@ -322,8 +323,12 @@ fn handle_command<R: Runtime>(
             });
             {
                 let c = conn.lock().unwrap();
-                for id in &paper_ids {
-                    let _ = db::enqueue_for_tag_update(&c, *id);
+                let eligible = db::discovery_eligible_ids(&c, &paper_ids).unwrap_or_default();
+                if eligible.is_empty() {
+                    return;
+                }
+                for id in eligible {
+                    let _ = db::enqueue_for_tag_update(&c, id);
                 }
             }
             let (size, batch_id) = {
@@ -460,7 +465,7 @@ fn handle_command<R: Runtime>(
             };
             let failed_ids = {
                 let c = conn.lock().unwrap();
-                db::list_failed_ids(&c).unwrap_or_default()
+                db::list_failed_ids_in_discovery(&c).unwrap_or_default()
             };
             if failed_ids.is_empty() {
                 return;
@@ -476,7 +481,7 @@ fn handle_command<R: Runtime>(
             });
             let (size, batch_id) = {
                 let c = conn.lock().unwrap();
-                let _ = db::reset_failed_to_pending(&c);
+                let _ = db::reset_failed_ids_to_pending(&c, &failed_ids);
                 for id in &failed_ids {
                     let _ = db::enqueue_paper(&c, *id);
                 }

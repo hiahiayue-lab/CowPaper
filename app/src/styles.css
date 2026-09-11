@@ -1331,6 +1331,8 @@ button.full {
 .library-only { display: none; }
 .library-workspace .library-only { display: inline-flex; }
 .library-workspace #btn-sync-main { display: none; }
+/* AI analysis is a Discovery workflow; Library only exposes Library tools. */
+.library-workspace #btn-ai-main { display: none !important; }
 #status { position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%); z-index: 100; max-width: min(650px, 85vw); white-space: normal; padding: 10px 16px; border: 1px solid #e2e2e2; border-radius: 8px; background: #fff; box-shadow: 0 4px 18px #00000014; font-size: 12px; }
 #status.idle, #status.dismissed { display: none; }
 .nav { padding: 3px 8px; }

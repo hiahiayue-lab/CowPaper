@@ -763,7 +763,7 @@ fn save_tag_config(items: Vec<models::TagDraftItem>, mode: String, state: State<
             .cloned()
             .collect();
         // eligible papers：有摘要且非已分析成功（或 hash stale）—— 简化：所有有摘要且 tag 缺失/stale
-        let paper_ids = db::papers_needing_tag_scores(&conn, &targets).map_err(|e| e.to_string())?;
+        let paper_ids = db::papers_needing_tag_scores_in_discovery(&conn, &targets).map_err(|e| e.to_string())?;
         res.ai_needed_papers = paper_ids.len() as i64;
         if !paper_ids.is_empty() && !targets.is_empty() {
             queue.cmd_tx
@@ -871,7 +871,7 @@ fn activate_scheduled_tag_config_if_due(conn: &rusqlite::Connection, queue: &AiQ
             .filter(|(_, name, _)| need_ai.iter().any(|n| n == name))
             .cloned()
             .collect();
-        let paper_ids = db::papers_needing_tag_scores(conn, &targets).map_err(|e| e.to_string())?;
+        let paper_ids = db::papers_needing_tag_scores_in_discovery(conn, &targets).map_err(|e| e.to_string())?;
         if !paper_ids.is_empty() && !targets.is_empty() {
             let _ = queue.cmd_tx.send(crate::ai_queue::QueueCommand::TagOnlyBatch {
                 paper_ids,
@@ -928,7 +928,9 @@ fn get_recommendation_run(id: i64, state: State<Db>) -> Result<models::Recommend
 #[tauri::command]
 fn list_papers(journal_id: Option<i64>, state: State<Db>) -> Result<Vec<models::Paper>, String> {
     let conn = state.inner().lock().unwrap();
-    db::list_papers(&conn, journal_id, 1000).map_err(|e| e.to_string())
+    // Discovery is membership-based; Library-only canonical papers are served
+    // by list_library_papers and must not leak into this surface.
+    db::list_discovery_papers(&conn, journal_id, 1000).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1979,13 +1981,13 @@ fn get_ai_status(state: State<Db>) -> Result<models::AiStatus, String> {
 #[tauri::command]
 fn get_pending_ai_count(state: State<Db>) -> Result<i64, String> {
     let conn = state.inner().lock().unwrap();
-    db::count_pending_papers(&conn).map_err(|e| e.to_string())
+    db::count_pending_papers_in_discovery(&conn).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 fn get_failed_ai_count(state: State<Db>) -> Result<i64, String> {
     let conn = state.inner().lock().unwrap();
-    db::count_by_status(&conn, "analysisFailed").map_err(|e| e.to_string())
+    db::count_by_status_in_discovery(&conn, "analysisFailed").map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -2173,8 +2175,8 @@ pub(crate) fn build_activity_state(conn: &Connection) -> Result<models::Activity
         last_sync: db::last_finished_sync_batch(conn).map_err(|e| e.to_string())?,
         last_analysis: db::last_finished_analysis_batch(conn).map_err(|e| e.to_string())?,
         retry_waiting,
-        pending_analysis: db::count_pending_papers(conn).unwrap_or(0),
-        analysis_failed: db::count_by_status(conn, "analysisFailed").unwrap_or(0),
+        pending_analysis: db::count_pending_papers_in_discovery(conn).unwrap_or(0),
+        analysis_failed: db::count_by_status_in_discovery(conn, "analysisFailed").unwrap_or(0),
         waiting_for_abstract: db::count_waiting_for_abstract_in_discovery_batch(conn, &local_day).unwrap_or(0),
     })
 }

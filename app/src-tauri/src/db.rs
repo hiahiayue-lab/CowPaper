@@ -1368,12 +1368,54 @@ fn row_to_paper(row: &rusqlite::Row) -> Result<Paper> {
     })
 }
 
-pub fn list_papers(conn: &Connection, journal_id: Option<i64>, limit: i64) -> Result<Vec<Paper>> {
+/// Explicit Discovery membership.  A canonical paper can exist in the
+/// Library without ever belonging to Discovery, so `papers.first_seen_cycle`
+/// and provenance/source fields are deliberately not used as eligibility.
+/// Existing recommendation snapshots are also membership evidence and must be
+/// retained across restarts and later Library imports.
+pub const DISCOVERY_MEMBERSHIP_PREDICATE: &str = "(EXISTS (SELECT 1 FROM sync_batch_papers sbp WHERE sbp.paper_id = p.id) OR EXISTS (SELECT 1 FROM recommendation_items ri WHERE ri.paper_id = p.id AND (COALESCE(p.discovery_source, '') <> 'external_pdf_import' OR EXISTS (SELECT 1 FROM library_items li WHERE li.paper_id = p.id AND li.added_source = 'external_pdf_import' AND ri.added_at <= li.added_at))))";
+
+pub fn is_discovery_eligible(conn: &Connection, paper_id: i64) -> Result<bool> {
+    conn.query_row(
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM papers p WHERE p.id=?1 AND {})",
+            DISCOVERY_MEMBERSHIP_PREDICATE
+        ),
+        params![paper_id],
+        |r| r.get(0),
+    )
+}
+
+/// Filter an explicit caller-provided scope through the same membership rule
+/// used by Discovery queries and AI queues.
+pub fn discovery_eligible_ids(conn: &Connection, paper_ids: &[i64]) -> Result<Vec<i64>> {
+    if paper_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut ids = paper_ids.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    let sql = format!(
+        "SELECT p.id FROM papers p WHERE p.id IN ({}) AND {} ORDER BY p.id",
+        ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(","),
+        DISCOVERY_MEMBERSHIP_PREDICATE,
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+    rows.collect()
+}
+
+fn list_papers_filtered(conn: &Connection, journal_id: Option<i64>, limit: i64, discovery_only: bool) -> Result<Vec<Paper>> {
     let sql = format!(
         "SELECT p.*, COALESCE(NULLIF(trim(p.container_title), ''), j.name) AS journal_name FROM papers p
          JOIN journals j ON j.id = p.journal_id
          {} ORDER BY p.published_date DESC, p.id DESC LIMIT ?1",
-        if journal_id.is_some() { "WHERE p.journal_id = ?2" } else { "" }
+        match (journal_id.is_some(), discovery_only) {
+            (true, true) => format!("WHERE p.journal_id = ?2 AND {}", DISCOVERY_MEMBERSHIP_PREDICATE),
+            (true, false) => "WHERE p.journal_id = ?2".to_string(),
+            (false, true) => format!("WHERE {}", DISCOVERY_MEMBERSHIP_PREDICATE),
+            (false, false) => String::new(),
+        }
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = if let Some(jid) = journal_id {
@@ -1388,11 +1430,21 @@ pub fn list_papers(conn: &Connection, journal_id: Option<i64>, limit: i64) -> Re
     Ok(papers)
 }
 
+/// All canonical papers, retained for internal data/identity operations and
+/// tests. UI Discovery must call `list_discovery_papers` instead.
+pub fn list_papers(conn: &Connection, journal_id: Option<i64>, limit: i64) -> Result<Vec<Paper>> {
+    list_papers_filtered(conn, journal_id, limit, false)
+}
+
+pub fn list_discovery_papers(conn: &Connection, journal_id: Option<i64>, limit: i64) -> Result<Vec<Paper>> {
+    list_papers_filtered(conn, journal_id, limit, true)
+}
+
 pub fn list_papers_for_first_seen_cycle(conn: &Connection, cycle_key: &str, missing_only: bool) -> Result<Vec<Paper>> {
     let sql = if missing_only {
-        "SELECT p.*,COALESCE(NULLIF(trim(p.container_title), ''), j.name) AS journal_name FROM papers p JOIN journals j ON j.id=p.journal_id WHERE p.first_seen_cycle=?1 AND p.first_seen_abstract_missing=1 ORDER BY p.id DESC"
+        &format!("SELECT p.*,COALESCE(NULLIF(trim(p.container_title), ''), j.name) AS journal_name FROM papers p JOIN journals j ON j.id=p.journal_id WHERE p.first_seen_cycle=?1 AND p.first_seen_abstract_missing=1 AND {} ORDER BY p.id DESC", DISCOVERY_MEMBERSHIP_PREDICATE)
     } else {
-        "SELECT p.*,COALESCE(NULLIF(trim(p.container_title), ''), j.name) AS journal_name FROM papers p JOIN journals j ON j.id=p.journal_id WHERE p.first_seen_cycle=?1 ORDER BY p.id DESC"
+        &format!("SELECT p.*,COALESCE(NULLIF(trim(p.container_title), ''), j.name) AS journal_name FROM papers p JOIN journals j ON j.id=p.journal_id WHERE p.first_seen_cycle=?1 AND {} ORDER BY p.id DESC", DISCOVERY_MEMBERSHIP_PREDICATE)
     };
     let mut stmt = conn.prepare(sql)?;
     let rows = stmt.query_map(params![cycle_key], row_to_paper)?;
@@ -1404,7 +1456,8 @@ pub fn list_papers_for_first_seen_cycle(conn: &Connection, cycle_key: &str, miss
 }
 
 pub fn list_current_missing_papers_for_cycle(conn: &Connection, cycle_key: &str) -> Result<Vec<Paper>> {
-    let mut stmt = conn.prepare("SELECT p.*,COALESCE(NULLIF(trim(p.container_title), ''), j.name) AS journal_name FROM papers p JOIN journals j ON j.id=p.journal_id WHERE p.first_seen_cycle=?1 AND p.abstract_quality='missing' ORDER BY p.id DESC")?;
+    let sql = format!("SELECT p.*,COALESCE(NULLIF(trim(p.container_title), ''), j.name) AS journal_name FROM papers p JOIN journals j ON j.id=p.journal_id WHERE p.first_seen_cycle=?1 AND p.abstract_quality='missing' AND {} ORDER BY p.id DESC", DISCOVERY_MEMBERSHIP_PREDICATE);
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params![cycle_key], row_to_paper)?;
     let mut papers: Vec<Paper> = rows.collect::<Result<Vec<_>>>()?;
     enrich_papers_collections(conn, &mut papers)?;
@@ -1415,20 +1468,23 @@ pub fn list_current_missing_papers_for_cycle(conn: &Connection, cycle_key: &str)
 
 pub fn list_daily_paper_summaries(conn: &Connection) -> Result<Vec<crate::models::DailyPaperSummary>> {
     let mut stmt = conn.prepare(
-        "WITH days AS (
-             SELECT first_seen_cycle AS cycle_key FROM papers WHERE first_seen_cycle IS NOT NULL
+        &format!("WITH discovery_papers AS (
+             SELECT p.id, p.first_seen_cycle, p.first_seen_abstract_missing
+             FROM papers p WHERE p.first_seen_cycle IS NOT NULL AND {}
+         ), days AS (
+             SELECT first_seen_cycle AS cycle_key FROM discovery_papers
              UNION SELECT cycle_key FROM recommendation_runs
          ), paper_counts AS (
              SELECT first_seen_cycle AS cycle_key, COUNT(DISTINCT id) AS paper_count,
                     COUNT(DISTINCT CASE WHEN first_seen_abstract_missing=1 THEN id END) AS missing_count
-             FROM papers WHERE first_seen_cycle IS NOT NULL GROUP BY first_seen_cycle
+             FROM discovery_papers GROUP BY first_seen_cycle
          ), recommendation_counts AS (
              SELECT r.cycle_key, r.id AS run_id, COUNT(DISTINCT ri.paper_id) AS recommendation_count
              FROM recommendation_runs r LEFT JOIN recommendation_items ri ON ri.run_id=r.id GROUP BY r.id,r.cycle_key
          )
          SELECT d.cycle_key,COALESCE(p.paper_count,0),COALESCE(p.missing_count,0),rc.run_id,COALESCE(rc.recommendation_count,0)
          FROM days d LEFT JOIN paper_counts p ON p.cycle_key=d.cycle_key
-         LEFT JOIN recommendation_counts rc ON rc.cycle_key=d.cycle_key ORDER BY d.cycle_key DESC"
+         LEFT JOIN recommendation_counts rc ON rc.cycle_key=d.cycle_key ORDER BY d.cycle_key DESC", DISCOVERY_MEMBERSHIP_PREDICATE),
     )?;
     let rows = stmt.query_map([], |r| Ok(crate::models::DailyPaperSummary { cycle_key:r.get(0)?, paper_count:r.get(1)?, missing_count:r.get(2)?, recommendation_run_id:r.get(3)?, recommendation_count:r.get(4)? }))?;
     rows.collect()
@@ -5008,7 +5064,11 @@ pub fn delete_library_tag(conn: &Connection, id: i64) -> Result<bool> {
 
 pub fn count_waiting_for_abstract(conn: &Connection) -> Result<i64> {
     conn.query_row(
-        "SELECT COUNT(*) FROM papers WHERE analysis_status = 'waitingForAbstract'",
+        &format!(
+            "SELECT COUNT(*) FROM papers p
+             WHERE p.analysis_status = 'waitingForAbstract' AND {}",
+            DISCOVERY_MEMBERSHIP_PREDICATE
+        ),
         [],
         |r| r.get(0),
     )
@@ -5037,6 +5097,20 @@ pub fn count_waiting_for_abstract_in_discovery_batch(
 pub fn count_pending_papers(conn: &Connection) -> Result<i64> {
     conn.query_row(
         "SELECT COUNT(*) FROM papers WHERE analysis_status = 'pendingAnalysis' AND abstract IS NOT NULL AND abstract != ''",
+        [],
+        |r| r.get(0),
+    )
+}
+
+pub fn count_pending_papers_in_discovery(conn: &Connection) -> Result<i64> {
+    conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM papers p
+             WHERE p.analysis_status = 'pendingAnalysis'
+               AND p.abstract IS NOT NULL AND p.abstract != ''
+               AND {}",
+            DISCOVERY_MEMBERSHIP_PREDICATE
+        ),
         [],
         |r| r.get(0),
     )
@@ -5871,6 +5945,23 @@ pub fn list_pending_papers(conn: &Connection, paper_ids: Option<&[i64]>) -> Resu
     rows.collect()
 }
 
+/// Discovery-only pending/failed scope used by all production AI entry
+/// points.  Library-only papers are deliberately absent even when they have
+/// a complete abstract from local PDF enrichment.
+pub fn list_pending_discovery_papers(conn: &Connection) -> Result<Vec<Paper>> {
+    let sql = format!(
+        "SELECT p.*, COALESCE(NULLIF(trim(p.container_title), ''), j.name) AS journal_name
+         FROM papers p JOIN journals j ON j.id = p.journal_id
+         WHERE p.analysis_status IN ('pendingAnalysis','analysisFailed')
+           AND p.abstract IS NOT NULL AND p.abstract != ''
+           AND {}",
+        DISCOVERY_MEMBERSHIP_PREDICATE
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], row_to_paper)?;
+    rows.collect()
+}
+
 /// Papers with a valid source title may receive a title-only translation. This
 /// query intentionally excludes only an existing Chinese title or an invalid
 /// source title; abstract/content/analysis state must not gate this backlog.
@@ -5911,11 +6002,12 @@ pub fn list_recoverable_paper_ids(conn: &Connection, paper_ids: &[i64]) -> Resul
     let mut ids = paper_ids.to_vec();
     ids.sort_unstable();
     ids.dedup();
-    let mut sql = String::from(
-        "SELECT id FROM papers WHERE id IN (",
-    );
+    let mut sql = format!("SELECT p.id FROM papers p WHERE p.id IN (",);
     sql.push_str(&ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(","));
-    sql.push_str(") AND abstract_quality != 'complete' AND abstract_status != 'not_expected' ORDER BY id ASC LIMIT ");
+    sql.push_str(&format!(
+        ") AND p.abstract_quality != 'complete' AND p.abstract_status != 'not_expected' AND {} ORDER BY p.id ASC LIMIT ",
+        DISCOVERY_MEMBERSHIP_PREDICATE
+    ));
     sql.push_str(&ABSTRACT_RECOVERY_BATCH_LIMIT.to_string());
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], |r| r.get(0))?;
@@ -6078,19 +6170,38 @@ pub fn count_by_status(conn: &Connection, status: &str) -> Result<i64> {
     )
 }
 
+pub fn count_by_status_in_discovery(conn: &Connection, status: &str) -> Result<i64> {
+    conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM papers p
+             WHERE p.analysis_status = ?1 AND {}",
+            DISCOVERY_MEMBERSHIP_PREDICATE
+        ),
+        params![status],
+        |r| r.get(0),
+    )
+}
+
 /// 队列中尚未完成的论文数（queued + analyzing）。
 pub fn count_active_queue(conn: &Connection) -> Result<i64> {
     conn.query_row(
-        "SELECT COUNT(*) FROM papers WHERE analysis_status IN ('queued','analyzing')",
+        &format!(
+            "SELECT COUNT(*) FROM papers p
+             WHERE p.analysis_status IN ('queued','analyzing') AND {}",
+            DISCOVERY_MEMBERSHIP_PREDICATE
+        ),
         [],
         |r| r.get(0),
     )
 }
 
 pub fn list_queued_ids(conn: &Connection, limit: i64) -> Result<Vec<i64>> {
-    let mut stmt = conn.prepare(
-        "SELECT id FROM papers WHERE analysis_status = 'queued' ORDER BY queued_at ASC, id ASC LIMIT ?1",
-    )?;
+    let sql = format!(
+        "SELECT p.id FROM papers p
+         WHERE p.analysis_status = 'queued' AND {} ORDER BY p.queued_at ASC, p.id ASC LIMIT ?1",
+        DISCOVERY_MEMBERSHIP_PREDICATE
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params![limit], |r| r.get::<_, i64>(0))?;
     rows.collect()
 }
@@ -6123,8 +6234,23 @@ pub fn revert_active_to_pending(conn: &Connection) -> Result<()> {
 
 /// 启动恢复：中断的 analyzing 论文退回 queued（作为剩余任务继续）。
 pub fn recover_analyzing_to_queued(conn: &Connection) -> Result<()> {
+    // Any interrupted Library-only work is quarantined back to pending first.
+    // It must never be reintroduced into the Discovery queue merely because
+    // an old process left an `analyzing` status behind.
     conn.execute(
-        "UPDATE papers SET analysis_status = 'queued', queued_at = ?1, updated_at = ?1 WHERE analysis_status = 'analyzing'",
+        &format!(
+            "UPDATE papers AS p SET analysis_status = 'pendingAnalysis', queued_at = NULL, updated_at = ?1
+             WHERE p.analysis_status = 'analyzing' AND NOT ({})",
+            DISCOVERY_MEMBERSHIP_PREDICATE
+        ),
+        params![now_utc()],
+    )?;
+    conn.execute(
+        &format!(
+            "UPDATE papers AS p SET analysis_status = 'queued', queued_at = ?1, updated_at = ?1
+             WHERE p.analysis_status = 'analyzing' AND {}",
+            DISCOVERY_MEMBERSHIP_PREDICATE
+        ),
         params![now_utc()],
     )?;
     Ok(())
@@ -6144,6 +6270,34 @@ pub fn list_failed_ids(conn: &Connection) -> Result<Vec<i64>> {
     let mut stmt = conn.prepare("SELECT id FROM papers WHERE analysis_status = 'analysisFailed'")?;
     let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
     rows.collect()
+}
+
+pub fn list_failed_ids_in_discovery(conn: &Connection) -> Result<Vec<i64>> {
+    let sql = format!(
+        "SELECT p.id FROM papers p
+         WHERE p.analysis_status = 'analysisFailed' AND {} ORDER BY p.id",
+        DISCOVERY_MEMBERSHIP_PREDICATE
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+    rows.collect()
+}
+
+pub fn reset_failed_ids_to_pending(conn: &Connection, paper_ids: &[i64]) -> Result<()> {
+    if paper_ids.is_empty() {
+        return Ok(());
+    }
+    let eligible = discovery_eligible_ids(conn, paper_ids)?;
+    if eligible.is_empty() {
+        return Ok(());
+    }
+    let sql = format!(
+        "UPDATE papers SET analysis_status = 'pendingAnalysis', retry_count = 0, updated_at = ?1
+         WHERE analysis_status = 'analysisFailed' AND id IN ({})",
+        eligible.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",")
+    );
+    conn.execute(&sql, params![now_utc()])?;
+    Ok(())
 }
 
 // ================= Round 4：Batch CRUD =================
@@ -6617,11 +6771,14 @@ fn row_to_recommendation_run(row: &rusqlite::Row) -> Result<RecommendationRun> {
 
 pub fn get_recommendation_run(conn: &Connection, id: i64) -> Result<Option<RecommendationRun>> {
     conn.query_row(
-        "SELECT r.*,
-            (SELECT COUNT(*) FROM recommendation_items i WHERE i.run_id = r.id) AS item_count,
-            (SELECT MAX(score_snapshot) FROM recommendation_items i WHERE i.run_id = r.id) AS max_score,
-            (SELECT COUNT(DISTINCT p.journal_id) FROM recommendation_items i JOIN papers p ON p.id = i.paper_id WHERE i.run_id = r.id) AS journal_count
+        &format!("SELECT r.*,
+            (SELECT COUNT(*) FROM recommendation_items i JOIN papers p ON p.id = i.paper_id WHERE i.run_id = r.id AND {}) AS item_count,
+            (SELECT MAX(i.score_snapshot) FROM recommendation_items i JOIN papers p ON p.id = i.paper_id WHERE i.run_id = r.id AND {}) AS max_score,
+            (SELECT COUNT(DISTINCT p.journal_id) FROM recommendation_items i JOIN papers p ON p.id = i.paper_id WHERE i.run_id = r.id AND {}) AS journal_count
          FROM recommendation_runs r WHERE r.id = ?1",
+         DISCOVERY_MEMBERSHIP_PREDICATE,
+         DISCOVERY_MEMBERSHIP_PREDICATE,
+         DISCOVERY_MEMBERSHIP_PREDICATE),
         params![id],
         row_to_recommendation_run,
     )
@@ -6629,13 +6786,17 @@ pub fn get_recommendation_run(conn: &Connection, id: i64) -> Result<Option<Recom
 }
 
 pub fn list_recommendation_runs(conn: &Connection) -> Result<Vec<RecommendationRun>> {
-    let mut stmt = conn.prepare(
+    let sql = format!(
         "SELECT r.*,
-            (SELECT COUNT(*) FROM recommendation_items i WHERE i.run_id = r.id) AS item_count,
-            (SELECT MAX(score_snapshot) FROM recommendation_items i WHERE i.run_id = r.id) AS max_score,
-            (SELECT COUNT(DISTINCT p.journal_id) FROM recommendation_items i JOIN papers p ON p.id = i.paper_id WHERE i.run_id = r.id) AS journal_count
+            (SELECT COUNT(*) FROM recommendation_items i JOIN papers p ON p.id = i.paper_id WHERE i.run_id = r.id AND {}) AS item_count,
+            (SELECT MAX(i.score_snapshot) FROM recommendation_items i JOIN papers p ON p.id = i.paper_id WHERE i.run_id = r.id AND {}) AS max_score,
+            (SELECT COUNT(DISTINCT p.journal_id) FROM recommendation_items i JOIN papers p ON p.id = i.paper_id WHERE i.run_id = r.id AND {}) AS journal_count
          FROM recommendation_runs r ORDER BY r.cycle_key DESC, r.id DESC",
-    )?;
+        DISCOVERY_MEMBERSHIP_PREDICATE,
+        DISCOVERY_MEMBERSHIP_PREDICATE,
+        DISCOVERY_MEMBERSHIP_PREDICATE,
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], row_to_recommendation_run)?;
     rows.collect()
 }
@@ -6989,13 +7150,26 @@ pub fn papers_needing_tag_scores(
     Ok(out)
 }
 
+pub fn papers_needing_tag_scores_in_discovery(
+    conn: &Connection,
+    tags: &[(i64, String, String)],
+) -> Result<Vec<i64>> {
+    let ids = papers_needing_tag_scores(conn, tags)?;
+    discovery_eligible_ids(conn, &ids)
+}
+
 /// 含指定 tag 名（removed/disabled）的 paper id 列表（本地重算用）。
 pub fn paper_ids_with_tag_names(conn: &Connection, removed: &[String], disabled: &[String]) -> Result<Vec<i64>> {
     let names: Vec<&str> = removed.iter().chain(disabled.iter()).map(|s| s.as_str()).collect();
     if names.is_empty() {
         return Ok(Vec::new());
     }
-    let mut stmt = conn.prepare("SELECT id, tag_matches_json FROM papers WHERE tag_matches_json IS NOT NULL")?;
+    let sql = format!(
+        "SELECT p.id, p.tag_matches_json FROM papers p
+         WHERE p.tag_matches_json IS NOT NULL AND {}",
+        DISCOVERY_MEMBERSHIP_PREDICATE
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
     let mut out = Vec::new();
     for row in rows {

@@ -90,6 +90,7 @@ pub fn refresh_current_recommendations(
     let sql = format!(
         "SELECT p.id, COALESCE(p.total_score, 0) FROM papers p
          WHERE p.analysis_status = 'analysisSucceeded'
+           AND {}
            AND p.total_score IS NOT NULL AND p.is_ignored = 0
            AND COALESCE(TRIM(p.chinese_title), '') != ''
            AND COALESCE(TRIM(p.chinese_abstract), '') != ''
@@ -97,8 +98,9 @@ pub fn refresh_current_recommendations(
            AND p.evidence_hash IS NOT NULL
            AND p.content_kind NOT IN ({})
            AND NOT EXISTS (SELECT 1 FROM recommendation_items ri WHERE ri.paper_id = p.id)
-         ORDER BY p.total_score DESC, p.published_date DESC, p.id DESC",
-        excluded
+        ORDER BY p.total_score DESC, p.published_date DESC, p.id DESC",
+        db::DISCOVERY_MEMBERSHIP_PREDICATE,
+        excluded,
     );
     let mut stmt = tx
         .prepare(&sql)
@@ -132,6 +134,12 @@ pub fn run_items_with_papers(
     let items = db::list_recommendation_items(conn, run_id).map_err(|e| e.to_string())?;
     let mut out = Vec::new();
     for it in items {
+        // Keep historical rows intact in SQLite, but never render a
+        // recommendation that cannot prove Discovery membership (for
+        // example an old Library-only external-PDF leak).
+        if !db::is_discovery_eligible(conn, it.paper_id).map_err(|e| e.to_string())? {
+            continue;
+        }
         let paper = db::get_paper(conn, it.paper_id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("论文 {} 不存在", it.paper_id))?;

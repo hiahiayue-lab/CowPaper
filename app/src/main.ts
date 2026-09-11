@@ -3524,6 +3524,13 @@ async function refreshWorkState() {
   renderPendingCount();
 }
 
+function syncDiscoveryActionVisibility(): void {
+  const aiBtn = $("btn-ai-main") as HTMLButtonElement;
+  const showDiscoveryActions = activeWorkspace === "discovery";
+  aiBtn.hidden = !showDiscoveryActions;
+  aiBtn.setAttribute("aria-hidden", showDiscoveryActions ? "false" : "true");
+}
+
 async function loadActivity() {
   try {
     activity = await invoke<ActivityState>("get_activity_state");
@@ -3548,6 +3555,10 @@ function renderWorkCenter() {
   const statusEl = $("work-status");
   const syncBtn = $("btn-sync-main") as HTMLButtonElement;
   const aiBtn = $("btn-ai-main") as HTMLButtonElement;
+  // AI analysis is a Discovery workflow. Keep the control out of Library and
+  // Settings at the rendering boundary as well as in CSS, so a rerender can
+  // never expose a Discovery action in another workspace.
+  syncDiscoveryActionVisibility();
   const a = activity;
   const s = aiStatus;
   const syncRunning = !!(a.syncBatch && a.syncBatch.status === "running");
@@ -3874,6 +3885,7 @@ function doSwitch(name: string, options: { preserveLibraryState?: boolean; refre
   activeWorkspace = isSettings ? "settings" : isLibrary ? "library" : "discovery";
   document.body.classList.toggle("library-workspace", isLibrary);
   document.body.classList.toggle("settings-workspace", isSettings);
+  syncDiscoveryActionVisibility();
   const librarySearchToolbar = ensureLibrarySearchToolbar();
   if (librarySearchToolbar) librarySearchToolbar.style.display = isLibrary ? "flex" : "none";
   document.querySelectorAll(".workspace-nav, .settings-nav").forEach((nav) => nav.classList.toggle("hidden", (nav as HTMLElement).dataset.workspaceNav !== activeWorkspace));

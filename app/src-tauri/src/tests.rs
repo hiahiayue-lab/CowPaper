@@ -271,6 +271,8 @@ fn test_queue_db_mechanics() {
             _ => panic!("expected new"),
         }
     }
+    let discovery_batch = db::create_sync_batch(&conn, "test").unwrap();
+    db::add_sync_batch_papers(&conn, discovery_batch, &ids, &[], &[]).unwrap();
     assert_eq!(db::count_pending_papers(&conn).unwrap(), 5);
 
     // 入队 → queued
@@ -389,6 +391,7 @@ fn test_ai_queue_scenarios() {
     {
         let c = conn.lock().unwrap();
         let jid = db::insert_journal(&c, "J", Some("0025-1909"), None, None, None).unwrap();
+        let mut paper_ids = Vec::new();
         for i in 0..20 {
             let cand = candidate(
                 Some(&format!("10.1000/q{}", i)),
@@ -396,8 +399,13 @@ fn test_ai_queue_scenarios() {
                 Some("abs"),
                 Some("crossref"),
             );
-            db::upsert_paper(&c, jid, &cand).unwrap();
+            match db::upsert_paper(&c, jid, &cand).unwrap() {
+                UpsertOutcome::New(id) => paper_ids.push(id),
+                _ => panic!("expected new paper"),
+            }
         }
+        let batch = db::create_sync_batch(&c, "test").unwrap();
+        db::add_sync_batch_papers(&c, batch, &paper_ids, &[], &[]).unwrap();
     }
     handle.manage(conn.clone());
     let (cmd_tx, cmd_rx) = mpsc::channel();
@@ -1583,6 +1591,8 @@ fn test_daily_first_seen_membership_is_stable() {
     let conn = mem_db();
     let jid = db::insert_journal(&conn, "J", Some("0025-1909"), None, None, None).unwrap();
     let id = match db::upsert_paper(&conn, jid, &candidate(Some("10.1000/daily"), "Daily", None, None)).unwrap() { UpsertOutcome::New(id) => id, _ => panic!() };
+    let batch = db::create_sync_batch(&conn, "test").unwrap();
+    db::add_sync_batch_papers(&conn, batch, &[id], &[], &[]).unwrap();
     conn.execute("UPDATE papers SET first_seen_cycle='2026-08-27' WHERE id=?1", params![id]).unwrap();
     assert_eq!(db::list_papers_for_first_seen_cycle(&conn, "2026-08-27", true).unwrap().len(), 1);
     db::merge_recovered_abstract(&conn, id, "crossref", "A complete abstract with sufficient research detail and results.").unwrap();
@@ -1623,6 +1633,9 @@ fn test_daily_summary_aggregates_papers_and_recommendations_independently() {
         ).unwrap();
         day_26_recommendations.push(conn.last_insert_rowid());
     }
+    let discovery_batch = db::create_sync_batch(&conn, "test").unwrap();
+    db::add_sync_batch_papers(&conn, discovery_batch, &day_27, &[], &[]).unwrap();
+    db::add_sync_batch_papers(&conn, discovery_batch, &day_26_recommendations, &[], &[]).unwrap();
     for (day, ids, count) in [("2026-08-27", &day_27, 221usize), ("2026-08-26", &day_26_recommendations, 111usize)] {
         let run = db::create_recommendation_run(&conn, day, "finalized").unwrap();
         for (rank, paper_id) in ids.iter().take(count).enumerate() {
@@ -1638,6 +1651,62 @@ fn test_daily_summary_aggregates_papers_and_recommendations_independently() {
     assert_eq!((day_27.paper_count, day_27.recommendation_count, day_27.missing_count), (372, 221, 83));
     let day_26 = summaries.iter().find(|s| s.cycle_key == "2026-08-26").unwrap();
     assert_eq!((day_26.paper_count, day_26.recommendation_count, day_26.missing_count), (34, 111, 20));
+}
+
+#[test]
+fn external_library_papers_require_explicit_discovery_membership() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "External PDFs", Some("0025-1909"), None, None, None).unwrap();
+    let mut external = candidate(
+        Some("10.1000/external-library-only"),
+        "External Library Paper",
+        Some("A complete abstract imported from a local PDF."),
+        Some("pdf_structured"),
+    );
+    external.discovery_source = "external_pdf_import".into();
+    let external_id = match db::upsert_paper(&conn, jid, &external).unwrap() {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected external paper to be new"),
+    };
+    db::add_paper_to_library(&conn, external_id, &[], &[], "external_pdf_import").unwrap();
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    assert!(!db::is_discovery_eligible(&conn, external_id).unwrap());
+    assert!(db::list_discovery_papers(&conn, None, 100).unwrap().is_empty());
+    assert!(db::list_papers_for_first_seen_cycle(&conn, &today, false).unwrap().is_empty());
+    assert!(db::list_current_missing_papers_for_cycle(&conn, &today).unwrap().is_empty());
+    assert!(db::list_pending_discovery_papers(&conn).unwrap().is_empty());
+    assert_eq!(db::count_pending_papers_in_discovery(&conn).unwrap(), 0);
+    let tag = db::add_tag(&conn, "External Test Tag", Some("test")).unwrap();
+    assert!(db::papers_needing_tag_scores_in_discovery(
+        &conn,
+        &[(tag.id, "External Test Tag".into(), "test".into())],
+    ).unwrap().is_empty());
+
+    conn.execute(
+        "UPDATE papers SET analysis_status='analysisSucceeded', chinese_title='中文', chinese_abstract='摘要', one_sentence_summary='句', total_score=9.0, evidence_hash='external-test' WHERE id=?1",
+        params![external_id],
+    ).unwrap();
+    let run = crate::recommendation::refresh_current_recommendations(&conn, &chrono::Local::now(), "09:00").unwrap();
+    assert!(!db::list_recommendation_items(&conn, run).unwrap().iter().any(|item| item.paper_id == external_id));
+
+    // A legacy leaked recommendation row must remain preserved in SQLite but
+    // must not make an external-only paper render as Discovery content.
+    let legacy_run = db::create_recommendation_run(&conn, "legacy-external", "finalized").unwrap();
+    conn.execute(
+        "INSERT INTO recommendation_items (run_id,paper_id,rank,score_snapshot,added_at) VALUES (?1,?2,1,1.0,?3)",
+        params![legacy_run, external_id, db::now_utc()],
+    ).unwrap();
+    assert!(!db::is_discovery_eligible(&conn, external_id).unwrap());
+    assert!(crate::recommendation::run_items_with_papers(&conn, legacy_run).unwrap().is_empty());
+
+    // The same canonical paper becomes a valid Discovery member only when a
+    // real sync batch proves it; Library membership does not create a second
+    // canonical row or remove the existing Discovery membership.
+    let discovery_batch = db::create_sync_batch(&conn, "test").unwrap();
+    db::add_sync_batch_papers(&conn, discovery_batch, &[external_id], &[], &[]).unwrap();
+    assert!(db::is_discovery_eligible(&conn, external_id).unwrap());
+    assert_eq!(db::list_discovery_papers(&conn, None, 100).unwrap().len(), 1);
+    assert_eq!(db::list_library_papers_scoped(&conn, "all", None, &[], 100).unwrap().len(), 1);
 }
 
 #[test]
@@ -1823,6 +1892,8 @@ fn test_work_state_consistency() {
             _ => panic!("expected new"),
         }
     }
+    let initial_discovery_batch = db::create_sync_batch(&conn, "manual").unwrap();
+    db::add_sync_batch_papers(&conn, initial_discovery_batch, &ids, &[], &[]).unwrap();
     let st = crate::build_activity_state(&conn).unwrap();
     assert_eq!(st.pending_analysis, 7, "A: 7 篇待分析 → pendingAnalysis=7");
     assert_eq!(st.analysis_failed, 0, "A: analysisFailed=0");
@@ -2673,6 +2744,8 @@ fn test_scoped_abstract_recovery_only_accepts_current_view_ids() {
     let ids: Vec<i64> = (1..=6).map(|n| match db::upsert_paper(
         &conn, jid, &candidate(Some(&format!("10.1000/recovery-{}", n)), &format!("P{}", n), None, None),
     ).unwrap() { UpsertOutcome::New(id) => id, _ => unreachable!() }).collect();
+    let discovery_batch = db::create_sync_batch(&conn, "test").unwrap();
+    db::add_sync_batch_papers(&conn, discovery_batch, &ids, &[], &[]).unwrap();
 
     // The page decides membership (today/day A/day B); the backend only
     // validates those submitted IDs and cannot expand the scope to all rows.
@@ -2692,6 +2765,8 @@ fn test_scoped_abstract_recovery_dedupes_and_caps_to_fifty_ids() {
     let ids: Vec<i64> = (0..61).map(|n| match db::upsert_paper(
         &conn, jid, &candidate(Some(&format!("10.1000/scoped-{}", n)), &format!("P{}", n), None, None),
     ).unwrap() { UpsertOutcome::New(id) => id, _ => unreachable!() }).collect();
+    let discovery_batch = db::create_sync_batch(&conn, "test").unwrap();
+    db::add_sync_batch_papers(&conn, discovery_batch, &ids, &[], &[]).unwrap();
     let mut requested = ids.clone();
     requested.extend_from_slice(&ids[..3]);
     let recoverable = db::list_recoverable_paper_ids(&conn, &requested).unwrap();
@@ -3460,6 +3535,8 @@ fn seed_paper_with_score(conn: &rusqlite::Connection, jid: i64, doi: &str, title
         UpsertOutcome::New(i) => i,
         _ => panic!("expected new"),
     };
+    let batch = db::create_sync_batch(conn, "test").unwrap();
+    db::add_sync_batch_papers(conn, batch, &[id], &[], &[]).unwrap();
     db::save_analysis(conn, id, "中文", "摘要", "句", "[]", score, "m", "v1", &format!("H-{}", id)).unwrap();
     id
 }
@@ -4646,6 +4723,8 @@ fn test_r7_research_article_missing_is_recoverable() {
     let p = db::get_paper(&conn, id).unwrap().unwrap();
     assert_eq!(p.content_kind, crate::content_kind::CK_RESEARCH_ARTICLE);
     assert_eq!(p.abstract_status, crate::content_kind::ABST_MISSING_RECOVERABLE);
+    let discovery_batch = db::create_sync_batch(&conn, "test").unwrap();
+    db::add_sync_batch_papers(&conn, discovery_batch, &[id], &[], &[]).unwrap();
     // 在 recovery 候选集中
     let ids = db::list_recoverable_paper_ids(&conn, &[id]).unwrap();
     assert_eq!(ids, vec![id]);
@@ -4671,6 +4750,8 @@ fn test_r7_news_is_not_expected_and_excluded_from_recovery() {
         UpsertOutcome::New(id) => id,
         _ => panic!("expected new paper"),
     };
+    let discovery_batch = db::create_sync_batch(&conn, "test").unwrap();
+    db::add_sync_batch_papers(&conn, discovery_batch, &[id, rid], &[], &[]).unwrap();
     let ids = db::list_recoverable_paper_ids(&conn, &[id, rid]).unwrap();
     assert_eq!(ids, vec![rid], "bulk recovery 必须只包含可恢复论文");
 }
@@ -4719,6 +4800,8 @@ fn test_r7_review_keeps_recommendation_eligibility_news_gated() {
     let p = db::get_paper(&conn, rev).unwrap().unwrap();
     assert_eq!(p.content_kind, crate::content_kind::CK_REVIEW);
     assert_eq!(p.abstract_status, crate::content_kind::ABST_MISSING_RECOVERABLE);
+    let discovery_batch = db::create_sync_batch(&conn, "test").unwrap();
+    db::add_sync_batch_papers(&conn, discovery_batch, &[rev, news, res], &[], &[]).unwrap();
     // 模拟 Full AI 已完成（DB 状态齐全），验证推荐资格门控
     for (id, score) in [(rev, 5.0), (news, 9.0), (res, 7.0)] {
         conn.execute(
@@ -4763,6 +4846,8 @@ fn test_r7_nature_landing_page_dc_description_recovery_with_provenance() {
     let id = match db::upsert_paper(&conn, jid, &cand_raw(doi, "Climate Policy", None, Some(&raw))).unwrap() {
         UpsertOutcome::New(id) => id, _ => panic!(),
     };
+    let discovery_batch = db::create_sync_batch(&conn, "test").unwrap();
+    db::add_sync_batch_papers(&conn, discovery_batch, &[id], &[], &[]).unwrap();
     let p0 = db::get_paper(&conn, id).unwrap().unwrap();
     assert_eq!(p0.abstract_status, crate::content_kind::ABST_UNKNOWN, "broad journal-article → unknown");
     assert_eq!(db::list_recoverable_paper_ids(&conn, &[id]).unwrap(), vec![id], "unknown 仍允许 recovery");
@@ -4851,6 +4936,8 @@ fn test_r7_bulk_recovery_scope_excludes_not_expected() {
         };
         ids.push(id);
     }
+    let discovery_batch = db::create_sync_batch(&conn, "test").unwrap();
+    db::add_sync_batch_papers(&conn, discovery_batch, &ids, &[], &[]).unwrap();
     let eligible = db::list_recoverable_paper_ids(&conn, &ids).unwrap();
     assert_eq!(eligible.len(), 2, "journal-article(unknown) 和 review-article 可恢复；news/editorial 排除");
     let kinds: Vec<String> = eligible.iter().map(|id| db::get_paper(&conn, *id).unwrap().unwrap().content_kind).collect();
