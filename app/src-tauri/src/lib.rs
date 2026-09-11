@@ -39,9 +39,9 @@ const AUTO_SYNC_MIN_INTERVAL: chrono::Duration = chrono::Duration::minutes(30);
 type Db = Arc<Mutex<Connection>>;
 type Secure = Arc<dyn SecureStore>;
 
-/// One process-wide permit for title-only translation. Both automatic backlog
-/// draining and the manual UI command use this guard, so the same paper can
-/// never be sent to DeepSeek by two workers at once.
+/// One process-wide permit for explicitly requested title-only translation
+/// batches, so the same paper can never be sent to DeepSeek by two workers at
+/// once.
 #[derive(Clone, Default)]
 struct TitleTranslationGate(Arc<Mutex<bool>>);
 
@@ -1722,9 +1722,10 @@ fn start_ai(
         .map_err(|e| e.to_string())
 }
 
-/// Schedule title-only translations for missing-abstract papers. This is kept
-/// outside the full AnalysisBatch state machine because those papers must stay
-/// waitingForAbstract and ineligible for recommendation.
+/// Run an explicitly requested title-only translation batch for
+/// missing-abstract papers. This is kept outside the full AnalysisBatch state
+/// machine because those papers must stay waitingForAbstract and ineligible
+/// for recommendation. There is no automatic caller for this command.
 #[tauri::command]
 fn translate_missing_titles(
     app: AppHandle,
@@ -1734,8 +1735,8 @@ fn translate_missing_titles(
     store: State<Secure>,
     gate: State<TitleTranslationGate>,
 ) -> Result<i64, String> {
-    // Acquire before selecting candidates so a manual click cannot race an
-    // automatic drain between selection and worker startup.
+    // Acquire before selecting candidates so two explicit manual requests
+    // cannot race between selection and worker startup.
     let permit = gate.acquire()?;
     let api_key = store.get().map_err(|e| e.to_string())?
         .filter(|key| !key.is_empty())
@@ -1885,26 +1886,41 @@ fn translate_library_abstract(
 }
 
 #[tauri::command]
-fn translate_library_title(paper_id: i64, model: String, state: State<Db>, store: State<Secure>) -> Result<models::LibraryItemMetadata, String> {
+fn translate_library_title(
+    paper_id: i64,
+    source_english_title: String,
+    model: String,
+    state: State<Db>,
+    store: State<Secure>,
+) -> Result<models::LibraryItemMetadata, String> {
+    let title = source_english_title.trim().to_string();
+    if title.is_empty() {
+        return Err("请先填写英文标题".into());
+    }
     let api_key = store.get().map_err(|e| e.to_string())?
         .filter(|s| !s.trim().is_empty()).ok_or_else(|| "未保存 API Key，请先在设置中保存".to_string())?;
-    let title = {
+    {
         let conn = state.inner().lock().unwrap();
-        let paper = db::get_library_paper(&conn, paper_id).map_err(|e| e.to_string())?
+        db::get_library_paper(&conn, paper_id).map_err(|e| e.to_string())?
             .ok_or_else(|| "论文不在文献库中".to_string())?;
-        if paper.effective_chinese_title.as_deref().is_some_and(|s| !s.trim().is_empty()) {
-            return Err("已有中文标题，无需重复翻译".into());
-        }
-        paper.effective_title.filter(|s| !s.trim().is_empty()).ok_or_else(|| "没有可翻译的标题".to_string())?
-    };
+    }
+    // The caller supplies the title currently visible in the editor. The
+    // second check prevents a concurrent edit from receiving a translation
+    // for an older title while the request was in flight.
     let translated = api::deepseek::DeepSeek::new().translate_title(&api_key, &model, &title).map_err(|e| e.to_string())?;
     let conn = state.inner().lock().unwrap();
-    db::set_library_title_translation_if_current(&conn, paper_id, &title, &translated)
-        .map_err(|e| match e {
-            rusqlite::Error::InvalidParameterName(name) if name == "english_title_changed" => "英文标题已更改，请重新翻译".to_string(),
-            rusqlite::Error::InvalidParameterName(name) if name == "chinese_title_already_set" => "已有手工中文标题，不会覆盖".to_string(),
-            other => other.to_string(),
-        })
+    let current_title = db::get_library_paper(&conn, paper_id)
+        .map_err(|e| e.to_string())?
+        .and_then(|paper| paper.effective_title)
+        .map(|value| value.trim().to_string());
+    if current_title.as_deref() != Some(title.as_str()) {
+        return Err("英文标题已更改，请重新翻译".into());
+    }
+    // This command is only reachable through an explicit user action, so an
+    // existing Chinese title may be intentionally replaced by the new
+    // translation. Automatic metadata/import flows never call this command.
+    db::set_library_translation(&conn, paper_id, &translated, true)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

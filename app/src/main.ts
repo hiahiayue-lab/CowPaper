@@ -524,6 +524,7 @@ let librarySearchMatches = new Map<number, LibrarySearchHit>();
 let librarySearchAdapter: LibrarySearchApi | null = null;
 const librarySearchHandledPointerSuggestions = new WeakSet<HTMLElement>();
 const libraryPaperIds = new Set<number>();
+let pendingLibraryTitleTranslation: { paperId: number; source: string; hasDraft: boolean } | null = null;
 type SettingsSection = "general" | "ai" | "pdf" | "library" | "recommend" | "about";
 let activeWorkspace: "discovery" | "library" | "settings" = "discovery";
 let activeViewName = "recommend";
@@ -1966,6 +1967,24 @@ function libraryMetadataInput(item: LibraryPaper): LibraryItemMetadataInput {
   };
 }
 
+function currentLibraryEnglishTitle(paperId: number): { source: string; hasDraft: boolean } {
+  const draftInput = document.querySelector<HTMLInputElement>(
+    `[data-library-inline-input="title"][data-library-inline-paper-id="${paperId}"]`,
+  );
+  if (draftInput) return { source: draftInput.value.trim(), hasDraft: true };
+  const item = libraryPapers.find((candidate) => candidate.paper.id === paperId);
+  const source = item ? libraryEnglishTitle(item) : "";
+  return { source: source === "（无标题）" ? "" : source.trim(), hasDraft: false };
+}
+
+async function persistLibraryEnglishTitle(paperId: number, source: string): Promise<void> {
+  const item = libraryPapers.find((candidate) => candidate.paper.id === paperId);
+  if (!item) throw new Error("论文不在文献库中");
+  const metadata = libraryMetadataInput(item);
+  metadata.titleOverride = source || null;
+  await invoke("set_library_item_metadata", { paperId, metadata });
+}
+
 function beginLibraryInlineEdit(paperId: number, field: LibraryInlineField, button: HTMLElement): void {
   const item = libraryPapers.find((candidate) => candidate.paper.id === paperId);
   if (!item) return;
@@ -1977,6 +1996,7 @@ function beginLibraryInlineEdit(paperId: number, field: LibraryInlineField, butt
   const input = document.createElement(multiline ? "textarea" : "input") as HTMLInputElement & HTMLTextAreaElement;
   input.className = "library-inline-input";
   input.dataset.libraryInlineInput = field;
+  input.dataset.libraryInlinePaperId = String(paperId);
   input.value = libraryInlineCurrentValue(item, field);
   input.placeholder = "清空后恢复原始值";
   if (!multiline) input.type = field === "year" ? "number" : "text";
@@ -2033,6 +2053,14 @@ function beginLibraryInlineEdit(paperId: number, field: LibraryInlineField, butt
   };
   input.addEventListener("keydown", (event) => {
     if (event.key === "Escape") { event.preventDefault(); cancel(); }
+    else if (event.key === "Enter" && event.isComposing) { event.preventDefault(); }
+    else if (event.key === "Enter" && (field === "title" || field === "chineseTitle")) {
+      // Title editors are intentionally not commit-on-Enter controls. This
+      // keeps focus in the editor and lets IME/text entry finish naturally;
+      // blur or an explicit outside action still persists the draft.
+      event.preventDefault();
+      event.stopPropagation();
+    }
     else if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void save(); }
   });
   input.addEventListener("blur", () => { void save(); }, { once: true });
@@ -2509,7 +2537,9 @@ function renderLibraryInspector(item: LibraryPaper) {
   const chineseTitle = libraryChineseTitle(item);
   const authors = authorText(libraryAuthors(item));
   const citation = `${authors}${libraryYear(item) !== "—" ? ` (${libraryYear(item)})` : ""}. ${englishTitle}. ${librarySource(item)}.`;
-  const chineseTitleValue = chineseTitle ? escapeHtml(chineseTitle) : `<button class="inspector-link" data-action="library-translate-title" data-paper-id="${p.id}">翻译中文标题</button>`;
+  const chineseTitleValue = chineseTitle ? escapeHtml(chineseTitle) : '<span class="empty-value">未添加中文标题</span>';
+  const chineseTitleTranslateLabel = chineseTitle ? "重新翻译中文标题" : "翻译中文标题";
+  const chineseTitleTranslate = `<button class="inspector-link" data-action="library-translate-title" data-paper-id="${p.id}" data-idle-label="${chineseTitleTranslateLabel}">${chineseTitleTranslateLabel}</button>`;
   const doi = libraryDoi(item);
   const url = libraryUrl(item);
   const doiValue = doi ? `<span>${escapeHtml(doi)}</span>` : '<span class="empty-value">未设置 DOI</span>';
@@ -2518,7 +2548,7 @@ function renderLibraryInspector(item: LibraryPaper) {
   const metadataRefreshDisabled = metadataRefreshBusy || !p.normalizedDoi;
   const metadataRefreshTitle = p.normalizedDoi ? "按 DOI 精确更新公开引用元数据；手动修改会保留" : "需要 DOI 才能精确更新引用元数据";
   $("library-inspector").innerHTML = `<div class="inspector-tab">元数据</div><div class="inspector-head"><span class="muted small">期刊论文</span><button type="button" class="ghost small danger" data-action="library-remove" data-paper-id="${p.id}">移出文献库</button></div>
-    <header class="inspector-title-block"><div class="inspector-title-line"><h2 title="${escapeHtml(englishTitle)}">${escapeHtml(englishTitle)}</h2>${libraryInlineEditButton(p.id, "title", "Title")}</div>${libraryInspectorRow("中文标题", chineseTitleValue, libraryInlineEditButton(p.id, "chineseTitle", "中文标题"), "inspector-hero-row")}${libraryInspectorRow("作者", escapeHtml(authors), libraryInlineEditButton(p.id, "authors", "作者"), "inspector-hero-row")}</header>
+    <header class="inspector-title-block"><div class="inspector-title-line"><h2 title="${escapeHtml(englishTitle)}">${escapeHtml(englishTitle)}</h2>${libraryInlineEditButton(p.id, "title", "Title")}</div>${libraryInspectorRow("中文标题", chineseTitleValue, `${chineseTitleTranslate}${libraryInlineEditButton(p.id, "chineseTitle", "中文标题")}`, "inspector-hero-row")}${libraryInspectorRow("作者", escapeHtml(authors), libraryInlineEditButton(p.id, "authors", "作者"), "inspector-hero-row")}</header>
     <section class="inspector-group inspector-metadata"><div class="inspector-section-head"><h3>引用</h3><div class="inspector-section-actions"><span class="muted small">公开来源</span><button type="button" class="ghost small" data-action="library-refresh-metadata" data-paper-id="${p.id}" title="${escapeHtml(metadataRefreshTitle)}"${metadataRefreshDisabled ? " disabled" : ""}>${metadataRefreshBusy ? "更新中…" : "刷新元数据"}</button></div></div><div class="inspector-rows">${libraryInspectorRow("期刊", escapeHtml(librarySource(item)), libraryInlineEditButton(p.id, "source", "期刊"))}${libraryInspectorRow("出版社", escapeHtml(item.effectivePublisher || "—"), libraryInlineEditButton(p.id, "publisher", "出版社"))}${libraryInspectorRow("年份", escapeHtml(libraryYear(item)), libraryInlineEditButton(p.id, "year", "年份"))}${libraryInspectorRow("月份日期", escapeHtml(item.effectivePublicationDate || p.publishedDate || "—"), libraryInlineEditButton(p.id, "publicationDate", "出版日期"))}${libraryInspectorRow("卷", escapeHtml(item.effectiveVolume || "—"), libraryInlineEditButton(p.id, "volume", "卷"))}${libraryInspectorRow("期", escapeHtml(item.effectiveIssue || "—"), libraryInlineEditButton(p.id, "issue", "期"))}${libraryInspectorRow("页码", escapeHtml(item.effectivePages || "—"), libraryInlineEditButton(p.id, "pages", "页码"))}${libraryInspectorRow("DOI", doiValue, libraryInlineEditButton(p.id, "doi", "DOI"))}${libraryInspectorRow("URL", urlValue, libraryInlineEditButton(p.id, "url", "URL"))}</div></section>
     <section class="inspector-group inspector-library"><div class="inspector-section-head"><h3>文库</h3></div><div class="inspector-rows">${libraryInspectorRow("备注", `<span class="${note ? "" : "empty-value"}">${escapeHtml(note || "未添加备注")}</span>`, libraryInlineEditButton(p.id, "note", "备注"))}${renderLibraryRelations(item, "collection")}${renderLibraryRelations(item, "tag")}</div></section>
     <section class="inspector-group inspector-abstract"><div class="inspector-section-head"><h3>摘要</h3><div class="inspector-section-actions"><div class="inspector-language-toggle" role="group" aria-label="摘要语言"><button class="seg ${abstractLanguage === "zh" ? "on" : ""}" data-action="library-abstract-lang" data-lang="zh">中文</button><button class="seg ${abstractLanguage === "en" ? "on" : ""}" data-action="library-abstract-lang" data-lang="en">English</button></div>${libraryInlineEditButton(p.id, abstractLanguage === "zh" ? "chineseAbstract" : "abstract", abstractLanguage === "zh" ? "中文摘要" : "摘要")}</div></div><p class="inspector-abstract-text${abstractText ? "" : " empty-value"}">${escapeHtml(abstractText || "暂无摘要")}</p>${abstractTranslate}</section>
@@ -3908,7 +3938,6 @@ async function requireKey(): Promise<boolean> {
  * restrict this to the current sync result.
  */
 let missingTitleBacklogInFlight = false;
-let missingTitleBacklogDraining = false;
 let missingTitleLastProgressAt = 0;
 let missingTitleLivenessTimer: number | null = null;
 // Rust bounds one title request at 45 seconds and retries it at most once.
@@ -3929,7 +3958,6 @@ function releaseStaleMissingTitleState(): void {
   // This only releases stale frontend state. The Rust process-wide permit
   // remains authoritative, so a later invoke cannot create a second worker.
   missingTitleBacklogInFlight = false;
-  missingTitleBacklogDraining = false;
   clearMissingTitleLivenessWatch();
   setStatus("标题翻译任务长时间无进度；前端状态已释放，后端仍会防止重复任务", "error");
   console.error("title-only translation liveness timeout");
@@ -3942,11 +3970,10 @@ function startMissingTitleLivenessWatch(): void {
 
 function releaseMissingTitleState(): void {
   missingTitleBacklogInFlight = false;
-  missingTitleBacklogDraining = false;
   clearMissingTitleLivenessWatch();
 }
 
-async function startMissingTitleTranslation(drainBacklog: boolean): Promise<number> {
+async function startMissingTitleTranslation(): Promise<number> {
   if (missingTitleBacklogInFlight) {
     setStatus("标题翻译正在进行中…", "running");
     return 0;
@@ -3956,7 +3983,6 @@ async function startMissingTitleTranslation(drainBacklog: boolean): Promise<numb
   missingTitleBacklogInFlight = true;
   missingTitleLastProgressAt = Date.now();
   startMissingTitleLivenessWatch();
-  if (drainBacklog) missingTitleBacklogDraining = true;
   try {
     const scheduled = await invoke<number>("translate_missing_titles", { paperIds: null, model: getModel() });
     if (scheduled) {
@@ -3973,11 +3999,6 @@ async function startMissingTitleTranslation(drainBacklog: boolean): Promise<numb
     console.error("translate_missing_titles invoke failed", err);
     return 0;
   }
-}
-
-async function scheduleMissingTitleBacklog(): Promise<number> {
-  if (!settings?.autoAnalyzeNew) return 0;
-  return startMissingTitleTranslation(true);
 }
 
 /// 统一的 start_ai 调用（所有入口必须走这里）：带 trigger + 错误捕获 + 即时反馈。
@@ -4383,33 +4404,22 @@ async function setupListeners() {
       });
       await refreshWorkState();
     }
-    // Missing abstracts never enter full analysis, but title translation is
-    // safe and useful without an abstract. It remains a separate, title-only
-    // operation and therefore cannot affect recommendation eligibility.
-    await scheduleMissingTitleBacklog();
   });
 
   await listen("title-translation://done", async (e) => {
     const r = e.payload as { translated: number; failed: number; translatedIds?: number[]; errors?: string[] };
-    const continueDraining = missingTitleBacklogDraining && r.translated > 0 && r.failed === 0;
     // Release before any rendering work: a listener/rendering failure must
-    // never leave the automatic backlog permanently suppressed.
+    // never leave the explicit manual batch permanently suppressed.
     releaseMissingTitleState();
-    try {
-      await loadPapers();
-      // The title-only worker may finish while Today or a historical missing
-      // list is visible. Rebuild that visible source immediately so users do
-      // not have to switch tabs, sync again, or restart to see chineseTitle.
-      await refreshRecommendations();
-      if (historyCycleKey && historyTab === "missing") await renderRecommendHistory();
-      if (r.translated || r.failed) {
-        const firstError = r.errors?.[0];
-        setStatus(`标题翻译完成：${r.translated}${r.failed ? ` · 失败 ${r.failed}${firstError ? `：${firstError}` : ""}` : ""}`, r.failed ? "error" : "done");
-      }
-    } finally {
-      // Only a fully successful batch drains further. A failure stops this
-      // run and leaves failed papers eligible for a later launch/sync/manual retry.
-      if (continueDraining) window.setTimeout(() => { void scheduleMissingTitleBacklog(); }, 0);
+    await loadPapers();
+    // The title-only worker may finish while Today or a historical missing
+    // list is visible. Rebuild that visible source immediately so users do
+    // not have to switch tabs, sync again, or restart to see chineseTitle.
+    await refreshRecommendations();
+    if (historyCycleKey && historyTab === "missing") await renderRecommendHistory();
+    if (r.translated || r.failed) {
+      const firstError = r.errors?.[0];
+      setStatus(`标题翻译完成：${r.translated}${r.failed ? ` · 失败 ${r.failed}${firstError ? `：${firstError}` : ""}` : ""}`, r.failed ? "error" : "done");
     }
   });
   await listen("title-translation://started", (e) => {
@@ -5087,12 +5097,28 @@ async function setupListeners() {
     }
     const translateTitle = t.closest<HTMLButtonElement>("[data-action='library-translate-title']");
     if (translateTitle) {
+      const paperId = Number(translateTitle.dataset.paperId);
+      const captured = pendingLibraryTitleTranslation?.paperId === paperId ? pendingLibraryTitleTranslation : null;
+      pendingLibraryTitleTranslation = null;
+      const current = captured || currentLibraryEnglishTitle(paperId);
+      if (!current.source) {
+        setStatus("请先填写英文标题", "error");
+        return;
+      }
       if (!(await hasKey())) { setStatus("请先在设置中保存 DeepSeek API Key", "error"); return; }
-      translateTitle.disabled = true; translateTitle.textContent = "翻译中…";
+      translateTitle.disabled = true;
+      translateTitle.textContent = "翻译中…";
       try {
-        await invoke("translate_library_title", { paperId: Number(translateTitle.dataset.paperId), model: getModel() });
-        await loadLibraryData(libraryView); setStatus("中文标题已保存", "done");
-      } catch (error) { setStatus(`中文标题翻译失败：${String(error)}`, "error"); translateTitle.disabled = false; translateTitle.textContent = "翻译中文标题"; }
+        if (current.hasDraft) await persistLibraryEnglishTitle(paperId, current.source);
+        setStatus("正在翻译中文标题…", "running");
+        await invoke("translate_library_title", { paperId, sourceEnglishTitle: current.source, model: getModel() });
+        await loadLibraryData(libraryView);
+        setStatus("中文标题已更新", "done");
+      } catch (error) {
+        setStatus(`中文标题翻译失败：${String(error)}`, "error");
+        translateTitle.disabled = false;
+        translateTitle.textContent = translateTitle.dataset.idleLabel || "翻译中文标题";
+      }
       return;
     }
     if (t.closest("[data-action='library-refresh']")) { await loadLibraryData(libraryView); return; }
@@ -5325,7 +5351,7 @@ async function setupListeners() {
       return;
     }
     if (t.closest("[data-action='translate-missing-titles']")) {
-      const scheduled = await startMissingTitleTranslation(false);
+      const scheduled = await startMissingTitleTranslation();
       if (!scheduled && !missingTitleBacklogInFlight) setStatus("没有需要翻译的缺摘要论文标题", "done");
       return;
     }
@@ -5569,6 +5595,17 @@ async function setupListeners() {
 
 window.addEventListener("DOMContentLoaded", () => {
   $("btn-settings-global").addEventListener("click", () => switchView("settings"));
+  // Capture the title before the editor's blur handler can rerender the
+  // Inspector. This makes clicking Translate reliable even with an unsaved
+  // English-title draft still focused.
+  document.addEventListener("pointerdown", (ev) => {
+    const translate = (ev.target as HTMLElement).closest<HTMLButtonElement>("[data-action='library-translate-title']");
+    if (!translate) return;
+    const paperId = Number(translate.dataset.paperId);
+    if (!Number.isInteger(paperId)) return;
+    const current = currentLibraryEnglishTitle(paperId);
+    pendingLibraryTitleTranslation = { paperId, source: current.source, hasDraft: current.hasDraft };
+  }, true);
   document.querySelector<HTMLElement>("[data-action='settings-back']")?.addEventListener("click", (ev) => {
     // Handle the native button directly so returning from Settings does not
     // depend on the document-level action delegation order.
@@ -5646,10 +5683,6 @@ window.addEventListener("DOMContentLoaded", () => {
     await refreshRecommendations();
     renderNextCheck();
     await refreshKeyStatus();
-    // Title-only translations use the same automatic-AI preference as
-    // post-sync analysis. This starts one rate-limited historical backlog
-    // batch even when no new papers are discovered this session.
-    await scheduleMissingTitleBacklog();
     // 启动自动同步（阈值判断在 Rust 端）
     await invoke("maybe_auto_sync").catch(() => {});
   })();

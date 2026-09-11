@@ -12,7 +12,8 @@ pub const PROMPT_VERSION: &str = "v1";
 // ================= 不变式（Round 7 Phase 1，Section 15）=================
 // CowPaper 永远不能：title → DeepSeek → AI 生成 abstract → 保存成真实 abstract。
 // - 两个 AI 入口（analyze_paper_once / tag_only_analyze）都要求真实摘要非空，
-//   否则直接拒绝 —— 缺少摘要的论文只能走 title-only 翻译（只写 chinese_title）。
+//   否则直接拒绝 —— 缺少摘要的论文只能在用户明确请求时走 title-only 翻译
+//   （只写 chinese_title）。
 // - AI 未来只允许：classification / parsing assistance / version matching assistance，
 //   绝不生成缺失摘要。title-only 翻译永远不写 abstract / chinese_abstract。
 // ======================================================================

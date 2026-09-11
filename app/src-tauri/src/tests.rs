@@ -1949,6 +1949,31 @@ fn library_title_translation_uses_effective_title_and_protects_manual_chinese_ti
     assert_eq!(db::get_library_paper(&conn, id).unwrap().unwrap().effective_chinese_title.as_deref(), Some("手工中文标题"));
 }
 
+#[test]
+fn explicit_library_title_translation_can_replace_existing_chinese_title() {
+    let conn = mem_db();
+    let id = test_paper(&conn, "10.1000/manual-title-retranslation", "Current English Title");
+    db::add_paper_to_library(&conn, id, &[], &[], "manual").unwrap();
+    db::set_library_translation(&conn, id, "旧中文标题", true).unwrap();
+
+    // Editing English Title alone never changes an existing Chinese Title.
+    db::set_library_item_metadata(
+        &conn,
+        id,
+        &crate::models::LibraryItemMetadataInput {
+            title_override: Some("A New Current English Title".into()),
+            chinese_title_override: Some("旧中文标题".into()),
+            ..Default::default()
+        },
+    ).unwrap();
+    assert_eq!(db::get_library_paper(&conn, id).unwrap().unwrap().effective_chinese_title.as_deref(), Some("旧中文标题"));
+
+    // This write represents the explicit Translate button path and is the
+    // only path allowed to replace the personal Chinese Title.
+    db::set_library_translation(&conn, id, "新中文标题", true).unwrap();
+    assert_eq!(db::get_library_paper(&conn, id).unwrap().unwrap().effective_chinese_title.as_deref(), Some("新中文标题"));
+}
+
 // ================= Round 5A：Canonical Journal Identity & Collections =================
 
 #[test]
