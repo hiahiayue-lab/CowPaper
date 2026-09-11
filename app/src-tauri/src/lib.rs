@@ -1153,6 +1153,72 @@ fn update_library_item_metadata(
     set_library_item_metadata(paper_id, metadata, state)
 }
 
+/// Refresh one Library row through the existing exact-DOI provider path.
+/// Network work happens before taking the SQLite mutex; applying the results
+/// only touches canonical Paper metadata and never the Library-only edit layer.
+#[tauri::command]
+fn refresh_library_item_metadata(
+    paper_id: i64,
+    state: State<Db>,
+) -> Result<models::LibraryMetadataRefreshResult, String> {
+    let doi = {
+        let conn = state.inner().lock().unwrap();
+        let paper = db::get_library_paper(&conn, paper_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "论文不在文献库中".to_string())?;
+        paper.paper.normalized_doi
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "这篇论文没有可用于精确刷新的 DOI".to_string())?
+    };
+
+    let crossref = api::crossref::Crossref::new(MAILTO);
+    let openalex = api::openalex::OpenAlex::new(MAILTO);
+    let mut candidates = Vec::new();
+    let mut errors = Vec::new();
+    match crossref.work_by_doi(&doi) {
+        Ok(Some(candidate)) => candidates.push(("Crossref".to_string(), candidate)),
+        Ok(None) => {}
+        Err(error) => errors.push(format!("Crossref：{error}")),
+    }
+    match openalex.work_by_doi(&doi) {
+        Ok(Some(candidate)) => candidates.push(("OpenAlex".to_string(), candidate)),
+        Ok(None) => {}
+        Err(error) => errors.push(format!("OpenAlex：{error}")),
+    }
+    if candidates.is_empty() {
+        return Err(if errors.is_empty() {
+            "未找到 DOI 对应的公开元数据".to_string()
+        } else {
+            format!("元数据刷新失败：{}", errors.join("；"))
+        });
+    }
+
+    let conn = state.inner().lock().unwrap();
+    let mut sources = Vec::new();
+    let mut refreshed_fields = Vec::new();
+    for (index, (source, candidate)) in candidates.into_iter().enumerate() {
+        let fields = if index == 0 {
+            db::refresh_library_metadata_from_candidate(&conn, paper_id, &candidate)
+        } else {
+            db::supplement_library_metadata_from_candidate(&conn, paper_id, &candidate)
+        }
+            .map_err(|error| match error {
+                rusqlite::Error::InvalidParameterName(name) if name == "doi_identity" => "provider DOI 与当前论文不一致，未刷新".to_string(),
+                other => other.to_string(),
+            })?;
+        sources.push(source);
+        for field in fields {
+            if !refreshed_fields.contains(&field) {
+                refreshed_fields.push(field);
+            }
+        }
+    }
+    let paper = db::get_library_paper(&conn, paper_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "刷新后无法读取文献库论文".to_string())?;
+    Ok(models::LibraryMetadataRefreshResult { paper, sources, refreshed_fields })
+}
+
 #[tauri::command]
 fn set_library_item_note(
     paper_id: i64,
@@ -2317,6 +2383,7 @@ pub fn run() {
             get_library_item_metadata,
             set_library_item_metadata,
             update_library_item_metadata,
+            refresh_library_item_metadata,
             set_library_item_note,
             clear_library_item_overrides,
             list_paper_attachments,

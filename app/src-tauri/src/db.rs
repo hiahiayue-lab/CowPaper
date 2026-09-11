@@ -2239,6 +2239,140 @@ fn clean_optional_text(value: Option<&str>) -> Option<String> {
     value.map(str::trim).filter(|value| !value.is_empty()).map(str::to_string)
 }
 
+/// Apply one exact-DOI provider result to canonical Paper metadata.
+///
+/// This is deliberately separate from the Library-only metadata layer:
+/// `library_item_metadata` is never written here, so every manual value keeps
+/// precedence in the effective Library projection. Identity is checked before
+/// any write; title/author/year matching is intentionally not a merge path.
+pub(crate) fn refresh_library_metadata_from_candidate(
+    conn: &Connection,
+    paper_id: i64,
+    candidate: &PaperCandidate,
+) -> Result<Vec<String>> {
+    refresh_library_metadata_from_candidate_with_policy(conn, paper_id, candidate, true)
+}
+
+/// Apply a lower-priority exact provider result without replacing fields that
+/// a higher-priority provider already supplied. Abstracts still use the
+/// shared quality selector and may upgrade the canonical abstract.
+pub(crate) fn supplement_library_metadata_from_candidate(
+    conn: &Connection,
+    paper_id: i64,
+    candidate: &PaperCandidate,
+) -> Result<Vec<String>> {
+    refresh_library_metadata_from_candidate_with_policy(conn, paper_id, candidate, false)
+}
+
+fn refresh_library_metadata_from_candidate_with_policy(
+    conn: &Connection,
+    paper_id: i64,
+    candidate: &PaperCandidate,
+    replace_existing: bool,
+) -> Result<Vec<String>> {
+    if !library_item_exists(conn, paper_id)? {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    let current_doi: Option<String> = conn.query_row(
+        "SELECT normalized_doi FROM papers WHERE id=?1",
+        params![paper_id],
+        |row| row.get(0),
+    )?;
+    let same_doi = current_doi.as_deref().and_then(crate::util::normalize_doi)
+        == candidate.normalized_doi.as_deref().and_then(crate::util::normalize_doi);
+    if current_doi.is_none() || candidate.normalized_doi.is_none() || !same_doi {
+        return Err(rusqlite::Error::InvalidParameterName("doi_identity".into()));
+    }
+
+    let before = get_paper(conn, paper_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+    let now = now_utc();
+    if replace_existing || before.title.is_none() {
+        if let Some(title) = clean_optional_text(candidate.title.as_deref()) {
+        conn.execute(
+            "UPDATE papers SET title=?1, title_norm=?2, updated_at=?3 WHERE id=?4",
+            params![title, normalize_title(&title), now, paper_id],
+        )?;
+        }
+    }
+    if (replace_existing || before.authors.is_empty()) && !candidate.authors.is_empty() {
+        let authors_json = serde_json::to_string(&candidate.authors).unwrap_or_else(|_| "[]".to_string());
+        conn.execute("UPDATE papers SET authors_json=?1, updated_at=?2 WHERE id=?3", params![authors_json, now, paper_id])?;
+    }
+    if replace_existing || before.published_date.is_none() {
+        if let Some(value) = candidate.published_date.as_deref() {
+            conn.execute("UPDATE papers SET published_date=?1, updated_at=?2 WHERE id=?3", params![value, now, paper_id])?;
+        }
+    }
+    if replace_existing || before.year.is_none() {
+        if let Some(value) = candidate.year {
+            conn.execute("UPDATE papers SET year=?1, updated_at=?2 WHERE id=?3", params![value, now, paper_id])?;
+        }
+    }
+    if replace_existing || before.url.is_none() {
+        if let Some(value) = candidate.url.as_deref() {
+            conn.execute("UPDATE papers SET url=?1, updated_at=?2 WHERE id=?3", params![value, now, paper_id])?;
+        }
+    }
+    if before.publisher_article_id.is_none() {
+        if let Some(value) = candidate.publisher_article_id.as_deref() {
+            conn.execute("UPDATE papers SET publisher_article_id=?1, updated_at=?2 WHERE id=?3", params![value, now, paper_id])?;
+        }
+    }
+    if before.openalex_work_id.is_none() {
+        if let Some(value) = candidate.openalex_work_id.as_deref() {
+            conn.execute("UPDATE papers SET openalex_work_id=?1, updated_at=?2 WHERE id=?3", params![value, now, paper_id])?;
+        }
+    }
+
+    let publication = publication_metadata(candidate);
+    if replace_existing || before.journal_name.is_none() {
+        if let Some(value) = publication.journal.as_deref() {
+            conn.execute("UPDATE papers SET container_title=?1, updated_at=?2 WHERE id=?3", params![value, now, paper_id])?;
+        }
+    }
+    if replace_existing || before.publisher.is_none() {
+        if let Some(value) = publication.publisher.as_deref() {
+            conn.execute("UPDATE papers SET publisher=?1, updated_at=?2 WHERE id=?3", params![value, now, paper_id])?;
+        }
+    }
+    if replace_existing || before.volume.is_none() {
+        if let Some(value) = publication.volume.as_deref() {
+            conn.execute("UPDATE papers SET volume=?1, updated_at=?2 WHERE id=?3", params![value, now, paper_id])?;
+        }
+    }
+    if replace_existing || before.issue.is_none() {
+        if let Some(value) = publication.issue.as_deref() {
+            conn.execute("UPDATE papers SET issue=?1, updated_at=?2 WHERE id=?3", params![value, now, paper_id])?;
+        }
+    }
+    if replace_existing || before.pages.is_none() {
+        if let Some(value) = publication.pages.as_deref() {
+            conn.execute("UPDATE papers SET pages=?1, updated_at=?2 WHERE id=?3", params![value, now, paper_id])?;
+        }
+    }
+
+    // Reuse the normal provider abstract ledger/quality selector. This also
+    // keeps stale Chinese translations hidden when the canonical abstract
+    // changes, while leaving a manually edited abstract override untouched.
+    merge_abstract(conn, paper_id, candidate)?;
+    insert_source_record(conn, paper_id, &candidate.discovery_source, candidate.source_id.as_deref(), candidate.raw_json.as_deref())?;
+
+    let after = get_paper(conn, paper_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+    let mut fields = Vec::new();
+    if before.title != after.title { fields.push("title".to_string()); }
+    if serde_json::to_string(&before.authors).ok() != serde_json::to_string(&after.authors).ok() { fields.push("authors".to_string()); }
+    if before.journal_name != after.journal_name { fields.push("journal".to_string()); }
+    if before.publisher != after.publisher { fields.push("publisher".to_string()); }
+    if before.published_date != after.published_date { fields.push("publicationDate".to_string()); }
+    if before.year != after.year { fields.push("year".to_string()); }
+    if before.volume != after.volume { fields.push("volume".to_string()); }
+    if before.issue != after.issue { fields.push("issue".to_string()); }
+    if before.pages != after.pages { fields.push("pages".to_string()); }
+    if before.url != after.url { fields.push("url".to_string()); }
+    if before.abstract_text != after.abstract_text { fields.push("abstract".to_string()); }
+    Ok(fields)
+}
+
 fn library_item_metadata_from_row(row: &rusqlite::Row) -> Result<crate::models::LibraryItemMetadata> {
     let authors_override = row
         .get::<_, Option<String>>("authors_override")?

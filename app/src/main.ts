@@ -263,6 +263,12 @@ interface LibraryPaper {
   attachments: PaperAttachment[];
 }
 
+interface LibraryMetadataRefreshResult {
+  paper: LibraryPaper;
+  sources: string[];
+  refreshedFields: string[];
+}
+
 type LibraryInlineField = "title" | "chineseTitle" | "source" | "publisher" | "publicationDate" | "volume" | "issue" | "pages" | "year" | "authors" | "abstract" | "chineseAbstract" | "note" | "doi" | "url";
 
 interface LibraryDropItem {
@@ -528,6 +534,7 @@ let abstractLang: "zh" | "en" = "zh";
 let libraryInspectorAbstractLang: "zh" | "en" = "zh";
 let libraryInspectorCollapsed = false;
 let libraryPdfBusyPaperId: number | null = null;
+let libraryMetadataRefreshBusyPaperId: number | null = null;
 let libraryPdfImportBusy = false;
 let libraryDropTargetPaperId: number | null = null;
 let libraryDropActive = false;
@@ -2505,14 +2512,41 @@ function renderLibraryInspector(item: LibraryPaper) {
   const url = libraryUrl(item);
   const doiValue = doi ? `<span>${escapeHtml(doi)}</span>` : '<span class="empty-value">未设置 DOI</span>';
   const urlValue = url ? `<button class="inspector-link" data-action="open" data-url="${escapeHtml(url)}">${escapeHtml(url)}</button>` : '<span class="empty-value">未设置 URL</span>';
+  const metadataRefreshBusy = libraryMetadataRefreshBusyPaperId === p.id;
+  const metadataRefreshDisabled = metadataRefreshBusy || !p.normalizedDoi;
+  const metadataRefreshTitle = p.normalizedDoi ? "按 DOI 精确更新公开引用元数据；手动修改会保留" : "需要 DOI 才能精确更新引用元数据";
   $("library-inspector").innerHTML = `<div class="inspector-tab">元数据</div><div class="inspector-head"><span class="muted small">期刊论文</span><button type="button" class="ghost small danger" data-action="library-remove" data-paper-id="${p.id}">移出文献库</button></div>
     <header class="inspector-title-block"><div class="inspector-title-line"><h2 title="${escapeHtml(englishTitle)}">${escapeHtml(englishTitle)}</h2>${libraryInlineEditButton(p.id, "title", "Title")}</div>${libraryInspectorRow("中文标题", chineseTitleValue, libraryInlineEditButton(p.id, "chineseTitle", "中文标题"), "inspector-hero-row")}${libraryInspectorRow("作者", escapeHtml(authors), libraryInlineEditButton(p.id, "authors", "作者"), "inspector-hero-row")}</header>
-    <section class="inspector-group inspector-metadata"><div class="inspector-section-head"><h3>引用</h3><span class="muted small">Library personal override</span></div><div class="inspector-rows">${libraryInspectorRow("期刊", escapeHtml(librarySource(item)), libraryInlineEditButton(p.id, "source", "期刊"))}${libraryInspectorRow("出版社", escapeHtml(item.effectivePublisher || "—"), libraryInlineEditButton(p.id, "publisher", "出版社"))}${libraryInspectorRow("年份", escapeHtml(libraryYear(item)), libraryInlineEditButton(p.id, "year", "年份"))}${libraryInspectorRow("月份日期", escapeHtml(item.effectivePublicationDate || p.publishedDate || "—"), libraryInlineEditButton(p.id, "publicationDate", "出版日期"))}${libraryInspectorRow("卷", escapeHtml(item.effectiveVolume || "—"), libraryInlineEditButton(p.id, "volume", "卷"))}${libraryInspectorRow("期", escapeHtml(item.effectiveIssue || "—"), libraryInlineEditButton(p.id, "issue", "期"))}${libraryInspectorRow("页码", escapeHtml(item.effectivePages || "—"), libraryInlineEditButton(p.id, "pages", "页码"))}${libraryInspectorRow("DOI", doiValue, libraryInlineEditButton(p.id, "doi", "DOI"))}${libraryInspectorRow("URL", urlValue, libraryInlineEditButton(p.id, "url", "URL"))}</div></section>
+    <section class="inspector-group inspector-metadata"><div class="inspector-section-head"><h3>引用</h3><div class="inspector-section-actions"><span class="muted small">公开来源</span><button type="button" class="ghost small" data-action="library-refresh-metadata" data-paper-id="${p.id}" title="${escapeHtml(metadataRefreshTitle)}"${metadataRefreshDisabled ? " disabled" : ""}>${metadataRefreshBusy ? "更新中…" : "刷新元数据"}</button></div></div><div class="inspector-rows">${libraryInspectorRow("期刊", escapeHtml(librarySource(item)), libraryInlineEditButton(p.id, "source", "期刊"))}${libraryInspectorRow("出版社", escapeHtml(item.effectivePublisher || "—"), libraryInlineEditButton(p.id, "publisher", "出版社"))}${libraryInspectorRow("年份", escapeHtml(libraryYear(item)), libraryInlineEditButton(p.id, "year", "年份"))}${libraryInspectorRow("月份日期", escapeHtml(item.effectivePublicationDate || p.publishedDate || "—"), libraryInlineEditButton(p.id, "publicationDate", "出版日期"))}${libraryInspectorRow("卷", escapeHtml(item.effectiveVolume || "—"), libraryInlineEditButton(p.id, "volume", "卷"))}${libraryInspectorRow("期", escapeHtml(item.effectiveIssue || "—"), libraryInlineEditButton(p.id, "issue", "期"))}${libraryInspectorRow("页码", escapeHtml(item.effectivePages || "—"), libraryInlineEditButton(p.id, "pages", "页码"))}${libraryInspectorRow("DOI", doiValue, libraryInlineEditButton(p.id, "doi", "DOI"))}${libraryInspectorRow("URL", urlValue, libraryInlineEditButton(p.id, "url", "URL"))}</div></section>
     <section class="inspector-group inspector-library"><div class="inspector-section-head"><h3>文库</h3></div><div class="inspector-rows">${libraryInspectorRow("备注", `<span class="${note ? "" : "empty-value"}">${escapeHtml(note || "未添加备注")}</span>`, libraryInlineEditButton(p.id, "note", "备注"))}${renderLibraryRelations(item, "collection")}${renderLibraryRelations(item, "tag")}</div></section>
     <section class="inspector-group inspector-abstract"><div class="inspector-section-head"><h3>摘要</h3><div class="inspector-section-actions"><div class="inspector-language-toggle" role="group" aria-label="摘要语言"><button class="seg ${abstractLanguage === "zh" ? "on" : ""}" data-action="library-abstract-lang" data-lang="zh">中文</button><button class="seg ${abstractLanguage === "en" ? "on" : ""}" data-action="library-abstract-lang" data-lang="en">English</button></div>${libraryInlineEditButton(p.id, abstractLanguage === "zh" ? "chineseAbstract" : "abstract", abstractLanguage === "zh" ? "中文摘要" : "摘要")}</div></div><p class="inspector-abstract-text${abstractText ? "" : " empty-value"}">${escapeHtml(abstractText || "暂无摘要")}</p>${abstractTranslate}</section>
     <section class="inspector-group inspector-attachments"><div class="inspector-section-head"><h3>PDF</h3>${attachmentAdd}</div><div class="attachment-list">${attachmentRows}</div></section>
     <section class="inspector-group inspector-citation"><div class="inspector-section-head"><h3>引用格式</h3></div><p>${escapeHtml(citation)}</p></section>`;
 
+}
+
+async function refreshLibraryMetadata(paperId: number): Promise<void> {
+  if (libraryMetadataRefreshBusyPaperId != null) return;
+  const item = libraryPapers.find((candidate) => candidate.paper.id === paperId);
+  if (!item?.paper.normalizedDoi) {
+    setStatus("这篇论文没有可用于精确刷新的 DOI", "error");
+    return;
+  }
+  libraryMetadataRefreshBusyPaperId = paperId;
+  renderLibrary();
+  setStatus("正在从公开来源更新引用元数据…", "running");
+  try {
+    const result = await invoke<LibraryMetadataRefreshResult>("refresh_library_item_metadata", { paperId });
+    selectedLibraryPaperId = paperId;
+    await Promise.all([loadPapers(), loadLibraryData(libraryView)]);
+    const sourceText = result.sources.join(" / ");
+    setStatus(result.refreshedFields.length ? `引用元数据已更新 · ${sourceText}` : `引用元数据已是最新 · ${sourceText}`, "done");
+  } catch (error) {
+    setStatus(`引用元数据更新失败：${String(error)}`, "error");
+  } finally {
+    libraryMetadataRefreshBusyPaperId = null;
+    renderLibrary();
+  }
 }
 
 async function pickPdfPath(): Promise<string | null> {
@@ -5015,6 +5049,11 @@ async function setupListeners() {
       return;
     }
     if (t.closest("[data-action='library-refresh']")) { await loadLibraryData(libraryView); return; }
+    const metadataRefresh = t.closest<HTMLButtonElement>("[data-action='library-refresh-metadata']");
+    if (metadataRefresh) {
+      await refreshLibraryMetadata(Number(metadataRefresh.dataset.paperId));
+      return;
+    }
     const libraryRemove = t.closest("[data-action='library-remove']") as HTMLElement | null;
     if (libraryRemove) {
       const ok = await requestLibraryInlineAction("移出文献库？论文与原始 PDF 均保留。", "移出", "取消");

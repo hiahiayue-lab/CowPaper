@@ -6142,6 +6142,74 @@ fn rc3_crossref_maps_journal_publisher_date_volume_issue_pages_and_provider_abst
 }
 
 #[test]
+fn rc2_library_metadata_refresh_updates_canonical_and_preserves_manual_layer() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "Refresh Journal", None, None, None, None).unwrap();
+    let initial = crate::api::crossref::parse_work(&serde_json::json!({
+        "DOI":"10.5555/refresh", "title":["Old provider title"],
+        "container-title":["Old Journal"], "publisher":"Old Publisher",
+        "published-print":{"date-parts":[[2025,1,2]]}, "volume":"1", "issue":"1", "page":"1-2"
+    })).unwrap();
+    let paper_id = match db::upsert_paper(&conn, jid, &initial).unwrap() {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new paper"),
+    };
+    db::add_paper_to_library(&conn, paper_id, &[], &[], "manual").unwrap();
+    db::set_library_item_metadata(&conn, paper_id, &crate::models::LibraryItemMetadataInput {
+        title_override: Some("My title".into()),
+        journal_override: Some("My journal".into()),
+        publisher_override: Some("My publisher".into()),
+        year_override: Some(1999),
+        abstract_override: Some("My abstract".into()),
+        note: Some("Keep this note".into()),
+        doi_override: Some("10.5555/personal-doi".into()),
+        ..Default::default()
+    }).unwrap();
+    let refreshed = crate::api::crossref::parse_work(&serde_json::json!({
+        "DOI":"10.5555/refresh", "title":["New provider title"],
+        "author":[{"given":"New","family":"Author"}],
+        "container-title":["New Journal"], "publisher":"New Publisher",
+        "published-print":{"date-parts":[[2027,3,4]]}, "volume":"2", "issue":"5", "page":"20-30",
+        "URL":"https://example.test/refreshed"
+    })).unwrap();
+    let fields = db::refresh_library_metadata_from_candidate(&conn, paper_id, &refreshed).unwrap();
+    assert!(fields.contains(&"title".to_string()));
+    assert!(fields.contains(&"journal".to_string()));
+    assert!(fields.contains(&"publicationDate".to_string()));
+    assert!(fields.contains(&"pages".to_string()));
+    let canonical = db::get_paper(&conn, paper_id).unwrap().unwrap();
+    assert_eq!(canonical.title.as_deref(), Some("New provider title"));
+    assert_eq!(canonical.journal_name.as_deref(), Some("New Journal"));
+    assert_eq!(canonical.publisher.as_deref(), Some("New Publisher"));
+    assert_eq!(canonical.year, Some(2027));
+    assert_eq!(canonical.normalized_doi.as_deref(), Some("10.5555/refresh"));
+    let library = db::get_library_paper(&conn, paper_id).unwrap().unwrap();
+    assert_eq!(library.effective_title.as_deref(), Some("My title"));
+    assert_eq!(library.effective_journal.as_deref(), Some("My journal"));
+    assert_eq!(library.effective_publisher.as_deref(), Some("My publisher"));
+    assert_eq!(library.effective_year, Some(1999));
+    assert_eq!(library.effective_abstract.as_deref(), Some("My abstract"));
+    assert_eq!(library.note.as_deref(), Some("Keep this note"));
+    assert_eq!(library.effective_doi.as_deref(), Some("10.5555/personal-doi"));
+    assert_eq!(conn.query_row("SELECT count(*) FROM source_records WHERE paper_id=?1 AND source='crossref'", params![paper_id], |row| row.get::<_, i64>(0)).unwrap(), 1);
+
+    let lower_priority = crate::api::openalex::parse_work(&serde_json::json!({
+        "doi":"10.5555/refresh", "title":"Lower-priority title", "id":"https://openalex.org/W-refresh",
+        "primary_location":{"source":{"display_name":"Alternate Journal"}},
+        "publication_date":"2028-01-01", "biblio":{"volume":"99","issue":"99","first_page":"999"}
+    })).unwrap();
+    db::supplement_library_metadata_from_candidate(&conn, paper_id, &lower_priority).unwrap();
+    let canonical = db::get_paper(&conn, paper_id).unwrap().unwrap();
+    assert_eq!(canonical.title.as_deref(), Some("New provider title"), "lower-priority provider must not replace title");
+    assert_eq!(canonical.journal_name.as_deref(), Some("New Journal"), "lower-priority provider must not replace journal");
+    assert_eq!(canonical.year, Some(2027), "lower-priority provider must not replace year");
+
+    let mismatch = crate::api::crossref::parse_work(&serde_json::json!({"DOI":"10.5555/other","title":["Must not merge"]})).unwrap();
+    assert!(db::refresh_library_metadata_from_candidate(&conn, paper_id, &mismatch).is_err());
+    assert_eq!(db::get_paper(&conn, paper_id).unwrap().unwrap().title.as_deref(), Some("New provider title"));
+}
+
+#[test]
 fn rc3_crossref_online_issued_and_article_number_fallbacks() {
     for key in ["published-online","issued"] {
         let mut v = serde_json::json!({"DOI":"10.5555/article-number","title":["Article"],"article-number":"e01256","created":{"date-parts":[[2000,1,1]]}});

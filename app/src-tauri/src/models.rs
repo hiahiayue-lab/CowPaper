@@ -604,6 +604,16 @@ pub struct LibraryPaper {
     pub attachments: Vec<PaperAttachment>,
 }
 
+/// Result of an exact-DOI Library metadata refresh. The returned Paper is the
+/// normal Library projection; no second metadata entity is created.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryMetadataRefreshResult {
+    pub paper: LibraryPaper,
+    pub sources: Vec<String>,
+    pub refreshed_fields: Vec<String>,
+}
+
 /// A relevance-ranked hit from the Library full-text index. The canonical
 /// paper id is the only identity returned by search; callers can load the
 /// existing LibraryPaper projection when they need the full row.

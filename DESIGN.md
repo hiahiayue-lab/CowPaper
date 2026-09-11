@@ -303,13 +303,13 @@ PDF attachments are subordinate children of a paper, not separate papers. A mana
 
 ## Inspector
 
-The Inspector is a continuous reading surface with a serif paper title and abstract, short label/value citation rows, and thin rules separating Citation, Library, Abstract, PDF, and Citation Format. Empty metadata uses muted text plus a concrete edit/add action when one exists. Inline edit affordances remain quiet until hover or keyboard focus. Attachment actions distinguish Open, Show Location, Relink, and Detach.
+The Inspector is a continuous reading surface with a serif paper title and abstract, short label/value citation rows, and thin rules separating Citation, Library, Abstract, PDF, and Citation Format. Empty metadata uses muted text plus a concrete edit/add action when one exists. Inline edit affordances remain quiet until hover or keyboard focus. Attachment actions distinguish Open, Show Location, Relink, and Detach. Citation includes a lightweight `刷新元数据` action when an exact DOI is available; it reuses the Crossref/OpenAlex DOI provider path, updates canonical metadata only, and leaves Library-only edits, notes, relations, and attachments intact.
 
 Only `元数据` is visible in v0.2.1. Do not render, reserve, or advertise an empty `标注`/Annotation tab. The future contract is documented below so implementation can remain stable without exposing unfinished UI.
 
 ### Future Inspector metadata/annotation contract
 
-The Metadata tab remains the owner of canonical citation metadata, effective/personal Library overrides, relations, abstract language, and attachment provenance. A future Annotation tab is a sibling view owned by the selected paper, not by the global Library or the current search query. Its conceptual record is:
+The Metadata tab remains the owner of canonical citation metadata, effective/library-only metadata overrides, relations, abstract language, and attachment provenance. A DOI refresh is deterministic: it accepts only provider responses whose normalized DOI exactly matches the selected canonical Paper, never merges by title/author similarity, never calls an LLM, and never writes the library-only override or note fields. A future Annotation tab is a sibling view owned by the selected paper, not by the global Library or the current search query. Its conceptual record is:
 
 ```ts
 type Annotation = {
