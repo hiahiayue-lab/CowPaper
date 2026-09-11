@@ -1056,11 +1056,8 @@ button.full {
 /* In-flight indication is a quiet state change only: no spin, no bounce, no
    glow — Inspector updates carry no motion. */
 .icon-action.busy { color: #9aa3ad; opacity: .55; }
-/* Manual title translation must never fail silently: every phase renders a
-   visible inline status next to its control. Success is transient (~1.8s);
-   an error stays until the next action replaces it. */
-.inspector-action-status { flex: 0 1 auto; min-width: 0; max-width: 220px; align-self: center; overflow: hidden; font-size: 11px; line-height: 1.4; color: #87909b; text-overflow: ellipsis; white-space: nowrap; }
-.inspector-action-status[hidden] { display: none; }
+/* Success is transient (~1.8s); an error stays until the next action
+   replaces it. Width is reserved with the row-actions rule above. */
 .inspector-action-status.running { color: #287cff; }
 .inspector-action-status.done { color: #1f8a4c; }
 .inspector-action-status.error { color: #d13b3b; }
@@ -1231,7 +1228,7 @@ button.full {
 .inspector-actions { gap: 4px; }
 .inspector-close { display: inline-block; }
 .inspector-title-block { padding: 10px 2px 2px; }
-.inspector-title-line { display: flex; align-items: flex-start; gap: 5px; min-width: 0; }
+.inspector-title-line { display: flex; flex-wrap: nowrap; align-items: flex-start; gap: 5px; min-width: 0; }
 .inspector-title-line h2 { flex: 1 1 auto; min-width: 0; overflow: hidden; font-size: 17px; text-overflow: ellipsis; white-space: nowrap; }
 .inspector-hero-row { min-height: 28px; padding: 4px 0; border-bottom: 0; }
 .inspector-group { padding: 12px 13px; margin-top: 10px; border: 1px solid #e1e5e9; border-radius: 11px; background: #fff; box-shadow: 0 1px 1px rgba(25, 34, 45, .025); }
@@ -1243,6 +1240,16 @@ button.full {
 .inspector-form-row .field-label { color: #89939e; font-size: 11px; }
 .inspector-form-row .field-value { min-width: 0; overflow: hidden; color: #4d5864; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .inspector-form-row .empty-value { color: #a4acb5; }
+/* One trailing affordance group per row. The row grids and the section headers
+   only ever see a single trailing child, so extra controls (⟳ / ✎) and the
+   transient action status can never create an implicit grid row, push the next
+   row down, or move an icon out of its trailing position. */
+.inspector-row-actions { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 4px; min-width: 0; }
+/* Reserved, fixed-width feedback slot, placed *before* the icons so the icons
+   keep the trailing edge. Reserving the width up front is what makes the row
+   perfectly still: text appearing/disappearing can no longer resize the row's
+   trailing column, wrap the value, push the next row down, or move an icon. */
+.inspector-action-status { flex: 0 0 46px; width: 46px; overflow: hidden; font-size: 11px; line-height: 1.4; color: #87909b; text-align: left; text-overflow: ellipsis; white-space: nowrap; }
 .inline-edit-button { flex: 0 0 auto; padding: 3px 5px; border: 0; border-radius: 5px; color: #9aa3ad; font-size: 12px; opacity: 0; }
 .inspector-form-row:hover .inline-edit-button, .inspector-title-line:hover .inline-edit-button, .inline-edit-button:focus-visible { opacity: 1; }
 .inline-edit-button:hover { background: #edf2f8; color: #356dbd; }

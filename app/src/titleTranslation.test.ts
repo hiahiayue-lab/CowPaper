@@ -106,19 +106,25 @@ function key(overrides: Partial<TitleEditorKeyEvent>): TitleEditorKeyEvent {
     ({ paperId, requestId, phase, message });
 
   const idle = titleTranslationControlState(null, 7);
-  assert(idle.statusText === "" && idle.disabled === false && idle.busy === false, "idle state renders no standing text");
+  assert(idle.statusText === "" && idle.detail === "" && idle.disabled === false && idle.busy === false, "idle state renders no standing text");
 
   const running = titleTranslationControlState(feedback("running"), 7);
   assert(running.busy === true && running.disabled === true && running.statusText !== "", "translating state must be visible and reentrant-safe");
 
   const done = titleTranslationControlState(feedback("done", 7, 1, "中文标题已更新"), 7);
-  assert(done.busy === false && done.statusText === "中文标题已更新" && done.tone === "done", "success state");
+  assert(done.busy === false && done.statusText === "已更新" && done.detail === "中文标题已更新" && done.tone === "done", "success state keeps a short slot label plus a full detail");
 
   const failed = titleTranslationControlState(feedback("error", 7, 1, "中文标题翻译失败：network"), 7);
-  assert(failed.busy === false && failed.tone === "error" && failed.statusText.includes("失败"), "errors must never be silent");
+  assert(failed.busy === false && failed.tone === "error" && failed.statusText.includes("失败") && failed.detail.includes("network"), "errors must never be silent");
 
   const otherPaper = titleTranslationControlState(feedback("running", 9), 7);
   assert(otherPaper.busy === false && otherPaper.disabled === false && otherPaper.statusText === "", "state is scoped to one paper");
+
+  // The inline slot label must stay short: it is rendered into a reserved,
+  // fixed-width slot so the row can never reflow.
+  for (const phase of ["running", "done", "error"] as const) {
+    assert(titleTranslationControlState(feedback(phase), 7).statusText.length <= 4, `inline ${phase} label must stay short`);
+  }
 }
 
 // ---------- The icon carries no standing text label; meaning lives in tooltip/aria.
@@ -149,12 +155,14 @@ function key(overrides: Partial<TitleEditorKeyEvent>): TitleEditorKeyEvent {
 {
   const view = (phase: InspectorActionFeedback["phase"], message = "") =>
     actionControlState({ paperId: 3, requestId: 2, phase, message }, 3, {
-      busy: "正在更新引用元数据…",
-      done: "引用元数据已更新",
-      error: "引用元数据更新失败",
+      busy: "更新中",
+      done: "已更新",
+      error: "更新失败",
     });
-  assert(view("running").busy === true && view("running").statusText === "正在更新引用元数据…", "metadata refresh busy state");
-  assert(view("done").tone === "done" && view("done").statusText === "引用元数据已更新", "metadata refresh success state");
+  const busyView = view("running");
+  assert(busyView.busy === true && busyView.statusText === "更新中", "metadata refresh busy state");
+  const doneView = view("done", "引用元数据已更新 · Crossref / OpenAlex");
+  assert(doneView.tone === "done" && doneView.statusText === "已更新" && doneView.detail.includes("Crossref"), "metadata refresh keeps a short slot label and a full detail");
   assert(view("error").tone === "error" && !shouldAutoDismissSuccess({ paperId: 3, requestId: 2, phase: "error", message: "" }, 3, 2), "metadata refresh errors persist");
 }
 

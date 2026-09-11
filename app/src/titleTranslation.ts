@@ -132,8 +132,14 @@ export interface InspectorActionControlState {
   /** The control is showing work in flight (disabled + `aria-busy`). */
   busy: boolean;
   disabled: boolean;
-  /** Inline status text; empty means nothing is rendered at all. */
+  /**
+   * Short inline label for the row's *fixed-width* feedback slot. It is short
+   * on purpose: the slot width is reserved up front, so the label can never
+   * resize the row's trailing column, wrap the value, or move an icon.
+   */
   statusText: string;
+  /** Full sentence for `title` and the global status region. */
+  detail: string;
   tone: "idle" | "running" | "done" | "error";
 }
 
@@ -144,17 +150,21 @@ export function actionControlState(
   messages: { busy: string; done: string; error: string },
 ): InspectorActionControlState {
   if (!feedback || feedback.paperId !== paperId) {
-    return { busy: false, disabled: false, statusText: "", tone: "idle" };
+    return { busy: false, disabled: false, statusText: "", detail: "", tone: "idle" };
   }
+  const label = (fallback: string): { statusText: string; detail: string } => ({
+    statusText: fallback,
+    detail: feedback.message || fallback,
+  });
   switch (feedback.phase) {
     case "running":
-      return { busy: true, disabled: true, statusText: feedback.message || messages.busy, tone: "running" };
+      return { busy: true, disabled: true, ...label(messages.busy), tone: "running" };
     case "done":
-      return { busy: false, disabled: false, statusText: feedback.message || messages.done, tone: "done" };
+      return { busy: false, disabled: false, ...label(messages.done), tone: "done" };
     case "error":
-      return { busy: false, disabled: false, statusText: feedback.message || messages.error, tone: "error" };
+      return { busy: false, disabled: false, ...label(messages.error), tone: "error" };
     default:
-      return { busy: false, disabled: false, statusText: "", tone: "idle" };
+      return { busy: false, disabled: false, statusText: "", detail: "", tone: "idle" };
   }
 }
 
@@ -168,9 +178,9 @@ export function titleTranslationControlState(
   paperId: number,
 ): InspectorActionControlState {
   return actionControlState(feedback, paperId, {
-    busy: "正在翻译中文标题…",
-    done: "中文标题已更新",
-    error: "中文标题翻译失败",
+    busy: "翻译中",
+    done: "已更新",
+    error: "翻译失败",
   });
 }
 
