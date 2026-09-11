@@ -1,8 +1,13 @@
 import {
+  actionControlState,
   resolveManualTitleTranslationSource,
   resolveTitleEditorKeyDecision,
-  titleTranslationButtonState,
+  shouldAutoDismissSuccess,
+  SUCCESS_FEEDBACK_MS,
+  titleTranslationAriaLabel,
+  titleTranslationControlState,
   type TitleEditorKeyEvent,
+  type InspectorActionFeedback,
 } from "./titleTranslation.ts";
 
 function assert(condition: unknown, message = "assertion failed"): asserts condition {
@@ -95,24 +100,62 @@ function key(overrides: Partial<TitleEditorKeyEvent>): TitleEditorKeyEvent {
   assert(resolveTitleEditorKeyDecision(key({ key: "a" }), "title").action === "none", "typing is untouched");
 }
 
-// ---------- Translate button state machine: idle / translating / success / error.
+// ---------- Translate icon: idle / translating / success / error states.
 {
-  const idle = titleTranslationButtonState(null, 7, false);
-  assert(idle.label === "翻译中文标题" && idle.disabled === false && idle.statusText === "", "idle state");
-  const idleWithChinese = titleTranslationButtonState(null, 7, true);
-  assert(idleWithChinese.label === "重新翻译中文标题", "an existing Chinese title offers a retranslate label");
+  const feedback = (phase: InspectorActionFeedback["phase"], paperId = 7, requestId = 1, message = ""): InspectorActionFeedback =>
+    ({ paperId, requestId, phase, message });
 
-  const running = titleTranslationButtonState({ paperId: 7, phase: "running", message: "" }, 7, false);
-  assert(running.disabled === true && running.label === "翻译中…" && running.statusText !== "", "translating state must be visible and reentrant-safe");
+  const idle = titleTranslationControlState(null, 7);
+  assert(idle.statusText === "" && idle.disabled === false && idle.busy === false, "idle state renders no standing text");
 
-  const done = titleTranslationButtonState({ paperId: 7, phase: "done", message: "中文标题已更新" }, 7, false);
-  assert(done.disabled === false && done.statusText === "中文标题已更新" && done.tone === "done", "success state");
+  const running = titleTranslationControlState(feedback("running"), 7);
+  assert(running.busy === true && running.disabled === true && running.statusText !== "", "translating state must be visible and reentrant-safe");
 
-  const failed = titleTranslationButtonState({ paperId: 7, phase: "error", message: "中文标题翻译失败：network" }, 7, false);
-  assert(failed.disabled === false && failed.tone === "error" && failed.statusText.includes("失败"), "errors must never be silent");
+  const done = titleTranslationControlState(feedback("done", 7, 1, "中文标题已更新"), 7);
+  assert(done.busy === false && done.statusText === "中文标题已更新" && done.tone === "done", "success state");
 
-  const otherPaper = titleTranslationButtonState({ paperId: 9, phase: "running", message: "" }, 7, false);
-  assert(otherPaper.disabled === false && otherPaper.label === "翻译中文标题", "state is scoped to one paper");
+  const failed = titleTranslationControlState(feedback("error", 7, 1, "中文标题翻译失败：network"), 7);
+  assert(failed.busy === false && failed.tone === "error" && failed.statusText.includes("失败"), "errors must never be silent");
+
+  const otherPaper = titleTranslationControlState(feedback("running", 9), 7);
+  assert(otherPaper.busy === false && otherPaper.disabled === false && otherPaper.statusText === "", "state is scoped to one paper");
+}
+
+// ---------- The icon carries no standing text label; meaning lives in tooltip/aria.
+{
+  assert(titleTranslationAriaLabel(true) === "重新翻译中文标题", "an existing Chinese title offers a retranslate label");
+  assert(titleTranslationAriaLabel(false) === "翻译中文标题", "a missing Chinese title offers a translate label");
+}
+
+// ---------- Success feedback is transient; errors are not.
+{
+  assert(SUCCESS_FEEDBACK_MS >= 1500 && SUCCESS_FEEDBACK_MS <= 2000, "success display duration must be ~1.5-2s");
+
+  const success: InspectorActionFeedback = { paperId: 7, requestId: 4, phase: "done", message: "中文标题已更新" };
+  assert(shouldAutoDismissSuccess(success, 7, 4), "the request that scheduled the timer may clear its own success state");
+  // A stale timer from an older request of the same paper must not clear it.
+  assert(!shouldAutoDismissSuccess(success, 7, 3), "an older request must not clear newer success state");
+  // Switching papers must not let the old paper's timer wipe the new state.
+  const nextPaper: InspectorActionFeedback = { paperId: 9, requestId: 5, phase: "done", message: "中文标题已更新" };
+  assert(!shouldAutoDismissSuccess(nextPaper, 7, 4), "another paper's timer must not clear this paper's state");
+  assert(shouldAutoDismissSuccess(nextPaper, 9, 5), "the new paper's own timer still works");
+  // Errors never auto-dismiss.
+  const failure: InspectorActionFeedback = { paperId: 7, requestId: 4, phase: "error", message: "中文标题翻译失败" };
+  assert(!shouldAutoDismissSuccess(failure, 7, 4), "an error must never auto-dismiss, even for its own request");
+  assert(!shouldAutoDismissSuccess(null, 7, 4), "nothing to clear");
+}
+
+// ---------- Metadata refresh reuses the same transient contract, not the LLM.
+{
+  const view = (phase: InspectorActionFeedback["phase"], message = "") =>
+    actionControlState({ paperId: 3, requestId: 2, phase, message }, 3, {
+      busy: "正在更新引用元数据…",
+      done: "引用元数据已更新",
+      error: "引用元数据更新失败",
+    });
+  assert(view("running").busy === true && view("running").statusText === "正在更新引用元数据…", "metadata refresh busy state");
+  assert(view("done").tone === "done" && view("done").statusText === "引用元数据已更新", "metadata refresh success state");
+  assert(view("error").tone === "error" && !shouldAutoDismissSuccess({ paperId: 3, requestId: 2, phase: "error", message: "" }, 3, 2), "metadata refresh errors persist");
 }
 
 console.log("title translation tests passed");

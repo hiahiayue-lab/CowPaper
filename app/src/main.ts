@@ -31,10 +31,14 @@ import {
   type SearchPaper,
 } from "./librarySearch";
 import {
+  actionControlState,
   resolveManualTitleTranslationSource,
   resolveTitleEditorKeyDecision,
-  titleTranslationButtonState,
-  type TitleTranslationState,
+  shouldAutoDismissSuccess,
+  SUCCESS_FEEDBACK_MS,
+  titleTranslationAriaLabel,
+  titleTranslationControlState,
+  type InspectorActionFeedback,
 } from "./titleTranslation";
 
 interface Journal {
@@ -530,7 +534,17 @@ let librarySearchMatches = new Map<number, LibrarySearchHit>();
 let librarySearchAdapter: LibrarySearchApi | null = null;
 const librarySearchHandledPointerSuggestions = new WeakSet<HTMLElement>();
 const libraryPaperIds = new Set<number>();
-let libraryTitleTranslation: TitleTranslationState | null = null;
+/**
+ * Explicit-action feedback for the Library Inspector. Both live in module state
+ * because the Inspector is rebuilt with `innerHTML` on every Library reload —
+ * the reload triggered by the title editor's own blur-save included — which
+ * detaches the clicked control and would otherwise discard idle / running /
+ * result state written onto that node.
+ */
+let libraryTitleTranslation: InspectorActionFeedback | null = null;
+let libraryMetadataRefreshFeedback: InspectorActionFeedback | null = null;
+/** Monotonic id so a stale dismiss timer can never clear a newer request. */
+let libraryActionRequestSeq = 0;
 /** True while the current pointer interaction already started a translation. */
 let libraryTitleTranslationPointerHandled = false;
 type SettingsSection = "general" | "ai" | "pdf" | "library" | "recommend" | "about";
@@ -1921,6 +1935,30 @@ function libraryInlineEditButton(paperId: number, field: LibraryInlineField, lab
   return `<button type="button" class="inline-edit-button" title="编辑 ${escapeHtml(label)}" aria-label="编辑 ${escapeHtml(label)}" data-action="library-inline-edit" data-paper-id="${paperId}" data-field="${field}">✎</button>`;
 }
 
+/**
+ * The single circular-arrow glyph used by both explicit Inspector actions.
+ * Same icon geometry, size, hit target and states everywhere; the meaning is
+ * carried by the surrounding row plus `title` / `aria-label`, never by a
+ * standing text label.
+ */
+const REFRESH_ICON_MARKUP = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><polyline points="23 4 23 10 17 10" /><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" /></svg>`;
+
+function libraryIconAction(
+  action: string,
+  paperId: number,
+  label: string,
+  options: { disabled?: boolean; busy?: boolean } = {},
+): string {
+  return `<button type="button" class="icon-action${options.busy ? " busy" : ""}" data-action="${action}" data-paper-id="${paperId}" title="${escapeHtml(label)}" aria-label="${escapeHtml(label)}" aria-busy="${options.busy ? "true" : "false"}"${options.disabled ? " disabled" : ""}>${REFRESH_ICON_MARKUP}</button>`;
+}
+
+/// Inline, non-silent feedback for one explicit Inspector action. Success is
+/// transient; an error stays until the next action replaces it. The full text
+/// is always available via `title` even when the inline row ellipsizes it.
+function libraryActionStatus(slot: "titleTranslation" | "metadataRefresh", paperId: number, statusText: string, tone: string): string {
+  return `<span class="inspector-action-status ${tone}" data-inspector-action-status="${slot}" data-paper-id="${paperId}" role="status" aria-live="polite" title="${escapeHtml(statusText)}"${statusText ? "" : " hidden"}>${escapeHtml(statusText)}</span>`;
+}
+
 function libraryInspectorRow(label: string, value: string, editButton = "", className = ""): string {
   return `<div class="inspector-form-row ${className}"><span class="field-label">${escapeHtml(label)}</span><span class="field-value" title="${escapeHtml(value.replace(/<[^>]+>/g, ""))}">${value}</span>${editButton}</div>`;
 }
@@ -2005,8 +2043,9 @@ async function runLibraryTitleTranslation(
   if (!Number.isInteger(paperId)) return;
   if (libraryTitleTranslation?.paperId === paperId && libraryTitleTranslation.phase === "running") return;
   const fail = (message: string): void => {
-    libraryTitleTranslation = { paperId, phase: "error", message };
-    refreshLibraryTitleTranslationUi(paperId);
+    // Errors stay until the next action: never auto-dismissed.
+    libraryTitleTranslation = { paperId, requestId: ++libraryActionRequestSeq, phase: "error", message };
+    refreshLibraryInspectorActionUi(paperId);
     setStatus(message, "error");
   };
   if (!current.source) {
@@ -2017,24 +2056,26 @@ async function runLibraryTitleTranslation(
     fail("请先在设置中保存 DeepSeek API Key");
     return;
   }
-  libraryTitleTranslation = { paperId, phase: "running", message: "" };
+  const requestId = ++libraryActionRequestSeq;
+  libraryTitleTranslation = { paperId, requestId, phase: "running", message: "" };
   // Patch the live Inspector instead of re-rendering it, so an open English
   // title draft is not discarded merely to show progress. Any concurrent
   // rerender (for example the one caused by the editor's own blur-save) renders
   // this same state from `libraryTitleTranslation`.
-  refreshLibraryTitleTranslationUi(paperId);
+  refreshLibraryInspectorActionUi(paperId);
   setStatus("正在翻译中文标题…", "running");
   try {
     if (current.hasDraft) await persistLibraryEnglishTitle(paperId, current.source);
     await invoke("translate_library_title", { paperId, sourceEnglishTitle: current.source, model: getModel() });
-    libraryTitleTranslation = { paperId, phase: "done", message: "中文标题已更新" };
+    libraryTitleTranslation = { paperId, requestId, phase: "done", message: "中文标题已更新" };
     await loadLibraryData(libraryView);
     setStatus("中文标题已更新", "done");
+    scheduleLibraryActionSuccessDismiss("titleTranslation", paperId, requestId);
   } catch (error) {
     const message = `中文标题翻译失败：${String(error)}`;
-    libraryTitleTranslation = { paperId, phase: "error", message };
+    libraryTitleTranslation = { paperId, requestId, phase: "error", message };
     await loadLibraryData(libraryView).catch(() => undefined);
-    refreshLibraryTitleTranslationUi(paperId);
+    refreshLibraryInspectorActionUi(paperId);
     setStatus(message, "error");
   }
 }
@@ -2047,24 +2088,56 @@ async function persistLibraryEnglishTitle(paperId: number, source: string): Prom
   await invoke("set_library_item_metadata", { paperId, metadata });
 }
 
-/** In-place view of `libraryTitleTranslation` for the currently rendered Inspector. */
-function refreshLibraryTitleTranslationUi(paperId: number): void {
-  const button = document.querySelector<HTMLButtonElement>(
-    `#library-inspector [data-action='library-translate-title'][data-paper-id="${paperId}"]`,
-  );
-  const status = document.querySelector<HTMLElement>(
-    `#library-inspector [data-title-translation-status="${paperId}"]`,
-  );
-  if (!button && !status) return;
+/// Success feedback is transient: it returns to idle after ~1.8s.
+/// The timer is bound to the paper *and* the request that scheduled it, so a
+/// stale timer can neither clear a newer request nor another paper's state
+/// after the user switches papers.
+function scheduleLibraryActionSuccessDismiss(
+  kind: "titleTranslation" | "metadataRefresh",
+  paperId: number,
+  requestId: number,
+): void {
+  window.setTimeout(() => {
+    const current = kind === "titleTranslation" ? libraryTitleTranslation : libraryMetadataRefreshFeedback;
+    if (!shouldAutoDismissSuccess(current, paperId, requestId)) return;
+    if (kind === "titleTranslation") libraryTitleTranslation = null;
+    else libraryMetadataRefreshFeedback = null;
+    refreshLibraryInspectorActionUi(paperId);
+  }, SUCCESS_FEEDBACK_MS);
+}
+
+/** In-place view of both Inspector action states for the rendered Inspector. */
+function refreshLibraryInspectorActionUi(paperId: number): void {
   const item = libraryPapers.find((candidate) => candidate.paper.id === paperId);
-  const view = titleTranslationButtonState(libraryTitleTranslation, paperId, Boolean(item && libraryChineseTitle(item)));
-  if (button) {
-    button.disabled = view.disabled;
-    button.textContent = view.label;
+  const translation = titleTranslationControlState(libraryTitleTranslation, paperId);
+  const metadataRefresh = actionControlState(libraryMetadataRefreshFeedback, paperId, {
+    busy: "正在更新引用元数据…",
+    done: "引用元数据已更新",
+    error: "引用元数据更新失败",
+  });
+  for (const [action, view] of [
+    ["library-translate-title", translation],
+    ["library-refresh-metadata", metadataRefresh],
+  ] as const) {
+    const button = document.querySelector<HTMLButtonElement>(
+      `#library-inspector [data-action='${action}'][data-paper-id="${paperId}"]`,
+    );
+    if (button) {
+      button.disabled = view.disabled || (action === "library-refresh-metadata" && !item?.paper.normalizedDoi);
+      button.classList.toggle("busy", view.busy);
+      button.setAttribute("aria-busy", view.busy ? "true" : "false");
+    }
   }
-  if (status) {
+  for (const [slot, view] of [
+    ["titleTranslation", translation],
+    ["metadataRefresh", metadataRefresh],
+  ] as const) {
+    const status = document.querySelector<HTMLElement>(
+      `#library-inspector [data-inspector-action-status="${slot}"][data-paper-id="${paperId}"]`,
+    );
+    if (!status) continue;
     status.textContent = view.statusText;
-    status.className = `inspector-translate-status ${view.tone}`;
+    status.className = `inspector-action-status ${view.tone}`;
     status.hidden = !view.statusText;
   }
 }
@@ -2623,23 +2696,30 @@ function renderLibraryInspector(item: LibraryPaper) {
   const authors = authorText(libraryAuthors(item));
   const citation = `${authors}${libraryYear(item) !== "—" ? ` (${libraryYear(item)})` : ""}. ${englishTitle}. ${librarySource(item)}.`;
   const chineseTitleValue = chineseTitle ? escapeHtml(chineseTitle) : '<span class="empty-value">未添加中文标题</span>';
-  // The Translate control renders from module state, never from the node that
-  // was clicked, so `translating` / `done` / `error` survive the Inspector
-  // rebuild that a Library reload (including the title editor's blur-save)
-  // performs. It is also the only title-translation entry point in the app:
-  // nothing translates a title on import, enrichment, refresh or save.
-  const translateView = titleTranslationButtonState(libraryTitleTranslation, p.id, Boolean(chineseTitle));
-  const chineseTitleTranslate = `<button type="button" class="inspector-link" data-action="library-translate-title" data-paper-id="${p.id}"${translateView.disabled ? " disabled" : ""}>${escapeHtml(translateView.label)}</button><span class="inspector-translate-status ${translateView.tone}" data-title-translation-status="${p.id}" role="status" aria-live="polite"${translateView.statusText ? "" : " hidden"}>${escapeHtml(translateView.statusText)}</span>`;
+  // The manual-translation affordance is an icon, and its state renders from
+  // module state rather than from the node that was clicked, so
+  // `translating` / `success` / `error` survive the Inspector rebuild that a
+  // Library reload (including the title editor's blur-save) performs. It is
+  // still the only title-translation entry point in the app: nothing translates
+  // a title on import, enrichment, metadata refresh or English-title save.
+  const translateView = titleTranslationControlState(libraryTitleTranslation, p.id);
+  const chineseTitleIcon = libraryIconAction("library-translate-title", p.id, titleTranslationAriaLabel(Boolean(chineseTitle)), { disabled: translateView.disabled, busy: translateView.busy });
+  const chineseTitleStatus = libraryActionStatus("titleTranslation", p.id, translateView.statusText, translateView.tone);
   const doi = libraryDoi(item);
   const url = libraryUrl(item);
   const doiValue = doi ? `<span>${escapeHtml(doi)}</span>` : '<span class="empty-value">未设置 DOI</span>';
   const urlValue = url ? `<button class="inspector-link" data-action="open" data-url="${escapeHtml(url)}">${escapeHtml(url)}</button>` : '<span class="empty-value">未设置 URL</span>';
-  const metadataRefreshBusy = libraryMetadataRefreshBusyPaperId === p.id;
-  const metadataRefreshDisabled = metadataRefreshBusy || !p.normalizedDoi;
-  const metadataRefreshTitle = p.normalizedDoi ? "按 DOI 精确更新公开引用元数据；手动修改会保留" : "需要 DOI 才能精确更新引用元数据";
+  // Deterministic scholarly provider refresh (exact DOI / scholarly ID), never
+  // an LLM. Its success feedback is transient, exactly like translation.
+  const metadataRefreshView = actionControlState(libraryMetadataRefreshFeedback, p.id, {
+    busy: "正在更新引用元数据…",
+    done: "引用元数据已更新",
+    error: "引用元数据更新失败",
+  });
+  const metadataRefreshControl = `${libraryIconAction("library-refresh-metadata", p.id, "刷新元数据", { disabled: metadataRefreshView.disabled || !p.normalizedDoi, busy: metadataRefreshView.busy })}${libraryActionStatus("metadataRefresh", p.id, metadataRefreshView.statusText, metadataRefreshView.tone)}`;
   $("library-inspector").innerHTML = `<div class="inspector-tab">元数据</div><div class="inspector-head"><span class="muted small">期刊论文</span><button type="button" class="ghost small danger" data-action="library-remove" data-paper-id="${p.id}">移出文献库</button></div>
-    <header class="inspector-title-block"><div class="inspector-title-line"><h2 title="${escapeHtml(englishTitle)}">${escapeHtml(englishTitle)}</h2>${libraryInlineEditButton(p.id, "title", "Title")}</div>${libraryInspectorRow("中文标题", chineseTitleValue, `${chineseTitleTranslate}${libraryInlineEditButton(p.id, "chineseTitle", "中文标题")}`, "inspector-hero-row")}${libraryInspectorRow("作者", escapeHtml(authors), libraryInlineEditButton(p.id, "authors", "作者"), "inspector-hero-row")}</header>
-    <section class="inspector-group inspector-metadata"><div class="inspector-section-head"><h3>引用</h3><div class="inspector-section-actions"><span class="muted small">公开来源</span><button type="button" class="ghost small" data-action="library-refresh-metadata" data-paper-id="${p.id}" title="${escapeHtml(metadataRefreshTitle)}"${metadataRefreshDisabled ? " disabled" : ""}>${metadataRefreshBusy ? "更新中…" : "刷新元数据"}</button></div></div><div class="inspector-rows">${libraryInspectorRow("期刊", escapeHtml(librarySource(item)), libraryInlineEditButton(p.id, "source", "期刊"))}${libraryInspectorRow("出版社", escapeHtml(item.effectivePublisher || "—"), libraryInlineEditButton(p.id, "publisher", "出版社"))}${libraryInspectorRow("年份", escapeHtml(libraryYear(item)), libraryInlineEditButton(p.id, "year", "年份"))}${libraryInspectorRow("月份日期", escapeHtml(item.effectivePublicationDate || p.publishedDate || "—"), libraryInlineEditButton(p.id, "publicationDate", "出版日期"))}${libraryInspectorRow("卷", escapeHtml(item.effectiveVolume || "—"), libraryInlineEditButton(p.id, "volume", "卷"))}${libraryInspectorRow("期", escapeHtml(item.effectiveIssue || "—"), libraryInlineEditButton(p.id, "issue", "期"))}${libraryInspectorRow("页码", escapeHtml(item.effectivePages || "—"), libraryInlineEditButton(p.id, "pages", "页码"))}${libraryInspectorRow("DOI", doiValue, libraryInlineEditButton(p.id, "doi", "DOI"))}${libraryInspectorRow("URL", urlValue, libraryInlineEditButton(p.id, "url", "URL"))}</div></section>
+    <header class="inspector-title-block"><div class="inspector-title-line"><h2 title="${escapeHtml(englishTitle)}">${escapeHtml(englishTitle)}</h2>${libraryInlineEditButton(p.id, "title", "Title")}</div>${libraryInspectorRow("中文标题", chineseTitleValue, `${chineseTitleIcon}${libraryInlineEditButton(p.id, "chineseTitle", "中文标题")}${chineseTitleStatus}`, "inspector-hero-row")}${libraryInspectorRow("作者", escapeHtml(authors), libraryInlineEditButton(p.id, "authors", "作者"), "inspector-hero-row")}</header>
+    <section class="inspector-group inspector-metadata"><div class="inspector-section-head"><h3>引用</h3><div class="inspector-section-actions"><span class="muted small">公开来源</span>${metadataRefreshControl}</div></div><div class="inspector-rows">${libraryInspectorRow("期刊", escapeHtml(librarySource(item)), libraryInlineEditButton(p.id, "source", "期刊"))}${libraryInspectorRow("出版社", escapeHtml(item.effectivePublisher || "—"), libraryInlineEditButton(p.id, "publisher", "出版社"))}${libraryInspectorRow("年份", escapeHtml(libraryYear(item)), libraryInlineEditButton(p.id, "year", "年份"))}${libraryInspectorRow("月份日期", escapeHtml(item.effectivePublicationDate || p.publishedDate || "—"), libraryInlineEditButton(p.id, "publicationDate", "出版日期"))}${libraryInspectorRow("卷", escapeHtml(item.effectiveVolume || "—"), libraryInlineEditButton(p.id, "volume", "卷"))}${libraryInspectorRow("期", escapeHtml(item.effectiveIssue || "—"), libraryInlineEditButton(p.id, "issue", "期"))}${libraryInspectorRow("页码", escapeHtml(item.effectivePages || "—"), libraryInlineEditButton(p.id, "pages", "页码"))}${libraryInspectorRow("DOI", doiValue, libraryInlineEditButton(p.id, "doi", "DOI"))}${libraryInspectorRow("URL", urlValue, libraryInlineEditButton(p.id, "url", "URL"))}</div></section>
     <section class="inspector-group inspector-library"><div class="inspector-section-head"><h3>文库</h3></div><div class="inspector-rows">${libraryInspectorRow("备注", `<span class="${note ? "" : "empty-value"}">${escapeHtml(note || "未添加备注")}</span>`, libraryInlineEditButton(p.id, "note", "备注"))}${renderLibraryRelations(item, "collection")}${renderLibraryRelations(item, "tag")}</div></section>
     <section class="inspector-group inspector-abstract"><div class="inspector-section-head"><h3>摘要</h3><div class="inspector-section-actions"><div class="inspector-language-toggle" role="group" aria-label="摘要语言"><button class="seg ${abstractLanguage === "zh" ? "on" : ""}" data-action="library-abstract-lang" data-lang="zh">中文</button><button class="seg ${abstractLanguage === "en" ? "on" : ""}" data-action="library-abstract-lang" data-lang="en">English</button></div>${libraryInlineEditButton(p.id, abstractLanguage === "zh" ? "chineseAbstract" : "abstract", abstractLanguage === "zh" ? "中文摘要" : "摘要")}</div></div><p class="inspector-abstract-text${abstractText ? "" : " empty-value"}">${escapeHtml(abstractText || "暂无摘要")}</p>${abstractTranslate}</section>
     <section class="inspector-group inspector-attachments"><div class="inspector-section-head"><h3>PDF</h3>${attachmentAdd}</div><div class="attachment-list">${attachmentRows}</div></section>
@@ -2651,10 +2731,14 @@ async function refreshLibraryMetadata(paperId: number): Promise<void> {
   if (libraryMetadataRefreshBusyPaperId != null) return;
   const item = libraryPapers.find((candidate) => candidate.paper.id === paperId);
   if (!item?.paper.normalizedDoi) {
+    libraryMetadataRefreshFeedback = null;
+    refreshLibraryInspectorActionUi(paperId);
     setStatus("这篇论文没有可用于精确刷新的 DOI", "error");
     return;
   }
+  const requestId = ++libraryActionRequestSeq;
   libraryMetadataRefreshBusyPaperId = paperId;
+  libraryMetadataRefreshFeedback = { paperId, requestId, phase: "running", message: "" };
   renderLibrary();
   setStatus("正在从公开来源更新引用元数据…", "running");
   try {
@@ -2662,9 +2746,15 @@ async function refreshLibraryMetadata(paperId: number): Promise<void> {
     selectedLibraryPaperId = paperId;
     await Promise.all([loadPapers(), loadLibraryData(libraryView)]);
     const sourceText = result.sources.join(" / ");
-    setStatus(result.refreshedFields.length ? `引用元数据已更新 · ${sourceText}` : `引用元数据已是最新 · ${sourceText}`, "done");
+    const message = result.refreshedFields.length ? `引用元数据已更新 · ${sourceText}` : `引用元数据已是最新 · ${sourceText}`;
+    libraryMetadataRefreshFeedback = { paperId, requestId, phase: "done", message };
+    setStatus(message, "done");
+    // Same transient contract as title translation: success clears itself.
+    scheduleLibraryActionSuccessDismiss("metadataRefresh", paperId, requestId);
   } catch (error) {
-    setStatus(`引用元数据更新失败：${String(error)}`, "error");
+    const message = `引用元数据更新失败：${String(error)}`;
+    libraryMetadataRefreshFeedback = { paperId, requestId, phase: "error", message };
+    setStatus(message, "error");
   } finally {
     libraryMetadataRefreshBusyPaperId = null;
     renderLibrary();

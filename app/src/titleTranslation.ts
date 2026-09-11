@@ -91,47 +91,89 @@ export function resolveTitleEditorKeyDecision(
   return { action: "commit", preventDefault: true, stopPropagation: false };
 }
 
-export type TitleTranslationPhase = "idle" | "running" | "done" | "error";
+export type InspectorActionPhase = "idle" | "running" | "done" | "error";
 
-export interface TitleTranslationState {
+/**
+ * Feedback for one explicit Inspector action (manual title translation,
+ * deterministic metadata refresh).
+ *
+ * `requestId` is what makes transient success safe across the Inspector's
+ * `innerHTML` rebuilds: a timer may only clear the feedback it scheduled
+ * itself, so a stale timer can never wipe a newer request's state — and never
+ * a state belonging to a different paper.
+ */
+export interface InspectorActionFeedback {
   paperId: number;
-  phase: TitleTranslationPhase;
+  requestId: number;
+  phase: InspectorActionPhase;
   message: string;
 }
 
-export interface TitleTranslationButtonState {
-  /** Never a silent no-op: every phase renders something the user can see. */
-  label: string;
+/** Success is transient feedback; errors are not. */
+export const SUCCESS_FEEDBACK_MS = 1800;
+
+/**
+ * True only for the exact request that scheduled the dismiss timer. A stale
+ * timer (older request of the same paper, or any request of another paper)
+ * must leave the current feedback untouched.
+ */
+export function shouldAutoDismissSuccess(
+  feedback: InspectorActionFeedback | null,
+  paperId: number,
+  requestId: number,
+): boolean {
+  return feedback !== null
+    && feedback.phase === "done"
+    && feedback.paperId === paperId
+    && feedback.requestId === requestId;
+}
+
+export interface InspectorActionControlState {
+  /** The control is showing work in flight (disabled + `aria-busy`). */
+  busy: boolean;
   disabled: boolean;
+  /** Inline status text; empty means nothing is rendered at all. */
   statusText: string;
   tone: "idle" | "running" | "done" | "error";
 }
 
-/**
- * Derive the Translate button and its inline status from module state rather
- * than from the DOM node that was clicked. The Library Inspector is rebuilt
- * with `innerHTML` whenever Library data reloads (including the reload caused
- * by the title editor's own blur-save), which detaches the clicked button — so
- * anything written directly onto that node is discarded. Rendering from state
- * keeps `translating` / `done` / `error` visible across those rerenders.
- */
-export function titleTranslationButtonState(
-  state: TitleTranslationState | null,
+/** Resolve the visible feedback for the given action and paper. */
+export function actionControlState(
+  feedback: InspectorActionFeedback | null,
   paperId: number,
-  hasChineseTitle: boolean,
-): TitleTranslationButtonState {
-  const idleLabel = hasChineseTitle ? "重新翻译中文标题" : "翻译中文标题";
-  if (!state || state.paperId !== paperId) {
-    return { label: idleLabel, disabled: false, statusText: "", tone: "idle" };
+  messages: { busy: string; done: string; error: string },
+): InspectorActionControlState {
+  if (!feedback || feedback.paperId !== paperId) {
+    return { busy: false, disabled: false, statusText: "", tone: "idle" };
   }
-  switch (state.phase) {
+  switch (feedback.phase) {
     case "running":
-      return { label: "翻译中…", disabled: true, statusText: "正在翻译中文标题…", tone: "running" };
+      return { busy: true, disabled: true, statusText: feedback.message || messages.busy, tone: "running" };
     case "done":
-      return { label: idleLabel, disabled: false, statusText: state.message || "中文标题已更新", tone: "done" };
+      return { busy: false, disabled: false, statusText: feedback.message || messages.done, tone: "done" };
     case "error":
-      return { label: idleLabel, disabled: false, statusText: state.message || "中文标题翻译失败", tone: "error" };
+      return { busy: false, disabled: false, statusText: feedback.message || messages.error, tone: "error" };
     default:
-      return { label: idleLabel, disabled: false, statusText: "", tone: "idle" };
+      return { busy: false, disabled: false, statusText: "", tone: "idle" };
   }
+}
+
+/**
+ * The icon affordance for a manual title translation. The visible string is
+ * only ever a tooltip / accessible name — the standing text label is gone, so
+ * when a Chinese title already exists the action reads as a *re*translation.
+ */
+export function titleTranslationControlState(
+  feedback: InspectorActionFeedback | null,
+  paperId: number,
+): InspectorActionControlState {
+  return actionControlState(feedback, paperId, {
+    busy: "正在翻译中文标题…",
+    done: "中文标题已更新",
+    error: "中文标题翻译失败",
+  });
+}
+
+export function titleTranslationAriaLabel(hasChineseTitle: boolean): string {
+  return hasChineseTitle ? "重新翻译中文标题" : "翻译中文标题";
 }

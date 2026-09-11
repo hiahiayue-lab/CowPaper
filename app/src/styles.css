@@ -1042,13 +1042,28 @@ button.full {
 .inspector-meta dd { min-width: 0; margin: 0; overflow-wrap: anywhere; }
 .inspector-link { max-width: 100%; padding: 0; overflow: hidden; color: var(--accent); font-size: inherit; text-align: left; text-overflow: ellipsis; white-space: nowrap; }
 .inspector-link:hover { text-decoration: underline; background: transparent; }
+/* One shared icon affordance for explicit Inspector actions (manual title
+   translation, deterministic metadata refresh): same glyph, size, hit target
+   and states everywhere; the meaning comes from the owning row plus
+   title/aria-label, never from a standing text label. */
+.icon-action { display: inline-flex; flex: 0 0 auto; align-items: center; justify-content: center; width: 22px; height: 22px; padding: 0; border: 1px solid transparent; border-radius: 5px; background: transparent; color: #9aa3ad; line-height: 1; }
+.icon-action > svg { display: block; }
+.icon-action:hover:not(:disabled) { background: #edf2f8; color: #356dbd; }
+.icon-action:active:not(:disabled) { background: #e2e9f3; color: #2b5da6; }
+/* No custom focus style: the shared `button:focus-visible` design-system ring
+   (`--ds-focus`) already applies, so both actions match every other control. */
+.icon-action:disabled { color: #b6bdc5; cursor: not-allowed; }
+/* In-flight indication is a quiet state change only: no spin, no bounce, no
+   glow — Inspector updates carry no motion. */
+.icon-action.busy { color: #9aa3ad; opacity: .55; }
 /* Manual title translation must never fail silently: every phase renders a
-   visible inline status next to the Translate control. */
-.inspector-translate-status { flex: 0 0 auto; align-self: center; font-size: 11px; line-height: 1.4; color: #87909b; }
-.inspector-translate-status[hidden] { display: none; }
-.inspector-translate-status.running { color: #287cff; }
-.inspector-translate-status.done { color: #1f8a4c; }
-.inspector-translate-status.error { color: #d13b3b; }
+   visible inline status next to its control. Success is transient (~1.8s);
+   an error stays until the next action replaces it. */
+.inspector-action-status { flex: 0 1 auto; min-width: 0; max-width: 220px; align-self: center; overflow: hidden; font-size: 11px; line-height: 1.4; color: #87909b; text-overflow: ellipsis; white-space: nowrap; }
+.inspector-action-status[hidden] { display: none; }
+.inspector-action-status.running { color: #287cff; }
+.inspector-action-status.done { color: #1f8a4c; }
+.inspector-action-status.error { color: #d13b3b; }
 .inspector-field-row { display: flex; align-items: flex-start; gap: 12px; padding: 13px 0 10px; }
 .field-label { flex: 0 0 auto; color: #87909b; font-size: 12px; }
 .field-value { min-width: 0; overflow-wrap: anywhere; font-size: 12px; line-height: 1.5; }

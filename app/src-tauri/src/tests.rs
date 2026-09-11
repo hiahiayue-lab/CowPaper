@@ -1901,6 +1901,79 @@ fn test_c_legacy_external_recommendation_rows_stay_but_lose_active_eligibility()
     assert!(db::list_failed_ids_in_discovery(&conn).unwrap().is_empty());
 }
 
+// ================= v0.2.2 RC4：Inspector icon affordances =================
+
+/// v0.2.2 收口：中文标题与引用两处显式动作改为同一个环形箭头 icon，
+/// 语义不变 —— 手动翻译仍然只能由用户点击触发，metadata refresh 仍然只走
+/// deterministic scholarly provider，绝不调用 LLM。
+#[test]
+fn rc4_inspector_actions_are_icon_only_and_keep_manual_semantics() {
+    let main_ts = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../src/main.ts")).unwrap();
+    let lib_rs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs")).unwrap();
+    let styles = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../src/styles.css")).unwrap();
+
+    // 1) 不再有常驻文字按钮（tooltip / aria-label 是唯一文本载体）。
+    assert!(!main_ts.contains(">重新翻译中文标题<"), "常驻文字按钮「重新翻译中文标题」必须移除");
+    assert!(!main_ts.contains(">刷新元数据<"), "常驻文字按钮「刷新元数据」必须移除");
+    assert!(main_ts.contains("titleTranslationAriaLabel"), "icon 动作必须带 tooltip/aria-label");
+    assert!(main_ts.contains("\"刷新元数据\""), "metadata icon 必须带 tooltip/aria-label");
+
+    // 2) 两个动作必须共用同一个 icon 与同一套视觉状态。
+    assert!(main_ts.contains("const REFRESH_ICON_MARKUP"), "必须只有一个共享的环形箭头 icon 定义");
+    assert_eq!(
+        main_ts.matches("REFRESH_ICON_MARKUP").count(),
+        2,
+        "icon 只能定义一次并被两个动作复用"
+    );
+    assert!(main_ts.contains("libraryIconAction(\"library-translate-title\""), "中文标题动作必须走共享 icon helper");
+    assert!(main_ts.contains("libraryIconAction(\"library-refresh-metadata\""), "引用动作必须走共享 icon helper");
+    for class_name in [".icon-action {", ".icon-action:hover:not(:disabled)", ".icon-action:disabled"] {
+        assert!(styles.contains(class_name), "共享 icon 样式缺失：{class_name}");
+    }
+    // 高频 Inspector 区域不加动画：不旋转、不弹跳、不发光的明确约定。
+    for line in styles.lines().filter(|line| line.contains(".icon-action") || line.contains(".inspector-action-status")) {
+        assert!(
+            !line.contains("animation") && !line.contains("transition"),
+            "icon / status 不得引入动画或过渡：{line}"
+        );
+    }
+    assert!(!main_ts.contains("<animate"), "icon 不得使用 SVG 动画");
+    assert!(styles.contains(".inspector-action-status"), "action 状态必须有独立样式槽位");
+
+    // 3) metadata refresh 仍然只使用 deterministic provider，绝不调用 LLM。
+    let refresh = lib_rs
+        .split("fn refresh_library_item_metadata")
+        .nth(1)
+        .expect("refresh_library_item_metadata 命令必须存在");
+    let refresh_body = refresh.split("\n#[tauri::command]").next().unwrap_or(refresh);
+    assert!(!refresh_body.contains("DeepSeek"), "metadata refresh 不得调用 DeepSeek");
+    assert!(!refresh_body.contains("deepseek"), "metadata refresh 不得调用 DeepSeek");
+    assert!(refresh_body.contains("crossref.work_by_doi"), "metadata refresh 必须使用 Crossref 精确 DOI");
+    assert!(refresh_body.contains("openalex.work_by_doi"), "metadata refresh 必须使用 OpenAlex 精确 DOI");
+
+    // 4) 自动成功消失 / 错误保留：success 走定时器，error 不走。
+    assert!(main_ts.contains("scheduleLibraryActionSuccessDismiss(\"titleTranslation\""), "翻译成功必须走 transient dismiss");
+    assert!(main_ts.contains("scheduleLibraryActionSuccessDismiss(\"metadataRefresh\""), "metadata 成功必须走 transient dismiss");
+    let dismiss = main_ts
+        .split("function scheduleLibraryActionSuccessDismiss")
+        .nth(1)
+        .expect("dismiss helper 必须存在");
+    let dismiss_body = dismiss.split("\n}").next().unwrap_or(dismiss);
+    assert!(dismiss_body.contains("shouldAutoDismissSuccess(current, paperId, requestId)"), "定时器必须校验 paperId + requestId，避免清掉新 paper 的状态");
+    let module = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../src/titleTranslation.ts")).unwrap();
+    let guard = module
+        .split("export function shouldAutoDismissSuccess")
+        .nth(1)
+        .expect("shouldAutoDismissSuccess 必须存在");
+    let guard_body = guard.split("\n}").next().unwrap_or(guard);
+    assert!(guard_body.contains("phase === \"done\""), "只有 success 允许自动消失");
+    assert!(guard_body.contains("feedback.paperId === paperId") && guard_body.contains("feedback.requestId === requestId"), "自动消失必须绑定 paperId 与 requestId");
+
+    // 5) 英文/中文标题的 Enter 语义不得被本次 UI 修改破坏。
+    assert!(module.contains("if (field === \"title\" || field === \"chineseTitle\")"), "标题编辑框 Enter 必须保持 NONE");
+    assert!(main_ts.contains("resolveTitleEditorKeyDecision("), "标题编辑框必须仍走被测的 Enter 策略");
+}
+
 #[test]
 fn test_v12_backfills_ledger_proven_legacy_missing_idempotently() {
     let conn = mem_db();

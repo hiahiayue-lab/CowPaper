@@ -303,7 +303,13 @@ PDF attachments are subordinate children of a paper, not separate papers. A mana
 
 ## Inspector
 
-The Inspector is a continuous reading surface with a serif paper title and abstract, short label/value citation rows, and thin rules separating Citation, Library, Abstract, PDF, and Citation Format. Empty metadata uses muted text plus a concrete edit/add action when one exists. Inline edit affordances remain quiet until hover or keyboard focus. Attachment actions distinguish Open, Show Location, Relink, and Detach. Citation includes a lightweight `刷新元数据` action when an exact DOI is available; it reuses the Crossref/OpenAlex DOI provider path, updates canonical metadata only, and leaves Library-only edits, notes, relations, and attachments intact.
+The Inspector is a continuous reading surface with a serif paper title and abstract, short label/value citation rows, and thin rules separating Citation, Library, Abstract, PDF, and Citation Format. Empty metadata uses muted text plus a concrete edit/add action when one exists. Inline edit affordances remain quiet until hover or keyboard focus. Attachment actions distinguish Open, Show Location, Relink, and Detach.
+
+Explicit Inspector actions use one shared circular-arrow icon control (`刷新元数据` in the Citation header, `翻译中文标题` / `重新翻译中文标题` on the Chinese Title row) — same glyph, size, hit target and hover/active/disabled states, and the design-system `button:focus-visible` ring. The action's meaning lives in the owning row plus `title` and `aria-label`; an action never occupies the row with a standing text label. No spin, bounce or glow: in-flight work is a quiet disabled/dimmed state change, and Inspector updates carry no motion.
+
+Explicit-action feedback is inline and never silent. Success is transient and returns to idle after ~1.8s; a failure stays until the next action replaces it, with the full message also on the `title` and in the status region. Because the Inspector is rebuilt with `innerHTML` on every Library reload, this feedback lives in module state keyed by paper *and* request id, so a stale dismiss timer can never clear a newer request or another paper's state.
+
+The Citation icon reuses the Crossref/OpenAlex exact-DOI provider path, updates canonical metadata only, never calls an LLM, and leaves Library-only edits, notes, relations, and attachments intact.
 
 Only `元数据` is visible in v0.2.1. Do not render, reserve, or advertise an empty `标注`/Annotation tab. The future contract is documented below so implementation can remain stable without exposing unfinished UI.
 
@@ -380,7 +386,7 @@ Metadata refresh stays fully deterministic (exact DOI / scholarly ID via the exi
 
 The English Title and Chinese Title editors are not commit-on-Enter controls: `Enter` does not save, submit, finish the edit, blur, lose the draft or translate. `blur`, an outside click, and `Escape` remain the ways out, and composition `Enter` belongs entirely to the IME.
 
-`翻译中文标题` is activated on `pointerdown`, not on `click`. The Library Inspector is rebuilt with `innerHTML` on every Library reload — including the reload caused by the title editor's own blur-save — which detaches the button that received `mousedown`; a `click`-only contract silently did nothing. The control renders its idle / translating / success / error state from module state so it survives those rebuilds, and it never fails silently.
+`翻译中文标题` is activated on `pointerdown`, not on `click`. The Library Inspector is rebuilt with `innerHTML` on every Library reload — including the reload caused by the title editor's own blur-save — which detaches the button that received `mousedown`; a `click`-only contract silently did nothing. The control renders its idle / translating / success / error state from module state so it survives those rebuilds, and it never fails silently. Its affordance is the shared circular-arrow icon (see Inspector) with `title` / `aria-label` — never a standing text label — and its success message returns to idle after ~1.8s while a failure persists until the next action.
 
 ## Do's and Don'ts
 
