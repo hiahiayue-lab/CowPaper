@@ -354,6 +354,8 @@ Focus must remain predictable: opening a popover keeps focus in its owning contr
 
 ## Motion
 
+Future CowPaper UI work must consult the Emil Kowalski design skills and apply their principles within CowPaper’s existing Tauri/Vanilla TS/CSS stack.
+
 CowPaper is a high-frequency desktop information surface. Search, IME, keyboard navigation, filtering, row replacement, selection, scope changes, and Inspector updates have no motion. Occasional spatial panels may use only `transform` and `opacity`, a 125–250ms ease-out, and a trigger-aware origin. Do not use `transition: all`, `ease-in`, layout-property animation, keyframe restarts, or spring motion for functional search.
 
 The reduced-motion mode removes movement and preserves state, focus, and progress information. A progress indicator may update instantly or use `transform: scaleX(...)`; it must not animate `width`. No visual effect should delay an input path or make a user wait for a result that is already available.
