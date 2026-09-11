@@ -1833,10 +1833,12 @@ fn translate_library_title(paper_id: i64, model: String, state: State<Db>, store
     };
     let translated = api::deepseek::DeepSeek::new().translate_title(&api_key, &model, &title).map_err(|e| e.to_string())?;
     let conn = state.inner().lock().unwrap();
-    if db::get_library_paper(&conn, paper_id).map_err(|e| e.to_string())?.and_then(|p| p.effective_title).as_deref() != Some(title.as_str()) {
-        return Err("标题已更改，请重新翻译".into());
-    }
-    db::set_library_translation(&conn, paper_id, &translated, true).map_err(|e| e.to_string())
+    db::set_library_title_translation_if_current(&conn, paper_id, &title, &translated)
+        .map_err(|e| match e {
+            rusqlite::Error::InvalidParameterName(name) if name == "english_title_changed" => "英文标题已更改，请重新翻译".to_string(),
+            rusqlite::Error::InvalidParameterName(name) if name == "chinese_title_already_set" => "已有手工中文标题，不会覆盖".to_string(),
+            other => other.to_string(),
+        })
 }
 
 #[tauri::command]
@@ -2079,8 +2081,10 @@ fn valid_daily_sync_time(value: &str) -> bool {
 /// 聚合全局 Activity 状态（get_activity_state 命令与一致性测试共用）。
 /// pending_analysis / analysis_failed / waiting_for_abstract 为实时 DB 计数，
 /// 与 last_analysis（上一次批次的 total）严格区分，杜绝"上次 7 篇"被误读成"待处理 7 篇"。
+/// 缺摘要只属于本地今日 Discovery batch，并按 canonical paper id 去重。
 pub(crate) fn build_activity_state(conn: &Connection) -> Result<models::ActivityState, String> {
     let retry_waiting = db::get_setting(conn, "queue.retry_waiting").unwrap_or_default() == "1";
+    let local_day = chrono::Local::now().format("%Y-%m-%d").to_string();
     Ok(models::ActivityState {
         sync_batch: db::get_running_sync_batch(conn).map_err(|e| e.to_string())?,
         analysis_batch: db::get_current_analysis_batch(conn).map_err(|e| e.to_string())?,
@@ -2089,7 +2093,7 @@ pub(crate) fn build_activity_state(conn: &Connection) -> Result<models::Activity
         retry_waiting,
         pending_analysis: db::count_pending_papers(conn).unwrap_or(0),
         analysis_failed: db::count_by_status(conn, "analysisFailed").unwrap_or(0),
-        waiting_for_abstract: db::count_waiting_for_abstract(conn).unwrap_or(0),
+        waiting_for_abstract: db::count_waiting_for_abstract_in_discovery_batch(conn, &local_day).unwrap_or(0),
     })
 }
 

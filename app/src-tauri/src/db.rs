@@ -4880,6 +4880,25 @@ pub fn count_waiting_for_abstract(conn: &Connection) -> Result<i64> {
     )
 }
 
+/// Current missing-abstract papers from today's local Discovery batches.
+/// A paper can occur more than once, so Activity counts canonical paper ids.
+/// This is a live count and deliberately does not touch first-seen snapshots.
+pub fn count_waiting_for_abstract_in_discovery_batch(
+    conn: &Connection,
+    local_day: &str,
+) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(DISTINCT sbp.paper_id)
+         FROM sync_batch_papers sbp
+         JOIN sync_batches sb ON sb.id = sbp.sync_batch_id
+         JOIN papers p ON p.id = sbp.paper_id
+         WHERE date(COALESCE(sb.started_at, sb.created_at), 'localtime') = ?1
+           AND p.analysis_status = 'waitingForAbstract'",
+        params![local_day],
+        |r| r.get(0),
+    )
+}
+
 /// 待分析（历史积压）数量：有摘要且尚未分析。
 pub fn count_pending_papers(conn: &Connection) -> Result<i64> {
     conn.query_row(
@@ -7048,6 +7067,35 @@ pub fn set_library_translation(conn: &Connection, paper_id: i64, translated: &st
         ON CONFLICT(paper_id) DO UPDATE SET {field}=excluded.{field},updated_at=excluded.updated_at"),
         params![paper_id,clean_optional_text(Some(translated)),now_utc()])?;
     if !title { tx.execute("UPDATE library_item_metadata SET chinese_abstract_source_hash=?1 WHERE paper_id=?2",params![source_hash,paper_id])?; }
+    tx.commit()?;
+    refresh_library_search_document(conn, paper_id)?;
+    get_library_item_metadata(conn, paper_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
+}
+
+/// Save a title translation only when the effective English title used for
+/// the request is still current and no personal/canonical Chinese title
+/// appeared while the provider request was in flight.
+pub fn set_library_title_translation_if_current(
+    conn: &Connection,
+    paper_id: i64,
+    expected_english_title: &str,
+    translated: &str,
+) -> Result<crate::models::LibraryItemMetadata> {
+    let tx = conn.unchecked_transaction()?;
+    let item = get_library_paper(&tx, paper_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+    if item.effective_title.as_deref().map(str::trim) != Some(expected_english_title.trim()) {
+        return Err(rusqlite::Error::InvalidParameterName("english_title_changed".into()));
+    }
+    if item.effective_chinese_title.as_deref().is_some_and(|value| !value.trim().is_empty()) {
+        return Err(rusqlite::Error::InvalidParameterName("chinese_title_already_set".into()));
+    }
+    tx.execute(
+        "INSERT INTO library_item_metadata(paper_id,chinese_title_override,updated_at)
+         VALUES(?1,?2,?3)
+         ON CONFLICT(paper_id) DO UPDATE SET chinese_title_override=excluded.chinese_title_override,updated_at=excluded.updated_at
+         WHERE library_item_metadata.chinese_title_override IS NULL OR TRIM(library_item_metadata.chinese_title_override) = ''",
+        params![paper_id, clean_optional_text(Some(translated)), now_utc()],
+    )?;
     tx.commit()?;
     refresh_library_search_document(conn, paper_id)?;
     get_library_item_metadata(conn, paper_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)

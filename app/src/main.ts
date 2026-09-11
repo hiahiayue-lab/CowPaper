@@ -2578,6 +2578,38 @@ async function openPdfAttachment(attachmentId: number): Promise<void> {
   }
 }
 
+function libraryDoubleClickAttachment(target: HTMLElement): { paperId: number; attachment: PaperAttachment } | null {
+  const child = target.closest<HTMLElement>(".library-attachment-child");
+  const attachmentRow = target.closest<HTMLElement>(".attachment-row");
+  const row = target.closest<HTMLElement>(".library-paper-row");
+  const paperId = Number((child || attachmentRow || row)?.dataset.paperId);
+  if (!Number.isInteger(paperId)) return null;
+  const item = libraryPapers.find((candidate) => candidate.paper.id === paperId);
+  if (!item) return null;
+  const attachmentId = Number(child?.dataset.attachmentId || attachmentRow?.dataset.attachmentId);
+  const attachment = Number.isInteger(attachmentId)
+    ? item.attachments.find((candidate) => candidate.id === attachmentId)
+    : item.attachments.find((candidate) => candidate.id === librarySelectedAttachmentId) || item.attachments[0];
+  return attachment ? { paperId, attachment } : null;
+}
+
+async function openLibraryDoubleClickAttachment(target: HTMLElement, event: MouseEvent): Promise<void> {
+  const match = libraryDoubleClickAttachment(target);
+  if (!match) return;
+  event.preventDefault();
+  event.stopPropagation();
+  librarySelectedAttachmentId = match.attachment.id;
+  selectedLibraryPaperId = match.paperId;
+  if (match.attachment.missing) return;
+  try {
+    setStatus("正在打开 PDF…", "running");
+    await openPdfAttachment(match.attachment.id);
+    setStatus("PDF 已打开", "done");
+  } catch (error) {
+    setStatus(`打开 PDF 失败：${String(error)}`, "error");
+  }
+}
+
 function preferredReaderForSettings(): string {
   const mode = ($("set-preferred-reader") as HTMLSelectElement).value;
   if (mode === "system") return "system";
@@ -2851,7 +2883,7 @@ class PaperRowDrag {
   }
 
   private onDown = (event: PointerEvent): void => {
-    if (event.button !== 0 || !claimLibraryDrag("paper-row")) return;
+    if (event.button !== 0 || event.detail > 1 || !claimLibraryDrag("paper-row")) return;
     const target = event.target as HTMLElement;
     const row = target.closest<HTMLElement>(".library-paper-row");
     const control = target.closest("[data-action]");
@@ -4578,6 +4610,13 @@ async function setupListeners() {
       }
       return;
     }
+    // A double click has one selection click followed by a second click and
+    // then the dblclick event. Keep the second click from re-running row
+    // selection while the dblclick handler opens the chosen PDF.
+    if (ev.detail > 1 && t.closest(".library-paper-row, .library-attachment-child, .attachment-row") && !t.closest(".attachment-actions, [data-action='library-toggle-attachments']")) {
+      ev.preventDefault();
+      return;
+    }
     const removeToken = t.closest("[data-action='library-search-remove-token']") as HTMLElement | null;
     if (removeToken) {
       const kind = removeToken.dataset.tokenKind;
@@ -5438,55 +5477,7 @@ async function setupListeners() {
   document.addEventListener("dblclick", async (ev) => {
     const target = ev.target as HTMLElement;
     if (target.closest(".attachment-actions, [data-action='library-toggle-attachments']")) return;
-    const child = target.closest<HTMLElement>(".library-attachment-child");
-    if (child) {
-      const attachmentId = Number(child.dataset.attachmentId);
-      const paperId = Number(child.dataset.paperId);
-      const attachment = libraryPapers.find((item) => item.paper.id === paperId)?.attachments.find((item) => item.id === attachmentId);
-      if (!attachment || attachment.missing) return;
-      ev.preventDefault();
-      librarySelectedAttachmentId = attachment.id;
-      selectedLibraryPaperId = paperId;
-      try {
-        setStatus("正在打开 PDF…", "running");
-        await openPdfAttachment(attachment.id);
-        setStatus("PDF 已打开", "done");
-      } catch (error) {
-        setStatus(`打开 PDF 失败：${String(error)}`, "error");
-      }
-      return;
-    }
-    const attachmentRow = target.closest<HTMLElement>(".attachment-row");
-    if (attachmentRow) {
-      const attachmentId = Number(attachmentRow.dataset.attachmentId);
-      const paperId = Number(attachmentRow.dataset.paperId);
-      const attachment = libraryPapers.find((item) => item.paper.id === paperId)?.attachments.find((item) => item.id === attachmentId);
-      if (!attachment || attachment.missing) return;
-      ev.preventDefault();
-      librarySelectedAttachmentId = attachment.id;
-      selectedLibraryPaperId = paperId;
-      try {
-        setStatus("正在打开 PDF…", "running");
-        await openPdfAttachment(attachment.id);
-        setStatus("PDF 已打开", "done");
-      } catch (error) {
-        setStatus(`打开 PDF 失败：${String(error)}`, "error");
-      }
-      return;
-    }
-    const row = target.closest<HTMLElement>(".library-paper-row");
-    if (!row) return;
-    const item = libraryPapers.find((candidate) => candidate.paper.id === Number(row.dataset.paperId));
-    const attachment = item?.attachments.find((candidate) => candidate.id === librarySelectedAttachmentId) || item?.attachments[0];
-    if (!attachment || attachment.missing) return;
-    ev.preventDefault();
-    try {
-      setStatus("正在打开 PDF…", "running");
-      await openPdfAttachment(attachment.id);
-      setStatus("PDF 已打开", "done");
-    } catch (error) {
-      setStatus(`打开 PDF 失败：${String(error)}`, "error");
-    }
+    await openLibraryDoubleClickAttachment(target, ev);
   });
 }
 

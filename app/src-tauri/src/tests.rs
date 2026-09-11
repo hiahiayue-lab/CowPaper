@@ -1873,6 +1873,8 @@ fn test_work_state_consistency() {
     assert_eq!(st.analysis_failed, 0, "D: 重试完成 → failed=0");
 
     // ===== Scenario E：sync 新增 3 篇（2 有摘要 + 1 无摘要 waitingForAbstract）→ pending=2, waiting=1 =====
+    let discovery_batch = db::create_sync_batch(&conn, "manual").unwrap();
+    let mut discovery_ids = Vec::new();
     for i in 0..2 {
         let c = candidate(
             Some(&format!("10.1000/ws-e{}", i)),
@@ -1881,19 +1883,70 @@ fn test_work_state_consistency() {
             Some("crossref"),
         );
         match db::upsert_paper(&conn, jid, &c).unwrap() {
-            UpsertOutcome::New(_) => {}
+            UpsertOutcome::New(id) => discovery_ids.push(id),
             _ => panic!("expected new"),
         }
     }
     let c = candidate(Some("10.1000/ws-e-noabs"), "WorkState ENoAbs", None, None);
     match db::upsert_paper(&conn, jid, &c).unwrap() {
-        UpsertOutcome::New(_) => {}
+        UpsertOutcome::New(id) => discovery_ids.push(id),
         _ => panic!("expected new"),
     }
+    db::add_sync_batch_papers(&conn, discovery_batch, &discovery_ids, &[], &[]).unwrap();
     let st = crate::build_activity_state(&conn).unwrap();
     assert_eq!(st.pending_analysis, 2, "E: 2 篇有摘要待分析（不得把无摘要篇计入）");
     assert_eq!(st.waiting_for_abstract, 1, "E: 1 篇等待摘要");
     assert_eq!(st.pending_analysis + st.waiting_for_abstract, 3, "E: 合计 3 篇");
+}
+
+#[test]
+fn activity_missing_abstract_counts_only_today_discovery_papers_once() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "Activity Discovery", Some("0025-1909"), None, None, None).unwrap();
+    let make_missing = |doi: &str| match db::upsert_paper(&conn, jid, &candidate(Some(doi), doi, None, None)).unwrap() {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new"),
+    };
+    let today_a = make_missing("10.1000/activity-a");
+    let today_b = make_missing("10.1000/activity-b");
+    let yesterday = make_missing("10.1000/activity-yesterday");
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let old_day = (chrono::Local::now() - chrono::Duration::days(1)).format("%Y-%m-%d").to_string();
+
+    let today_batch = db::create_sync_batch(&conn, "manual").unwrap();
+    let old_batch = db::create_sync_batch(&conn, "daily").unwrap();
+    conn.execute("UPDATE sync_batches SET created_at=?1, started_at=?1 WHERE id=?2", params![format!("{today}T12:00:00Z"), today_batch]).unwrap();
+    conn.execute("UPDATE sync_batches SET created_at=?1, started_at=?1 WHERE id=?2", params![format!("{old_day}T12:00:00Z"), old_batch]).unwrap();
+    db::add_sync_batch_papers(&conn, today_batch, &[today_a, today_b, today_a], &[], &[]).unwrap();
+    db::add_sync_batch_papers(&conn, old_batch, &[yesterday], &[], &[]).unwrap();
+    conn.execute("UPDATE papers SET first_seen_cycle=?1, first_seen_abstract_missing=1 WHERE id=?2", params![old_day, yesterday]).unwrap();
+
+    assert_eq!(db::count_waiting_for_abstract_in_discovery_batch(&conn, &today).unwrap(), 2);
+    let snapshot = db::list_daily_paper_summaries(&conn).unwrap();
+    assert!(snapshot.iter().any(|day| day.cycle_key == old_day && day.missing_count == 1), "历史 first-seen missing snapshot remains intact");
+}
+
+#[test]
+fn library_title_translation_uses_effective_title_and_protects_manual_chinese_title() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "Title Translation", Some("0025-1909"), None, None, None).unwrap();
+    let id = match db::upsert_paper(&conn, jid, &candidate(Some("10.1000/title-translation"), "Canonical English", Some("abstract"), Some("crossref"))).unwrap() {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new"),
+    };
+    db::add_paper_to_library(&conn, id, &[], &[], "manual").unwrap();
+    conn.execute("UPDATE papers SET total_score=4.2, analysis_status='analysisSucceeded' WHERE id=?1", params![id]).unwrap();
+    db::set_library_item_metadata(&conn, id, &crate::models::LibraryItemMetadataInput { title_override: Some("Edited English".into()), ..Default::default() }).unwrap();
+
+    db::set_library_title_translation_if_current(&conn, id, "Edited English", "编辑后的中文").unwrap();
+    let translated = db::get_library_paper(&conn, id).unwrap().unwrap();
+    assert_eq!(translated.effective_title.as_deref(), Some("Edited English"));
+    assert_eq!(translated.effective_chinese_title.as_deref(), Some("编辑后的中文"));
+    assert_eq!(conn.query_row("SELECT total_score FROM papers WHERE id=?1", params![id], |r| r.get::<_, Option<f64>>(0)).unwrap(), Some(4.2));
+
+    db::set_library_item_metadata(&conn, id, &crate::models::LibraryItemMetadataInput { title_override: Some("Edited Again".into()), chinese_title_override: Some("手工中文标题".into()), ..Default::default() }).unwrap();
+    assert!(db::set_library_title_translation_if_current(&conn, id, "Edited Again", "不应覆盖").is_err());
+    assert_eq!(db::get_library_paper(&conn, id).unwrap().unwrap().effective_chinese_title.as_deref(), Some("手工中文标题"));
 }
 
 // ================= Round 5A：Canonical Journal Identity & Collections =================
