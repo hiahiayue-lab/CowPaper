@@ -526,6 +526,8 @@ const librarySearchHandledPointerSuggestions = new WeakSet<HTMLElement>();
 const libraryPaperIds = new Set<number>();
 type SettingsSection = "general" | "ai" | "pdf" | "library" | "recommend" | "about";
 let activeWorkspace: "discovery" | "library" | "settings" = "discovery";
+let activeViewName = "recommend";
+let settingsReturnState: { workspace: "discovery" | "library"; view: string } | null = null;
 let activeSettingsSection: SettingsSection = "general";
 let aiStatus: AiStatus = emptyAiStatus();
 let activity: ActivityState = emptyActivity();
@@ -3752,6 +3754,16 @@ function renderNextCheck() {
 // ---------- 动作 ----------
 
 function switchView(name: string) {
+  if (name === "settings" && activeWorkspace === "settings") {
+    returnFromSettings();
+    return;
+  }
+  if (name === "settings" && activeWorkspace !== "settings") {
+    settingsReturnState = {
+      workspace: activeWorkspace === "library" ? "library" : "discovery",
+      view: activeViewName,
+    };
+  }
   // Unsaved Guard（Round 6.5）：标签有未保存修改时拦截导航
   if (tagConfigDirty && name !== "tags") {
     showConfirmModal({
@@ -3769,6 +3781,19 @@ function switchView(name: string) {
     return;
   }
   doSwitch(name);
+}
+
+function returnFromSettings(): void {
+  const target = settingsReturnState || { workspace: "discovery" as const, view: "recommend" };
+  settingsReturnState = null;
+  if (target.workspace === "library") {
+    // Keep the mounted Library DOM and its stateful search/selection intact.
+    // Re-loading here would clear the user's scroll position and can briefly
+    // replace the scoped result set while leaving Settings.
+    doSwitch(target.view.startsWith("library-") ? target.view : "library-all", { preserveLibraryState: true, refreshLibrary: false });
+    return;
+  }
+  doSwitch(target.view);
 }
 
 function switchSettingsSection(section: SettingsSection): void {
@@ -3806,15 +3831,16 @@ function ensureLibrarySearchToolbar(): HTMLElement | null {
   return toolbar;
 }
 
-function doSwitch(name: string) {
+function doSwitch(name: string, options: { preserveLibraryState?: boolean; refreshLibrary?: boolean } = {}) {
   const isLibrary = name.startsWith("library-");
   const isSettings = name === "settings";
-  if (isLibrary && ["library-all", "library-recent", "library-unfiled"].includes(name)) {
+  if (isLibrary && !options.preserveLibraryState && ["library-all", "library-recent", "library-unfiled"].includes(name)) {
     // Standard Library views own the scope; collection/tag filters are a
     // separate sidebar mode and should not leak into Recent or Unfiled.
     clearLibraryScope();
     libraryInspectorCollapsed = window.innerWidth < 1100;
   }
+  if (!isSettings) activeViewName = name;
   activeWorkspace = isSettings ? "settings" : isLibrary ? "library" : "discovery";
   document.body.classList.toggle("library-workspace", isLibrary);
   document.body.classList.toggle("settings-workspace", isSettings);
@@ -3831,6 +3857,9 @@ function doSwitch(name: string) {
     "library-all": "全部文献", "library-recent": "最近收录", "library-unfiled": "未分类",
   };
   $("view-title").textContent = isSettings ? "通用" : titles[name] || name;
+  const settingsButton = $("btn-settings-global");
+  settingsButton.setAttribute("title", isSettings ? "返回当前工作区" : "设置");
+  settingsButton.setAttribute("aria-label", isSettings ? "返回当前工作区" : "设置");
   if (isSettings) switchSettingsSection(activeSettingsSection);
   // 进入活动页时渲染 master-detail（数据来自统一 activity + 批次查询）
   if (name === "activity") renderActivityCenter().catch(() => {});
@@ -3843,7 +3872,7 @@ function doSwitch(name: string) {
   }
   // 进入标签页时加载 Draft Editor
   if (name === "tags") loadTagEditor();
-  if (isLibrary) {
+  if (isLibrary && options.refreshLibrary !== false) {
     const view = name === "library-recent" ? "recent" : name === "library-unfiled" ? "unfiled" : "all";
     loadLibraryData(view);
   }
@@ -4523,6 +4552,20 @@ async function setupListeners() {
     ev.dataTransfer?.setData("application/x-cowpaper-library-scope", suggestion.dataset.searchSuggestionId || "");
   });
   document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape" && activeWorkspace === "settings") {
+      const modal = $("confirm-modal");
+      if (modal && !modal.classList.contains("hidden")) return;
+      const transient = document.querySelector<HTMLElement>(".status-popover:not(.hidden), .library-column-menu:not(.hidden), .library-context-menu:not(.hidden)");
+      if (transient) {
+        transient.classList.add("hidden");
+        $("work-status")?.setAttribute("aria-expanded", "false");
+        ev.preventDefault();
+        return;
+      }
+      ev.preventDefault();
+      returnFromSettings();
+      return;
+    }
     if ((ev.metaKey || ev.ctrlKey) && ev.key.toLocaleLowerCase() === "f" && activeWorkspace === "library") {
       ev.preventDefault();
       const input = $("library-search-input") as HTMLInputElement | null;
@@ -4700,6 +4743,10 @@ async function setupListeners() {
       } else {
         doSwitch("recommend");
       }
+      return;
+    }
+    if (t.closest("[data-action='settings-back']")) {
+      returnFromSettings();
       return;
     }
     const settingsSection = t.closest("[data-settings-section]") as HTMLElement | null;
@@ -5522,6 +5569,33 @@ async function setupListeners() {
 
 window.addEventListener("DOMContentLoaded", () => {
   $("btn-settings-global").addEventListener("click", () => switchView("settings"));
+  document.querySelector<HTMLElement>("[data-action='settings-back']")?.addEventListener("click", (ev) => {
+    // Handle the native button directly so returning from Settings does not
+    // depend on the document-level action delegation order.
+    ev.stopPropagation();
+    returnFromSettings();
+  });
+  document.querySelectorAll<HTMLElement>("[data-settings-section]").forEach((item) => {
+    item.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      const section = item.dataset.settingsSection as SettingsSection | undefined;
+      if (section) switchSettingsSection(section);
+    });
+  });
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Escape" || activeWorkspace !== "settings") return;
+    const modal = $("confirm-modal");
+    if (modal && !modal.classList.contains("hidden")) return;
+    const transient = document.querySelector<HTMLElement>(".status-popover:not(.hidden), .library-column-menu:not(.hidden), .library-context-menu:not(.hidden)");
+    if (transient) {
+      transient.classList.add("hidden");
+      $("work-status")?.setAttribute("aria-expanded", "false");
+    } else {
+      returnFromSettings();
+    }
+    ev.preventDefault();
+    ev.stopImmediatePropagation();
+  }, true);
   $("add-form").addEventListener("submit", addJournalHandler);
   $("btn-refresh").addEventListener("click", loadPapers);
   $("journal-filter").addEventListener("change", renderPapers);
