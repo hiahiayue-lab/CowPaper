@@ -360,6 +360,28 @@ CowPaper is a high-frequency desktop information surface. Search, IME, keyboard 
 
 The reduced-motion mode removes movement and preserves state, focus, and progress information. A progress indicator may update instantly or use `transform: scaleX(...)`; it must not animate `width`. No visual effect should delay an input path or make a user wait for a result that is already available.
 
+## Discovery membership and Library-only papers (permanent invariant)
+
+A canonical `papers.id` may be referenced by both workspaces, and Discovery and Library may share one row. The existence of the canonical Paper therefore proves nothing about Discovery: **canonical Paper exists ≠ belongs to Discovery**.
+
+Discovery eligibility is proven only by explicit membership rows — the journal-sync ledger (`sync_batch_papers`) or a recommendation snapshot (`recommendation_items`) — and never by `first_seen_cycle`, by a title/DOI match, or by a `discovery_source` blacklist. A future import source (DOI, BibTeX, RIS, manual entry, annotation import) must need no change to this rule.
+
+A Library-only Paper (in `library_items`, no Discovery membership) may own a canonical Paper, a Library membership, an attachment, metadata enrichment, and Library Search indexing. It must never appear in 今日, Discovery history, 稍后看, recommendation membership or a recommendation batch, the Discovery AI queue, Research Tag scoring, a new `tag_matches_json`/`total_score`, or recommendation ranking. When a paper that already belongs to Discovery is added to the Library, both memberships coexist on the same `papers.id` and no duplicate Paper is created. Historical recommendation rows produced by the pre-RC4 Library AI leak stay in SQLite but lose all active eligibility.
+
+Library exposes no generic `AI 分析` and no `检查新论文`. Its AI surface is limited to explicit, action-specific tools owned by one paper — `翻译中文标题` and `翻译为中文` (abstract).
+
+## Title translation (permanent invariant)
+
+**AUTO TITLE TRANSLATION = NO.** A Chinese title is produced only by an explicit user click on `翻译中文标题`. PDF import, Library import, metadata enrichment, metadata refresh, English-title save, app startup, background workers, recommendation analysis, Discovery analysis and every other background flow never translate a title.
+
+The translation source is always the English title the user is looking at: the open editor draft first, then the effective persisted English title, and the canonical title only when neither exists. The backend never re-reads `papers.title` as an implicit source; the caller passes the visible title and the command rejects a source that no longer matches the visible title. When a draft is dirty it is persisted with the exact same string that is sent to the provider, so UI, database and translation cannot disagree. An existing manual Chinese title is never changed by editing the English title — only an explicit Translate replaces it.
+
+Metadata refresh stays fully deterministic (exact DOI / scholarly ID via the existing Crossref/OpenAlex/publisher providers), never calls an LLM for titles, and never triggers translation.
+
+The English Title and Chinese Title editors are not commit-on-Enter controls: `Enter` does not save, submit, finish the edit, blur, lose the draft or translate. `blur`, an outside click, and `Escape` remain the ways out, and composition `Enter` belongs entirely to the IME.
+
+`翻译中文标题` is activated on `pointerdown`, not on `click`. The Library Inspector is rebuilt with `innerHTML` on every Library reload — including the reload caused by the title editor's own blur-save — which detaches the button that received `mousedown`; a `click`-only contract silently did nothing. The control renders its idle / translating / success / error state from module state so it survives those rebuilds, and it never fails silently.
+
 ## Do's and Don'ts
 
 - Keep one accent role per view and keep secondary actions neutral.

@@ -1042,6 +1042,13 @@ button.full {
 .inspector-meta dd { min-width: 0; margin: 0; overflow-wrap: anywhere; }
 .inspector-link { max-width: 100%; padding: 0; overflow: hidden; color: var(--accent); font-size: inherit; text-align: left; text-overflow: ellipsis; white-space: nowrap; }
 .inspector-link:hover { text-decoration: underline; background: transparent; }
+/* Manual title translation must never fail silently: every phase renders a
+   visible inline status next to the Translate control. */
+.inspector-translate-status { flex: 0 0 auto; align-self: center; font-size: 11px; line-height: 1.4; color: #87909b; }
+.inspector-translate-status[hidden] { display: none; }
+.inspector-translate-status.running { color: #287cff; }
+.inspector-translate-status.done { color: #1f8a4c; }
+.inspector-translate-status.error { color: #d13b3b; }
 .inspector-field-row { display: flex; align-items: flex-start; gap: 12px; padding: 13px 0 10px; }
 .field-label { flex: 0 0 auto; color: #87909b; font-size: 12px; }
 .field-value { min-width: 0; overflow-wrap: anywhere; font-size: 12px; line-height: 1.5; }

@@ -1368,12 +1368,55 @@ fn row_to_paper(row: &rusqlite::Row) -> Result<Paper> {
     })
 }
 
-/// Explicit Discovery membership.  A canonical paper can exist in the
-/// Library without ever belonging to Discovery, so `papers.first_seen_cycle`
-/// and provenance/source fields are deliberately not used as eligibility.
-/// Existing recommendation snapshots are also membership evidence and must be
-/// retained across restarts and later Library imports.
-pub const DISCOVERY_MEMBERSHIP_PREDICATE: &str = "(EXISTS (SELECT 1 FROM sync_batch_papers sbp WHERE sbp.paper_id = p.id) OR EXISTS (SELECT 1 FROM recommendation_items ri WHERE ri.paper_id = p.id AND (COALESCE(p.discovery_source, '') <> 'external_pdf_import' OR EXISTS (SELECT 1 FROM library_items li WHERE li.paper_id = p.id AND li.added_source = 'external_pdf_import' AND ri.added_at <= li.added_at))))";
+/// Explicit Discovery membership — the single authoritative rule for
+/// "does this canonical paper belong to Discovery?".
+///
+/// A canonical `papers.id` may be referenced by both workspaces, so the mere
+/// existence of the row (or of `first_seen_cycle`, provenance columns, or any
+/// `discovery_source` value) proves nothing.  Membership has exactly two
+/// independent proofs, both of them explicit membership rows:
+///
+/// 1. `sync_batch_papers` — the journal-sync discovery ledger.  Every paper a
+///    sync inserts, re-sees, or re-abstracts is recorded here, so this is the
+///    primary proof.  Library/PDF/DOI/BibTeX/RIS import paths never write it.
+/// 2. `recommendation_items` — a recommendation snapshot is also membership
+///    evidence and survives restarts and later Library imports.
+///
+/// A third, deliberately narrow clause keeps *legacy* recommendation rows from
+/// resurrecting a Library-only paper.  Historically a local PDF imported into
+/// the Library could be sent through the Discovery AI pipeline, which produced
+/// a tainted `recommendation_items` row.  Such a row only counts as membership
+/// when it predates the Library membership that created it — i.e. when the
+/// paper genuinely was in Discovery first and the user added it to the Library
+/// afterwards.  The comparison is `>=` so a same-second collision is treated as
+/// tainted; legitimate pre-existing Discovery papers are still covered by
+/// clause 1.  This is a legacy-data adjudication on top of explicit membership,
+/// not a `discovery_source` blacklist used as the eligibility rule: adding a
+/// new import source (DOI, BibTeX, RIS, manual entry, annotation import) needs
+/// no change here.
+pub const DISCOVERY_MEMBERSHIP_PREDICATE: &str = "(EXISTS (SELECT 1 FROM sync_batch_papers sbp WHERE sbp.paper_id = p.id) OR EXISTS (SELECT 1 FROM recommendation_items ri WHERE ri.paper_id = p.id AND (COALESCE(p.discovery_source, '') <> 'external_pdf_import' OR NOT EXISTS (SELECT 1 FROM library_items li WHERE li.paper_id = p.id AND li.added_source = 'external_pdf_import' AND ri.added_at >= li.added_at))))";
+
+/// A canonical paper that exists in the Library but has no Discovery membership.
+///
+/// “Library-only” is the exact scope every Discovery pipeline must exclude.
+/// Discovery-owned queries use [`DISCOVERY_MEMBERSHIP_PREDICATE`] directly
+/// (eligibility must be proven, not merely un-disproven); this predicate exists
+/// for the few scopes that are deliberately broader than Discovery — such as the
+/// historical missing-title backlog, which is intentionally not gated by
+/// abstract/analysis state but must still never touch a Library-only paper.
+pub const LIBRARY_ONLY_PREDICATE: &str = "(EXISTS (SELECT 1 FROM library_items li WHERE li.paper_id = p.id) AND NOT (EXISTS (SELECT 1 FROM sync_batch_papers sbp WHERE sbp.paper_id = p.id) OR EXISTS (SELECT 1 FROM recommendation_items ri WHERE ri.paper_id = p.id AND (COALESCE(p.discovery_source, '') <> 'external_pdf_import' OR NOT EXISTS (SELECT 1 FROM library_items li2 WHERE li2.paper_id = p.id AND li2.added_source = 'external_pdf_import' AND ri.added_at >= li2.added_at)))))";
+
+/// True when the paper is in the Library and is not a Discovery member.
+pub fn is_library_only(conn: &Connection, paper_id: i64) -> Result<bool> {
+    conn.query_row(
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM papers p WHERE p.id=?1 AND {})",
+            LIBRARY_ONLY_PREDICATE
+        ),
+        params![paper_id],
+        |r| r.get(0),
+    )
+}
 
 pub fn is_discovery_eligible(conn: &Connection, paper_id: i64) -> Result<bool> {
     conn.query_row(
@@ -5965,8 +6008,11 @@ pub fn list_pending_discovery_papers(conn: &Connection) -> Result<Vec<Paper>> {
 /// Papers with a valid source title may receive a title-only translation. This
 /// query intentionally excludes only an existing Chinese title or an invalid
 /// source title; abstract/content/analysis state must not gate this backlog.
-/// It deliberately has no sync-batch or first-seen predicate: historical
-/// papers are backlog candidates too. A bounded, newest-first batch lets the
+/// It has no sync-batch or first-seen *day* predicate: historical Discovery
+/// papers are backlog candidates too. A Library-only paper is excluded, because
+/// this backlog is the Discovery work-center action and a paper that only exists
+/// in the Library must never be translated by it (the Library owns its own
+/// explicit, per-paper translate action). A bounded, newest-first batch lets the
 /// papers currently visible after a sync get their titles in this session,
 /// without turning one launch or sync into an unbounded API run.
 pub const TITLE_TRANSLATION_BATCH_LIMIT: usize = 25;
@@ -5974,17 +6020,19 @@ pub fn list_missing_title_translation_candidates(
     conn: &Connection,
     paper_ids: Option<&[i64]>,
 ) -> Result<Vec<(i64, String)>> {
-    let mut sql = String::from(
-        "SELECT id, title FROM papers WHERE title IS NOT NULL AND TRIM(title) != '' \
-         AND (chinese_title IS NULL OR TRIM(chinese_title) = '')",
+    let mut sql = format!(
+        "SELECT p.id, p.title FROM papers p WHERE p.title IS NOT NULL AND TRIM(p.title) != '' \
+         AND (p.chinese_title IS NULL OR TRIM(p.chinese_title) = '') \
+         AND NOT {}",
+        LIBRARY_ONLY_PREDICATE
     );
     if let Some(ids) = paper_ids {
         if ids.is_empty() { return Ok(vec![]); }
-        sql.push_str(" AND id IN (");
+        sql.push_str(" AND p.id IN (");
         sql.push_str(&ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(","));
         sql.push(')');
     }
-    sql.push_str(" ORDER BY created_at DESC, id DESC LIMIT ");
+    sql.push_str(" ORDER BY p.created_at DESC, p.id DESC LIMIT ");
     sql.push_str(&TITLE_TRANSLATION_BATCH_LIMIT.to_string());
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
@@ -7410,6 +7458,42 @@ pub fn set_library_title_translation_if_current(
 }
 
 fn abstract_text_hash(text: &str) -> String { format!("{:x}", Sha256::digest(text.as_bytes())) }
+
+/// Resolve the English title a *manual* "翻译中文标题" request must translate.
+///
+/// Permanent product invariant: the translation source is always the title the
+/// user is currently looking at — the Inspector editor draft first, otherwise
+/// the effective persisted English title. `papers.title` (the canonical title)
+/// is deliberately never consulted here, because it can legitimately differ
+/// from what the Inspector displays after a manual rename. The only job of this
+/// helper is to prove the paper is a Library member and to hand back the
+/// caller's string unchanged (trimmed), so the provider request cannot silently
+/// substitute a different title.
+pub fn manual_title_translation_source(
+    conn: &Connection,
+    paper_id: i64,
+    caller_supplied_source: &str,
+) -> Result<String> {
+    if get_library_paper(conn, paper_id)?.is_none() {
+        return Err(rusqlite::Error::InvalidParameterName("paper_not_in_library".into()));
+    }
+    Ok(caller_supplied_source.trim().to_string())
+}
+
+/// True when `source` is still the title the Inspector would display for this
+/// Library paper. Used to reject a translation whose request lost a race with a
+/// later English-title edit. Whitespace-only differences are not a change.
+pub fn title_translation_source_is_current(
+    conn: &Connection,
+    paper_id: i64,
+    source: &str,
+) -> Result<bool> {
+    let current = get_library_paper(conn, paper_id)?
+        .and_then(|paper| paper.effective_title)
+        .map(|value| value.trim().to_string());
+    Ok(current.as_deref() == Some(source.trim()))
+}
+
 fn is_provider_abstract_source(source: &str) -> bool { matches!(source, "crossref" | "openalex" | "provider") || source.starts_with("publisher") }
 
 /// Translation is allowed only for a real English abstract. This is a

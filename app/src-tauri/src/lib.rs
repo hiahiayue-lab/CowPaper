@@ -1895,27 +1895,28 @@ fn translate_library_title(
     state: State<Db>,
     store: State<Secure>,
 ) -> Result<models::LibraryItemMetadata, String> {
-    let title = source_english_title.trim().to_string();
+    let api_key = store.get().map_err(|e| e.to_string())?
+        .filter(|s| !s.trim().is_empty()).ok_or_else(|| "未保存 API Key，请先在设置中保存".to_string())?;
+    // The translation source is exactly the string the caller displayed in the
+    // Inspector (editor draft first, then the effective persisted title). The
+    // canonical `papers.title` is never re-read as a source, so an old
+    // canonical title can never be translated by accident.
+    let title = {
+        let conn = state.inner().lock().unwrap();
+        db::manual_title_translation_source(&conn, paper_id, &source_english_title).map_err(|e| match e {
+            rusqlite::Error::InvalidParameterName(name) if name == "paper_not_in_library" => "论文不在文献库中".to_string(),
+            other => other.to_string(),
+        })?
+    };
     if title.is_empty() {
         return Err("请先填写英文标题".into());
     }
-    let api_key = store.get().map_err(|e| e.to_string())?
-        .filter(|s| !s.trim().is_empty()).ok_or_else(|| "未保存 API Key，请先在设置中保存".to_string())?;
-    {
-        let conn = state.inner().lock().unwrap();
-        db::get_library_paper(&conn, paper_id).map_err(|e| e.to_string())?
-            .ok_or_else(|| "论文不在文献库中".to_string())?;
-    }
-    // The caller supplies the title currently visible in the editor. The
-    // second check prevents a concurrent edit from receiving a translation
-    // for an older title while the request was in flight.
     let translated = api::deepseek::DeepSeek::new().translate_title(&api_key, &model, &title).map_err(|e| e.to_string())?;
     let conn = state.inner().lock().unwrap();
-    let current_title = db::get_library_paper(&conn, paper_id)
-        .map_err(|e| e.to_string())?
-        .and_then(|paper| paper.effective_title)
-        .map(|value| value.trim().to_string());
-    if current_title.as_deref() != Some(title.as_str()) {
+    // The request is asynchronous, so the editor may have moved on while
+    // DeepSeek was answering. Refuse to attach a translation that no longer
+    // matches the visible title instead of silently writing the wrong one.
+    if !db::title_translation_source_is_current(&conn, paper_id, &title).map_err(|e| e.to_string())? {
         return Err("英文标题已更改，请重新翻译".into());
     }
     // This command is only reachable through an explicit user action, so an

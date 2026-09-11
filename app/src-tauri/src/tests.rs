@@ -1709,6 +1709,198 @@ fn external_library_papers_require_explicit_discovery_membership() {
     assert_eq!(db::list_library_papers_scoped(&conn, "all", None, &[], 100).unwrap().len(), 1);
 }
 
+// ================= v0.2.2 RC4：TEST A / B / C =================
+
+/// TEST A：外部 PDF 只进 Library。
+///
+/// 结果必须是：Library = YES；Discovery Today = NO；Discovery active
+/// membership = NO；Recommendation = NO；AI queue = NO；Research Tag scoring = NO。
+/// 走真实 import 入口，确保不是只测了一个手工构造的行。
+#[test]
+fn test_a_external_pdf_import_enters_library_and_never_discovery() {
+    let conn = mem_db();
+    let root = test_pdf_library("rc4-external-only");
+    set_pdf_storage_settings(&conn, "copy", &root, "{title} - {year}.pdf", "year");
+    let path = test_pdf_path(
+        "rc4-external-only",
+        "%PDF-1.7\n1 0 obj << /Title (RC4 External Only Paper) /Author (External Author) /CreationDate (D:2024) /DOI (10.1000/rc4-external-only) >>\n",
+    );
+    let result = db::import_external_pdf(&conn, path.to_str().unwrap(), None).unwrap();
+    assert_eq!(result.outcome, "createdExternalPaper");
+    let id = result.paper_id.unwrap();
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+    // Library = YES
+    assert!(db::get_library_membership(&conn, id).unwrap().is_some(), "TEST A: 外部导入必须属于 Library");
+    assert_eq!(db::list_library_papers_scoped(&conn, "all", None, &[], 100).unwrap().len(), 1);
+
+    // Discovery = NO, on every surface.
+    assert!(!db::is_discovery_eligible(&conn, id).unwrap());
+    assert!(db::is_library_only(&conn, id).unwrap(), "TEST A: 该论文必须是 library-only");
+    assert!(db::list_discovery_papers(&conn, None, 100).unwrap().is_empty(), "TEST A: 不得出现在 Discovery 列表");
+    assert!(db::list_papers_for_first_seen_cycle(&conn, &today, false).unwrap().is_empty(), "TEST A: 不得出现在 Discovery Today");
+    assert!(db::list_papers_for_first_seen_cycle(&conn, &today, true).unwrap().is_empty());
+    assert!(db::list_current_missing_papers_for_cycle(&conn, &today).unwrap().is_empty());
+    assert_eq!(
+        db::count_waiting_for_abstract_in_discovery_batch(&conn, &today).unwrap(),
+        0,
+        "TEST A: 不得计入 Activity 今日缺失摘要"
+    );
+    assert!(db::list_sync_batch_papers(&conn, 0).unwrap().is_empty(), "TEST A: 外部导入不得写 sync_batch_papers");
+
+    // Recommendation = NO (even after the paper looks fully analysed).
+    conn.execute(
+        "UPDATE papers SET analysis_status='analysisSucceeded', abstract='A complete abstract imported from a local PDF.', chinese_title='中文', chinese_abstract='摘要', one_sentence_summary='句', total_score=9.5, evidence_hash='rc4-external' WHERE id=?1",
+        params![id],
+    )
+    .unwrap();
+    let run = crate::recommendation::refresh_current_recommendations(&conn, &chrono::Local::now(), "09:00").unwrap();
+    assert!(
+        !db::list_recommendation_items(&conn, run).unwrap().iter().any(|item| item.paper_id == id),
+        "TEST A: 外部导入不得进入 recommendation"
+    );
+
+    // AI queue = NO, for both the backlog drain and an explicit id list.
+    assert!(db::list_pending_discovery_papers(&conn).unwrap().is_empty());
+    assert!(db::discovery_eligible_ids(&conn, &[id]).unwrap().is_empty(), "TEST A: 显式 paper_ids 也必须被成员资格过滤");
+    assert_eq!(db::count_pending_papers_in_discovery(&conn).unwrap(), 0);
+    assert_eq!(db::count_by_status_in_discovery(&conn, "pendingAnalysis").unwrap(), 0);
+
+    // Research Tag scoring = NO.
+    let tag = db::add_tag(&conn, "RC4 External Tag", Some("test")).unwrap();
+    let targets = vec![(tag.id, "RC4 External Tag".to_string(), "test".to_string())];
+    assert!(
+        db::papers_needing_tag_scores(&conn, &targets).unwrap().contains(&id),
+        "前提：不加成员资格过滤时该论文会被 Research Tag scoring 选中（证明下面的过滤是必要的）"
+    );
+    assert!(
+        db::papers_needing_tag_scores_in_discovery(&conn, &targets).unwrap().is_empty(),
+        "TEST A: 外部导入不得进入 Research Tag scoring"
+    );
+    // A legacy tag artifact must not make the local recompute path pick it up.
+    conn.execute(
+        "UPDATE papers SET tag_matches_json='[{\"tag\":\"RC4 External Tag\",\"score\":1.0}]' WHERE id=?1",
+        params![id],
+    )
+    .unwrap();
+    assert!(
+        !db::paper_ids_with_tag_names(&conn, &["RC4 External Tag".into()], &[]).unwrap().contains(&id),
+        "TEST A: 旧 tag_matches_json 不得让 Library-only 论文重新进入 Research Tag 重算"
+    );
+
+    // The Discovery work-center title backlog must not touch it either.
+    assert!(
+        db::list_missing_title_translation_candidates(&conn, None).unwrap().iter().all(|(pid, _)| *pid != id),
+        "TEST A: Library-only 论文不得被 Discovery 标题翻译 backlog 选中"
+    );
+
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// TEST B：先真实存在于 Discovery 的论文，之后再加入 Library。
+/// Discovery = YES、Library = YES、同一个 papers.id、不产生重复论文。
+#[test]
+fn test_b_existing_discovery_paper_added_to_library_keeps_both_memberships() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "Discovery Journal", Some("0025-1909"), None, None, None).unwrap();
+    let id = match db::upsert_paper(
+        &conn,
+        jid,
+        &candidate(Some("10.1000/rc4-discovery-then-library"), "Discovery First Paper", Some("A complete abstract with enough research detail for analysis."), Some("crossref")),
+    )
+    .unwrap() {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new paper"),
+    };
+    let batch = db::create_sync_batch(&conn, "manual").unwrap();
+    db::add_sync_batch_papers(&conn, batch, &[id], &[], &[]).unwrap();
+    // The paper legitimately has a recommendation snapshot before the user ever
+    // adds it to the Library.
+    let run = db::create_recommendation_run(&conn, &chrono::Local::now().format("%Y-%m-%d").to_string(), "finalized").unwrap();
+    conn.execute(
+        "INSERT INTO recommendation_items (run_id,paper_id,rank,score_snapshot,added_at) VALUES (?1,?2,1,1.0,?3)",
+        params![run, id, "2026-09-01T00:00:00Z"],
+    )
+    .unwrap();
+    assert!(db::is_discovery_eligible(&conn, id).unwrap());
+    assert!(db::get_library_membership(&conn, id).unwrap().is_none());
+
+    // 之后加入 Library —— 同一个 canonical papers.id，双会员资格。
+    db::add_paper_to_library(&conn, id, &[], &[], "external_pdf_import").unwrap();
+    assert!(db::is_discovery_eligible(&conn, id).unwrap(), "TEST B: Discovery membership 必须保留");
+    assert!(db::get_library_membership(&conn, id).unwrap().is_some(), "TEST B: Library membership 必须增加");
+    assert!(!db::is_library_only(&conn, id).unwrap());
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM papers", [], |r| r.get::<_, i64>(0)).unwrap(), 1, "TEST B: 不得 duplicate Paper");
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM library_items WHERE paper_id=?1", params![id], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    assert_eq!(db::list_discovery_papers(&conn, None, 100).unwrap().len(), 1);
+    assert_eq!(db::list_library_papers_scoped(&conn, "all", None, &[], 100).unwrap().len(), 1);
+    assert_eq!(db::discovery_eligible_ids(&conn, &[id]).unwrap(), vec![id]);
+
+    // 标题翻译 backlog 仍然覆盖合法 Discovery 论文（只是排除 library-only）。
+    conn.execute("UPDATE papers SET title='Discovery First Paper' WHERE id=?1", params![id]).unwrap();
+    assert!(db::list_missing_title_translation_candidates(&conn, None).unwrap().iter().any(|(pid, _)| *pid == id));
+}
+
+/// TEST C：历史遗留 external recommendation row 存在，但没有合法 Discovery
+/// membership。历史行必须物理保留，却完全失去 active eligibility。
+#[test]
+fn test_c_legacy_external_recommendation_rows_stay_but_lose_active_eligibility() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "Legacy External", Some("0025-1909"), None, None, None).unwrap();
+    let mut external = candidate(
+        Some("10.1000/rc4-legacy-external"),
+        "Legacy External Leak",
+        Some("A complete abstract imported from a local PDF long ago."),
+        Some("pdf_structured"),
+    );
+    external.discovery_source = "external_pdf_import".into();
+    let id = match db::upsert_paper(&conn, jid, &external).unwrap() {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new paper"),
+    };
+    // Historical shape: the Library membership came first (the import), and the
+    // tainted recommendation row was produced afterwards by the old pipeline.
+    db::add_paper_to_library(&conn, id, &[], &[], "external_pdf_import").unwrap();
+    conn.execute("UPDATE library_items SET added_at='2026-08-01T00:00:00Z' WHERE paper_id=?1", params![id]).unwrap();
+    let legacy_run = db::create_recommendation_run(&conn, "2026-08-02", "finalized").unwrap();
+    conn.execute(
+        "INSERT INTO recommendation_items (run_id,paper_id,rank,score_snapshot,added_at) VALUES (?1,?2,1,8.0,'2026-08-02T00:00:00Z')",
+        params![legacy_run, id],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE papers SET analysis_status='analysisSucceeded', chinese_title='中文', chinese_abstract='摘要', one_sentence_summary='句', total_score=8.0, evidence_hash='legacy-external', tag_matches_json='[{\"tag\":\"x\",\"score\":1.0}]', first_seen_cycle='2026-08-01', first_seen_abstract_missing=1 WHERE id=?1",
+        params![id],
+    )
+    .unwrap();
+
+    // Historical rows are physically preserved.
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM recommendation_items WHERE paper_id=?1", params![id], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    assert!(conn.query_row("SELECT tag_matches_json FROM papers WHERE id=?1", params![id], |r| r.get::<_, Option<String>>(0)).unwrap().is_some(), "历史 tag_matches_json 必须保留");
+
+    // ...but they are inert now.
+    assert!(!db::is_discovery_eligible(&conn, id).unwrap(), "TEST C: 无合法 membership 的历史行必须失去 eligibility");
+    assert!(db::is_library_only(&conn, id).unwrap());
+    assert!(db::list_discovery_papers(&conn, None, 100).unwrap().is_empty());
+    assert!(crate::recommendation::run_items_with_papers(&conn, legacy_run).unwrap().is_empty(), "TEST C: 历史 run 不得再渲染这篇论文");
+    let run = crate::recommendation::refresh_current_recommendations(&conn, &chrono::Local::now(), "09:00").unwrap();
+    assert!(!db::list_recommendation_items(&conn, run).unwrap().iter().any(|item| item.paper_id == id));
+    assert_eq!(db::get_recommendation_run(&conn, legacy_run).unwrap().unwrap().item_count, 0, "TEST C: Today 数量不得计入");
+    assert!(db::list_daily_paper_summaries(&conn).unwrap().iter().all(|day| day.missing_count == 0), "TEST C: Activity 缺失摘要数量不得计入");
+    assert_eq!(db::count_waiting_for_abstract(&conn).unwrap(), 0);
+    assert!(db::list_pending_discovery_papers(&conn).unwrap().is_empty());
+    assert!(db::discovery_eligible_ids(&conn, &[id]).unwrap().is_empty(), "TEST C: AI queue 不得进入");
+    assert!(db::list_missing_title_translation_candidates(&conn, None).unwrap().is_empty(), "TEST C: Discovery 标题 backlog 不得进入");
+    let tag = db::add_tag(&conn, "RC4 Legacy Tag", Some("test")).unwrap();
+    assert!(
+        db::papers_needing_tag_scores_in_discovery(&conn, &[(tag.id, "RC4 Legacy Tag".into(), "test".into())]).unwrap().is_empty(),
+        "TEST C: Research scoring 不得进入"
+    );
+    assert!(db::reset_failed_ids_to_pending(&conn, &[id]).is_ok());
+    assert!(db::list_failed_ids_in_discovery(&conn).unwrap().is_empty());
+}
+
 #[test]
 fn test_v12_backfills_ledger_proven_legacy_missing_idempotently() {
     let conn = mem_db();
@@ -2043,6 +2235,238 @@ fn explicit_library_title_translation_can_replace_existing_chinese_title() {
     // only path allowed to replace the personal Chinese Title.
     db::set_library_translation(&conn, id, "新中文标题", true).unwrap();
     assert_eq!(db::get_library_paper(&conn, id).unwrap().unwrap().effective_chinese_title.as_deref(), Some("新中文标题"));
+}
+
+// ================= v0.2.2 RC4：TEST D — 手工翻译源 =================
+
+/// TEST D：canonical title 与 UI 顶部的 effective title 不同时，
+/// 手工“翻译中文标题”的 source 永远是 UI 正在显示的那一个。
+#[test]
+fn test_d_manual_title_translation_source_is_the_visible_title_not_the_canonical_one() {
+    let conn = mem_db();
+    let id = test_paper(&conn, "10.1000/rc4-manual-source", "Old Canonical Title");
+    db::add_paper_to_library(&conn, id, &[], &[], "manual").unwrap();
+    db::set_library_item_metadata(
+        &conn,
+        id,
+        &crate::models::LibraryItemMetadataInput {
+            title_override: Some("The Knowledge-Engineering Paradox".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // What the Inspector displays (effective title) is the only valid source.
+    let visible = db::get_library_paper(&conn, id).unwrap().unwrap().effective_title.unwrap();
+    assert_eq!(visible, "The Knowledge-Engineering Paradox");
+    let source = db::manual_title_translation_source(&conn, id, &visible).unwrap();
+    assert_eq!(source, "The Knowledge-Engineering Paradox", "TEST D: source 必须是 UI 当前标题");
+    assert_ne!(source, "Old Canonical Title", "TEST D: 绝不能使用旧 canonical title");
+    assert!(db::title_translation_source_is_current(&conn, id, &source).unwrap());
+
+    // The canonical title is NOT an acceptable substitute: the backend refuses
+    // it rather than silently translating the wrong paper title.
+    let canonical = db::get_paper(&conn, id).unwrap().unwrap().title.unwrap();
+    assert_eq!(canonical, "Old Canonical Title");
+    assert!(
+        !db::title_translation_source_is_current(&conn, id, &canonical).unwrap(),
+        "TEST D: stale canonical title 必须被拒绝，而不是被翻译"
+    );
+
+    // A whitespace-only difference is not a title change.
+    assert!(db::title_translation_source_is_current(&conn, id, &format!("  {visible}  ")).unwrap());
+    // A paper outside the Library can never be translated through this command.
+    let outside = test_paper(&conn, "10.1000/rc4-not-in-library", "Not In Library");
+    assert!(db::manual_title_translation_source(&conn, outside, "Not In Library").is_err());
+}
+
+/// TEST E：editor 有未保存 draft 时，draft 就是翻译源，并且先以同一个字符串落库。
+#[test]
+fn test_e_unsaved_title_draft_is_the_translation_source_and_is_persisted_verbatim() {
+    let conn = mem_db();
+    let id = test_paper(&conn, "10.1000/rc4-unsaved-draft", "Saved Title");
+    db::add_paper_to_library(&conn, id, &[], &[], "manual").unwrap();
+    assert_eq!(
+        db::get_library_paper(&conn, id).unwrap().unwrap().effective_title.as_deref(),
+        Some("Saved Title")
+    );
+
+    // The Inspector captured the draft; the same string is persisted and sent.
+    let draft = "A Completely New English Title";
+    assert_eq!(db::manual_title_translation_source(&conn, id, draft).unwrap(), draft);
+    db::set_library_item_metadata(
+        &conn,
+        id,
+        &crate::models::LibraryItemMetadataInput { title_override: Some(draft.into()), ..Default::default() },
+    )
+    .unwrap();
+    assert_eq!(db::get_library_paper(&conn, id).unwrap().unwrap().effective_title.as_deref(), Some(draft));
+    assert!(db::title_translation_source_is_current(&conn, id, draft).unwrap());
+    assert!(
+        !db::title_translation_source_is_current(&conn, id, "Saved Title").unwrap(),
+        "TEST E: 旧 saved title 不得再作为翻译源"
+    );
+}
+
+/// TEST G：手写中文标题的保护 —— 改英文标题不会动中文标题，
+/// 只有显式 Translate 才更新它。
+/// 这里刻意复刻 Inspector 的真实保存路径：`libraryMetadataInput(item)` 会把
+/// 当前所有 override 一起回写，再覆盖 titleOverride —— 中文标题必须在其中
+/// 原样保留。
+#[test]
+fn test_g_editing_english_title_never_touches_an_existing_chinese_title() {
+    let conn = mem_db();
+    let id = test_paper(&conn, "10.1000/rc4-manual-chinese-protection", "Original English Title");
+    db::add_paper_to_library(&conn, id, &[], &[], "manual").unwrap();
+    db::set_library_translation(&conn, id, "手工中文标题", true).unwrap();
+    let before = db::get_library_paper(&conn, id).unwrap().unwrap();
+    assert_eq!(before.effective_chinese_title.as_deref(), Some("手工中文标题"));
+
+    // Exactly what the English-title editor does on save.
+    let existing = db::get_library_item_metadata(&conn, id).unwrap().unwrap();
+    db::set_library_item_metadata(
+        &conn,
+        id,
+        &crate::models::LibraryItemMetadataInput {
+            journal_override: existing.journal_override,
+            publisher_override: existing.publisher_override,
+            publication_date_override: existing.publication_date_override,
+            volume_override: existing.volume_override,
+            issue_override: existing.issue_override,
+            pages_override: existing.pages_override,
+            title_override: Some("Renamed English Title".into()),
+            chinese_title_override: existing.chinese_title_override,
+            source_override: existing.source_override,
+            year_override: existing.year_override,
+            authors_override: existing.authors_override,
+            abstract_override: existing.abstract_override,
+            chinese_abstract_override: existing.chinese_abstract_override,
+            note: existing.note,
+            doi_override: existing.doi_override,
+            url_override: existing.url_override,
+        },
+    )
+    .unwrap();
+    let after_rename = db::get_library_paper(&conn, id).unwrap().unwrap();
+    assert_eq!(after_rename.effective_title.as_deref(), Some("Renamed English Title"));
+    assert_eq!(
+        after_rename.effective_chinese_title.as_deref(),
+        Some("手工中文标题"),
+        "TEST G: 英文标题保存不得改变已有中文标题"
+    );
+    // ...and the canonical title is untouched by a Library-local rename.
+    assert_eq!(db::get_paper(&conn, id).unwrap().unwrap().title.as_deref(), Some("Original English Title"));
+
+    // Explicit translate is the only writer allowed to replace it.
+    db::set_library_translation(&conn, id, "新的中文标题", true).unwrap();
+    assert_eq!(
+        db::get_library_paper(&conn, id).unwrap().unwrap().effective_chinese_title.as_deref(),
+        Some("新的中文标题")
+    );
+}
+
+/// TEST H：只有显式 Translate 路径可以调用翻译 provider。
+/// 这是一条永久不变式，因此用静态检查固定：`translate_title` 只能出现在
+/// provider 定义与两个显式命令里，绝不出现在 import / enrichment /
+/// refresh / analysis / recommendation / startup 代码中。
+#[test]
+fn test_h_title_translation_provider_is_only_reachable_from_explicit_commands() {
+    let src_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+    let mut modules: Vec<std::path::PathBuf> = std::fs::read_dir(src_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    modules.extend(
+        std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/src/api"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path()),
+    );
+    let mut offenders: Vec<String> = Vec::new();
+    for path in modules {
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        // The provider itself, the test suite, and the Tauri command layer are
+        // the only files allowed to name the title-translation call.
+        if matches!(name.as_str(), "deepseek.rs" | "tests.rs" | "lib.rs") {
+            continue;
+        }
+        let body = std::fs::read_to_string(&path).unwrap();
+        if body.contains("translate_title") {
+            offenders.push(name);
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "TEST H: import/enrichment/refresh/analysis 代码不得引用标题翻译 provider：{offenders:?}"
+    );
+
+    // In lib.rs every call site must live inside an explicitly user-triggered
+    // command, never in a startup/sync/analysis helper.
+    let lib = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs")).unwrap();
+    let enclosing_fn = |source: &str, line_no: usize| -> String {
+        source
+            .lines()
+            .take(line_no)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .find_map(|line| {
+                for prefix in ["fn ", "async function ", "function "] {
+                    if let Some(rest) = line.strip_prefix(prefix) {
+                        return Some(rest.split(['(', '<']).next().unwrap_or("").trim().to_string());
+                    }
+                }
+                None
+            })
+            .unwrap_or_default()
+    };
+    for (line_no, line) in lib.lines().enumerate() {
+        if !line.contains("translate_title") {
+            continue;
+        }
+        let owner = enclosing_fn(&lib, line_no);
+        assert!(
+            owner == "translate_missing_titles" || owner == "translate_library_title",
+            "TEST H: lib.rs:{} 的 translate_title 调用不在显式翻译命令内（当前属于 fn {owner}）：{line}",
+            line_no + 1
+        );
+    }
+    assert!(!lib.contains("scheduleMissingTitleBacklog"), "TEST H: 自动标题翻译排程不得重新出现");
+
+    // The frontend must not start a title translation from any non-manual path.
+    let main_ts = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../src/main.ts")).unwrap();
+    assert!(
+        !main_ts.contains("scheduleMissingTitleBacklog") && !main_ts.contains("missingTitleBacklogDraining"),
+        "TEST H: 前端自动标题翻译排程不得重新出现"
+    );
+    for call in ["translate_library_title", "translate_missing_titles"] {
+        for (line_no, line) in main_ts.lines().enumerate() {
+            if !line.contains(&format!("invoke(\"{call}\"")) && !line.contains(&format!("invoke<number>(\"{call}\"")) {
+                continue;
+            }
+            let owner = enclosing_fn(&main_ts, line_no);
+            assert!(
+                owner == "runLibraryTitleTranslation" || owner == "startMissingTitleTranslation",
+                "TEST H: main.ts:{} 的 {call} 调用必须在显式用户操作内（当前属于 {owner}）",
+                line_no + 1
+            );
+        }
+    }
+    // AUTO TITLE TRANSLATION = NO: import / enrichment / refresh must not touch
+    // either translate command at all.
+    for forbidden in ["importExternalPdf", "importDroppedPdf", "refreshLibraryMetadata", "attachPdfToPaper", "processLibraryDrop"] {
+        if let Some(start) = main_ts.find(&format!("function {forbidden}")) {
+            let body = &main_ts[start..];
+            let end = body[1..].find("\nfunction ").map(|i| i + 1).unwrap_or(body.len());
+            let body = &body[..end];
+            assert!(
+                !body.contains("translate_library_title") && !body.contains("translate_missing_titles"),
+                "TEST H: {forbidden} 不得触发标题翻译"
+            );
+        }
+    }
 }
 
 // ================= Round 5A：Canonical Journal Identity & Collections =================

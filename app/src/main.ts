@@ -30,6 +30,12 @@ import {
   type LibrarySearchState,
   type SearchPaper,
 } from "./librarySearch";
+import {
+  resolveManualTitleTranslationSource,
+  resolveTitleEditorKeyDecision,
+  titleTranslationButtonState,
+  type TitleTranslationState,
+} from "./titleTranslation";
 
 interface Journal {
   id: number;
@@ -524,7 +530,9 @@ let librarySearchMatches = new Map<number, LibrarySearchHit>();
 let librarySearchAdapter: LibrarySearchApi | null = null;
 const librarySearchHandledPointerSuggestions = new WeakSet<HTMLElement>();
 const libraryPaperIds = new Set<number>();
-let pendingLibraryTitleTranslation: { paperId: number; source: string; hasDraft: boolean } | null = null;
+let libraryTitleTranslation: TitleTranslationState | null = null;
+/** True while the current pointer interaction already started a translation. */
+let libraryTitleTranslationPointerHandled = false;
 type SettingsSection = "general" | "ai" | "pdf" | "library" | "recommend" | "about";
 let activeWorkspace: "discovery" | "library" | "settings" = "discovery";
 let activeViewName = "recommend";
@@ -1971,10 +1979,64 @@ function currentLibraryEnglishTitle(paperId: number): { source: string; hasDraft
   const draftInput = document.querySelector<HTMLInputElement>(
     `[data-library-inline-input="title"][data-library-inline-paper-id="${paperId}"]`,
   );
-  if (draftInput) return { source: draftInput.value.trim(), hasDraft: true };
   const item = libraryPapers.find((candidate) => candidate.paper.id === paperId);
-  const source = item ? libraryEnglishTitle(item) : "";
-  return { source: source === "（无标题）" ? "" : source.trim(), hasDraft: false };
+  const effective = item ? libraryEnglishTitle(item) : "";
+  // Priority: live editor draft → effective persisted title → canonical title.
+  // `papers.title` is only reachable through `effectiveTitle`, which already
+  // falls back to the canonical title, so an older canonical title can never
+  // replace a title the user is currently looking at.
+  const resolved = resolveManualTitleTranslationSource({
+    draft: draftInput ? draftInput.value : null,
+    effectiveTitle: effective === "（无标题）" ? null : effective,
+    canonicalTitle: item?.paper.title ?? null,
+  });
+  return { source: resolved.source, hasDraft: resolved.hasDraft };
+}
+
+/**
+ * The user explicitly asked to translate the title shown in the Inspector.
+ * Any unsaved draft is persisted first with the exact same string that is then
+ * sent to the provider, so UI, database and translation can never disagree.
+ */
+async function runLibraryTitleTranslation(
+  paperId: number,
+  current: { source: string; hasDraft: boolean },
+): Promise<void> {
+  if (!Number.isInteger(paperId)) return;
+  if (libraryTitleTranslation?.paperId === paperId && libraryTitleTranslation.phase === "running") return;
+  const fail = (message: string): void => {
+    libraryTitleTranslation = { paperId, phase: "error", message };
+    refreshLibraryTitleTranslationUi(paperId);
+    setStatus(message, "error");
+  };
+  if (!current.source) {
+    fail("请先填写英文标题");
+    return;
+  }
+  if (!(await hasKey())) {
+    fail("请先在设置中保存 DeepSeek API Key");
+    return;
+  }
+  libraryTitleTranslation = { paperId, phase: "running", message: "" };
+  // Patch the live Inspector instead of re-rendering it, so an open English
+  // title draft is not discarded merely to show progress. Any concurrent
+  // rerender (for example the one caused by the editor's own blur-save) renders
+  // this same state from `libraryTitleTranslation`.
+  refreshLibraryTitleTranslationUi(paperId);
+  setStatus("正在翻译中文标题…", "running");
+  try {
+    if (current.hasDraft) await persistLibraryEnglishTitle(paperId, current.source);
+    await invoke("translate_library_title", { paperId, sourceEnglishTitle: current.source, model: getModel() });
+    libraryTitleTranslation = { paperId, phase: "done", message: "中文标题已更新" };
+    await loadLibraryData(libraryView);
+    setStatus("中文标题已更新", "done");
+  } catch (error) {
+    const message = `中文标题翻译失败：${String(error)}`;
+    libraryTitleTranslation = { paperId, phase: "error", message };
+    await loadLibraryData(libraryView).catch(() => undefined);
+    refreshLibraryTitleTranslationUi(paperId);
+    setStatus(message, "error");
+  }
 }
 
 async function persistLibraryEnglishTitle(paperId: number, source: string): Promise<void> {
@@ -1983,6 +2045,28 @@ async function persistLibraryEnglishTitle(paperId: number, source: string): Prom
   const metadata = libraryMetadataInput(item);
   metadata.titleOverride = source || null;
   await invoke("set_library_item_metadata", { paperId, metadata });
+}
+
+/** In-place view of `libraryTitleTranslation` for the currently rendered Inspector. */
+function refreshLibraryTitleTranslationUi(paperId: number): void {
+  const button = document.querySelector<HTMLButtonElement>(
+    `#library-inspector [data-action='library-translate-title'][data-paper-id="${paperId}"]`,
+  );
+  const status = document.querySelector<HTMLElement>(
+    `#library-inspector [data-title-translation-status="${paperId}"]`,
+  );
+  if (!button && !status) return;
+  const item = libraryPapers.find((candidate) => candidate.paper.id === paperId);
+  const view = titleTranslationButtonState(libraryTitleTranslation, paperId, Boolean(item && libraryChineseTitle(item)));
+  if (button) {
+    button.disabled = view.disabled;
+    button.textContent = view.label;
+  }
+  if (status) {
+    status.textContent = view.statusText;
+    status.className = `inspector-translate-status ${view.tone}`;
+    status.hidden = !view.statusText;
+  }
 }
 
 function beginLibraryInlineEdit(paperId: number, field: LibraryInlineField, button: HTMLElement): void {
@@ -2052,16 +2136,17 @@ function beginLibraryInlineEdit(paperId: number, field: LibraryInlineField, butt
     }
   };
   input.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") { event.preventDefault(); cancel(); }
-    else if (event.key === "Enter" && event.isComposing) { event.preventDefault(); }
-    else if (event.key === "Enter" && (field === "title" || field === "chineseTitle")) {
-      // Title editors are intentionally not commit-on-Enter controls. This
-      // keeps focus in the editor and lets IME/text entry finish naturally;
-      // blur or an explicit outside action still persists the draft.
-      event.preventDefault();
-      event.stopPropagation();
-    }
-    else if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void save(); }
+    // Title editors are intentionally not commit-on-Enter controls: Enter keeps
+    // the editor, the focus and the draft, and a composing Enter stays with the
+    // IME. See `resolveTitleEditorKeyDecision` for the tested policy.
+    const decision = resolveTitleEditorKeyDecision(
+      { key: event.key, shiftKey: event.shiftKey, isComposing: event.isComposing, keyCode: event.keyCode },
+      field,
+    );
+    if (decision.preventDefault) event.preventDefault();
+    if (decision.stopPropagation) event.stopPropagation();
+    if (decision.action === "cancel") cancel();
+    else if (decision.action === "commit") void save();
   });
   input.addEventListener("blur", () => { void save(); }, { once: true });
   input.focus();
@@ -2538,8 +2623,13 @@ function renderLibraryInspector(item: LibraryPaper) {
   const authors = authorText(libraryAuthors(item));
   const citation = `${authors}${libraryYear(item) !== "—" ? ` (${libraryYear(item)})` : ""}. ${englishTitle}. ${librarySource(item)}.`;
   const chineseTitleValue = chineseTitle ? escapeHtml(chineseTitle) : '<span class="empty-value">未添加中文标题</span>';
-  const chineseTitleTranslateLabel = chineseTitle ? "重新翻译中文标题" : "翻译中文标题";
-  const chineseTitleTranslate = `<button class="inspector-link" data-action="library-translate-title" data-paper-id="${p.id}" data-idle-label="${chineseTitleTranslateLabel}">${chineseTitleTranslateLabel}</button>`;
+  // The Translate control renders from module state, never from the node that
+  // was clicked, so `translating` / `done` / `error` survive the Inspector
+  // rebuild that a Library reload (including the title editor's blur-save)
+  // performs. It is also the only title-translation entry point in the app:
+  // nothing translates a title on import, enrichment, refresh or save.
+  const translateView = titleTranslationButtonState(libraryTitleTranslation, p.id, Boolean(chineseTitle));
+  const chineseTitleTranslate = `<button type="button" class="inspector-link" data-action="library-translate-title" data-paper-id="${p.id}"${translateView.disabled ? " disabled" : ""}>${escapeHtml(translateView.label)}</button><span class="inspector-translate-status ${translateView.tone}" data-title-translation-status="${p.id}" role="status" aria-live="polite"${translateView.statusText ? "" : " hidden"}>${escapeHtml(translateView.statusText)}</span>`;
   const doi = libraryDoi(item);
   const url = libraryUrl(item);
   const doiValue = doi ? `<span>${escapeHtml(doi)}</span>` : '<span class="empty-value">未设置 DOI</span>';
@@ -3524,11 +3614,21 @@ async function refreshWorkState() {
   renderPendingCount();
 }
 
+/**
+ * Discovery-only actions (“检查新论文”, AI analysis) must not exist in the
+ * Library or Settings workspaces. Both entry paths are covered: the `hidden`
+ * property removes them from rendering, hit-testing and the tab order, and the
+ * `library-workspace` / `settings-workspace` CSS rules keep them out even if a
+ * rerender runs before this function.
+ */
 function syncDiscoveryActionVisibility(): void {
-  const aiBtn = $("btn-ai-main") as HTMLButtonElement;
   const showDiscoveryActions = activeWorkspace === "discovery";
-  aiBtn.hidden = !showDiscoveryActions;
-  aiBtn.setAttribute("aria-hidden", showDiscoveryActions ? "false" : "true");
+  for (const id of ["btn-ai-main", "btn-sync-main"]) {
+    const button = $(id) as HTMLButtonElement | null;
+    if (!button) continue;
+    button.hidden = !showDiscoveryActions;
+    button.setAttribute("aria-hidden", showDiscoveryActions ? "false" : "true");
+  }
 }
 
 async function loadActivity() {
@@ -5109,28 +5209,13 @@ async function setupListeners() {
     }
     const translateTitle = t.closest<HTMLButtonElement>("[data-action='library-translate-title']");
     if (translateTitle) {
+      // A pointer interaction already started this translation on pointerdown.
+      if (libraryTitleTranslationPointerHandled) return;
       const paperId = Number(translateTitle.dataset.paperId);
-      const captured = pendingLibraryTitleTranslation?.paperId === paperId ? pendingLibraryTitleTranslation : null;
-      pendingLibraryTitleTranslation = null;
-      const current = captured || currentLibraryEnglishTitle(paperId);
-      if (!current.source) {
-        setStatus("请先填写英文标题", "error");
-        return;
-      }
-      if (!(await hasKey())) { setStatus("请先在设置中保存 DeepSeek API Key", "error"); return; }
-      translateTitle.disabled = true;
-      translateTitle.textContent = "翻译中…";
-      try {
-        if (current.hasDraft) await persistLibraryEnglishTitle(paperId, current.source);
-        setStatus("正在翻译中文标题…", "running");
-        await invoke("translate_library_title", { paperId, sourceEnglishTitle: current.source, model: getModel() });
-        await loadLibraryData(libraryView);
-        setStatus("中文标题已更新", "done");
-      } catch (error) {
-        setStatus(`中文标题翻译失败：${String(error)}`, "error");
-        translateTitle.disabled = false;
-        translateTitle.textContent = translateTitle.dataset.idleLabel || "翻译中文标题";
-      }
+      // Keyboard activation (Enter/Space on the focused button) has no
+      // pointerdown, so the source is resolved here. When the editor is open it
+      // owns focus, so this path always reads a settled, persisted title.
+      await runLibraryTitleTranslation(paperId, currentLibraryEnglishTitle(paperId));
       return;
     }
     if (t.closest("[data-action='library-refresh']")) { await loadLibraryData(libraryView); return; }
@@ -5607,16 +5692,32 @@ async function setupListeners() {
 
 window.addEventListener("DOMContentLoaded", () => {
   $("btn-settings-global").addEventListener("click", () => switchView("settings"));
-  // Capture the title before the editor's blur handler can rerender the
-  // Inspector. This makes clicking Translate reliable even with an unsaved
-  // English-title draft still focused.
+  // “翻译中文标题” is activated on pointerdown, exactly like the Library search
+  // suggestions, because the click it would otherwise rely on can be destroyed
+  // before it is dispatched:
+  //   pointerdown → the English-title editor loses focus → its blur handler
+  //   saves and reloads the Library → `renderLibrary()` rebuilds the Inspector
+  //   with innerHTML → the button that received mousedown is detached → the
+  //   delegated `click` never reaches `[data-action='library-translate-title']`
+  //   → the user sees nothing at all.
+  // Capturing the draft *and* starting the request during the pointerdown makes
+  // the interaction independent of that rerender. A flag marks the pointer
+  // sequence so its trailing click is not a second translation; keyboard
+  // activation still goes through the click handler.
   document.addEventListener("pointerdown", (ev) => {
+    if (ev.button !== 0) return;
     const translate = (ev.target as HTMLElement).closest<HTMLButtonElement>("[data-action='library-translate-title']");
-    if (!translate) return;
+    if (!translate || translate.disabled) return;
     const paperId = Number(translate.dataset.paperId);
     if (!Number.isInteger(paperId)) return;
-    const current = currentLibraryEnglishTitle(paperId);
-    pendingLibraryTitleTranslation = { paperId, source: current.source, hasDraft: current.hasDraft };
+    libraryTitleTranslationPointerHandled = true;
+    void runLibraryTitleTranslation(paperId, currentLibraryEnglishTitle(paperId));
+  }, true);
+  // The trailing click of the same pointer sequence belongs to that translation
+  // and must never start a second one. Timers run after the click dispatch.
+  document.addEventListener("pointerup", () => {
+    if (!libraryTitleTranslationPointerHandled) return;
+    window.setTimeout(() => { libraryTitleTranslationPointerHandled = false; }, 0);
   }, true);
   document.querySelector<HTMLElement>("[data-action='settings-back']")?.addEventListener("click", (ev) => {
     // Handle the native button directly so returning from Settings does not

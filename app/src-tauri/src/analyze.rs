@@ -18,6 +18,25 @@ pub const PROMPT_VERSION: &str = "v1";
 //   绝不生成缺失摘要。title-only 翻译永远不写 abstract / chinese_abstract。
 // ======================================================================
 
+// ================= 不变式（v0.2.2 RC4）：Discovery 会员资格 =================
+// 两个 AI 入口都只服务 Discovery。canonical papers.id 可以同时被 Library 引用，
+// 但“行存在”不等于“属于 Discovery”：外部 PDF / 未来 DOI、BibTeX、RIS、
+// 手动录入都只创建 Library 会员，绝不能进入 AI 分析、tag_matches_json、
+// total_score 或推荐排序。会员资格由 db::is_discovery_eligible 判定，并在
+// 入队（enqueue）、取件（list_queued_ids）与这里三处独立把关，因此这些入口
+// 在结构上就无法被 Library-only 论文触发。
+// ==========================================================================
+fn ensure_discovery_member(conn: &Arc<Mutex<Connection>>, paper_id: i64) -> Result<(), AiError> {
+    let c = conn.lock().unwrap();
+    match db::is_discovery_eligible(&c, paper_id) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(AiError::Paper(
+            "论文不属于 Discovery（仅存在于文献库），不进入 AI 分析".to_string(),
+        )),
+        Err(e) => Err(AiError::Paper(e.to_string())),
+    }
+}
+
 /// 标签上下文：入队时快照一次，整批复用（仅包含当前启用标签 = canonical set）。
 /// 每项 (tag_id, name, description)——Full AI 保存时必须写 tag identity（Round small fix）。
 #[derive(Debug, Clone)]
@@ -84,6 +103,7 @@ pub fn analyze_paper_once(
     if title.trim().is_empty() || abstract_text.trim().is_empty() {
         return Err(AiError::Paper("缺少标题或摘要".to_string()));
     }
+    ensure_discovery_member(conn, paper_id)?;
     let tag_names: String = ctx
         .tag_pairs
         .iter()
@@ -157,6 +177,7 @@ pub fn tag_only_analyze(
     if title.trim().is_empty() || abstract_text.trim().is_empty() {
         return Err(AiError::Paper("缺少标题或摘要".to_string()));
     }
+    ensure_discovery_member(conn, paper_id)?;
     let id_strs: Vec<(String, String, String)> = tags
         .iter()
         .map(|(id, n, d)| (id.to_string(), n.clone(), d.clone()))
