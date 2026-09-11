@@ -32,6 +32,14 @@
           <div class="nav-section-label">标签 <span class="nav-section-hint">Library Tags</span><button class="nav-add" title="新建 Library Tag" aria-label="新建 Library Tag" data-action="library-create-tag">＋</button></div>
           <div id="library-tag-nav"></div>
         </nav>
+        <nav class="nav settings-nav hidden" data-workspace-nav="settings" aria-label="设置分区">
+          <button class="nav-item active" type="button" data-settings-section="general">通用</button>
+          <button class="nav-item" type="button" data-settings-section="ai">AI / DeepSeek</button>
+          <button class="nav-item" type="button" data-settings-section="pdf">PDF</button>
+          <button class="nav-item" type="button" data-settings-section="library">文献库</button>
+          <button class="nav-item" type="button" data-settings-section="recommend">推荐</button>
+          <button class="nav-item" type="button" data-settings-section="about">关于 / 更新</button>
+        </nav>
       </aside>
 
       <main class="main">
@@ -180,8 +188,112 @@
 
         <section id="view-settings" class="view">
           <div class="settings">
-            <h3>应用更新</h3>
-            <div class="settings-row update-panel">
+            <section class="settings-section" data-settings-content="general" aria-labelledby="settings-general-title">
+              <h3 id="settings-general-title">通用</h3>
+              <div class="settings-row">
+                <label for="set-abstract-lang">默认摘要语言</label>
+                <select id="set-abstract-lang">
+                  <option value="zh">中文</option>
+                  <option value="en">English</option>
+                </select>
+              </div>
+            </section>
+
+            <section class="settings-section hidden" data-settings-content="ai" aria-labelledby="settings-ai-title">
+              <h3 id="settings-ai-title">AI / DeepSeek</h3>
+              <div class="settings-row">
+                <label for="api-key">DeepSeek API Key</label>
+                <input id="api-key" type="password" placeholder="sk-..." autocomplete="off" />
+                <span id="key-status" class="muted small"></span>
+                <p class="muted small">保存在此设备的 CowPaper 本地应用数据中，仅当前用户可读。</p>
+              </div>
+              <div class="settings-row">
+                <label for="model">模型</label>
+                <input id="model" type="text" />
+              </div>
+              <div class="settings-row actions">
+                <button id="btn-save-key" class="primary">保存</button>
+                <button id="btn-test" class="ghost">测试连接</button>
+                <button id="btn-clear-key" class="ghost danger">删除 Key</button>
+              </div>
+              <div id="deepseek-status" class="deepseek-status muted small"></div>
+
+              <div class="settings-subsection">
+                <h4>AI 分析</h4>
+                <div class="settings-row">
+                  <label class="check">
+                    <input type="checkbox" id="set-auto-analyze" /> 同步后自动分析新论文
+                  </label>
+                  <p class="muted small">仅自动分析新同步且有摘要的论文。历史待分析论文不会在后台自动全部处理。</p>
+                </div>
+                <div class="settings-row">
+                  <span class="muted small" id="pending-count"></span>
+                </div>
+              </div>
+            </section>
+
+            <section class="settings-section hidden" data-settings-content="pdf" aria-labelledby="settings-pdf-title">
+              <h3 id="settings-pdf-title">PDF</h3>
+              <div class="settings-row settings-reader-row">
+                <div><label for="set-preferred-reader">Preferred reader</label><p class="muted small">打开 PDF 时交给系统默认应用，或交给指定的本机 PDF 应用。</p></div>
+                <div class="settings-reader-controls"><select id="set-preferred-reader"><option value="system">System default</option><option value="custom">Custom application</option></select><span id="set-reader-application-name" class="muted small">System default</span><input id="set-reader-application-path" type="text" placeholder="/Applications/Preview.app" aria-label="指定 PDF 应用路径" disabled /><button type="button" class="ghost small" data-action="select-reader-application">选择应用</button></div>
+              </div>
+            </section>
+
+            <section class="settings-section hidden" data-settings-content="library" aria-labelledby="settings-library-title">
+              <h3 id="settings-library-title">文献库</h3>
+              <section class="settings-group pdf-settings-group" aria-labelledby="pdf-settings-title">
+                <div class="settings-group-head">
+                  <div><h3 id="pdf-settings-title">PDF 文件库</h3><p class="muted small">新导入或关联的 PDF 使用这些规则；不会自动整理旧文件。</p></div>
+                  <span class="settings-group-badge">Library</span>
+                </div>
+                <div class="settings-form-rows">
+                  <div class="settings-form-row">
+                    <div class="settings-label"><label for="set-pdf-file-handling-mode">文件处理</label><span>拖入文献库时如何保存原文件</span></div>
+                    <select id="set-pdf-file-handling-mode">
+                      <option value="none">none · 保持原文件链接</option>
+                      <option value="copy">copy · 拷贝到文件库</option>
+                      <option value="move">move · 移动到文件库</option>
+                    </select>
+                  </div>
+                  <div class="settings-form-row settings-form-row-stacked">
+                    <div class="settings-label"><label for="set-pdf-library-root">Library root directory</label><span>copy / move 模式使用的目标目录</span></div>
+                    <div class="settings-control settings-root-control"><input id="set-pdf-library-root" type="text" placeholder="选择 CowPaper 文件库目录" /><div class="settings-inline-actions"><button type="button" class="ghost small" data-action="select-pdf-library-root">更改</button><button type="button" class="ghost small" data-action="reset-pdf-library-root">重置</button></div></div>
+                  </div>
+                  <div id="pdf-move-warning" class="settings-warning hidden" role="note">移动模式会在每次新关联/导入时迁移源文件；不会自动整理已有 PDF。请确认目标文件库已备份。</div>
+                  <div class="settings-form-row settings-form-row-stacked">
+                    <div class="settings-label"><label for="set-pdf-naming-template">命名模板</label><span>仅影响 managed PDF 的新目标文件名</span></div>
+                    <div class="settings-control"><input id="set-pdf-naming-template" type="text" value="{title} - {journal} - {first_author} - {year}.pdf" spellcheck="false" /><div class="pdf-template-tokens" aria-label="可用命名 token"><button type="button" class="token-chip" data-pdf-token="title">{title}</button><button type="button" class="token-chip" data-pdf-token="journal">{journal}</button><button type="button" class="token-chip" data-pdf-token="source">{source}</button><button type="button" class="token-chip" data-pdf-token="first_author">{first_author}</button><button type="button" class="token-chip" data-pdf-token="authors">{authors}</button><button type="button" class="token-chip" data-pdf-token="year">{year}</button><button type="button" class="token-chip" data-pdf-token="doi">{doi}</button></div><div class="settings-preview"><span>示例预览</span><code id="pdf-template-preview"></code></div><p id="pdf-template-warning" class="settings-inline-warning hidden"></p></div>
+                  </div>
+                  <div class="settings-form-row">
+                    <div class="settings-label"><label for="set-pdf-subfolder-rule">子文件夹规则</label><span>managed PDF 的目录层级</span></div>
+                    <select id="set-pdf-subfolder-rule"><option value="none">none · 不分文件夹</option><option value="year">year · 按年份</option><option value="journal/source">journal/source · 按期刊 / 来源</option></select>
+                  </div>
+                </div>
+              </section>
+            </section>
+
+            <section class="settings-section hidden" data-settings-content="recommend" aria-labelledby="settings-recommend-title">
+              <h3 id="settings-recommend-title">推荐</h3>
+              <div class="settings-row">
+                <label class="check"><input type="checkbox" id="set-startup-sync" /> 启动时自动检查新论文</label>
+              </div>
+              <div class="settings-row">
+                <label class="check"><input type="checkbox" id="set-daily-sync" /> 每日自动检查</label>
+              </div>
+              <div class="settings-row">
+                <label for="set-daily-time">每日检查时间</label>
+                <input id="set-daily-time" type="time" value="09:00" />
+              </div>
+              <div class="settings-row">
+                <span class="muted small" id="next-check"></span>
+              </div>
+              <p class="muted small">CowPaper 运行时按计划自动检查；完全退出后将在下次启动时补同步。</p>
+            </section>
+
+            <section class="settings-section hidden" data-settings-content="about" aria-labelledby="settings-about-title">
+              <h3 id="settings-about-title">关于 / 更新</h3>
+              <div class="settings-row update-panel">
               <div class="update-version-row">
                 <span>当前版本</span><strong id="current-version">读取中…</strong>
               </div>
@@ -194,96 +306,8 @@
                 <button id="btn-check-update" class="ghost">检查更新</button>
                 <button id="btn-install-update" class="primary hidden">下载并安装</button>
               </div>
-            </div>
-
-            <h3>DeepSeek</h3>
-            <div class="settings-row">
-              <label for="api-key">DeepSeek API Key</label>
-              <input id="api-key" type="password" placeholder="sk-..." autocomplete="off" />
-              <span id="key-status" class="muted small"></span>
-              <p class="muted small">保存在此设备的 CowPaper 本地应用数据中，仅当前用户可读。</p>
-            </div>
-            <div class="settings-row">
-              <label for="model">模型</label>
-              <input id="model" type="text" />
-            </div>
-            <div class="settings-row actions">
-              <button id="btn-save-key" class="primary">保存</button>
-              <button id="btn-test" class="ghost">测试连接</button>
-              <button id="btn-clear-key" class="ghost danger">删除 Key</button>
-            </div>
-            <!-- DeepSeek 模块内专用状态区：测试连接 / 保存 / 删除结果只显示在这里 -->
-            <div id="deepseek-status" class="deepseek-status muted small"></div>
-
-            <h3>AI 分析</h3>
-            <div class="settings-row">
-              <label class="check">
-                <input type="checkbox" id="set-auto-analyze" /> 同步后自动分析新论文
-              </label>
-              <p class="muted small">仅自动分析新同步且有摘要的论文。历史待分析论文不会在后台自动全部处理。</p>
-            </div>
-            <div class="settings-row">
-              <span class="muted small" id="pending-count"></span>
-            </div>
-
-            <h3>摘要</h3>
-            <div class="settings-row">
-              <label for="set-abstract-lang">默认摘要语言</label>
-              <select id="set-abstract-lang">
-                <option value="zh">中文</option>
-                <option value="en">English</option>
-              </select>
-            </div>
-            <div class="settings-row settings-reader-row">
-              <div><label for="set-preferred-reader">Preferred reader</label><p class="muted small">打开 PDF 时交给系统默认应用，或交给指定的本机 PDF 应用。</p></div>
-              <div class="settings-reader-controls"><select id="set-preferred-reader"><option value="system">System default</option><option value="custom">Custom application</option></select><span id="set-reader-application-name" class="muted small">System default</span><input id="set-reader-application-path" type="text" placeholder="/Applications/Preview.app" aria-label="指定 PDF 应用路径" disabled /><button type="button" class="ghost small" data-action="select-reader-application">选择应用</button></div>
-            </div>
-
-            <section class="settings-group pdf-settings-group" aria-labelledby="pdf-settings-title">
-              <div class="settings-group-head">
-                <div><h3 id="pdf-settings-title">PDF 文件库</h3><p class="muted small">新导入或关联的 PDF 使用这些规则；不会自动整理旧文件。</p></div>
-                <span class="settings-group-badge">Library</span>
-              </div>
-              <div class="settings-form-rows">
-                <div class="settings-form-row">
-                  <div class="settings-label"><label for="set-pdf-file-handling-mode">文件处理</label><span>拖入文献库时如何保存原文件</span></div>
-                  <select id="set-pdf-file-handling-mode">
-                    <option value="none">none · 保持原文件链接</option>
-                    <option value="copy">copy · 拷贝到文件库</option>
-                    <option value="move">move · 移动到文件库</option>
-                  </select>
-                </div>
-                <div class="settings-form-row settings-form-row-stacked">
-                  <div class="settings-label"><label for="set-pdf-library-root">Library root directory</label><span>copy / move 模式使用的目标目录</span></div>
-                  <div class="settings-control settings-root-control"><input id="set-pdf-library-root" type="text" placeholder="选择 CowPaper 文件库目录" /><div class="settings-inline-actions"><button type="button" class="ghost small" data-action="select-pdf-library-root">更改</button><button type="button" class="ghost small" data-action="reset-pdf-library-root">重置</button></div></div>
-                </div>
-                <div id="pdf-move-warning" class="settings-warning hidden" role="note">移动模式会在每次新关联/导入时迁移源文件；不会自动整理已有 PDF。请确认目标文件库已备份。</div>
-                <div class="settings-form-row settings-form-row-stacked">
-                  <div class="settings-label"><label for="set-pdf-naming-template">命名模板</label><span>仅影响 managed PDF 的新目标文件名</span></div>
-                  <div class="settings-control"><input id="set-pdf-naming-template" type="text" value="{title} - {journal} - {first_author} - {year}.pdf" spellcheck="false" /><div class="pdf-template-tokens" aria-label="可用命名 token"><button type="button" class="token-chip" data-pdf-token="title">{title}</button><button type="button" class="token-chip" data-pdf-token="journal">{journal}</button><button type="button" class="token-chip" data-pdf-token="source">{source}</button><button type="button" class="token-chip" data-pdf-token="first_author">{first_author}</button><button type="button" class="token-chip" data-pdf-token="authors">{authors}</button><button type="button" class="token-chip" data-pdf-token="year">{year}</button><button type="button" class="token-chip" data-pdf-token="doi">{doi}</button></div><div class="settings-preview"><span>示例预览</span><code id="pdf-template-preview"></code></div><p id="pdf-template-warning" class="settings-inline-warning hidden"></p></div>
-                </div>
-                <div class="settings-form-row">
-                  <div class="settings-label"><label for="set-pdf-subfolder-rule">子文件夹规则</label><span>managed PDF 的目录层级</span></div>
-                  <select id="set-pdf-subfolder-rule"><option value="none">none · 不分文件夹</option><option value="year">year · 按年份</option><option value="journal/source">journal/source · 按期刊 / 来源</option></select>
-                </div>
               </div>
             </section>
-
-            <h3>同步</h3>
-            <div class="settings-row">
-              <label class="check"><input type="checkbox" id="set-startup-sync" /> 启动时自动检查新论文</label>
-            </div>
-            <div class="settings-row">
-              <label class="check"><input type="checkbox" id="set-daily-sync" /> 每日自动检查</label>
-            </div>
-            <div class="settings-row">
-              <label for="set-daily-time">每日检查时间</label>
-              <input id="set-daily-time" type="time" value="09:00" />
-            </div>
-            <div class="settings-row">
-              <span class="muted small" id="next-check"></span>
-            </div>
-            <p class="muted small">CowPaper 运行时按计划自动检查；完全退出后将在下次启动时补同步。</p>
 
             <button id="btn-save-settings" class="primary">保存设置</button>
             <p id="settings-msg" class="muted small"></p>

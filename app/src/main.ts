@@ -518,7 +518,9 @@ let librarySearchMatches = new Map<number, LibrarySearchHit>();
 let librarySearchAdapter: LibrarySearchApi | null = null;
 const librarySearchHandledPointerSuggestions = new WeakSet<HTMLElement>();
 const libraryPaperIds = new Set<number>();
-let activeWorkspace: "discovery" | "library" = "discovery";
+type SettingsSection = "general" | "ai" | "pdf" | "library" | "recommend" | "about";
+let activeWorkspace: "discovery" | "library" | "settings" = "discovery";
+let activeSettingsSection: SettingsSection = "general";
 let aiStatus: AiStatus = emptyAiStatus();
 let activity: ActivityState = emptyActivity();
 let settings: Settings | null = null;
@@ -3703,6 +3705,25 @@ function switchView(name: string) {
   doSwitch(name);
 }
 
+function switchSettingsSection(section: SettingsSection): void {
+  activeSettingsSection = section;
+  document.querySelectorAll<HTMLElement>("[data-settings-section]").forEach((item) => {
+    item.classList.toggle("active", item.dataset.settingsSection === section);
+  });
+  document.querySelectorAll<HTMLElement>("[data-settings-content]").forEach((content) => {
+    content.classList.toggle("hidden", content.dataset.settingsContent !== section);
+  });
+  const titles: Record<SettingsSection, string> = {
+    general: "通用",
+    ai: "AI / DeepSeek",
+    pdf: "PDF",
+    library: "文献库",
+    recommend: "推荐",
+    about: "关于 / 更新",
+  };
+  $("view-title").textContent = titles[section];
+}
+
 function ensureLibrarySearchToolbar(): HTMLElement | null {
   const existing = document.querySelector<HTMLElement>(".library-search-toolbar");
   if (existing) return existing;
@@ -3721,17 +3742,19 @@ function ensureLibrarySearchToolbar(): HTMLElement | null {
 
 function doSwitch(name: string) {
   const isLibrary = name.startsWith("library-");
+  const isSettings = name === "settings";
   if (isLibrary && ["library-all", "library-recent", "library-unfiled"].includes(name)) {
     // Standard Library views own the scope; collection/tag filters are a
     // separate sidebar mode and should not leak into Recent or Unfiled.
     clearLibraryScope();
     libraryInspectorCollapsed = window.innerWidth < 1100;
   }
-  activeWorkspace = isLibrary ? "library" : "discovery";
+  activeWorkspace = isSettings ? "settings" : isLibrary ? "library" : "discovery";
   document.body.classList.toggle("library-workspace", isLibrary);
+  document.body.classList.toggle("settings-workspace", isSettings);
   const librarySearchToolbar = ensureLibrarySearchToolbar();
   if (librarySearchToolbar) librarySearchToolbar.style.display = isLibrary ? "flex" : "none";
-  document.querySelectorAll(".workspace-nav").forEach((nav) => nav.classList.toggle("hidden", (nav as HTMLElement).dataset.workspaceNav !== activeWorkspace));
+  document.querySelectorAll(".workspace-nav, .settings-nav").forEach((nav) => nav.classList.toggle("hidden", (nav as HTMLElement).dataset.workspaceNav !== activeWorkspace));
   document.querySelectorAll(".workspace-tab").forEach((tab) => tab.classList.toggle("active", (tab as HTMLElement).dataset.workspace === activeWorkspace));
   document.querySelectorAll(".nav-item").forEach((t) => t.classList.toggle("active", (t as HTMLElement).dataset.view === name));
   // Recent/unfiled are views of the same three-column shell; only the data set changes.
@@ -3741,7 +3764,8 @@ function doSwitch(name: string) {
     recommend: "今日", "recommend-history": "历史", papers: "所有论文", favorites: "稍后看", journals: "期刊", tags: "研究兴趣", settings: "设置", activity: "活动",
     "library-all": "全部文献", "library-recent": "最近收录", "library-unfiled": "未分类",
   };
-  $("view-title").textContent = titles[name] || name;
+  $("view-title").textContent = isSettings ? "通用" : titles[name] || name;
+  if (isSettings) switchSettingsSection(activeSettingsSection);
   // 进入活动页时渲染 master-detail（数据来自统一 activity + 批次查询）
   if (name === "activity") renderActivityCenter().catch(() => {});
   // 进入期刊订阅页：保持当前 tab（互斥渲染）
@@ -4603,6 +4627,12 @@ async function setupListeners() {
       } else {
         doSwitch("recommend");
       }
+      return;
+    }
+    const settingsSection = t.closest("[data-settings-section]") as HTMLElement | null;
+    if (settingsSection) {
+      const section = settingsSection.dataset.settingsSection as SettingsSection | undefined;
+      if (section) switchSettingsSection(section);
       return;
     }
     const nav = t.closest(".nav-item") as HTMLElement | null;
