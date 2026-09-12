@@ -2654,12 +2654,12 @@ function renderLibraryAnnotationTab(item: LibraryPaper): string {
   });
   const head = `<div class="inspector-section-head"><h3>标注</h3><div class="inspector-section-actions"><span class="muted small">${panel.kind === "list" ? `${panel.count} 条` : "PDF 标注"}</span>${readAction}</div></div>`;
   if (panel.kind === "list") {
-    return `<section class="inspector-group inspector-annotations" id="library-inspector-panel" role="tabpanel">${head}<div class="library-annotation-list">${annotations.map(renderLibraryAnnotationCard).join("")}</div></section>`;
+    return `<section class="inspector-group inspector-annotations" id="library-inspector-panel" role="tabpanel" aria-label="标注">${head}<div class="library-annotation-list">${annotations.map(renderLibraryAnnotationCard).join("")}</div></section>`;
   }
   const body = panel.tone === "error"
     ? `<div class="inspector-inline-error" role="status">${escapeHtml(panel.message)}</div>`
     : `<div class="inspector-placeholder"><span class="placeholder-icon" aria-hidden="true">⌁</span><span>${escapeHtml(panel.message)}</span></div>`;
-  return `<section class="inspector-group inspector-annotations" id="library-inspector-panel" role="tabpanel">${head}${body}</section>`;
+  return `<section class="inspector-group inspector-annotations" id="library-inspector-panel" role="tabpanel" aria-label="标注">${head}${body}</section>`;
 }
 
 async function loadLibraryAnnotations(paperId: number, force = false): Promise<boolean> {
@@ -2825,7 +2825,8 @@ function renderLibraryInspector(item: LibraryPaper) {
     <section class="inspector-group inspector-abstract"><div class="inspector-section-head"><h3>摘要</h3><div class="inspector-section-actions"><div class="inspector-language-toggle" role="group" aria-label="摘要语言"><button class="seg ${abstractLanguage === "zh" ? "on" : ""}" data-action="library-abstract-lang" data-lang="zh">中文</button><button class="seg ${abstractLanguage === "en" ? "on" : ""}" data-action="library-abstract-lang" data-lang="en">English</button></div>${libraryInlineEditButton(p.id, abstractLanguage === "zh" ? "chineseAbstract" : "abstract", abstractLanguage === "zh" ? "中文摘要" : "摘要")}</div></div><p class="inspector-abstract-text${abstractText ? "" : " empty-value"}">${escapeHtml(abstractText || "暂无摘要")}</p>${abstractTranslate}</section>
     <section class="inspector-group inspector-attachments"><div class="inspector-section-head"><h3>PDF</h3>${attachmentAdd}</div><div class="attachment-list">${attachmentRows}</div></section>
     <section class="inspector-group inspector-citation"><div class="inspector-section-head"><h3>引用格式</h3></div><p>${escapeHtml(citation)}</p></section>`;
-  $("library-inspector").innerHTML = `${renderInspectorTabs(activeTab, p.id)}<div class="inspector-head"><span class="muted small">期刊论文</span><button type="button" class="ghost small danger" data-action="library-remove" data-paper-id="${p.id}">移出文献库</button></div>${activeTab === "annotations" ? renderLibraryAnnotationTab(item) : metadataBody}`;
+  const metadataPanel = `<div class="inspector-panel" id="library-inspector-panel" role="tabpanel" aria-label="元数据">${metadataBody}</div>`;
+  $("library-inspector").innerHTML = `${renderInspectorTabs(activeTab, p.id)}<div class="inspector-head"><span class="muted small">期刊论文</span><button type="button" class="ghost small danger" data-action="library-remove" data-paper-id="${p.id}">移出文献库</button></div>${activeTab === "annotations" ? renderLibraryAnnotationTab(item) : metadataPanel}`;
 }
 
 async function refreshLibraryMetadata(paperId: number): Promise<void> {

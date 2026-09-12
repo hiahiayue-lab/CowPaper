@@ -2134,9 +2134,16 @@ fn v030_inspector_two_tab_and_zero_footprint_status_contract() {
     assert!(module.contains("{ id: \"metadata\", label: \"元数据\" }"), "缺少元数据 tab");
     assert!(module.contains("{ id: \"annotations\", label: \"标注\" }"), "缺少标注 tab");
     assert!(
-        main_ts.contains("activeTab === \"annotations\" ? renderLibraryAnnotationTab(item) : metadataBody"),
+        main_ts.contains("activeTab === \"annotations\" ? renderLibraryAnnotationTab(item) : metadataPanel"),
         "tab 必须决定渲染哪个视图"
     );
+    // 两个视图都必须提供自身的 tabpanel 身份，aria-controls 不得悬空
+    assert_eq!(
+        main_ts.matches("id=\"library-inspector-panel\"").count(),
+        3,
+        "两个 tabpanel 与 metadata panel 必须共用同一个 panel id（annotation 两处分支 + metadata 一处）"
+    );
+    assert!(main_ts.contains("role=\"tabpanel\""), "视图必须声明 tabpanel 角色");
     // 2) 标注视图不得再出现在元数据视图内
     assert!(!main_ts.contains("${renderLibraryAnnotations(item)}"), "标注视图不得嵌在元数据 tab 内");
     assert!(!main_ts.contains("function renderLibraryAnnotations"), "旧的 section 渲染器必须移除");
