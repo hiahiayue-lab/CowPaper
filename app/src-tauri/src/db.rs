@@ -101,7 +101,8 @@ pub fn open(path: &Path) -> Result<Connection> {
 /// Literature Workspace 为 v14；v15 为 Library Attachments + User Metadata；
 /// v16 为 canonical bibliographic keywords；v17 为出版字段；v18 为 RC5
 /// Library overrides、collection-scoped tags 与 PDF enrichment jobs；v19 为
-/// Library full-text search projection；v20 为 PDF annotation records。
+/// Library full-text search projection；v20 为 attachment-scoped PDF
+/// annotation import and scan state.
 /// 生产构建中仅由迁移系统隐式使用；测试中直接断言。
 #[allow(dead_code)]
 pub const SCHEMA_VERSION: i64 = 20;
@@ -3204,6 +3205,9 @@ fn paper_attachment_from_row(row: &rusqlite::Row) -> Result<crate::models::Paper
         kind: row.get("kind")?,
         storage_mode: row.get("storage_mode")?,
         missing: !Path::new(&absolute_path).is_file(),
+        annotation_status: row.get::<_, String>("annotation_status").unwrap_or_else(|_| "never_scanned".to_string()),
+        annotation_error: row.get("annotation_error").unwrap_or(None),
+        annotation_scanned_at: row.get("annotation_scanned_at").unwrap_or(None),
         absolute_path,
         relative_path: row.get("relative_path")?,
         url: row.get("url")?,
@@ -3363,10 +3367,15 @@ fn paper_annotation_from_row(row: &rusqlite::Row) -> Result<PaperAnnotation> {
         quoted_text: row.get("quoted_text")?,
         comment: row.get("comment")?,
         author: row.get("author")?,
+        pdf_created_at: row.get("pdf_created_at").unwrap_or(None),
+        pdf_modified_at: row.get("pdf_modified_at").unwrap_or(None),
+        translation: row.get("translation").unwrap_or(None),
         created_at: row.get("created_at")?,
         modified_at: row.get("modified_at")?,
         imported_at: row.get("imported_at")?,
+        updated_at: row.get("updated_at").unwrap_or_else(|_| row.get("imported_at").unwrap_or_default()),
         fingerprint: row.get("fingerprint")?,
+        source_sha256: row.get("source_sha256").unwrap_or_default(),
         extraction_status: row.get("extraction_status")?,
         source_app: row.get("source_app")?,
         raw_metadata_json: row.get("raw_metadata_json")?,
@@ -3507,8 +3516,8 @@ fn upsert_paper_annotation_inner(
             paper_id, attachment_id, external_annotation_id, kind, page_index,
             color, quoted_text, comment, author, created_at, modified_at,
             imported_at, fingerprint, geometry_fingerprint, extraction_status,
-            source_app, raw_metadata_json
-         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+            source_app, raw_metadata_json, updated_at, source_sha256
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?12,'')",
         params![
             paper_id,
             attachment_id,
@@ -3603,6 +3612,161 @@ pub fn delete_paper_annotation(conn: &Connection, paper_id: i64, annotation_id: 
         params![annotation_id, paper_id],
     )? == 1)
 }
+pub fn list_attachment_annotations(conn: &Connection, attachment_id: i64) -> Result<Vec<crate::models::PaperAnnotation>> {
+    let mut stmt = conn.prepare(
+        "SELECT * FROM paper_annotations WHERE attachment_id=?1
+         ORDER BY page_index, id",
+    )?;
+    let rows = stmt.query_map(params![attachment_id], paper_annotation_from_row)?.collect();
+    rows
+}
+
+/// Re-scan one attachment without ever writing to its source PDF. Annotation
+/// identity is attachment-local and prefers page-scoped PDF /NM; the fallback
+/// fingerprint is geometry/content based. Refresh is safe for malformed PDFs:
+/// it records a visible attachment error and retains prior imported rows.
+pub fn refresh_pdf_annotations(
+    conn: &Connection,
+    attachment_id: i64,
+) -> Result<crate::models::PdfAnnotationRefreshResult> {
+    let attachment: Option<(i64, String, Option<String>)> = conn
+        .query_row(
+            "SELECT paper_id, absolute_path, sha256 FROM paper_attachments WHERE id=?1",
+            params![attachment_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((paper_id, path, stored_sha256)) = attachment else {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    };
+    let now = now_utc();
+    if !Path::new(&path).is_file() {
+        conn.execute(
+            "UPDATE paper_attachments SET annotation_status='missing_attachment',
+             annotation_error=?1, annotation_scanned_at=?2 WHERE id=?3",
+            params!["attachment_missing", now, attachment_id],
+        )?;
+        return Ok(crate::models::PdfAnnotationRefreshResult {
+            attachment_id,
+            source_sha256: stored_sha256,
+            status: "missing_attachment".into(),
+            error: Some("attachment_missing".into()),
+            ..Default::default()
+        });
+    }
+    let source_sha256 = sha256_file(Path::new(&path))?;
+    let scan = crate::pdf_annotations::scan_path(Path::new(&path));
+    if scan.status != "completed" {
+        conn.execute(
+            "UPDATE paper_attachments SET annotation_status=?1, annotation_error=?2,
+             annotation_scanned_at=?3 WHERE id=?4",
+            params![scan.status, scan.error, now, attachment_id],
+        )?;
+        return Ok(crate::models::PdfAnnotationRefreshResult {
+            attachment_id,
+            source_sha256: Some(source_sha256),
+            status: scan.status,
+            error: scan.error,
+            unsupported: scan.unsupported_count,
+            ..Default::default()
+        });
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    let existing: Vec<(String, String)> = {
+        let mut stmt = tx.prepare("SELECT fingerprint, extraction_status FROM paper_annotations WHERE attachment_id=?1")?;
+        let rows = stmt.query_map(params![attachment_id], |row| Ok((row.get(0)?, row.get(1)?)))?.collect::<Result<Vec<_>>>()?;
+        rows
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut imported = 0_i64;
+    let mut updated = 0_i64;
+    let mut unchanged = 0_i64;
+    for item in &scan.annotations {
+        let was_present: Option<(String, String)> = tx.query_row(
+            "SELECT source_sha256, extraction_status FROM paper_annotations
+             WHERE attachment_id=?1 AND fingerprint=?2",
+            params![attachment_id, item.fingerprint],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        let imported_at = now.clone();
+        let normalized_kind = item.kind.to_ascii_lowercase();
+        tx.execute(
+            "INSERT INTO paper_annotations (
+                paper_id, attachment_id, external_annotation_id, kind, page_index,
+                color, quoted_text, comment, author, pdf_created_at, pdf_modified_at,
+                imported_at, updated_at, fingerprint, source_sha256,
+                extraction_status, source_app, raw_metadata_json
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12,?13,?14,?15,NULL,?16)
+             ON CONFLICT(attachment_id, fingerprint) DO UPDATE SET
+                paper_id=excluded.paper_id,
+                external_annotation_id=excluded.external_annotation_id,
+                kind=excluded.kind,
+                page_index=excluded.page_index,
+                color=excluded.color,
+                quoted_text=excluded.quoted_text,
+                comment=excluded.comment,
+                author=excluded.author,
+                pdf_created_at=excluded.pdf_created_at,
+                pdf_modified_at=excluded.pdf_modified_at,
+                updated_at=excluded.updated_at,
+                source_sha256=excluded.source_sha256,
+                extraction_status=excluded.extraction_status,
+                raw_metadata_json=excluded.raw_metadata_json",
+            params![
+                paper_id,
+                attachment_id,
+                item.external_annotation_id,
+                normalized_kind,
+                item.page_index,
+                item.color,
+                item.quoted_text,
+                item.comment,
+                item.author,
+                item.pdf_created_at,
+                item.pdf_modified_at,
+                imported_at,
+                item.fingerprint,
+                source_sha256,
+                item.extraction_status,
+                item.raw_metadata_json,
+            ],
+        )?;
+        seen.insert(item.fingerprint.clone());
+        match was_present {
+            None => imported += 1,
+            Some((old_hash, old_status)) if old_hash == source_sha256 && old_status == item.extraction_status => unchanged += 1,
+            Some(_) => updated += 1,
+        }
+    }
+    let mut stale = 0_i64;
+    for (fingerprint, status) in existing {
+        if !seen.contains(&fingerprint) && status != "stale" {
+            stale += tx.execute(
+                "UPDATE paper_annotations SET extraction_status='stale', updated_at=?1
+                 WHERE attachment_id=?2 AND fingerprint=?3",
+                params![now, attachment_id, fingerprint],
+            )? as i64;
+        }
+    }
+    tx.execute(
+        "UPDATE paper_attachments SET annotation_status='completed',
+         annotation_error=NULL, annotation_scanned_at=?1 WHERE id=?2",
+        params![now, attachment_id],
+    )?;
+    tx.commit()?;
+    Ok(crate::models::PdfAnnotationRefreshResult {
+        attachment_id,
+        source_sha256: Some(source_sha256),
+        status: "completed".into(),
+        error: None,
+        imported,
+        updated,
+        unchanged,
+        stale,
+        unsupported: scan.unsupported_count,
+    })
+}
 
 fn prepare_current_pdf_storage(
     conn: &Connection,
@@ -3650,6 +3814,7 @@ fn insert_file_attachment(
     if let Some(prepared) = prepared.as_ref() {
         finalize_prepared_storage(conn, prepared)?;
     }
+    let _ = refresh_pdf_annotations(conn, id);
     get_paper_attachment(conn, id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
 }
 
@@ -3712,6 +3877,7 @@ pub fn attach_discovery_pdf(
         finalize_prepared_storage(conn, prepared)?;
     }
     refresh_library_search_document(conn, paper_id)?;
+    let _ = refresh_pdf_annotations(conn, id);
     get_paper_attachment(conn, id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
 }
 
@@ -3737,6 +3903,7 @@ pub fn relink_pdf(
          WHERE id=?5",
         params![file.absolute_path.to_string_lossy().as_ref(), file.filename, file.sha256, now_utc(), attachment_id],
     )?;
+    let _ = refresh_pdf_annotations(conn, attachment_id);
     get_paper_attachment(conn, attachment_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
 }
 
@@ -3786,6 +3953,7 @@ fn manage_existing_attachment(
         return Err(error);
     }
     finalize_prepared_storage(conn, &prepared)?;
+    let _ = refresh_pdf_annotations(conn, attachment_id);
     get_paper_attachment(conn, attachment_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
 }
 
@@ -5651,7 +5819,7 @@ fn migrations() -> Vec<(i64, &'static str, fn(&Connection) -> Result<()>)> {
         (17, "Bibliographic Publication Metadata", migrate_to_v17),
         (18, "library-rc5-overrides-scoped-tags-pdf-enrichment", migrate_to_v18),
         (19, "library-full-text-search", migrate_to_v19),
-        (20, "pdf-annotation-records", migrate_to_v20),
+        (20, "attachment-scoped-pdf-annotations", migrate_to_v20),
     ]
 }
 
@@ -7771,48 +7939,61 @@ fn migrate_to_v19(conn: &Connection) -> Result<()> {
     rebuild_library_search_index(conn)
 }
 
-/// v20: imported PDF annotation records. This is deliberately an additive
-/// layer: annotations point to the canonical Paper and existing attachment,
-/// never to a path or a copied Paper. `fingerprint` is unique per attachment
-/// and makes re-extraction idempotent; `geometry_fingerprint` enables a
-/// unique no-`/NM` row to survive a comment edit without guessing across
-/// ambiguous candidates.
+/// v20: attachment-scoped, read-only embedded PDF annotations. Existing
+/// attachment rows remain valid and all fields are additive. Annotation rows
+/// are kept when a later source PDF no longer contains them; refresh marks
+/// them stale instead of deleting user-visible history.
 fn migrate_to_v20(conn: &Connection) -> Result<()> {
+    for (field, definition) in [
+        ("annotation_status", "TEXT NOT NULL DEFAULT 'never_scanned'"),
+        ("annotation_error", "TEXT"),
+        ("annotation_scanned_at", "TEXT"),
+    ] {
+        if !column_exists(conn, "paper_attachments", field) {
+            conn.execute_batch(&format!("ALTER TABLE paper_attachments ADD COLUMN {field} {definition};"))?;
+        }
+    }
     conn.execute_batch(
         r#"
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_attachments_paper_id_id
-            ON paper_attachments(paper_id, id);
         CREATE TABLE IF NOT EXISTS paper_annotations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             paper_id INTEGER NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
-            attachment_id INTEGER NOT NULL,
+            attachment_id INTEGER NOT NULL REFERENCES paper_attachments(id) ON DELETE CASCADE,
             external_annotation_id TEXT,
             kind TEXT NOT NULL CHECK (kind IN ('highlight','underline','strikeout','text','freetext')),
-            page_index INTEGER NOT NULL CHECK (page_index >= 0),
+            page_index INTEGER NOT NULL,
             color TEXT,
             quoted_text TEXT,
             comment TEXT,
             author TEXT,
+            pdf_created_at TEXT,
+            pdf_modified_at TEXT,
+            translation TEXT,
             created_at TEXT,
             modified_at TEXT,
             imported_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
             fingerprint TEXT NOT NULL,
             geometry_fingerprint TEXT,
-            extraction_status TEXT NOT NULL CHECK (extraction_status IN ('extracted','no_text','scanned','encrypted','malformed','unsupported','missing_attachment')),
+            source_sha256 TEXT NOT NULL DEFAULT '',
+            extraction_status TEXT NOT NULL CHECK (extraction_status IN ('extracted','completed','no_text','scanned','encrypted','malformed','unsupported','missing_attachment','stale')),
             source_app TEXT,
-            raw_metadata_json TEXT,
+            raw_metadata_json TEXT NOT NULL DEFAULT '',
             UNIQUE(attachment_id, fingerprint),
             FOREIGN KEY (paper_id, attachment_id)
                 REFERENCES paper_attachments(paper_id, id) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_paper_annotations_paper
-            ON paper_annotations(paper_id, page_index, id);
+            ON paper_annotations(paper_id, attachment_id, page_index, id);
         CREATE INDEX IF NOT EXISTS idx_paper_annotations_attachment
             ON paper_annotations(attachment_id, page_index, kind, id);
         CREATE INDEX IF NOT EXISTS idx_paper_annotations_external
             ON paper_annotations(attachment_id, page_index, external_annotation_id);
+        CREATE INDEX IF NOT EXISTS idx_paper_annotations_search
+            ON paper_annotations(attachment_id, extraction_status);
         "#,
-    )
+    )?;
+    Ok(())
 }
 
 fn update_abstract_provenance(conn: &Connection, id: i64) -> Result<()> {

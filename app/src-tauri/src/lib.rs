@@ -9,6 +9,7 @@ mod analyze;
 mod api;
 mod db;
 mod models;
+mod pdf_annotations;
 mod secure_store;
 mod sync;
 mod sync_coordinator;
@@ -1250,6 +1251,33 @@ fn list_paper_attachments(
 }
 
 #[tauri::command]
+fn list_paper_annotations(
+    paper_id: i64,
+    state: State<Db>,
+) -> Result<Vec<models::PaperAnnotation>, String> {
+    let conn = state.inner().lock().unwrap();
+    db::list_paper_annotations(&conn, paper_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn list_attachment_annotations(
+    attachment_id: i64,
+    state: State<Db>,
+) -> Result<Vec<models::PaperAnnotation>, String> {
+    let conn = state.inner().lock().unwrap();
+    db::list_attachment_annotations(&conn, attachment_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn refresh_pdf_annotations(
+    attachment_id: i64,
+    state: State<Db>,
+) -> Result<models::PdfAnnotationRefreshResult, String> {
+    let conn = state.inner().lock().unwrap();
+    db::refresh_pdf_annotations(&conn, attachment_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn attach_pdf(
     paper_id: i64,
     path: String,
@@ -2406,6 +2434,9 @@ pub fn run() {
             set_library_item_note,
             clear_library_item_overrides,
             list_paper_attachments,
+            list_paper_annotations,
+            list_attachment_annotations,
+            refresh_pdf_annotations,
             attach_pdf,
             attach_discovery_pdf,
             detach_pdf,

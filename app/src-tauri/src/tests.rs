@@ -228,6 +228,94 @@ fn test_annotation_delete_is_paper_scoped_and_does_not_delete_pdf() {
     assert!(db::list_paper_annotations(&conn, paper_id, None).unwrap().is_empty());
 }
 
+fn annotated_pdf_path(label: &str) -> std::path::PathBuf {
+    use lopdf::content::{Content, Operation};
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let path = test_pdf_path(label, "%PDF-1.7\n");
+    let mut doc = Document::with_version("1.7");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Courier",
+    });
+    let resources_id = doc.add_object(dictionary! { "Font" => dictionary! { "F1" => font_id } });
+    let text = "Reliable quoted text";
+    let content = Content {
+        operations: vec![
+            Operation::new("BT", vec![]),
+            Operation::new("Tf", vec![Object::Name(b"F1".to_vec()), 12.into()]),
+            Operation::new("Tm", vec![1.into(), 0.into(), 0.into(), 1.into(), 54.into(), 670.into()]),
+            Operation::new("Tj", vec![Object::string_literal(text)]),
+            Operation::new("ET", vec![]),
+        ],
+    };
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content.encode().unwrap()));
+    let mut make_annotation = |subtype: &str, name: &str, x0: i64, x1: i64, contents: &str, color: Vec<Object>| {
+        doc.add_object(dictionary! {
+            "Type" => "Annot",
+            "Subtype" => subtype,
+            "Rect" => vec![(x0 - 1).into(), 668.into(), (x1 + 1).into(), 682.into()],
+            "QuadPoints" => vec![x0.into(), 681.into(), x1.into(), 681.into(), x0.into(), 669.into(), x1.into(), 669.into()],
+            "C" => color,
+            "Contents" => Object::string_literal(contents),
+            "NM" => Object::string_literal(name),
+            "T" => Object::string_literal("Test Author"),
+            "M" => Object::string_literal("D:20260912120000Z"),
+        })
+    };
+    let highlight_id = make_annotation("Highlight", "highlight-1", 54, 174, "Reviewer comment", vec![1.into(), 0.into(), 0.into()]);
+    let underline_id = make_annotation("Underline", "underline-1", 54, 174, "Underline note", vec![0.into(), 1.into(), 0.into()]);
+    let text_id = doc.add_object(dictionary! {
+        "Type" => "Annot",
+        "Subtype" => "Text",
+        "Rect" => vec![440.into(), 520.into(), 470.into(), 550.into()],
+        "Contents" => Object::string_literal("Standalone note"),
+        "NM" => Object::string_literal("note-1"),
+        "T" => Object::string_literal("Test Author"),
+    });
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "Contents" => content_id,
+        "Resources" => resources_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Annots" => vec![highlight_id.into(), underline_id.into(), text_id.into()],
+    });
+    doc.objects.insert(pages_id, dictionary! {
+        "Type" => "Pages",
+        "Kids" => vec![page_id.into()],
+        "Count" => 1,
+    }.into());
+    let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog_id);
+    doc.save(&path).unwrap();
+    path
+}
+
+fn empty_pdf_path(label: &str) -> std::path::PathBuf {
+    use lopdf::{dictionary, Document};
+
+    let path = test_pdf_path(label, "%PDF-1.7\n");
+    let mut doc = Document::with_version("1.7");
+    let pages_id = doc.new_object_id();
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+    });
+    doc.objects.insert(pages_id, dictionary! {
+        "Type" => "Pages",
+        "Kids" => vec![page_id.into()],
+        "Count" => 1,
+    }.into());
+    let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog_id);
+    doc.save(&path).unwrap();
+    path
+}
+
 #[test]
 fn test_normalize_doi() {
     assert_eq!(
@@ -6200,19 +6288,6 @@ fn test_library_search_v19_fts_filters_effective_values_and_sync() {
 #[test]
 fn v030_library_search_annotations_are_indexed_deduped_and_refreshable() {
     let conn = mem_db();
-    conn.execute_batch(
-        "CREATE TABLE paper_annotations (
-            id INTEGER PRIMARY KEY,
-            paper_id INTEGER NOT NULL,
-            attachment_id INTEGER,
-            kind TEXT NOT NULL,
-            page_index INTEGER NOT NULL,
-            quoted_text TEXT,
-            comment TEXT,
-            translation TEXT
-        )",
-    )
-    .unwrap();
     let jid = db::insert_journal(&conn, "Annotation Journal", Some("0025-1909"), None, None, None).unwrap();
     let pid = match db::upsert_paper(
         &conn,
@@ -6224,17 +6299,24 @@ fn v030_library_search_annotations_are_indexed_deduped_and_refreshable() {
         UpsertOutcome::New(id) => id,
         _ => panic!("expected new paper"),
     };
+    let attachment_id = test_attachment(&conn, pid, "annotation.pdf");
     db::add_paper_to_library(&conn, pid, &[], &[], "annotation-test").unwrap();
     conn.execute(
-        "INSERT INTO paper_annotations(id,paper_id,kind,page_index,quoted_text,comment,translation)
-         VALUES(1,?1,'highlight',2,'Reliable quoted text','first review note','可靠引文')",
-        params![pid],
+        "INSERT INTO paper_annotations(
+            id,paper_id,attachment_id,kind,page_index,quoted_text,comment,translation,
+            imported_at,updated_at,fingerprint,source_sha256,extraction_status,raw_metadata_json
+         ) VALUES(1,?1,?2,'highlight',2,'Reliable quoted text','first review note','可靠引文',
+                   '2026-09-12T00:00:00Z','2026-09-12T00:00:00Z','fixture-1','','extracted','{}')",
+        params![pid, attachment_id],
     )
     .unwrap();
     conn.execute(
-        "INSERT INTO paper_annotations(id,paper_id,kind,page_index,quoted_text,comment,translation)
-         VALUES(2,?1,'underline',3,'Second annotation fragment','second review note',NULL)",
-        params![pid],
+        "INSERT INTO paper_annotations(
+            id,paper_id,attachment_id,kind,page_index,quoted_text,comment,translation,
+            imported_at,updated_at,fingerprint,source_sha256,extraction_status,raw_metadata_json
+         ) VALUES(2,?1,?2,'underline',3,'Second annotation fragment','second review note',NULL,
+                   '2026-09-12T00:00:00Z','2026-09-12T00:00:00Z','fixture-2','','extracted','{}')",
+        params![pid, attachment_id],
     )
     .unwrap();
     db::refresh_library_search_document(&conn, pid).unwrap();
@@ -6378,6 +6460,72 @@ fn test_v15_linked_attachment_detach_missing_and_relink() {
     assert!(second.exists(), "detach 不得删除用户 PDF");
     assert!(db::list_paper_attachments(&conn, pid).unwrap().is_empty());
     let _ = std::fs::remove_file(second);
+}
+
+#[test]
+fn test_pdf_annotations_extract_fields_deduplicate_refresh_and_preserve_source() {
+    let conn = mem_db();
+    let pid = test_paper(&conn, "10.1000/annotation-extraction", "Annotation Paper");
+    let source = annotated_pdf_path("annotation-extraction");
+    let before = std::fs::read(&source).unwrap();
+    let attachment = db::attach_pdf_to_paper(&conn, pid, source.to_str().unwrap()).unwrap();
+
+    let annotations = db::list_paper_annotations(&conn, pid).unwrap();
+    assert_eq!(annotations.len(), 3);
+    let highlight = annotations.iter().find(|item| item.kind == "Highlight").unwrap();
+    assert_eq!(highlight.page_index, 0);
+    assert_eq!(highlight.color.as_deref(), Some("#FF0000"));
+    assert_eq!(highlight.comment.as_deref(), Some("Reviewer comment"));
+    assert_eq!(highlight.quoted_text.as_deref(), Some("Reliable quoted text"));
+    assert_eq!(highlight.author.as_deref(), Some("Test Author"));
+    assert_ne!(highlight.quoted_text, highlight.comment, "Contents must remain a comment, not the quote");
+    assert!(annotations.iter().any(|item| item.kind == "Underline" && item.color.as_deref() == Some("#00FF00")));
+    let note = annotations.iter().find(|item| item.kind == "Text").unwrap();
+    assert_eq!(note.quoted_text, None);
+    assert_eq!(note.comment.as_deref(), Some("Standalone note"));
+
+    let refreshed = db::refresh_pdf_annotations(&conn, attachment.id).unwrap();
+    assert_eq!(refreshed.status, "completed");
+    assert_eq!(refreshed.imported, 0);
+    assert_eq!(refreshed.unchanged, 3);
+    assert_eq!(db::list_paper_annotations(&conn, pid).unwrap().len(), 3);
+    assert_eq!(before, std::fs::read(&source).unwrap(), "annotation extraction must not rewrite the source PDF");
+    let replacement = annotated_pdf_path("annotation-relink");
+    let ids_before_relink: Vec<i64> = db::list_paper_annotations(&conn, pid).unwrap().iter().map(|item| item.id).collect();
+    let relinked = db::relink_pdf(&conn, attachment.id, replacement.to_str().unwrap()).unwrap();
+    assert_eq!(relinked.id, attachment.id);
+    assert_eq!(ids_before_relink, db::list_paper_annotations(&conn, pid).unwrap().iter().map(|item| item.id).collect::<Vec<_>>());
+    assert_eq!(db::list_paper_annotations(&conn, pid).unwrap().len(), 3);
+    let _ = std::fs::remove_file(source);
+    let _ = std::fs::remove_file(replacement);
+}
+
+#[test]
+fn test_pdf_annotations_malformed_pdf_is_visible_and_does_not_break_attachment() {
+    let conn = mem_db();
+    let pid = test_paper(&conn, "10.1000/annotation-malformed", "Malformed Annotation Paper");
+    let source = test_pdf_path("annotation-malformed", "%PDF-1.7\nnot a valid PDF");
+    let before = std::fs::read(&source).unwrap();
+    let attachment = db::attach_pdf_to_paper(&conn, pid, source.to_str().unwrap()).unwrap();
+    let loaded = db::get_paper_attachment(&conn, attachment.id).unwrap().unwrap();
+    assert_eq!(loaded.annotation_status, "malformed");
+    assert!(loaded.annotation_error.is_some());
+    assert!(db::list_paper_annotations(&conn, pid).unwrap().is_empty());
+    assert_eq!(before, std::fs::read(&source).unwrap());
+    let _ = std::fs::remove_file(source);
+}
+
+#[test]
+fn test_pdf_annotations_empty_valid_pdf_completes_with_zero_rows() {
+    let conn = mem_db();
+    let pid = test_paper(&conn, "10.1000/annotation-empty", "Empty Annotation Paper");
+    let source = empty_pdf_path("annotation-empty");
+    let attachment = db::attach_pdf_to_paper(&conn, pid, source.to_str().unwrap()).unwrap();
+    let loaded = db::get_paper_attachment(&conn, attachment.id).unwrap().unwrap();
+    assert_eq!(loaded.annotation_status, "completed");
+    assert!(loaded.annotation_error.is_none());
+    assert!(db::list_paper_annotations(&conn, pid).unwrap().is_empty());
+    let _ = std::fs::remove_file(source);
 }
 
 #[test]

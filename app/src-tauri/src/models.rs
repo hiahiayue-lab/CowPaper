@@ -524,11 +524,30 @@ pub struct PaperAttachment {
     pub updated_at: String,
     /// Computed at read time. Missing files retain their attachment row.
     pub missing: bool,
+    /// Read-only annotation scan state. This is attachment-local so two PDFs
+    /// owned by the same Paper never share annotation identity.
+    pub annotation_status: String,
+    pub annotation_error: Option<String>,
+    pub annotation_scanned_at: Option<String>,
 }
 
-/// A read-only annotation imported from a PDF attachment. `paper_id` is the
-/// canonical Paper identity; `attachment_id` is required so two PDF
-/// attachments belonging to one Paper never share annotation identity.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PdfAnnotationRefreshResult {
+    pub attachment_id: i64,
+    pub source_sha256: Option<String>,
+    pub status: String,
+    pub error: Option<String>,
+    pub imported: i64,
+    pub updated: i64,
+    pub unchanged: i64,
+    pub stale: i64,
+    pub unsupported: i64,
+}
+
+/// An embedded PDF annotation imported from one specific attachment. The
+/// canonical Paper identity is `paper_id`; attachment-local fingerprints make
+/// refresh idempotent without modifying the source PDF.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PaperAnnotation {
@@ -542,13 +561,18 @@ pub struct PaperAnnotation {
     pub quoted_text: Option<String>,
     pub comment: Option<String>,
     pub author: Option<String>,
+    pub pdf_created_at: Option<String>,
+    pub pdf_modified_at: Option<String>,
+    pub translation: Option<String>,
     pub created_at: Option<String>,
     pub modified_at: Option<String>,
     pub imported_at: String,
+    pub updated_at: String,
     pub fingerprint: String,
+    pub source_sha256: String,
     pub extraction_status: String,
     pub source_app: Option<String>,
-    pub raw_metadata_json: Option<String>,
+    pub raw_metadata_json: String,
 }
 
 /// Input from a PDF annotation extractor. `quadpoints` is kept outside the
