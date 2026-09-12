@@ -1,9 +1,9 @@
 /**
- * The read-only Library annotation contract.
+ * The Library annotation display contract.
  *
  * The backend owns PDF parsing and attachment identity. The Inspector only
  * renders the normalized record; it never treats a comment as quoted text and
- * never creates or persists an annotation row.
+ * never creates or persists an annotation row in the UI.
  */
 
 export type LibraryAnnotation = {
@@ -20,6 +20,7 @@ export type LibraryAnnotation = {
 };
 
 function text(value: unknown): string | null {
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
   return trimmed || null;
@@ -48,8 +49,8 @@ export function normalizeLibraryAnnotations(value: unknown): LibraryAnnotation[]
       kind: text(record.kind) || "unknown",
       color: text(record.color),
       pageIndex,
-      excerpt: text(record.excerpt),
-      note: text(record.note),
+      excerpt: text(record.excerpt) || text(record.quotedText),
+      note: text(record.note) || text(record.comment),
       extractionStatus: text(record.extractionStatus) || "metadata_only",
     }];
   });
@@ -68,11 +69,15 @@ export function annotationKindLabel(kind: string): string {
 
 export function annotationStatusLabel(status: string): string {
   switch (status) {
-    case "extracted": return "";
+    case "extracted":
+    case "completed": return "";
     case "no_text": return "暂无可验证的页面摘录";
     case "scanned": return "扫描 PDF · 没有文字层";
     case "malformed": return "标注数据不完整";
     case "missing_attachment": return "PDF 附件不可用";
+    case "encrypted": return "PDF 已加密，无法读取标注";
+    case "unsupported": return "标注类型暂不支持";
+    case "stale": return "该标注已不在当前 PDF 中";
     default: return "页面摘录暂不可用";
   }
 }

@@ -3755,6 +3755,7 @@ pub fn refresh_pdf_annotations(
         params![now, attachment_id],
     )?;
     tx.commit()?;
+    refresh_library_search_document(conn, paper_id)?;
     Ok(crate::models::PdfAnnotationRefreshResult {
         attachment_id,
         source_sha256: Some(source_sha256),
@@ -7955,6 +7956,8 @@ fn migrate_to_v20(conn: &Connection) -> Result<()> {
     }
     conn.execute_batch(
         r#"
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_attachments_paper_id_id
+            ON paper_attachments(paper_id, id);
         CREATE TABLE IF NOT EXISTS paper_annotations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             paper_id INTEGER NOT NULL REFERENCES papers(id) ON DELETE CASCADE,

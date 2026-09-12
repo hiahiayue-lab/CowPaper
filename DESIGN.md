@@ -362,6 +362,16 @@ Focus must remain predictable: opening a popover keeps focus in its owning contr
 
 Future CowPaper UI work must consult the Emil Kowalski design skills and apply their principles within CowPaper’s existing Tauri/Vanilla TS/CSS stack.
 
+### v0.3.0 annotation surface
+
+The v0.3.0 Inspector annotation surface is a compact sibling of Metadata and
+PDF. It uses persisted attachment-scoped records and keeps type/color, page,
+quoted text, and optional comment visible without turning each annotation into
+a large card. `刷新` is an explicit, low-noise action; extraction has no
+background animation and never writes back to the source PDF. Search evidence
+uses the single `Annotation` field label and remains deduplicated by the
+canonical Paper row.
+
 CowPaper is a high-frequency desktop information surface. Search, IME, keyboard navigation, filtering, row replacement, selection, scope changes, and Inspector updates have no motion. Occasional spatial panels may use only `transform` and `opacity`, a 125–250ms ease-out, and a trigger-aware origin. Do not use `transition: all`, `ease-in`, layout-property animation, keyframe restarts, or spring motion for functional search.
 
 The reduced-motion mode removes movement and preserves state, focus, and progress information. A progress indicator may update instantly or use `transform: scaleX(...)`; it must not animate `width`. No visual effect should delay an input path or make a user wait for a result that is already available.

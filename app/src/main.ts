@@ -585,7 +585,7 @@ let librarySuppressNextClick = false;
 const expandedLibraryAttachmentPaperIds = new Set<number>();
 let libraryToastTimer = 0;
 let preferredPdfReader = "system";
-let currentAppVersion = "0.2.2";
+let currentAppVersion = "0.3.0";
 let pendingUpdate: Update | null = null;
 let updateBusy = false;
 
@@ -2655,7 +2655,7 @@ async function loadLibraryAnnotations(paperId: number, force = false): Promise<b
   libraryAnnotationErrors.delete(paperId);
   if (selectedLibraryPaperId === paperId) renderLibraryInspector(item);
   try {
-    const result = await invoke<unknown>("list_library_annotations", { paperId });
+    const result = await invoke<unknown>("list_paper_annotations", { paperId });
     if (requestId !== libraryAnnotationRequestSeq) return false;
     libraryAnnotations.set(paperId, normalizeLibraryAnnotations(result));
     libraryAnnotationState.set(paperId, "loaded");
@@ -5401,6 +5401,11 @@ async function setupListeners() {
     if (annotationRefresh) {
       const paperId = Number(annotationRefresh.dataset.paperId);
       annotationRefresh.disabled = true;
+      const currentItem = libraryPapers.find((candidate) => candidate.paper.id === paperId);
+      const refreshes = currentItem?.attachments
+        .filter((attachment) => !attachment.missing)
+        .map((attachment) => invoke("refresh_pdf_annotations", { attachmentId: attachment.id })) || [];
+      try { await Promise.all(refreshes); } catch { /* the reload below exposes the readable error state */ }
       const ok = await loadLibraryAnnotations(paperId, true);
       setStatus(ok ? "PDF 标注已刷新" : "PDF 标注刷新失败", ok ? "done" : "error");
       return;

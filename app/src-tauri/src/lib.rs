@@ -1256,7 +1256,7 @@ fn list_paper_annotations(
     state: State<Db>,
 ) -> Result<Vec<models::PaperAnnotation>, String> {
     let conn = state.inner().lock().unwrap();
-    db::list_paper_annotations(&conn, paper_id).map_err(|e| e.to_string())
+    db::list_paper_annotations(&conn, paper_id, None).map_err(|e| e.to_string())
 }
 
 #[tauri::command]

@@ -6470,17 +6470,17 @@ fn test_pdf_annotations_extract_fields_deduplicate_refresh_and_preserve_source()
     let before = std::fs::read(&source).unwrap();
     let attachment = db::attach_pdf_to_paper(&conn, pid, source.to_str().unwrap()).unwrap();
 
-    let annotations = db::list_paper_annotations(&conn, pid).unwrap();
+    let annotations = db::list_paper_annotations(&conn, pid, None).unwrap();
     assert_eq!(annotations.len(), 3);
-    let highlight = annotations.iter().find(|item| item.kind == "Highlight").unwrap();
+    let highlight = annotations.iter().find(|item| item.kind == "highlight").unwrap();
     assert_eq!(highlight.page_index, 0);
     assert_eq!(highlight.color.as_deref(), Some("#FF0000"));
     assert_eq!(highlight.comment.as_deref(), Some("Reviewer comment"));
     assert_eq!(highlight.quoted_text.as_deref(), Some("Reliable quoted text"));
     assert_eq!(highlight.author.as_deref(), Some("Test Author"));
     assert_ne!(highlight.quoted_text, highlight.comment, "Contents must remain a comment, not the quote");
-    assert!(annotations.iter().any(|item| item.kind == "Underline" && item.color.as_deref() == Some("#00FF00")));
-    let note = annotations.iter().find(|item| item.kind == "Text").unwrap();
+    assert!(annotations.iter().any(|item| item.kind == "underline" && item.color.as_deref() == Some("#00FF00")));
+    let note = annotations.iter().find(|item| item.kind == "text").unwrap();
     assert_eq!(note.quoted_text, None);
     assert_eq!(note.comment.as_deref(), Some("Standalone note"));
 
@@ -6488,14 +6488,14 @@ fn test_pdf_annotations_extract_fields_deduplicate_refresh_and_preserve_source()
     assert_eq!(refreshed.status, "completed");
     assert_eq!(refreshed.imported, 0);
     assert_eq!(refreshed.unchanged, 3);
-    assert_eq!(db::list_paper_annotations(&conn, pid).unwrap().len(), 3);
+    assert_eq!(db::list_paper_annotations(&conn, pid, None).unwrap().len(), 3);
     assert_eq!(before, std::fs::read(&source).unwrap(), "annotation extraction must not rewrite the source PDF");
     let replacement = annotated_pdf_path("annotation-relink");
-    let ids_before_relink: Vec<i64> = db::list_paper_annotations(&conn, pid).unwrap().iter().map(|item| item.id).collect();
+    let ids_before_relink: Vec<i64> = db::list_paper_annotations(&conn, pid, None).unwrap().iter().map(|item| item.id).collect();
     let relinked = db::relink_pdf(&conn, attachment.id, replacement.to_str().unwrap()).unwrap();
     assert_eq!(relinked.id, attachment.id);
-    assert_eq!(ids_before_relink, db::list_paper_annotations(&conn, pid).unwrap().iter().map(|item| item.id).collect::<Vec<_>>());
-    assert_eq!(db::list_paper_annotations(&conn, pid).unwrap().len(), 3);
+    assert_eq!(ids_before_relink, db::list_paper_annotations(&conn, pid, None).unwrap().iter().map(|item| item.id).collect::<Vec<_>>());
+    assert_eq!(db::list_paper_annotations(&conn, pid, None).unwrap().len(), 3);
     let _ = std::fs::remove_file(source);
     let _ = std::fs::remove_file(replacement);
 }
@@ -6510,7 +6510,7 @@ fn test_pdf_annotations_malformed_pdf_is_visible_and_does_not_break_attachment()
     let loaded = db::get_paper_attachment(&conn, attachment.id).unwrap().unwrap();
     assert_eq!(loaded.annotation_status, "malformed");
     assert!(loaded.annotation_error.is_some());
-    assert!(db::list_paper_annotations(&conn, pid).unwrap().is_empty());
+    assert!(db::list_paper_annotations(&conn, pid, None).unwrap().is_empty());
     assert_eq!(before, std::fs::read(&source).unwrap());
     let _ = std::fs::remove_file(source);
 }
@@ -6524,7 +6524,7 @@ fn test_pdf_annotations_empty_valid_pdf_completes_with_zero_rows() {
     let loaded = db::get_paper_attachment(&conn, attachment.id).unwrap().unwrap();
     assert_eq!(loaded.annotation_status, "completed");
     assert!(loaded.annotation_error.is_none());
-    assert!(db::list_paper_annotations(&conn, pid).unwrap().is_empty());
+    assert!(db::list_paper_annotations(&conn, pid, None).unwrap().is_empty());
     let _ = std::fs::remove_file(source);
 }
 
