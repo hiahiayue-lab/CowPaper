@@ -1406,8 +1406,12 @@ button.full {
 /* Inspector views: 元数据 | 标注. A compact underline tab bar in the
    Inspector's own language — no pill, no giant segmented control, and no
    motion on switch (high-frequency UI switches instantly). */
-.inspector-tabs { display: flex; width: 100%; margin-bottom: 12px; border-bottom: 1px solid #e9e9e9; }
-.inspector-tab-button { flex: 1 1 0; min-width: 0; padding: 7px 0; border: 0; border-bottom: 2px solid transparent; background: transparent; color: #87909b; font-size: 11px; font-weight: 600; text-align: center; }
+/* Two views, strictly 50/50 of the Inspector's available content width.
+   A two-column grid (not flex + negative-margin bleed) is what guarantees the
+   bar fills the content box exactly: no intrinsic sizing, no reserved gap and
+   no dead space on the right. */
+.inspector-tabs { display: grid; grid-template-columns: 1fr 1fr; align-items: stretch; width: auto; margin: 0 0 12px; padding: 0; border-bottom: 1px solid #e9e9e9; }
+.inspector-tab-button { display: block; width: 100%; min-width: 0; padding: 7px 0; border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: transparent; color: #87909b; font-size: 11px; font-weight: 600; text-align: center; }
 .inspector-tab-button:hover { color: #4d5864; background: transparent; }
 .inspector-tab-button.active { color: #222; border-bottom-color: #3487ff; }
 .inspector-panel { display: block; }
@@ -2317,12 +2321,12 @@ body.library-workspace .inspector-tabs {
   position: sticky;
   top: 0;
   z-index: 2;
-  display: flex;
-  align-items: center;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  align-items: stretch;
   min-height: 28px;
-  height: 28px;
-  padding: 0 16px;
-  margin: 0 -16px 8px;
+  padding: 0;
+  margin: 0 0 8px;
   border-bottom: 1px solid var(--ds-divider);
   background: var(--ds-inspector);
   box-shadow: 0 1px 0 var(--ds-inspector);
@@ -2855,8 +2859,8 @@ body.library-workspace .library-inspector {
 }
 
 body.library-workspace .inspector-tabs {
-  margin: 0 -16px 8px;
-  padding-inline: 16px;
+  margin: 0 0 8px;
+  padding: 0;
   border-bottom-color: var(--ui-divider);
   background: var(--ui-inspector);
   box-shadow: none;
@@ -3030,9 +3034,8 @@ body.library-workspace .inspector-annotations .inspector-section-head {
 
 .library-annotation-kind > span:not(.library-annotation-color),
 .library-annotation-attachment,
-.library-annotation-status,
 .library-annotation-empty,
-.library-annotation-note-label {
+.library-annotation-section-label {
   color: var(--ui-secondary);
   font-size: 10px;
 }
@@ -3064,11 +3067,19 @@ body.library-workspace .inspector-annotations .inspector-section-head {
   white-space: pre-wrap;
 }
 
-.library-annotation-empty,
-.library-annotation-status {
-  display: block;
+.library-annotation-quote {
   margin-top: 5px;
+}
+
+.library-annotation-empty {
+  display: block;
+  margin-top: 3px;
   color: #9a9fa6;
+}
+
+/* The quote and the comment are separate, labelled sections. */
+.library-annotation-section-label {
+  letter-spacing: 0.02em;
 }
 
 .library-annotation-note {

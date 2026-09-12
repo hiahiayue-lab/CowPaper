@@ -6527,6 +6527,218 @@ fn test_v15_linked_attachment_detach_missing_and_relink() {
     let _ = std::fs::remove_file(second);
 }
 
+/// A realistic annotation fixture: a Type0 / Identity-H font whose only usable
+/// code -> Unicode mapping is a /ToUnicode CMap, real /W widths, and a two-line
+/// text body. This is the shape of a published paper PDF, and the shape the
+/// previous byte-wise extractor could not recover a quote from.
+fn cid_annotated_pdf_path_with(label: &str, include_to_unicode: bool) -> std::path::PathBuf {
+    use lopdf::content::{Content, Operation};
+    use lopdf::{dictionary, Document, Object, Stream, StringFormat};
+
+    let line_one_text = "First line of the page body";
+    let line_two_text = "Second line holds the highlight";
+    let glyph_width = 500.0_f32; // /W -> 0.5 em, i.e. 6.0 units at 12pt
+    let size = 12.0_f32;
+    let left = 72.0_f32;
+    let baseline_one = 700.0_f32;
+    let leading = 14.0_f32;
+
+    // One code per distinct character, so the CMap stays small and explicit.
+    let mut alphabet: Vec<char> = Vec::new();
+    let mut encode = |text: &str| -> Vec<u8> {
+        text.chars()
+            .flat_map(|ch| {
+                let index = alphabet.iter().position(|known| *known == ch).unwrap_or_else(|| {
+                    alphabet.push(ch);
+                    alphabet.len() - 1
+                });
+                ((index as u16) + 1).to_be_bytes()
+            })
+            .collect()
+    };
+    let line_one = encode(line_one_text);
+    let line_two = encode(line_two_text);
+    let mut cmap = String::from(
+        "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n/CMapName /CowPaper-Test-UCS def\n/CMapType 2 def\n1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n",
+    );
+    cmap.push_str(&format!("{} beginbfchar\n", alphabet.len()));
+    for (index, ch) in alphabet.iter().enumerate() {
+        let mut units = [0_u16; 2];
+        let hex = ch.encode_utf16(&mut units).iter().map(|unit| format!("{unit:04X}")).collect::<String>();
+        cmap.push_str(&format!("<{:04X}> <{hex}>\n", index + 1));
+    }
+    cmap.push_str("endbfchar\nendcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n");
+
+    let path = test_pdf_path(label, "%PDF-1.7\n");
+    let mut doc = Document::with_version("1.7");
+    let pages_id = doc.new_object_id();
+    let cmap_id = doc.add_object(Stream::new(dictionary! {}, cmap.into_bytes()));
+    let descendant_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "CIDFontType2",
+        "BaseFont" => "CowPaperTest",
+        "CIDSystemInfo" => dictionary! {
+            "Registry" => Object::string_literal("Adobe"),
+            "Ordering" => Object::string_literal("Identity"),
+            "Supplement" => 0,
+        },
+        "DW" => 1000,
+        "W" => vec![Object::Integer(1), Object::Integer(200), Object::Real(glyph_width)],
+    });
+    let mut font = dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type0",
+        "BaseFont" => "CowPaperTest",
+        "Encoding" => "Identity-H",
+        "DescendantFonts" => vec![descendant_id.into()],
+    };
+    if include_to_unicode {
+        font.set("ToUnicode", cmap_id);
+    }
+    let font_id = doc.add_object(font);
+    let resources_id = doc.add_object(dictionary! { "Font" => dictionary! { "F1" => font_id } });
+    let content = Content {
+        operations: vec![
+            Operation::new("BT", vec![]),
+            Operation::new("Tf", vec![Object::Name(b"F1".to_vec()), Object::Real(size)]),
+            Operation::new("TL", vec![Object::Real(leading)]),
+            Operation::new("Tm", vec![Object::Integer(1), Object::Integer(0), Object::Integer(0), Object::Integer(1), Object::Real(left), Object::Real(baseline_one)]),
+            Operation::new("Tj", vec![Object::String(line_one, StringFormat::Hexadecimal)]),
+            Operation::new("T*", vec![]),
+            Operation::new("Tj", vec![Object::String(line_two, StringFormat::Hexadecimal)]),
+            Operation::new("ET", vec![]),
+        ],
+    };
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content.encode().unwrap()));
+    // Exact geometry: every glyph advances glyph_width/1000*size = 6.0 units.
+    let advance = glyph_width / 1000.0 * size;
+    let quad = |start: usize, len: usize, baseline: f32| -> Vec<Object> {
+        let x0 = left + start as f32 * advance;
+        let x1 = x0 + len as f32 * advance;
+        vec![
+            Object::Real(x0), Object::Real(baseline + 6.0), Object::Real(x1), Object::Real(baseline + 6.0),
+            Object::Real(x0), Object::Real(baseline - 6.0), Object::Real(x1), Object::Real(baseline - 6.0),
+        ]
+    };
+    // "Second line holds the highlight": the phrase starts at character 12.
+    let quads = quad(12, "holds the highlight".chars().count(), baseline_one - leading);
+    let highlight = doc.add_object(dictionary! {
+        "Type" => "Annot",
+        "Subtype" => "Highlight",
+        "Rect" => vec![quads[0].clone(), quads[1].clone(), quads[2].clone(), quads[3].clone()],
+        "QuadPoints" => quads,
+        "C" => vec![Object::Integer(1), Object::Real(0.75), Object::Integer(0)],
+        "Contents" => pdf_text_string("组织正在要求我们重新审视该结论。"),
+        "NM" => Object::string_literal("cid-highlight"),
+        "T" => pdf_text_string("Test Author"),
+    });
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "Contents" => content_id,
+        "Resources" => resources_id,
+        "MediaBox" => vec![Object::Integer(0), Object::Integer(0), Object::Integer(612), Object::Integer(792)],
+        "Annots" => vec![highlight.into()],
+    });
+    doc.objects.insert(pages_id, Object::Dictionary(dictionary! {
+        "Type" => "Pages",
+        "Kids" => vec![page_id.into()],
+        "Count" => 1,
+    }));
+    let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog_id);
+    doc.save(&path).unwrap();
+    path
+}
+
+fn cid_annotated_pdf_path(label: &str) -> std::path::PathBuf {
+    cid_annotated_pdf_path_with(label, true)
+}
+
+/// Non-ASCII PDF text strings must be UTF-16BE with a BOM; a raw UTF-8 literal
+/// would be read back as PDFDocEncoding mojibake.
+fn pdf_text_string(text: &str) -> lopdf::Object {
+    use lopdf::{Object, StringFormat};
+    let mut bytes = vec![0xFE_u8, 0xFF_u8];
+    for unit in text.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_be_bytes());
+    }
+    Object::String(bytes, StringFormat::Hexadecimal)
+}
+
+/// The recovery path that matters for real papers: a CID font whose text is only
+/// reachable through /ToUnicode and a second line reached through the text line
+/// matrix (T*) must yield the genuinely highlighted page text.
+#[test]
+fn test_pdf_annotations_cid_to_unicode_recovers_the_real_page_quote() {
+    let conn = mem_db();
+    let pid = test_paper(&conn, "10.1000/annotation-cid", "CID Annotation Paper");
+    let source = cid_annotated_pdf_path("annotation-cid");
+    let before = std::fs::read(&source).unwrap();
+    db::attach_pdf_to_paper(&conn, pid, source.to_str().unwrap()).unwrap();
+
+    let annotations = db::list_paper_annotations(&conn, pid, None).unwrap();
+    assert_eq!(annotations.len(), 1);
+    let highlight = &annotations[0];
+    assert_eq!(highlight.kind, "highlight");
+    assert_eq!(highlight.page_index, 0);
+    assert_eq!(
+        highlight.quoted_text.as_deref(),
+        Some("holds the highlight"),
+        "the quote must be the page text the quad actually covers"
+    );
+    assert_eq!(highlight.comment.as_deref(), Some("组织正在要求我们重新审视该结论。"));
+    assert_ne!(highlight.quoted_text, highlight.comment, "Contents is never the quote");
+    assert_eq!(highlight.extraction_status, "extracted");
+    assert_eq!(before, std::fs::read(&source).unwrap(), "annotation extraction must not rewrite the source PDF");
+    let _ = std::fs::remove_file(source);
+}
+
+/// A CID font with no /ToUnicode CMap cannot map its codes to text. The extractor
+/// must refuse rather than decode glyph indices into invented Latin text.
+#[test]
+fn test_pdf_annotations_unmappable_cid_font_never_invents_a_quote() {
+    let conn = mem_db();
+    let pid = test_paper(&conn, "10.1000/annotation-unmappable", "Unmappable CID Paper");
+    let source = cid_annotated_pdf_path_with("annotation-unmappable", false);
+    let before = std::fs::read(&source).unwrap();
+    db::attach_pdf_to_paper(&conn, pid, source.to_str().unwrap()).unwrap();
+    let annotations = db::list_paper_annotations(&conn, pid, None).unwrap();
+    assert_eq!(annotations.len(), 1);
+    assert_eq!(annotations[0].quoted_text, None, "unmappable codes must never become a quote");
+    assert_eq!(annotations[0].comment.as_deref(), Some("组织正在要求我们重新审视该结论。"));
+    assert_ne!(annotations[0].extraction_status, "extracted");
+    assert_eq!(before, std::fs::read(&source).unwrap());
+    let _ = std::fs::remove_file(source);
+}
+
+/// Read-only diagnostic against a real user PDF (opt-in via env var). Prints the
+/// recovered quote/comment per annotation and proves the file bytes are unchanged.
+/// Ignored by default so CI never depends on a local path.
+#[test]
+#[ignore]
+fn diagnostic_scan_real_annotation_pdf() {
+    let Ok(path) = std::env::var("COWPAPER_ANNOTATION_PDF") else { return };
+    let before = std::fs::read(&path).unwrap();
+    let scan = crate::pdf_annotations::scan_path(std::path::Path::new(&path));
+    println!("FILE {} status={} error={:?} unsupported={}", path, scan.status, scan.error, scan.unsupported_count);
+    for item in &scan.annotations {
+        println!(
+            "PAGE {} {}{} extraction={}\n  quote   = {:?}\n  comment = {:?}\n  color={:?} author={:?}",
+            item.page_index + 1,
+            item.kind,
+            item.external_annotation_id.as_deref().map(|id| format!(" nm={id}")).unwrap_or_default(),
+            item.extraction_status,
+            item.quoted_text,
+            item.comment,
+            item.color,
+            item.author,
+        );
+    }
+    assert_eq!(before, std::fs::read(&path).unwrap(), "scan must not modify the PDF");
+    println!("PDF_UNCHANGED=YES annotations={}", scan.annotations.len());
+}
+
 #[test]
 fn test_pdf_annotations_extract_fields_deduplicate_refresh_and_preserve_source() {
     let conn = mem_db();

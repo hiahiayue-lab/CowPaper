@@ -32,6 +32,10 @@ if (annotationStatusLabel("no_text") !== "暂无可验证的页面摘录") throw
 const html = renderLibraryAnnotationCard(annotations[0]);
 if (!html.includes("高亮") || !html.includes("第 3 页") || !html.includes("paper.pdf")) throw new Error("annotation card metadata missing");
 if (!html.includes("Reliable quoted text.") || !html.includes("Review this result")) throw new Error("annotation card content missing");
+if (!html.includes("PDF 原文") || !html.includes("批注")) throw new Error("quote and comment need separate section labels");
+const quoteIndex = html.indexOf("PDF 原文");
+const noteIndex = html.indexOf("批注");
+if (quoteIndex < 0 || noteIndex < 0 || quoteIndex > noteIndex) throw new Error("the PDF quote section must come first");
 if (html.includes("<script>")) throw new Error("annotation text must be escaped");
 
 const metadataOnly = normalizeLibraryAnnotations([{
@@ -46,7 +50,22 @@ const metadataOnly = normalizeLibraryAnnotations([{
   note: "A note",
   extractionStatus: "metadata_only",
 }])[0];
-if (!renderLibraryAnnotationCard(metadataOnly).includes("页面摘录暂不可用")) throw new Error("missing excerpt state is visible");
+// A sticky note has no marked-up page text, so it must not claim a PDF quote.
+const stickyNote = renderLibraryAnnotationCard(metadataOnly);
+if (stickyNote.includes("PDF 原文")) throw new Error("a text note must not invent a PDF quote section");
+if (!stickyNote.includes("批注") || !stickyNote.includes("A note")) throw new Error("a text note keeps its comment");
+
+// A markup annotation whose quote could not be recovered states that plainly and
+// keeps the specific extraction reason in the tooltip.
+const unrecovered = renderLibraryAnnotationCard({ ...annotations[0], excerpt: null, extractionStatus: "no_text", note: "Review this result" });
+if (!unrecovered.includes("PDF 原文")) throw new Error("a markup annotation keeps its PDF quote section");
+if (!unrecovered.includes("无法提取此标注的页面原文")) throw new Error("missing quote must state so plainly");
+if (!unrecovered.includes(`title="${annotationStatusLabel("no_text")}"`)) throw new Error("the specific extraction reason belongs in the title");
+if (!unrecovered.includes("Review this result")) throw new Error("the comment is still shown next to an unrecovered quote");
+if (unrecovered.includes(`>${"暂无可验证的页面摘录"}<`)) throw new Error("the status wording must stay in the tooltip, not the body");
+
+// No comment, no comment section.
+if (renderLibraryAnnotationCard({ ...annotations[0], note: null }).includes("批注")) throw new Error("an empty comment section must not be rendered");
 
 console.log("Library annotation rendering contract passed");
 

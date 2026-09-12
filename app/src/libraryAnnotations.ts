@@ -67,6 +67,11 @@ export function annotationKindLabel(kind: string): string {
   }
 }
 
+/** True for annotations that mark up existing page text (so a PDF quote is expected). */
+export function annotationKindHasPageText(kind: string): boolean {
+  return kind === "highlight" || kind === "underline" || kind === "strikeout";
+}
+
 export function annotationStatusLabel(status: string): string {
   switch (status) {
     case "extracted":
@@ -97,16 +102,29 @@ function safeColor(color: string | null): string {
   return color && /^#[0-9a-f]{6}$/i.test(color) ? color : "#d7dce2";
 }
 
-/** Render one compact card using only the existing Inspector surface language. */
+/**
+ * Render one compact card using only the existing Inspector surface language.
+ *
+ * The PDF quote and the annotation comment are separate sections and are never
+ * mixed: the quote is page text recovered from the annotation geometry, the
+ * comment is the annotation's own /Contents. A markup annotation without a
+ * recoverable quote states that plainly (the specific reason stays in `title`)
+ * instead of substituting the comment or nearby text.
+ */
 export function renderLibraryAnnotationCard(annotation: LibraryAnnotation): string {
   const status = annotationStatusLabel(annotation.extractionStatus);
-  const excerpt = annotation.excerpt
-    ? `<blockquote class="library-annotation-excerpt">${escapeHtml(annotation.excerpt)}</blockquote>`
-    : `<span class="library-annotation-empty">${escapeHtml(status || "暂无页面摘录")}</span>`;
-  const note = annotation.note
-    ? `<div class="library-annotation-note"><span class="library-annotation-note-label">批注</span><p>${escapeHtml(annotation.note)}</p></div>`
+  const quote = annotationKindHasPageText(annotation.kind)
+    ? `<div class="library-annotation-quote"><span class="library-annotation-section-label">PDF 原文</span>${
+        annotation.excerpt
+          ? `<blockquote class="library-annotation-excerpt">${escapeHtml(annotation.excerpt)}</blockquote>`
+          : `<span class="library-annotation-empty" title="${escapeHtml(status)}">无法提取此标注的页面原文</span>`
+      }</div>`
     : "";
-  return `<article class="library-annotation-card" data-annotation-id="${escapeHtml(annotation.id)}"><div class="library-annotation-head"><span class="library-annotation-kind"><span class="library-annotation-color" style="background:${safeColor(annotation.color)}" aria-label="标注颜色" title="标注颜色"></span><strong>${escapeHtml(annotationKindLabel(annotation.kind))}</strong><span>第 ${annotation.pageIndex + 1} 页</span></span><span class="library-annotation-attachment" title="${escapeHtml(annotation.attachmentName)}">${escapeHtml(annotation.attachmentName)}</span></div>${excerpt}${status && annotation.excerpt ? `<span class="library-annotation-status">${escapeHtml(status)}</span>` : ""}${note}</article>`;
+  // An empty comment section is never rendered.
+  const note = annotation.note
+    ? `<div class="library-annotation-note"><span class="library-annotation-section-label">批注</span><p>${escapeHtml(annotation.note)}</p></div>`
+    : "";
+  return `<article class="library-annotation-card" data-annotation-id="${escapeHtml(annotation.id)}"><div class="library-annotation-head"><span class="library-annotation-kind"><span class="library-annotation-color" style="background:${safeColor(annotation.color)}" aria-label="标注颜色" title="标注颜色"></span><strong>${escapeHtml(annotationKindLabel(annotation.kind))}</strong><span>第 ${annotation.pageIndex + 1} 页</span></span><span class="library-annotation-attachment" title="${escapeHtml(annotation.attachmentName)}">${escapeHtml(annotation.attachmentName)}</span></div>${quote}${note}</article>`;
 }
 
 /* ================= Inspector tab contract (v0.3.0) ================= */
