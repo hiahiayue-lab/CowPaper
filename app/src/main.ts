@@ -31,6 +31,11 @@ import {
   type SearchPaper,
 } from "./librarySearch";
 import {
+  normalizeLibraryAnnotations,
+  renderLibraryAnnotationCard,
+  type LibraryAnnotation,
+} from "./libraryAnnotations";
+import {
   actionControlState,
   resolveManualTitleTranslationSource,
   resolveTitleEditorKeyDecision,
@@ -549,6 +554,10 @@ let libraryMetadataRefreshFeedback: InspectorActionFeedback | null = null;
 let libraryActionRequestSeq = 0;
 /** True while the current pointer interaction already started a translation. */
 let libraryTitleTranslationPointerHandled = false;
+let libraryAnnotations = new Map<number, LibraryAnnotation[]>();
+let libraryAnnotationState = new Map<number, "loading" | "loaded" | "error">();
+let libraryAnnotationErrors = new Map<number, string>();
+let libraryAnnotationRequestSeq = 0;
 type SettingsSection = "general" | "ai" | "pdf" | "library" | "recommend" | "about";
 let activeWorkspace: "discovery" | "library" | "settings" = "discovery";
 let activeViewName = "recommend";
@@ -1954,12 +1963,13 @@ function libraryIconAction(
   return `<button type="button" class="icon-action${options.busy ? " busy" : ""}" data-action="${action}" data-paper-id="${paperId}" title="${escapeHtml(label)}" aria-label="${escapeHtml(label)}" aria-busy="${options.busy ? "true" : "false"}"${options.disabled ? " disabled" : ""}>${REFRESH_ICON_MARKUP}</button>`;
 }
 
-/// The row's fixed-width feedback slot. It is always present (never `hidden`)
-/// so its width is reserved: text appearing or disappearing can never resize
-/// the row's trailing column, wrap the value or move an icon. The full sentence
-/// lives in `title` and in the global status region.
+/// The row's inline feedback slot. The idle slot collapses to zero width so an
+/// empty status never creates trailing whitespace; active feedback remains in
+/// the same row and the full sentence lives in `title` and the global status
+/// region.
 function libraryActionStatus(slot: "titleTranslation" | "metadataRefresh", paperId: number, statusText: string, tone: string, detail: string): string {
-  return `<span class="inspector-action-status ${tone}" data-inspector-action-status="${slot}" data-paper-id="${paperId}" role="status" aria-live="polite" title="${escapeHtml(detail)}">${escapeHtml(statusText)}</span>`;
+  const idle = !statusText;
+  return `<span class="inspector-action-status ${tone}${idle ? " idle" : ""}" data-inspector-action-status="${slot}" data-paper-id="${paperId}" role="status" aria-live="polite" aria-hidden="${idle ? "true" : "false"}" title="${escapeHtml(detail)}">${escapeHtml(statusText)}</span>`;
 }
 
 function libraryInspectorRow(label: string, value: string, trailing = "", className = ""): string {
@@ -2145,7 +2155,8 @@ function refreshLibraryInspectorActionUi(paperId: number): void {
     );
     if (!status) continue;
     status.textContent = view.statusText;
-    status.className = `inspector-action-status ${view.tone}`;
+    status.className = `inspector-action-status ${view.tone}${view.statusText ? "" : " idle"}`;
+    status.setAttribute("aria-hidden", view.statusText ? "false" : "true");
     status.title = view.detail;
   }
 }
@@ -2602,6 +2613,66 @@ function renderLibraryAttachmentChild(item: LibraryPaper, attachment: PaperAttac
   return `<div class="library-attachment-child${selected ? " selected" : ""}" data-paper-id="${item.paper.id}" data-attachment-id="${attachment.id}" data-action="library-select-attachment" role="button" tabindex="0" aria-selected="${selected}" aria-label="PDF：${escapeHtml(attachment.filename)}" title="点击选择 PDF；双击打开"><span class="attachment-child-icon" aria-hidden="true">PDF</span><span class="attachment-child-name" title="${escapeHtml(attachment.absolutePath)}">${escapeHtml(attachment.filename)}</span></div>`;
 }
 
+function invalidateLibraryAnnotations(paperId: number): void {
+  libraryAnnotationRequestSeq += 1;
+  libraryAnnotations.delete(paperId);
+  libraryAnnotationState.delete(paperId);
+  libraryAnnotationErrors.delete(paperId);
+}
+
+function renderLibraryAnnotations(item: LibraryPaper): string {
+  const paperId = item.paper.id;
+  const state = libraryAnnotationState.get(paperId) || "loading";
+  const annotations = libraryAnnotations.get(paperId) || [];
+  const loading = state === "loading";
+  const allAttachmentsMissing = item.attachments.length > 0 && item.attachments.every((attachment) => attachment.missing);
+  const refresh = `<button type="button" class="ghost small library-annotation-refresh" data-action="library-refresh-annotations" data-paper-id="${paperId}"${loading || allAttachmentsMissing ? " disabled" : ""}>${loading ? "读取中…" : "刷新"}</button>`;
+  if (!item.attachments.length) {
+    return `<section class="inspector-group inspector-annotations"><div class="inspector-section-head"><h3>标注</h3>${refresh}</div><div class="inspector-placeholder"><span class="placeholder-icon" aria-hidden="true">⌁</span><span>添加 PDF 后，这里会显示嵌入式标注。</span></div></section>`;
+  }
+  if (allAttachmentsMissing) {
+    return `<section class="inspector-group inspector-annotations"><div class="inspector-section-head"><h3>标注</h3>${refresh}</div><div class="inspector-placeholder"><span class="placeholder-icon" aria-hidden="true">⌁</span><span>PDF 文件不可用，请先重新链接。</span></div></section>`;
+  }
+  if (state === "error") {
+    return `<section class="inspector-group inspector-annotations"><div class="inspector-section-head"><h3>标注</h3>${refresh}</div><div class="inspector-inline-error" role="status">无法读取 PDF 标注：${escapeHtml(libraryAnnotationErrors.get(paperId) || "未知错误")}</div></section>`;
+  }
+  if (loading) {
+    return `<section class="inspector-group inspector-annotations"><div class="inspector-section-head"><h3>标注</h3>${refresh}</div><div class="inspector-placeholder"><span class="placeholder-icon" aria-hidden="true">⌁</span><span>正在读取 PDF 标注…</span></div></section>`;
+  }
+  const body = annotations.length
+    ? `<div class="library-annotation-list">${annotations.map(renderLibraryAnnotationCard).join("")}</div>`
+    : `<div class="inspector-placeholder"><span class="placeholder-icon" aria-hidden="true">⌁</span><span>PDF 中没有可显示的嵌入式标注。</span></div>`;
+  return `<section class="inspector-group inspector-annotations"><div class="inspector-section-head"><h3>标注</h3>${refresh}</div>${body}</section>`;
+}
+
+async function loadLibraryAnnotations(paperId: number, force = false): Promise<boolean> {
+  const item = libraryPapers.find((candidate) => candidate.paper.id === paperId);
+  if (!item) return false;
+  const currentState = libraryAnnotationState.get(paperId);
+  if (!force && (currentState === "loading" || currentState === "loaded")) return currentState === "loaded";
+  const requestId = ++libraryAnnotationRequestSeq;
+  libraryAnnotationState.set(paperId, "loading");
+  libraryAnnotationErrors.delete(paperId);
+  if (selectedLibraryPaperId === paperId) renderLibraryInspector(item);
+  try {
+    const result = await invoke<unknown>("list_library_annotations", { paperId });
+    if (requestId !== libraryAnnotationRequestSeq) return false;
+    libraryAnnotations.set(paperId, normalizeLibraryAnnotations(result));
+    libraryAnnotationState.set(paperId, "loaded");
+    const currentItem = libraryPapers.find((candidate) => candidate.paper.id === paperId);
+    if (selectedLibraryPaperId === paperId && currentItem) renderLibraryInspector(currentItem);
+    return true;
+  } catch (error) {
+    if (requestId !== libraryAnnotationRequestSeq) return false;
+    libraryAnnotations.set(paperId, []);
+    libraryAnnotationErrors.set(paperId, String(error));
+    libraryAnnotationState.set(paperId, "error");
+    const currentItem = libraryPapers.find((candidate) => candidate.paper.id === paperId);
+    if (selectedLibraryPaperId === paperId && currentItem) renderLibraryInspector(currentItem);
+    return false;
+  }
+}
+
 function renderLibrary() {
   const title = libraryView === "recent" ? "最近收录" : libraryView === "unfiled" ? "未分类" : "全部文献";
   const titleEl = activeWorkspace === "library" ? $("view-title") : null;
@@ -2732,7 +2803,10 @@ function renderLibraryInspector(item: LibraryPaper) {
     <section class="inspector-group inspector-library"><div class="inspector-section-head"><h3>文库</h3></div><div class="inspector-rows">${libraryInspectorRow("备注", `<span class="${note ? "" : "empty-value"}">${escapeHtml(note || "未添加备注")}</span>`, libraryInlineEditButton(p.id, "note", "备注"))}${renderLibraryRelations(item, "collection")}${renderLibraryRelations(item, "tag")}</div></section>
     <section class="inspector-group inspector-abstract"><div class="inspector-section-head"><h3>摘要</h3><div class="inspector-section-actions"><div class="inspector-language-toggle" role="group" aria-label="摘要语言"><button class="seg ${abstractLanguage === "zh" ? "on" : ""}" data-action="library-abstract-lang" data-lang="zh">中文</button><button class="seg ${abstractLanguage === "en" ? "on" : ""}" data-action="library-abstract-lang" data-lang="en">English</button></div>${libraryInlineEditButton(p.id, abstractLanguage === "zh" ? "chineseAbstract" : "abstract", abstractLanguage === "zh" ? "中文摘要" : "摘要")}</div></div><p class="inspector-abstract-text${abstractText ? "" : " empty-value"}">${escapeHtml(abstractText || "暂无摘要")}</p>${abstractTranslate}</section>
     <section class="inspector-group inspector-attachments"><div class="inspector-section-head"><h3>PDF</h3>${attachmentAdd}</div><div class="attachment-list">${attachmentRows}</div></section>
+    ${renderLibraryAnnotations(item)}
     <section class="inspector-group inspector-citation"><div class="inspector-section-head"><h3>引用格式</h3></div><p>${escapeHtml(citation)}</p></section>`;
+
+  if (!libraryAnnotationState.has(p.id) && item.attachments.some((attachment) => !attachment.missing)) void loadLibraryAnnotations(p.id);
 
 }
 
@@ -5323,6 +5397,14 @@ async function setupListeners() {
       await refreshLibraryMetadata(Number(metadataRefresh.dataset.paperId));
       return;
     }
+    const annotationRefresh = t.closest<HTMLButtonElement>("[data-action='library-refresh-annotations']");
+    if (annotationRefresh) {
+      const paperId = Number(annotationRefresh.dataset.paperId);
+      annotationRefresh.disabled = true;
+      const ok = await loadLibraryAnnotations(paperId, true);
+      setStatus(ok ? "PDF 标注已刷新" : "PDF 标注刷新失败", ok ? "done" : "error");
+      return;
+    }
     const libraryRemove = t.closest("[data-action='library-remove']") as HTMLElement | null;
     if (libraryRemove) {
       const ok = await requestLibraryInlineAction("移出文献库？论文与原始 PDF 均保留。", "移出", "取消");
@@ -5395,6 +5477,7 @@ async function setupListeners() {
     }
     const relinkPdf = t.closest("[data-action='library-relink-pdf']") as HTMLElement | null;
     if (relinkPdf) {
+      const paperId = libraryPapers.find((item) => item.attachments.some((attachment) => attachment.id === Number(relinkPdf.dataset.attachmentId)))?.paper.id;
       let path: string | null = null;
       try {
         path = await pickPdfPath();
@@ -5409,6 +5492,7 @@ async function setupListeners() {
       try {
         setStatus("正在重新链接 PDF…", "running");
         await invoke("relink_pdf", { attachmentId: Number(relinkPdf.dataset.attachmentId), path });
+        if (paperId) invalidateLibraryAnnotations(paperId);
         await loadLibraryData(libraryView);
         setStatus("PDF 已重新链接", "done");
       } catch (error) {
@@ -5420,6 +5504,7 @@ async function setupListeners() {
     }
     const detachPdf = t.closest("[data-action='library-detach-pdf']") as HTMLElement | null;
     if (detachPdf) {
+      const paperId = libraryPapers.find((item) => item.attachments.some((attachment) => attachment.id === Number(detachPdf.dataset.attachmentId)))?.paper.id;
       const confirmed = await requestLibraryInlineAction("解除 PDF 关联？原始文件不会被删除。", "解除关联", "取消");
       if (!confirmed) return;
       const detachButton = detachPdf as HTMLButtonElement;
@@ -5428,6 +5513,7 @@ async function setupListeners() {
       try {
         setStatus("正在解除 PDF 关联…", "running");
         await invoke("detach_pdf", { attachmentId: Number(detachPdf.dataset.attachmentId) });
+        if (paperId) invalidateLibraryAnnotations(paperId);
         await loadLibraryData(libraryView);
         setStatus("PDF 关联已解除，原始文件保留", "done");
       } catch (error) {

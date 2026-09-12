@@ -2919,6 +2919,154 @@ body.library-workspace .inspector-abstract-text {
   font-weight: 700;
 }
 
+/* RC candidate: PDF actions are one owned row at desktop width. Equal flex
+   slots keep the four labels aligned; the narrow fallback wraps into a small
+   two-column action grid instead of letting controls collide or drift. */
+body.library-workspace .attachment-row .attachment-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  width: 100%;
+  gap: 4px;
+  margin: 6px 0 0;
+  flex-wrap: nowrap;
+}
+
+body.library-workspace .attachment-row .attachment-actions button {
+  min-width: 0;
+  flex: 1 1 0;
+  overflow: hidden;
+  padding: 2px 4px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The idle feedback is not a blank fourth column. It stays in the same
+   one-line action group when active, while the title row keeps its icons
+   tightly aligned in the normal state. */
+body.library-workspace .inspector-hero-row .inspector-action-status.idle {
+  width: 0;
+  flex-basis: 0;
+}
+
+body.library-workspace .inspector-hero-row .inspector-row-actions {
+  gap: 2px;
+}
+
+/* Compact read-only annotation cards reuse the Inspector's continuous
+   surface: a thin rule and typography carry hierarchy, not nested cards. */
+body.library-workspace .inspector-annotations .inspector-section-head {
+  min-height: 22px;
+}
+
+.library-annotation-refresh {
+  flex: 0 0 auto;
+  padding: 2px 6px;
+  font-size: 10px;
+}
+
+.library-annotation-list {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  margin-top: 7px;
+}
+
+.library-annotation-card {
+  min-width: 0;
+  padding: 7px 0 8px;
+  border-bottom: 1px solid var(--ui-divider);
+  color: var(--ui-secondary);
+  font-size: 11px;
+  line-height: 16px;
+}
+
+.library-annotation-card:last-child {
+  border-bottom: 0;
+}
+
+.library-annotation-head,
+.library-annotation-kind {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+}
+
+.library-annotation-head {
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.library-annotation-kind strong {
+  color: var(--ui-text);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.library-annotation-kind > span:not(.library-annotation-color),
+.library-annotation-attachment,
+.library-annotation-status,
+.library-annotation-empty,
+.library-annotation-note-label {
+  color: var(--ui-secondary);
+  font-size: 10px;
+}
+
+.library-annotation-attachment {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.library-annotation-color {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  flex: 0 0 auto;
+  border: 1px solid #c7ccd3;
+  border-radius: 50%;
+}
+
+.library-annotation-excerpt {
+  padding: 0 0 0 8px;
+  margin: 5px 0 0;
+  border-left: 2px solid #dfe3e8;
+  color: #535d68;
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+
+.library-annotation-empty,
+.library-annotation-status {
+  display: block;
+  margin-top: 5px;
+  color: #9a9fa6;
+}
+
+.library-annotation-note {
+  padding-top: 5px;
+  margin-top: 5px;
+  border-top: 1px solid #eef0f2;
+}
+
+.library-annotation-note p {
+  padding: 0;
+  margin: 1px 0 0;
+  color: #686f78;
+  white-space: pre-wrap;
+}
+
+.inspector-inline-error {
+  padding: 6px 0 2px;
+  color: var(--danger);
+  font-size: 11px;
+  line-height: 16px;
+}
+
 .drop-queue-progress span {
   transition: none;
 }
@@ -2947,6 +3095,16 @@ body.library-workspace .inspector-abstract-text {
   .library-workspace #btn-ai-main,
   .library-workspace [data-action="library-reset-columns"] {
     display: none;
+  }
+}
+
+@media (max-width: 340px) {
+  body.library-workspace .attachment-row .attachment-actions {
+    flex-wrap: wrap;
+  }
+
+  body.library-workspace .attachment-row .attachment-actions button {
+    flex-basis: calc(50% - 2px);
   }
 }
 
