@@ -30,3 +30,18 @@
 - 依赖：`rusqlite`(bundled SQLite)、`reqwest`(blocking + rustls)、`chrono`、`serde`、`tauri v2`。
 - 网络：Crossref 需 `mailto`（polite pool）；OpenAlex 请求带 `sort=publication_date:desc`（否则结果集漂移）。
 - 同步在后台线程执行（`std::thread::spawn`），通过 Tauri 事件 `sync://*` 回报进度，UI 不被阻塞。
+
+## D5：PDF annotation storage is additive and attachment-scoped
+
+- Schema v20 adds `paper_annotations` as a read-only import projection. Every
+  row points to the canonical `papers.id` and an existing
+  `paper_attachments.id`; absolute paths are never annotation identity.
+- `/NM` is preferred only when unique within attachment + page. Re-extraction
+  otherwise uses a versioned SHA-256 fingerprint over attachment, page, kind,
+  quantized geometry, normalized excerpt, and normalized comment. A unique
+  geometry match may absorb a comment edit; ambiguous matches are retained.
+- Refresh is additive and idempotent: it upserts supplied rows in one
+  transaction and never deletes absent rows. Deletion is an explicit,
+  paper-scoped operation, so flattened or temporarily unreadable PDFs cannot
+  erase imported history. Raw PDF metadata remains available for future
+  navigation and extraction work.

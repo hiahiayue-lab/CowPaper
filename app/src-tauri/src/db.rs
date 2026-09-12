@@ -3,17 +3,19 @@ use sha2::{Digest, Sha256};
 use lopdf::{Document, LoadOptions, Object};
 use quick_xml::events::Event;
 use quick_xml::Reader;
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Runtime};
+use unicode_normalization::UnicodeNormalization;
 
 use crate::models::{
     AnalysisBatch, AnalysisBatchItem, Author, Journal, Paper, PaperCandidate,
     AbstractRecoveryBatch, AbstractRecoveryItem, RecommendationItem, RecommendationRun, SyncBatch, SyncBatchPaper, Tag, TagMatch,
-    UpsertOutcome, IDT_ONLINE, IDT_PRINT, SBC_FAILED, ST_PENDING, ST_SUCCEEDED,
+    PaperAnnotation, PaperAnnotationInput, UpsertOutcome, IDT_ONLINE, IDT_PRINT, SBC_FAILED, ST_PENDING, ST_SUCCEEDED,
     ST_WAITING_ABSTRACT,
 };
 
@@ -99,10 +101,10 @@ pub fn open(path: &Path) -> Result<Connection> {
 /// Literature Workspace 为 v14；v15 为 Library Attachments + User Metadata；
 /// v16 为 canonical bibliographic keywords；v17 为出版字段；v18 为 RC5
 /// Library overrides、collection-scoped tags 与 PDF enrichment jobs；v19 为
-/// Library full-text search projection。
+/// Library full-text search projection；v20 为 PDF annotation records。
 /// 生产构建中仅由迁移系统隐式使用；测试中直接断言。
 #[allow(dead_code)]
-pub const SCHEMA_VERSION: i64 = 19;
+pub const SCHEMA_VERSION: i64 = 20;
 
 pub fn init(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
@@ -3179,6 +3181,378 @@ pub fn list_paper_attachments(conn: &Connection, paper_id: i64) -> Result<Vec<cr
     rows.collect()
 }
 
+const ANNOTATION_KINDS: [&str; 5] = ["highlight", "underline", "strikeout", "text", "freetext"];
+const ANNOTATION_STATUSES: [&str; 7] = [
+    "extracted", "no_text", "scanned", "encrypted", "malformed", "unsupported", "missing_attachment",
+];
+
+fn normalize_annotation_text(value: Option<&str>) -> String {
+    value
+        .unwrap_or_default()
+        .nfkc()
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn quantize_annotation_geometry(points: Option<&[f64]>) -> Option<Vec<i64>> {
+    let points = points?;
+    if points.is_empty() || points.iter().any(|point| !point.is_finite()) {
+        return None;
+    }
+    // Half-point buckets absorb harmless PDF writer float noise while raw
+    // coordinates remain available in raw_metadata_json for navigation.
+    Some(points.iter().map(|point| (point * 2.0).round() as i64).collect())
+}
+
+fn annotation_digest(value: &serde_json::Value) -> String {
+    format!("{:x}", Sha256::digest(serde_json::to_vec(value).unwrap_or_default()))
+}
+
+fn annotation_fingerprints(
+    attachment_id: i64,
+    input: &PaperAnnotationInput,
+    use_external_identity: bool,
+) -> (String, Option<String>) {
+    let points = input.quadpoints.as_deref().or(input.rect.as_deref());
+    let geometry = quantize_annotation_geometry(points);
+    let geometry_fingerprint = geometry.as_ref().map(|geometry| {
+        format!(
+            "v1:geometry:{}",
+            annotation_digest(&serde_json::json!({
+                "attachment_id": attachment_id,
+                "page_index": input.page_index,
+                "kind": input.kind,
+                "geometry": geometry,
+            }))
+        )
+    });
+    let fingerprint = if use_external_identity {
+        let external_id = input.external_annotation_id.as_deref().unwrap_or_default();
+        format!("v1:nm:{}:{}:{}", attachment_id, input.page_index, external_id)
+    } else {
+        format!(
+            "v1:fp:{}",
+            annotation_digest(&serde_json::json!({
+                "version": 1,
+                "attachment_id": attachment_id,
+                "page_index": input.page_index,
+                "kind": input.kind,
+                "quantized_quadpoints": geometry,
+                "normalized_quoted_text": normalize_annotation_text(input.quoted_text.as_deref()),
+                "normalized_comment": normalize_annotation_text(input.comment.as_deref()),
+            }))
+        )
+    };
+    (fingerprint, geometry_fingerprint)
+}
+
+fn external_annotation_row_count(
+    conn: &Connection,
+    paper_id: i64,
+    attachment_id: i64,
+    input: &PaperAnnotationInput,
+) -> Result<usize> {
+    let Some(external_id) = input.external_annotation_id.as_deref().filter(|id| !id.is_empty()) else {
+        return Ok(0);
+    };
+    conn.query_row(
+        "SELECT COUNT(*) FROM paper_annotations
+         WHERE paper_id=?1 AND attachment_id=?2 AND page_index=?3 AND external_annotation_id=?4",
+        params![paper_id, attachment_id, input.page_index, external_id],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|count| count as usize)
+}
+
+fn validate_annotation_input(input: &PaperAnnotationInput) -> Result<()> {
+    if !ANNOTATION_KINDS.contains(&input.kind.as_str()) {
+        return Err(rusqlite::Error::InvalidParameterName("annotation_kind".into()));
+    }
+    if input.page_index < 0 {
+        return Err(rusqlite::Error::InvalidParameterName("page_index".into()));
+    }
+    if !ANNOTATION_STATUSES.contains(&input.extraction_status.as_str()) {
+        return Err(rusqlite::Error::InvalidParameterName("extraction_status".into()));
+    }
+    for points in [input.quadpoints.as_deref(), input.rect.as_deref()].into_iter().flatten() {
+        if points.iter().any(|point| !point.is_finite()) {
+            return Err(rusqlite::Error::InvalidParameterName("annotation_geometry".into()));
+        }
+    }
+    if let Some(raw) = input.raw_metadata_json.as_deref() {
+        serde_json::from_str::<serde_json::Value>(raw)
+            .map_err(|_| rusqlite::Error::InvalidParameterName("raw_metadata_json".into()))?;
+    }
+    Ok(())
+}
+
+fn annotation_attachment_belongs_to_paper(conn: &Connection, paper_id: i64, attachment_id: i64) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM paper_attachments
+            WHERE id=?1 AND paper_id=?2
+        )",
+        params![attachment_id, paper_id],
+        |row| row.get(0),
+    )
+}
+
+fn paper_annotation_from_row(row: &rusqlite::Row) -> Result<PaperAnnotation> {
+    Ok(PaperAnnotation {
+        id: row.get("id")?,
+        paper_id: row.get("paper_id")?,
+        attachment_id: row.get("attachment_id")?,
+        external_annotation_id: row.get("external_annotation_id")?,
+        kind: row.get("kind")?,
+        page_index: row.get("page_index")?,
+        color: row.get("color")?,
+        quoted_text: row.get("quoted_text")?,
+        comment: row.get("comment")?,
+        author: row.get("author")?,
+        created_at: row.get("created_at")?,
+        modified_at: row.get("modified_at")?,
+        imported_at: row.get("imported_at")?,
+        fingerprint: row.get("fingerprint")?,
+        extraction_status: row.get("extraction_status")?,
+        source_app: row.get("source_app")?,
+        raw_metadata_json: row.get("raw_metadata_json")?,
+    })
+}
+
+fn get_paper_annotation(conn: &Connection, annotation_id: i64) -> Result<Option<PaperAnnotation>> {
+    conn.query_row(
+        "SELECT * FROM paper_annotations WHERE id=?1",
+        params![annotation_id],
+        paper_annotation_from_row,
+    )
+    .optional()
+}
+
+fn matching_annotation_id(
+    conn: &Connection,
+    paper_id: i64,
+    attachment_id: i64,
+    input: &PaperAnnotationInput,
+    fingerprint: &str,
+    geometry_fingerprint: Option<&str>,
+    allow_external_identity: bool,
+) -> Result<Option<i64>> {
+    if allow_external_identity {
+        if let Some(external_id) = input.external_annotation_id.as_deref().filter(|id| !id.is_empty()) {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM paper_annotations
+                 WHERE paper_id=?1 AND attachment_id=?2 AND page_index=?3 AND external_annotation_id=?4
+                 ORDER BY id",
+            )?;
+            let ids: Vec<i64> = stmt
+                .query_map(params![paper_id, attachment_id, input.page_index, external_id], |row| row.get(0))?
+                .collect::<Result<Vec<_>>>()?;
+            if ids.len() == 1 {
+                return Ok(ids.first().copied());
+            }
+            // The spike explicitly treats duplicate page-scoped /NM values as
+            // ambiguous. Fall through to the versioned fingerprint instead of
+            // silently updating one arbitrary row.
+        }
+    }
+
+    if let Some(id) = conn
+        .query_row(
+            "SELECT id FROM paper_annotations
+             WHERE paper_id=?1 AND attachment_id=?2 AND fingerprint=?3",
+            params![paper_id, attachment_id, fingerprint],
+            |row| row.get(0),
+        )
+        .optional()?
+    {
+        return Ok(Some(id));
+    }
+
+    // A no-/NM import can still receive a stable /NM after a PDF is rewritten,
+    // and a comment edit should update the unique geometry match. Never fuzzy
+    // merge a source with an ambiguous /NM in the same refresh batch.
+    if allow_external_identity {
+        if let Some(geometry_fingerprint) = geometry_fingerprint {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM paper_annotations
+                 WHERE paper_id=?1 AND attachment_id=?2 AND page_index=?3 AND kind=?4
+                   AND geometry_fingerprint=?5
+                 ORDER BY id",
+            )?;
+            let ids: Vec<i64> = stmt
+                .query_map(
+                    params![paper_id, attachment_id, input.page_index, input.kind, geometry_fingerprint],
+                    |row| row.get(0),
+                )?
+                .collect::<Result<Vec<_>>>()?;
+            if ids.len() == 1 {
+                return Ok(ids.first().copied());
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn upsert_paper_annotation_inner(
+    conn: &Connection,
+    paper_id: i64,
+    attachment_id: i64,
+    input: &PaperAnnotationInput,
+    allow_external_identity: bool,
+) -> Result<i64> {
+    validate_annotation_input(input)?;
+    if !annotation_attachment_belongs_to_paper(conn, paper_id, attachment_id)? {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    let use_external_identity = allow_external_identity
+        && external_annotation_row_count(conn, paper_id, attachment_id, input)? <= 1;
+    let (fingerprint, geometry_fingerprint) = annotation_fingerprints(attachment_id, input, use_external_identity);
+    let existing = matching_annotation_id(
+        conn,
+        paper_id,
+        attachment_id,
+        input,
+        &fingerprint,
+        geometry_fingerprint.as_deref(),
+        use_external_identity,
+    )?;
+    let raw_metadata_json = input.raw_metadata_json.as_deref();
+    if let Some(id) = existing {
+        conn.execute(
+            "UPDATE paper_annotations SET
+                external_annotation_id=?1, kind=?2, page_index=?3, color=?4,
+                quoted_text=?5, comment=?6, author=?7, created_at=?8,
+                modified_at=?9, fingerprint=?10, geometry_fingerprint=?11,
+                extraction_status=?12, source_app=?13, raw_metadata_json=?14
+             WHERE id=?15 AND paper_id=?16 AND attachment_id=?17",
+            params![
+                input.external_annotation_id.as_deref().filter(|id| !id.is_empty()),
+                input.kind,
+                input.page_index,
+                input.color,
+                input.quoted_text,
+                input.comment,
+                input.author,
+                input.created_at,
+                input.modified_at,
+                fingerprint,
+                geometry_fingerprint,
+                input.extraction_status,
+                input.source_app,
+                raw_metadata_json,
+                id,
+                paper_id,
+                attachment_id,
+            ],
+        )?;
+        return Ok(id);
+    }
+    let imported_at = now_utc();
+    conn.execute(
+        "INSERT INTO paper_annotations (
+            paper_id, attachment_id, external_annotation_id, kind, page_index,
+            color, quoted_text, comment, author, created_at, modified_at,
+            imported_at, fingerprint, geometry_fingerprint, extraction_status,
+            source_app, raw_metadata_json
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+        params![
+            paper_id,
+            attachment_id,
+            input.external_annotation_id.as_deref().filter(|id| !id.is_empty()),
+            input.kind,
+            input.page_index,
+            input.color,
+            input.quoted_text,
+            input.comment,
+            input.author,
+            input.created_at,
+            input.modified_at,
+            imported_at,
+            fingerprint,
+            geometry_fingerprint,
+            input.extraction_status,
+            input.source_app,
+            raw_metadata_json,
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Insert or update one imported annotation. Existing rows are updated in
+/// place when their unique `/NM` identity or exact fallback fingerprint
+/// matches, so imported_at and local row identity survive re-extraction.
+pub fn upsert_paper_annotation(
+    conn: &Connection,
+    paper_id: i64,
+    attachment_id: i64,
+    input: &PaperAnnotationInput,
+) -> Result<PaperAnnotation> {
+    let id = upsert_paper_annotation_inner(conn, paper_id, attachment_id, input, true)?;
+    get_paper_annotation(conn, id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
+}
+
+/// Re-import all annotations found in one attachment. This is intentionally
+/// additive: absent rows are retained as historical imports, while all
+/// supplied rows are deduplicated/upserted in one transaction. That preserves
+/// evidence when a later PDF is flattened or temporarily unreadable.
+pub fn refresh_paper_annotations(
+    conn: &Connection,
+    paper_id: i64,
+    attachment_id: i64,
+    inputs: &[PaperAnnotationInput],
+) -> Result<Vec<PaperAnnotation>> {
+    if !annotation_attachment_belongs_to_paper(conn, paper_id, attachment_id)? {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    let mut external_counts = HashMap::<(i64, String), usize>::new();
+    for input in inputs {
+        if let Some(external_id) = input.external_annotation_id.as_deref().filter(|id| !id.is_empty()) {
+            *external_counts.entry((input.page_index, external_id.to_string())).or_default() += 1;
+        }
+    }
+    let tx = conn.unchecked_transaction()?;
+    for input in inputs {
+        let external_is_unique = input
+            .external_annotation_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .and_then(|id| external_counts.get(&(input.page_index, id.to_string())))
+            .map_or(true, |count| *count == 1);
+        upsert_paper_annotation_inner(&tx, paper_id, attachment_id, input, external_is_unique)?;
+    }
+    tx.commit()?;
+    list_paper_annotations(conn, paper_id, Some(attachment_id))
+}
+
+/// List annotations through the canonical Paper identity. An optional
+/// attachment scope is useful for Inspector grouping and prevents page-number
+/// collisions between multiple PDFs owned by one Paper.
+pub fn list_paper_annotations(
+    conn: &Connection,
+    paper_id: i64,
+    attachment_id: Option<i64>,
+) -> Result<Vec<PaperAnnotation>> {
+    let mut stmt = conn.prepare(
+        "SELECT * FROM paper_annotations
+         WHERE paper_id=?1 AND (?2 IS NULL OR attachment_id=?2)
+         ORDER BY attachment_id, page_index, id",
+    )?;
+    let rows = stmt.query_map(params![paper_id, attachment_id], paper_annotation_from_row)?;
+    rows.collect()
+}
+
+/// Delete only the requested row under its canonical Paper scope. It never
+/// deletes the Paper, attachment, source PDF, or other Paper's annotation.
+pub fn delete_paper_annotation(conn: &Connection, paper_id: i64, annotation_id: i64) -> Result<bool> {
+    Ok(conn.execute(
+        "DELETE FROM paper_annotations WHERE id=?1 AND paper_id=?2",
+        params![annotation_id, paper_id],
+    )? == 1)
+}
+
 fn prepare_current_pdf_storage(
     conn: &Connection,
     paper_id: i64,
@@ -5226,6 +5600,7 @@ fn migrations() -> Vec<(i64, &'static str, fn(&Connection) -> Result<()>)> {
         (17, "Bibliographic Publication Metadata", migrate_to_v17),
         (18, "library-rc5-overrides-scoped-tags-pdf-enrichment", migrate_to_v18),
         (19, "library-full-text-search", migrate_to_v19),
+        (20, "pdf-annotation-records", migrate_to_v20),
     ]
 }
 
@@ -7343,6 +7718,50 @@ fn migrate_to_v19(conn: &Connection) -> Result<()> {
         return Err(rusqlite::Error::InvalidQuery);
     }
     rebuild_library_search_index(conn)
+}
+
+/// v20: imported PDF annotation records. This is deliberately an additive
+/// layer: annotations point to the canonical Paper and existing attachment,
+/// never to a path or a copied Paper. `fingerprint` is unique per attachment
+/// and makes re-extraction idempotent; `geometry_fingerprint` enables a
+/// unique no-`/NM` row to survive a comment edit without guessing across
+/// ambiguous candidates.
+fn migrate_to_v20(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_attachments_paper_id_id
+            ON paper_attachments(paper_id, id);
+        CREATE TABLE IF NOT EXISTS paper_annotations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            paper_id INTEGER NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+            attachment_id INTEGER NOT NULL,
+            external_annotation_id TEXT,
+            kind TEXT NOT NULL CHECK (kind IN ('highlight','underline','strikeout','text','freetext')),
+            page_index INTEGER NOT NULL CHECK (page_index >= 0),
+            color TEXT,
+            quoted_text TEXT,
+            comment TEXT,
+            author TEXT,
+            created_at TEXT,
+            modified_at TEXT,
+            imported_at TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,
+            geometry_fingerprint TEXT,
+            extraction_status TEXT NOT NULL CHECK (extraction_status IN ('extracted','no_text','scanned','encrypted','malformed','unsupported','missing_attachment')),
+            source_app TEXT,
+            raw_metadata_json TEXT,
+            UNIQUE(attachment_id, fingerprint),
+            FOREIGN KEY (paper_id, attachment_id)
+                REFERENCES paper_attachments(paper_id, id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_paper_annotations_paper
+            ON paper_annotations(paper_id, page_index, id);
+        CREATE INDEX IF NOT EXISTS idx_paper_annotations_attachment
+            ON paper_annotations(attachment_id, page_index, kind, id);
+        CREATE INDEX IF NOT EXISTS idx_paper_annotations_external
+            ON paper_annotations(attachment_id, page_index, external_annotation_id);
+        "#,
+    )
 }
 
 fn update_abstract_provenance(conn: &Connection, id: i64) -> Result<()> {

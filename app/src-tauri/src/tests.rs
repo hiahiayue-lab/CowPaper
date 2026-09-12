@@ -101,6 +101,133 @@ fn test_paper(conn: &Connection, doi: &str, title: &str) -> i64 {
     }
 }
 
+fn test_attachment(conn: &Connection, paper_id: i64, filename: &str) -> i64 {
+    let now = db::now_utc();
+    conn.execute(
+        "INSERT INTO paper_attachments (
+            paper_id, kind, storage_mode, absolute_path, filename, mime_type,
+            sha256, created_at, updated_at
+         ) VALUES (?1, 'pdf', 'linked', ?2, ?3, 'application/pdf', ?4, ?5, ?5)",
+        params![paper_id, format!("/missing/{filename}"), filename, filename, now],
+    )
+    .unwrap();
+    conn.last_insert_rowid()
+}
+
+fn annotation_input(
+    external_annotation_id: Option<&str>,
+    comment: Option<&str>,
+    quadpoints: Option<Vec<f64>>,
+) -> crate::models::PaperAnnotationInput {
+    crate::models::PaperAnnotationInput {
+        external_annotation_id: external_annotation_id.map(str::to_string),
+        kind: "highlight".to_string(),
+        page_index: 2,
+        color: Some("#ffcc00".to_string()),
+        quoted_text: Some("Reliable quoted text".to_string()),
+        comment: comment.map(str::to_string),
+        author: Some("Reviewer".to_string()),
+        created_at: None,
+        modified_at: Some("D:20260912090000Z".to_string()),
+        extraction_status: "extracted".to_string(),
+        source_app: Some("Preview".to_string()),
+        raw_metadata_json: Some(r#"{"quadpoints":[10,20,30,20,10,10,30,10]}"#.to_string()),
+        quadpoints,
+        rect: None,
+    }
+}
+
+#[test]
+fn test_annotation_v19_to_v20_migration_preserves_existing_records() {
+    let conn = Connection::open_in_memory().unwrap();
+    db::init_test_schema_at_version(&conn, 19).unwrap();
+    let paper_id = test_paper(&conn, "10.1000/annotation-migration", "Annotation migration");
+    let attachment_id = test_attachment(&conn, paper_id, "migration.pdf");
+    conn.execute(
+        "INSERT INTO app_state(key,value) VALUES('annotation-migration-sentinel','keep')",
+        [],
+    )
+    .unwrap();
+
+    db::init(&conn).unwrap();
+    assert_eq!(conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 20);
+    assert_eq!(conn.query_row("SELECT paper_id FROM paper_attachments WHERE id=?1", params![attachment_id], |row| row.get::<_, i64>(0)).unwrap(), paper_id);
+    assert_eq!(db::get_setting(&conn, "annotation-migration-sentinel").as_deref(), Some("keep"));
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM paper_annotations", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+    db::init(&conn).unwrap();
+    assert_eq!(conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 20);
+}
+
+#[test]
+fn test_annotation_upsert_requires_canonical_attachment_and_preserves_identity() {
+    let conn = mem_db();
+    let paper_id = test_paper(&conn, "10.1000/annotation-upsert", "Annotation upsert");
+    let other_paper_id = test_paper(&conn, "10.1000/annotation-other", "Other paper");
+    let attachment_id = test_attachment(&conn, paper_id, "source.pdf");
+    let input = annotation_input(Some("nm-1"), Some("first comment"), Some(vec![10.0, 20.0, 30.0, 20.0, 10.0, 10.0, 30.0, 10.0]));
+
+    assert!(db::upsert_paper_annotation(&conn, other_paper_id, attachment_id, &input).is_err());
+    let first = db::upsert_paper_annotation(&conn, paper_id, attachment_id, &input).unwrap();
+    let imported_at = first.imported_at.clone();
+    let mut changed = input.clone();
+    changed.comment = Some("edited comment".to_string());
+    let second = db::upsert_paper_annotation(&conn, paper_id, attachment_id, &changed).unwrap();
+    assert_eq!(first.id, second.id);
+    assert_eq!(second.imported_at, imported_at);
+    assert_eq!(second.comment.as_deref(), Some("edited comment"));
+    assert_eq!(db::list_paper_annotations(&conn, paper_id, Some(attachment_id)).unwrap().len(), 1);
+}
+
+#[test]
+fn test_annotation_refresh_deduplicates_fallback_and_keeps_attachment_identity() {
+    let conn = mem_db();
+    let paper_id = test_paper(&conn, "10.1000/annotation-refresh", "Annotation refresh");
+    let first_attachment_id = test_attachment(&conn, paper_id, "first.pdf");
+    let second_attachment_id = test_attachment(&conn, paper_id, "second.pdf");
+    let input = annotation_input(None, Some("first comment"), Some(vec![1.0, 2.0, 9.0, 2.0, 1.0, 0.0, 9.0, 0.0]));
+
+    let first = db::refresh_paper_annotations(&conn, paper_id, first_attachment_id, &[input.clone()]).unwrap();
+    let imported_at = first[0].imported_at.clone();
+    assert_eq!(db::refresh_paper_annotations(&conn, paper_id, first_attachment_id, &[input.clone()]).unwrap().len(), 1);
+    let mut edited = input.clone();
+    edited.comment = Some("edited comment".to_string());
+    let refreshed = db::refresh_paper_annotations(&conn, paper_id, first_attachment_id, &[edited]).unwrap();
+    assert_eq!(refreshed.len(), 1);
+    assert_eq!(refreshed[0].imported_at, imported_at);
+    assert_eq!(refreshed[0].comment.as_deref(), Some("edited comment"));
+
+    let second = db::upsert_paper_annotation(&conn, paper_id, second_attachment_id, &input).unwrap();
+    assert_ne!(refreshed[0].id, second.id);
+    assert_eq!(db::list_paper_annotations(&conn, paper_id, None).unwrap().len(), 2);
+
+    let duplicate_a = annotation_input(Some("ambiguous-nm"), Some("one"), Some(vec![40.0, 2.0, 49.0, 2.0, 40.0, 0.0, 49.0, 0.0]));
+    let duplicate_b = annotation_input(Some("ambiguous-nm"), Some("two"), Some(vec![60.0, 2.0, 69.0, 2.0, 60.0, 0.0, 69.0, 0.0]));
+    let ambiguous = db::refresh_paper_annotations(&conn, paper_id, first_attachment_id, &[duplicate_a, duplicate_b]).unwrap();
+    assert_eq!(ambiguous.len(), 3, "duplicate page-scoped /NM values use fallback identity rather than merging");
+    assert_eq!(ambiguous.iter().filter(|row| row.comment.as_deref() == Some("one")).count(), 1);
+    assert_eq!(ambiguous.iter().filter(|row| row.comment.as_deref() == Some("two")).count(), 1);
+}
+
+#[test]
+fn test_annotation_delete_is_paper_scoped_and_does_not_delete_pdf() {
+    let conn = mem_db();
+    let paper_id = test_paper(&conn, "10.1000/annotation-delete", "Annotation delete");
+    let other_paper_id = test_paper(&conn, "10.1000/annotation-delete-other", "Other paper");
+    let attachment_id = test_attachment(&conn, paper_id, "delete.pdf");
+    let annotation = db::upsert_paper_annotation(
+        &conn,
+        paper_id,
+        attachment_id,
+        &annotation_input(Some("delete-me"), None, Some(vec![1.0, 2.0, 3.0, 2.0, 1.0, 0.0, 3.0, 0.0])),
+    )
+    .unwrap();
+
+    assert!(!db::delete_paper_annotation(&conn, other_paper_id, annotation.id).unwrap());
+    assert!(db::delete_paper_annotation(&conn, paper_id, annotation.id).unwrap());
+    assert!(db::get_paper_attachment(&conn, attachment_id).unwrap().is_some());
+    assert!(db::list_paper_annotations(&conn, paper_id, None).unwrap().is_empty());
+}
+
 #[test]
 fn test_normalize_doi() {
     assert_eq!(
@@ -2750,7 +2877,7 @@ fn test_migration_v2_to_v3_preserves_data() {
 
     // 迁移到 v3
     db::init(&conn).unwrap();
-    assert_eq!(db::SCHEMA_VERSION, 19);
+    assert_eq!(db::SCHEMA_VERSION, 20);
 
     // 8) 旧 issn 迁移进 journal_identifiers（类型按列，不猜）
     let ids = db::list_journal_identifiers(&conn, jid).unwrap();
@@ -2791,7 +2918,7 @@ fn test_database_restart_persistence() {
     {
         let conn = db::open(&path).unwrap();
         db::init(&conn).unwrap(); // 幂等：user_version=3 不重复迁移
-        assert_eq!(db::SCHEMA_VERSION, 19);
+        assert_eq!(db::SCHEMA_VERSION, 20);
         let j = db::get_journal(&conn, 1).unwrap().expect("期刊持久化");
         assert_eq!(j.print_issn.as_deref(), Some("0025-1909"));
         assert_eq!(j.identifiers.len(), 1);
@@ -3422,7 +3549,7 @@ fn test_migration_v4_abstract_quality_init() {
     .unwrap();
 
     db::init(&conn).unwrap();
-    assert_eq!(db::SCHEMA_VERSION, 19);
+    assert_eq!(db::SCHEMA_VERSION, 20);
 
     let papers = db::list_papers(&conn, Some(jid), 100).unwrap();
     assert_eq!(papers.len(), 3, "迁移不得丢论文");
@@ -4119,7 +4246,7 @@ fn test_updater_config_requires_signed_cross_platform_artifacts() {
     assert_eq!(endpoints.len(), 1);
     assert!(endpoints[0].as_str().unwrap().starts_with("https://github.com/"));
     assert!(endpoints[0].as_str().unwrap().ends_with("/latest/download/latest.json"));
-    assert_eq!(db::SCHEMA_VERSION, 19, "updater must not claim migration ownership");
+    assert_eq!(db::SCHEMA_VERSION, 20, "updater must not claim migration ownership");
 }
 
 #[test]
@@ -5730,7 +5857,7 @@ fn test_library_migration_v13_to_v16_preserves_existing_data() {
 
     db::init(&conn).unwrap();
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-    assert_eq!(version, 19);
+    assert_eq!(version, 20);
     let paper = db::get_paper(&conn, pid).unwrap().unwrap();
     assert_eq!(paper.abstract_text.as_deref(), Some("preserved abstract"));
     assert_eq!(paper.chinese_title.as_deref(), Some("保留中文标题"));
@@ -5744,7 +5871,7 @@ fn test_library_migration_v13_to_v16_preserves_existing_data() {
 
     db::init(&conn).unwrap();
     let version_again: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-    assert_eq!(version_again, 19);
+    assert_eq!(version_again, 20);
     for table in [
         "library_items",
         "library_collections",
@@ -5779,7 +5906,7 @@ fn test_migration_v14_to_v16_creates_attachment_metadata_and_keyword_tables() {
     conn.execute("DROP TABLE paper_attachments", []).unwrap();
     conn.pragma_update(None, "user_version", 14).unwrap();
     db::init(&conn).unwrap();
-    assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 19);
+    assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 20);
     assert!(db::get_library_membership(&conn, pid).unwrap().is_some(), "v15 不得破坏 v14 Library membership");
     for table in ["paper_attachments", "library_item_metadata", "paper_keywords"] {
         assert!(conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)", params![table], |r| r.get::<_, bool>(0)).unwrap());
@@ -6950,7 +7077,7 @@ fn rc3_v16_to_v17_preserves_canonical_keywords_library_and_untrusted_history() {
         INSERT INTO library_item_metadata(paper_id,chinese_abstract_override,note,updated_at) VALUES(1,'旧个人翻译','Keep note','now');
         INSERT INTO paper_keywords(paper_id,keyword,normalized_keyword,kind,source,confidence,retrieved_at,created_at) VALUES(1,'Evidence','evidence','subject','crossref','HIGH','now','now');").unwrap();
     db::init(&conn).unwrap();db::init(&conn).unwrap();
-    assert_eq!(conn.query_row("PRAGMA user_version",[],|r|r.get::<_,i64>(0)).unwrap(),19);
+    assert_eq!(conn.query_row("PRAGMA user_version",[],|r|r.get::<_,i64>(0)).unwrap(),20);
     let p=db::get_paper(&conn,1).unwrap().unwrap();
     assert_eq!(p.abstract_text.as_deref(),Some("INFORMS Management Science 2026:1-17"));assert_eq!(p.abstract_provenance,"legacy_unverified");assert_eq!(p.total_score,Some(4.8));assert_eq!(p.keywords.len(),1);
     let library=db::get_library_paper(&conn,1).unwrap().unwrap();

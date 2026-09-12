@@ -526,6 +526,53 @@ pub struct PaperAttachment {
     pub missing: bool,
 }
 
+/// A read-only annotation imported from a PDF attachment. `paper_id` is the
+/// canonical Paper identity; `attachment_id` is required so two PDF
+/// attachments belonging to one Paper never share annotation identity.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaperAnnotation {
+    pub id: i64,
+    pub paper_id: i64,
+    pub attachment_id: i64,
+    pub external_annotation_id: Option<String>,
+    pub kind: String,
+    pub page_index: i64,
+    pub color: Option<String>,
+    pub quoted_text: Option<String>,
+    pub comment: Option<String>,
+    pub author: Option<String>,
+    pub created_at: Option<String>,
+    pub modified_at: Option<String>,
+    pub imported_at: String,
+    pub fingerprint: String,
+    pub extraction_status: String,
+    pub source_app: Option<String>,
+    pub raw_metadata_json: Option<String>,
+}
+
+/// Input from a PDF annotation extractor. `quadpoints` is kept outside the
+/// relational projection because it is source geometry; it is copied into
+/// `raw_metadata_json` by the extractor and participates in fallback identity.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaperAnnotationInput {
+    pub external_annotation_id: Option<String>,
+    pub kind: String,
+    pub page_index: i64,
+    pub color: Option<String>,
+    pub quoted_text: Option<String>,
+    pub comment: Option<String>,
+    pub author: Option<String>,
+    pub created_at: Option<String>,
+    pub modified_at: Option<String>,
+    pub extraction_status: String,
+    pub source_app: Option<String>,
+    pub raw_metadata_json: Option<String>,
+    pub quadpoints: Option<Vec<f64>>,
+    pub rect: Option<Vec<f64>>,
+}
+
 /// Library-only personal metadata.  These values never overwrite the
 /// canonical fields on `papers`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
