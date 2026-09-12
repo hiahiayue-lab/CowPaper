@@ -108,3 +108,84 @@ export function renderLibraryAnnotationCard(annotation: LibraryAnnotation): stri
     : "";
   return `<article class="library-annotation-card" data-annotation-id="${escapeHtml(annotation.id)}"><div class="library-annotation-head"><span class="library-annotation-kind"><span class="library-annotation-color" style="background:${safeColor(annotation.color)}" aria-label="标注颜色" title="标注颜色"></span><strong>${escapeHtml(annotationKindLabel(annotation.kind))}</strong><span>第 ${annotation.pageIndex + 1} 页</span></span><span class="library-annotation-attachment" title="${escapeHtml(annotation.attachmentName)}">${escapeHtml(annotation.attachmentName)}</span></div>${excerpt}${status && annotation.excerpt ? `<span class="library-annotation-status">${escapeHtml(status)}</span>` : ""}${note}</article>`;
 }
+
+/* ================= Inspector tab contract (v0.3.0) ================= */
+
+/**
+ * The Inspector is a two-view surface. `元数据` owns canonical/Library
+ * metadata; `标注` owns the attachment-scoped annotation projection. The
+ * annotation view is never rendered inside the metadata view.
+ */
+export type InspectorTab = "metadata" | "annotations";
+
+export const INSPECTOR_TABS: ReadonlyArray<{ id: InspectorTab; label: string }> = [
+  { id: "metadata", label: "元数据" },
+  { id: "annotations", label: "标注" },
+];
+
+/**
+ * Selecting a paper defaults to `元数据`. Switching papers keeps the tab the
+ * user is already on instead of forcing them back. With no selected paper the
+ * Inspector keeps its existing empty behavior and no tab is rendered.
+ *
+ * Tab state is front-end session state only: no DB field, no migration.
+ */
+export function resolveInspectorTab(current: InspectorTab | null, hasSelectedPaper: boolean): InspectorTab | null {
+  if (!hasSelectedPaper) return null;
+  return current === "annotations" ? "annotations" : "metadata";
+}
+
+export type AnnotationPanelKind =
+  | "no-pdf"
+  | "pdf-missing"
+  | "error"
+  | "reading"
+  | "unread"
+  | "empty"
+  | "list";
+
+export interface AnnotationPanelState {
+  kind: AnnotationPanelKind;
+  /** The read/refresh icon action is offered and enabled. */
+  canRead: boolean;
+  /** Annotation rows for the selected paper (0 unless `kind === "list"`). */
+  count: number;
+  /** Inline message for empty/error states; empty for `list`. */
+  message: string;
+  tone: "muted" | "error";
+}
+
+/**
+ * Resolve the annotation tab body from the paper's attachment shape and the
+ * in-memory read state. Every state is explicit: a paper without a PDF, a PDF
+ * that cannot be read, a read in flight, a read that has not been requested
+ * yet, an empty result, an error, and a populated list.
+ */
+export function resolveAnnotationPanelState(input: {
+  attachmentCount: number;
+  usableAttachmentCount: number;
+  readState: "unread" | "loading" | "loaded" | "error";
+  error: string | null;
+  count: number;
+}): AnnotationPanelState {
+  const { attachmentCount, usableAttachmentCount, readState, error, count } = input;
+  if (attachmentCount === 0) {
+    return { kind: "no-pdf", canRead: false, count: 0, message: "此文献尚未关联 PDF", tone: "muted" };
+  }
+  if (usableAttachmentCount === 0) {
+    return { kind: "pdf-missing", canRead: false, count: 0, message: "PDF 文件不可用，请先重新链接", tone: "muted" };
+  }
+  if (readState === "error") {
+    return { kind: "error", canRead: true, count: 0, message: `无法读取 PDF 标注：${error || "未知错误"}`, tone: "error" };
+  }
+  if (readState === "loading") {
+    return { kind: "reading", canRead: false, count: 0, message: "正在读取 PDF 标注…", tone: "muted" };
+  }
+  if (readState === "unread") {
+    return { kind: "unread", canRead: true, count: 0, message: "尚未读取 PDF 标注", tone: "muted" };
+  }
+  if (count > 0) {
+    return { kind: "list", canRead: true, count, message: "", tone: "muted" };
+  }
+  return { kind: "empty", canRead: true, count: 0, message: "此 PDF 暂无标注", tone: "muted" };
+}

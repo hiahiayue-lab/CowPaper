@@ -1,8 +1,11 @@
 import {
   annotationKindLabel,
   annotationStatusLabel,
+  INSPECTOR_TABS,
   normalizeLibraryAnnotations,
   renderLibraryAnnotationCard,
+  resolveAnnotationPanelState,
+  resolveInspectorTab,
 } from "./libraryAnnotations.ts";
 
 const annotations = normalizeLibraryAnnotations([
@@ -46,3 +49,40 @@ const metadataOnly = normalizeLibraryAnnotations([{
 if (!renderLibraryAnnotationCard(metadataOnly).includes("页面摘录暂不可用")) throw new Error("missing excerpt state is visible");
 
 console.log("Library annotation rendering contract passed");
+
+// ---------- v0.3.0: Inspector is a real two-tab surface ----------
+{
+  if (INSPECTOR_TABS.map((tab) => tab.label).join("|") !== "元数据|标注") throw new Error("Inspector must expose exactly 元数据 + 标注");
+  if (resolveInspectorTab(null, true) !== "metadata") throw new Error("a newly selected paper opens 元数据");
+  if (resolveInspectorTab("annotations", true) !== "annotations") throw new Error("switching papers keeps the 标注 tab");
+  if (resolveInspectorTab("metadata", true) !== "metadata") throw new Error("switching papers keeps the 元数据 tab");
+  if (resolveInspectorTab("annotations", false) !== null) throw new Error("no selected paper keeps the existing empty Inspector");
+
+  const panel = (o: Partial<Parameters<typeof resolveAnnotationPanelState>[0]>) =>
+    resolveAnnotationPanelState({ attachmentCount: 1, usableAttachmentCount: 1, readState: "loaded", error: null, count: 0, ...o });
+
+  const noPdf = panel({ attachmentCount: 0, usableAttachmentCount: 0, readState: "unread" });
+  if (noPdf.kind !== "no-pdf" || noPdf.message !== "此文献尚未关联 PDF" || noPdf.canRead) throw new Error("no-PDF empty state");
+
+  const missing = panel({ usableAttachmentCount: 0 });
+  if (missing.kind !== "pdf-missing" || missing.canRead) throw new Error("unavailable PDF state");
+
+  const unread = panel({ readState: "unread" });
+  if (unread.kind !== "unread" || unread.message !== "尚未读取 PDF 标注" || !unread.canRead) throw new Error("unread state must offer a read action");
+
+  const reading = panel({ readState: "loading" });
+  if (reading.kind !== "reading" || reading.canRead || reading.message !== "正在读取 PDF 标注…") throw new Error("reading state");
+
+  const failed = panel({ readState: "error", error: "malformed" });
+  if (failed.kind !== "error" || failed.tone !== "error" || !failed.message.includes("malformed") || !failed.canRead) throw new Error("extraction error state must stay visible and recoverable");
+
+  const emptyPdf = panel({});
+  if (emptyPdf.kind !== "empty" || emptyPdf.message !== "此 PDF 暂无标注" || !emptyPdf.canRead) throw new Error("no-annotation empty state");
+
+  const listed = panel({ count: 3 });
+  if (listed.kind !== "list" || listed.count !== 3) throw new Error("annotation list state");
+}
+
+
+
+console.log("Library annotation tab + layout contract passed");

@@ -31,8 +31,12 @@ import {
   type SearchPaper,
 } from "./librarySearch";
 import {
+  INSPECTOR_TABS,
   normalizeLibraryAnnotations,
   renderLibraryAnnotationCard,
+  resolveAnnotationPanelState,
+  resolveInspectorTab,
+  type InspectorTab,
   type LibraryAnnotation,
 } from "./libraryAnnotations";
 import {
@@ -555,7 +559,9 @@ let libraryActionRequestSeq = 0;
 /** True while the current pointer interaction already started a translation. */
 let libraryTitleTranslationPointerHandled = false;
 let libraryAnnotations = new Map<number, LibraryAnnotation[]>();
-let libraryAnnotationState = new Map<number, "loading" | "loaded" | "error">();
+let libraryAnnotationState = new Map<number, "unread" | "loading" | "loaded" | "error">();
+/** Inspector tab is front-end session state only: no DB field, no migration. */
+let libraryInspectorTab: InspectorTab | null = null;
 let libraryAnnotationErrors = new Map<number, string>();
 let libraryAnnotationRequestSeq = 0;
 type SettingsSection = "general" | "ai" | "pdf" | "library" | "recommend" | "about";
@@ -2620,29 +2626,40 @@ function invalidateLibraryAnnotations(paperId: number): void {
   libraryAnnotationErrors.delete(paperId);
 }
 
-function renderLibraryAnnotations(item: LibraryPaper): string {
+/** Compact two-tab bar for the Inspector. No pill, no segmented CTA. */
+function renderInspectorTabs(active: InspectorTab, paperId: number): string {
+  return `<div class="inspector-tabs" role="tablist" aria-label="Inspector 视图">${INSPECTOR_TABS
+    .map((tab) => `<button type="button" role="tab" class="inspector-tab-button${tab.id === active ? " active" : ""}" data-action="library-inspector-tab" data-tab="${tab.id}" data-paper-id="${paperId}" aria-selected="${tab.id === active ? "true" : "false"}" aria-controls="library-inspector-panel">${tab.label}</button>`)
+    .join("")}</div>`;
+}
+
+/**
+ * The `标注` tab body. It only ever renders annotation content for the selected
+ * paper: attachment-scoped records, an explicit empty/unread/error state, and a
+ * light icon action that re-reads the PDF annotations (extraction only).
+ */
+function renderLibraryAnnotationTab(item: LibraryPaper): string {
   const paperId = item.paper.id;
-  const state = libraryAnnotationState.get(paperId) || "loading";
   const annotations = libraryAnnotations.get(paperId) || [];
-  const loading = state === "loading";
-  const allAttachmentsMissing = item.attachments.length > 0 && item.attachments.every((attachment) => attachment.missing);
-  const refresh = `<button type="button" class="ghost small library-annotation-refresh" data-action="library-refresh-annotations" data-paper-id="${paperId}"${loading || allAttachmentsMissing ? " disabled" : ""}>${loading ? "读取中…" : "刷新"}</button>`;
-  if (!item.attachments.length) {
-    return `<section class="inspector-group inspector-annotations"><div class="inspector-section-head"><h3>标注</h3>${refresh}</div><div class="inspector-placeholder"><span class="placeholder-icon" aria-hidden="true">⌁</span><span>添加 PDF 后，这里会显示嵌入式标注。</span></div></section>`;
+  const panel = resolveAnnotationPanelState({
+    attachmentCount: item.attachments.length,
+    usableAttachmentCount: item.attachments.filter((attachment) => !attachment.missing).length,
+    readState: libraryAnnotationState.get(paperId) || "unread",
+    error: libraryAnnotationErrors.get(paperId) || null,
+    count: annotations.length,
+  });
+  const readAction = libraryIconAction("library-refresh-annotations", paperId, "重新读取 PDF 标注", {
+    disabled: !panel.canRead,
+    busy: panel.kind === "reading",
+  });
+  const head = `<div class="inspector-section-head"><h3>标注</h3><div class="inspector-section-actions"><span class="muted small">${panel.kind === "list" ? `${panel.count} 条` : "PDF 标注"}</span>${readAction}</div></div>`;
+  if (panel.kind === "list") {
+    return `<section class="inspector-group inspector-annotations" id="library-inspector-panel" role="tabpanel">${head}<div class="library-annotation-list">${annotations.map(renderLibraryAnnotationCard).join("")}</div></section>`;
   }
-  if (allAttachmentsMissing) {
-    return `<section class="inspector-group inspector-annotations"><div class="inspector-section-head"><h3>标注</h3>${refresh}</div><div class="inspector-placeholder"><span class="placeholder-icon" aria-hidden="true">⌁</span><span>PDF 文件不可用，请先重新链接。</span></div></section>`;
-  }
-  if (state === "error") {
-    return `<section class="inspector-group inspector-annotations"><div class="inspector-section-head"><h3>标注</h3>${refresh}</div><div class="inspector-inline-error" role="status">无法读取 PDF 标注：${escapeHtml(libraryAnnotationErrors.get(paperId) || "未知错误")}</div></section>`;
-  }
-  if (loading) {
-    return `<section class="inspector-group inspector-annotations"><div class="inspector-section-head"><h3>标注</h3>${refresh}</div><div class="inspector-placeholder"><span class="placeholder-icon" aria-hidden="true">⌁</span><span>正在读取 PDF 标注…</span></div></section>`;
-  }
-  const body = annotations.length
-    ? `<div class="library-annotation-list">${annotations.map(renderLibraryAnnotationCard).join("")}</div>`
-    : `<div class="inspector-placeholder"><span class="placeholder-icon" aria-hidden="true">⌁</span><span>PDF 中没有可显示的嵌入式标注。</span></div>`;
-  return `<section class="inspector-group inspector-annotations"><div class="inspector-section-head"><h3>标注</h3>${refresh}</div>${body}</section>`;
+  const body = panel.tone === "error"
+    ? `<div class="inspector-inline-error" role="status">${escapeHtml(panel.message)}</div>`
+    : `<div class="inspector-placeholder"><span class="placeholder-icon" aria-hidden="true">⌁</span><span>${escapeHtml(panel.message)}</span></div>`;
+  return `<section class="inspector-group inspector-annotations" id="library-inspector-panel" role="tabpanel">${head}${body}</section>`;
 }
 
 async function loadLibraryAnnotations(paperId: number, force = false): Promise<boolean> {
@@ -2797,17 +2814,18 @@ function renderLibraryInspector(item: LibraryPaper) {
     error: "更新失败",
   });
   const metadataRefreshControl = `<span class="inspector-row-actions">${libraryActionStatus("metadataRefresh", p.id, metadataRefreshView.statusText, metadataRefreshView.tone, metadataRefreshView.detail)}${libraryIconAction("library-refresh-metadata", p.id, "刷新元数据", { disabled: metadataRefreshView.disabled || !p.normalizedDoi, busy: metadataRefreshView.busy })}</span>`;
-  $("library-inspector").innerHTML = `<div class="inspector-tab">元数据</div><div class="inspector-head"><span class="muted small">期刊论文</span><button type="button" class="ghost small danger" data-action="library-remove" data-paper-id="${p.id}">移出文献库</button></div>
+  // Two real Inspector views. The annotation view is its own tab and is never
+  // rendered inside the metadata tab.
+  const activeTab: InspectorTab = resolveInspectorTab(libraryInspectorTab, true) ?? "metadata";
+  libraryInspectorTab = activeTab;
+  const metadataBody = `<header class="inspector-title-block">
     <header class="inspector-title-block"><div class="inspector-title-line"><h2 title="${escapeHtml(englishTitle)}">${escapeHtml(englishTitle)}</h2><span class="inspector-row-actions">${libraryInlineEditButton(p.id, "title", "Title")}</span></div>${libraryInspectorRow("中文标题", chineseTitleValue, `${chineseTitleStatus}${chineseTitleIcon}${libraryInlineEditButton(p.id, "chineseTitle", "中文标题")}`, "inspector-hero-row")}${libraryInspectorRow("作者", escapeHtml(authors), libraryInlineEditButton(p.id, "authors", "作者"), "inspector-hero-row")}</header>
     <section class="inspector-group inspector-metadata"><div class="inspector-section-head"><h3>引用</h3><div class="inspector-section-actions"><span class="muted small">公开来源</span>${metadataRefreshControl}</div></div><div class="inspector-rows">${libraryInspectorRow("期刊", escapeHtml(librarySource(item)), libraryInlineEditButton(p.id, "source", "期刊"))}${libraryInspectorRow("出版社", escapeHtml(item.effectivePublisher || "—"), libraryInlineEditButton(p.id, "publisher", "出版社"))}${libraryInspectorRow("年份", escapeHtml(libraryYear(item)), libraryInlineEditButton(p.id, "year", "年份"))}${libraryInspectorRow("月份日期", escapeHtml(item.effectivePublicationDate || p.publishedDate || "—"), libraryInlineEditButton(p.id, "publicationDate", "出版日期"))}${libraryInspectorRow("卷", escapeHtml(item.effectiveVolume || "—"), libraryInlineEditButton(p.id, "volume", "卷"))}${libraryInspectorRow("期", escapeHtml(item.effectiveIssue || "—"), libraryInlineEditButton(p.id, "issue", "期"))}${libraryInspectorRow("页码", escapeHtml(item.effectivePages || "—"), libraryInlineEditButton(p.id, "pages", "页码"))}${libraryInspectorRow("DOI", doiValue, libraryInlineEditButton(p.id, "doi", "DOI"))}${libraryInspectorRow("URL", urlValue, libraryInlineEditButton(p.id, "url", "URL"))}</div></section>
     <section class="inspector-group inspector-library"><div class="inspector-section-head"><h3>文库</h3></div><div class="inspector-rows">${libraryInspectorRow("备注", `<span class="${note ? "" : "empty-value"}">${escapeHtml(note || "未添加备注")}</span>`, libraryInlineEditButton(p.id, "note", "备注"))}${renderLibraryRelations(item, "collection")}${renderLibraryRelations(item, "tag")}</div></section>
     <section class="inspector-group inspector-abstract"><div class="inspector-section-head"><h3>摘要</h3><div class="inspector-section-actions"><div class="inspector-language-toggle" role="group" aria-label="摘要语言"><button class="seg ${abstractLanguage === "zh" ? "on" : ""}" data-action="library-abstract-lang" data-lang="zh">中文</button><button class="seg ${abstractLanguage === "en" ? "on" : ""}" data-action="library-abstract-lang" data-lang="en">English</button></div>${libraryInlineEditButton(p.id, abstractLanguage === "zh" ? "chineseAbstract" : "abstract", abstractLanguage === "zh" ? "中文摘要" : "摘要")}</div></div><p class="inspector-abstract-text${abstractText ? "" : " empty-value"}">${escapeHtml(abstractText || "暂无摘要")}</p>${abstractTranslate}</section>
     <section class="inspector-group inspector-attachments"><div class="inspector-section-head"><h3>PDF</h3>${attachmentAdd}</div><div class="attachment-list">${attachmentRows}</div></section>
-    ${renderLibraryAnnotations(item)}
     <section class="inspector-group inspector-citation"><div class="inspector-section-head"><h3>引用格式</h3></div><p>${escapeHtml(citation)}</p></section>`;
-
-  if (!libraryAnnotationState.has(p.id) && item.attachments.some((attachment) => !attachment.missing)) void loadLibraryAnnotations(p.id);
-
+  $("library-inspector").innerHTML = `${renderInspectorTabs(activeTab, p.id)}<div class="inspector-head"><span class="muted small">期刊论文</span><button type="button" class="ghost small danger" data-action="library-remove" data-paper-id="${p.id}">移出文献库</button></div>${activeTab === "annotations" ? renderLibraryAnnotationTab(item) : metadataBody}`;
 }
 
 async function refreshLibraryMetadata(paperId: number): Promise<void> {
@@ -5395,6 +5413,15 @@ async function setupListeners() {
     const metadataRefresh = t.closest<HTMLButtonElement>("[data-action='library-refresh-metadata']");
     if (metadataRefresh) {
       await refreshLibraryMetadata(Number(metadataRefresh.dataset.paperId));
+      return;
+    }
+    const inspectorTab = t.closest<HTMLElement>("[data-action='library-inspector-tab']");
+    if (inspectorTab) {
+      const next: InspectorTab = inspectorTab.dataset.tab === "annotations" ? "annotations" : "metadata";
+      if (next !== libraryInspectorTab) {
+        libraryInspectorTab = next;
+        renderLibrary();
+      }
       return;
     }
     const annotationRefresh = t.closest<HTMLButtonElement>("[data-action='library-refresh-annotations']");

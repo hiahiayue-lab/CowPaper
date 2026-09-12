@@ -245,7 +245,7 @@ components:
 
 CowPaper is a desktop literature workspace with two related modes: Discovery for finding, evaluating, and saving papers, and Library for organizing saved papers and their PDF attachments. The visual system is quiet, dense, and macOS-like: neutral surfaces carry the information, one restrained blue accent carries active and actionable state, and shadows are reserved for transient surfaces.
 
-The contract applies to the whole app. The Library's RC2/RC3 decisions remain normative: a 168px navigation rail, a 54px workspace row, one all-field Library Search box, compact table rows, a continuous Inspector, and no empty Annotation tab.
+The contract applies to the whole app. The Library's RC2/RC3 decisions remain normative: a 168px navigation rail, a 54px workspace row, one all-field Library Search box, compact table rows, a continuous two-view Inspector (`元数据` / `标注`), and no empty Annotation tab.
 
 ## Foundations
 
@@ -311,7 +311,17 @@ Explicit-action feedback is inline and never silent. Success is transient and re
 
 The Citation icon reuses the Crossref/OpenAlex exact-DOI provider path, updates canonical metadata only, never calls an LLM, and leaves Library-only edits, notes, relations, and attachments intact.
 
-Only `元数据` is visible in v0.2.1. Do not render, reserve, or advertise an empty `标注`/Annotation tab. The future contract is documented below so implementation can remain stable without exposing unfinished UI.
+### Inspector views (v0.3.0)
+
+The Inspector is a two-view surface with a compact underline tab bar at the top: `元数据 | 标注`. The tab bar is the Inspector's own visual language — not a pill, not a large segmented control, and it switches instantly with no slide, spring, blur or large fade.
+
+`元数据` owns the English/Chinese title rows, authors, Citation, Library (relations, note), Abstract, PDF attachments and Citation Format. `标注` owns the attachment-scoped annotation projection only; annotation content is never repeated inside the metadata view.
+
+Selecting a paper opens `元数据`. Switching papers keeps the tab the user is already on. With no selected paper the Inspector keeps its existing empty state and renders no tab bar. Tab state is front-end session state: no DB column, no migration.
+
+`标注` states are explicit and never blank: no PDF (`此文献尚未关联 PDF`), unavailable PDF (`PDF 文件不可用，请先重新链接`), not yet read (`尚未读取 PDF 标注`), reading (`正在读取 PDF 标注…`), no annotations (`此 PDF 暂无标注`), an extraction error that stays visible, and the populated card list. Reading is an explicit, light circular-arrow icon action (`重新读取 PDF 标注`) that runs annotation extraction only — never metadata refresh, never an LLM, never recommendation analysis. Every annotation row keeps its `paper_id` + `attachment_id` binding; the view is paper-scoped and never changes canonical metadata, Library-only metadata, attachment ownership, or Discovery membership.
+
+The Chinese-title row's action group is a fixed `[⟳][✎]` pair whose width is identical in idle / translating / success / error. Translation feedback is a zero-footprint overlay anchored to that group: it never participates in the row's grid or flex sizing, so the value start, both icons, the author row and the row height cannot move when a status appears or disappears. There is no idle/active width switching and no reserved gap.
 
 ### Future Inspector metadata/annotation contract
 
@@ -405,6 +415,6 @@ The English Title and Chinese Title editors are not commit-on-Enter controls: `E
 - Prefer borders, separators, and surface changes over persistent shadows.
 - Give every empty state one useful next action when one is possible.
 - Keep Library Search single-mode and all-field; keep scope in tokens.
-- Keep the future Annotation contract documented but the v0.2.1 UI metadata-only.
+- Keep the Inspector two-tab (`元数据` / `标注`) contract; never repeat annotation content inside the metadata view.
 - Do not introduce React, Tailwind, Radix, Motion, or a second design-token system; the current surface is Vanilla TypeScript and CSS.
-- Do not add gradients, glow, fake native window controls, a second persistent Search field, or an empty Annotation tab.
+- Do not add gradients, glow, fake native window controls, a second persistent Search field, or an annotation tab that renders with no annotation capability.

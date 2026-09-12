@@ -2116,6 +2116,64 @@ fn test_c_legacy_external_recommendation_rows_stay_but_lose_active_eligibility()
     assert!(db::list_failed_ids_in_discovery(&conn).unwrap().is_empty());
 }
 
+// ================= v0.3.0：Inspector 双 Tab 与零足迹状态 =================
+
+/// v0.3.0：Inspector 必须是真正的「元数据 / 标注」两个视图，且中文标题行的翻译
+/// 状态不得参与该行的 grid/flex sizing（不得再用 idle width=0 / active 46px 切换
+/// layout footprint）。这是静态契约守卫，跨文件断言前端实现。
+#[test]
+fn v030_inspector_two_tab_and_zero_footprint_status_contract() {
+    let main_ts = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../src/main.ts")).unwrap();
+    let css = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../src/styles.css")).unwrap();
+    let module = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../src/libraryAnnotations.ts")).unwrap();
+
+    // 1) 双 Tab：紧凑 tab bar + 可切换按钮 + 两个视图标签
+    assert!(main_ts.contains("renderInspectorTabs"), "Inspector 必须渲染 tab bar");
+    assert!(main_ts.contains("data-action=\"library-inspector-tab\""), "tab 必须是可操作按钮");
+    assert!(module.contains("INSPECTOR_TABS"), "tab 模型必须在 libraryAnnotations 模块内");
+    assert!(module.contains("{ id: \"metadata\", label: \"元数据\" }"), "缺少元数据 tab");
+    assert!(module.contains("{ id: \"annotations\", label: \"标注\" }"), "缺少标注 tab");
+    assert!(
+        main_ts.contains("activeTab === \"annotations\" ? renderLibraryAnnotationTab(item) : metadataBody"),
+        "tab 必须决定渲染哪个视图"
+    );
+    // 2) 标注视图不得再出现在元数据视图内
+    assert!(!main_ts.contains("${renderLibraryAnnotations(item)}"), "标注视图不得嵌在元数据 tab 内");
+    assert!(!main_ts.contains("function renderLibraryAnnotations"), "旧的 section 渲染器必须移除");
+    // 3) tab 状态：session-only，跨 paper 保持
+    assert!(module.contains("resolveInspectorTab"), "tab 状态解析必须存在");
+    assert!(module.contains("current === \"annotations\" ? \"annotations\" : \"metadata\""), "跨 paper 必须保持当前 tab");
+    assert!(!main_ts.contains("localStorage.setItem(\"libraryInspectorTab\""), "tab 状态不得持久化到存储");
+    // 4) 标注 tab 的读取动作：共享环形箭头 icon + 明确 tooltip，且只做 extraction
+    assert!(main_ts.contains("libraryIconAction(\"library-refresh-annotations\""), "标注刷新必须是共享 icon action");
+    assert!(main_ts.contains("\"重新读取 PDF 标注\""), "标注刷新缺少 tooltip/aria-label");
+    assert!(main_ts.contains("invoke(\"refresh_pdf_annotations\""), "标注刷新必须调用 extraction 命令");
+
+    // 5) 中文标题行：状态零足迹（绝对定位），且禁止 idle/active 宽度切换
+    assert!(
+        !css.contains(".inspector-action-status.idle"),
+        "禁止用 .inspector-action-status.idle 切换 layout footprint"
+    );
+    let hero = css
+        .split(".inspector-hero-row .inspector-action-status {")
+        .nth(1)
+        .expect("中文标题行必须有显式 status 规则");
+    let hero_body = hero.split('}').next().unwrap();
+    assert!(hero_body.contains("position: absolute"), "中文标题行 status 必须脱离 flow");
+    assert!(hero_body.contains("right: calc(100% + 6px)"), "中文标题行 status 必须锚定到动作组左侧");
+    assert!(hero_body.contains("pointer-events: none"), "浮层不得拦截点击");
+    let actions = css
+        .split(".inspector-hero-row .inspector-row-actions {")
+        .nth(1)
+        .expect("中文标题行动作组必须有定位上下文");
+    assert!(actions.split('}').next().unwrap().contains("position: relative"), "动作组必须是定位上下文");
+    // 动作组内只允许 [⟳][✎]，宽度恒定
+    assert!(
+        main_ts.contains("${chineseTitleIcon}${libraryInlineEditButton(p.id, \"chineseTitle\", \"中文标题\")}"),
+        "中文标题行动作组必须只有 ↻ 与 ✎"
+    );
+}
+
 // ================= v0.2.2 RC4：Inspector icon affordances =================
 
 /// v0.2.2 收口：中文标题与引用两处显式动作改为同一个环形箭头 icon，
