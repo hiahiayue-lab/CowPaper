@@ -19,6 +19,7 @@ export const LIBRARY_SEARCH_FIELDS = [
   "note",
   "abstract",
   "chineseAbstract",
+  "annotation",
 ] as const;
 
 export type LibrarySearchField = typeof LIBRARY_SEARCH_FIELDS[number];
@@ -38,6 +39,7 @@ export const LIBRARY_SEARCH_FIELD_DEFINITIONS: readonly LibrarySearchFieldDefini
   { field: "note", label: "Note" },
   { field: "abstract", label: "English abstract" },
   { field: "chineseAbstract", label: "Chinese abstract" },
+  { field: "annotation", label: "Annotation" },
 ];
 
 /** Display-only metadata. These names are intentionally not searchable. */
@@ -82,13 +84,15 @@ export interface SearchPaper {
   note?: string | null;
   abstract?: string | null;
   chineseAbstract?: string | null;
+  /** Aggregated quoted text, comments, and translations from annotations. */
+  annotationText?: string | null;
   collectionIds?: number[];
   tagIds?: number[];
   tags?: string[];
 }
 
 export interface LibrarySearchFieldClause {
-  /** One of the nine values in LIBRARY_SEARCH_FIELDS. */
+  /** One of the searchable values in LIBRARY_SEARCH_FIELDS. */
   field: LibrarySearchField;
   /** Terms in one clause are AND-ed within this field. */
   query: string;
@@ -112,7 +116,7 @@ export interface LibrarySearchScope {
 export interface LibrarySearchQuery extends LibrarySearchScope {
   /** Optional field-scoped clauses; clauses are AND-ed with freeTextQuery. */
   fieldClauses: LibrarySearchFieldClause[];
-  /** Terms are AND-ed across the nine allowed fields. */
+  /** Terms are AND-ed across the allowed fields. */
   freeTextQuery: string;
 }
 
@@ -209,6 +213,7 @@ const FIELD_TOKEN_LABELS: Record<LibrarySearchField, string> = {
   note: "备注",
   abstract: "英文摘要",
   chineseAbstract: "中文摘要",
+  annotation: "Annotation",
 };
 
 export function librarySearchFieldLabel(field: LibrarySearchField): string {
@@ -262,6 +267,10 @@ const FIELD_ALIASES: Record<string, LibrarySearchField> = {
   chineseAbstract: "chineseAbstract",
   chinese_abstract: "chineseAbstract",
   中文摘要: "chineseAbstract",
+  annotation: "annotation",
+  annotations: "annotation",
+  标注: "annotation",
+  注释: "annotation",
 };
 
 function normalizeField(value: unknown): LibrarySearchField | null {
@@ -342,7 +351,7 @@ export function expandCollectionIds(collections: readonly SearchCollection[], se
   return expanded;
 }
 
-/** Project a Paper into the nine searchable fields. Excluded metadata is absent by construction. */
+/** Project a Paper into the searchable fields. Excluded metadata is absent by construction. */
 export function librarySearchFieldValues(paper: SearchPaper): Record<LibrarySearchField, string> {
   return {
     title: valueText(paper.title),
@@ -354,6 +363,7 @@ export function librarySearchFieldValues(paper: SearchPaper): Record<LibrarySear
     note: valueText(paper.note),
     abstract: valueText(paper.abstract),
     chineseAbstract: valueText(paper.chineseAbstract),
+    annotation: valueText(paper.annotationText),
   };
 }
 
@@ -439,6 +449,7 @@ const FIELD_INTENT_LABELS: Record<LibrarySearchField, string> = {
   note: "备注中搜索",
   abstract: "英文摘要中搜索",
   chineseAbstract: "中文摘要中搜索",
+  annotation: "标注中搜索",
 };
 
 /** Build one flat dropdown list; there is deliberately no Search Action item. */

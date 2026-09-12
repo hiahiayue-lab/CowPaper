@@ -47,6 +47,7 @@ const paper: SearchPaper = {
   collectionIds: [10, 11],
   tagIds: [1, 2],
   tags: ["Core", "Review"],
+  annotationText: "Reviewer highlighted the governance mechanism.",
 };
 const secondPaper: SearchPaper = {
   id: 102,
@@ -58,11 +59,12 @@ const secondPaper: SearchPaper = {
   tagIds: [1],
   tags: ["Core"],
 };
-const duplicatePaper = { ...paper, title: "Duplicate row must not escape papers.id" };
+const duplicatePaper = { ...paper, title: "Duplicate row must not escape papers.id", annotationText: "A second annotation on the same paper." };
 
-// API field contract: exactly nine searchable fields, with display metadata
+// API field contract: the nine original fields plus the v0.3 annotation field,
+// with display metadata
 // kept outside the projection.
-equal(LIBRARY_SEARCH_FIELDS.length, 9, "RC3 has nine searchable fields");
+equal(LIBRARY_SEARCH_FIELDS.length, 10, "v0.3 has ten searchable fields");
 assert(LIBRARY_SEARCH_FIELDS.includes("libraryTags"), "Library Tags are searchable");
 assert(LIBRARY_SEARCH_EXCLUDED_FIELDS.every((field) => !LIBRARY_SEARCH_FIELDS.includes(field as never)), "excluded fields are not allowed fields");
 for (const field of LIBRARY_SEARCH_EXCLUDED_FIELDS) {
@@ -93,6 +95,11 @@ assert(hit.paperId === 101, "hit keeps canonical paper id");
 assert(hit.matched_fields.includes("chineseTitle") && hit.matched_fields.includes("chineseAbstract"), "matched_fields reports actual fields");
 assert(hit.matched_fields.every((field) => LIBRARY_SEARCH_FIELDS.includes(field)), "matched_fields never reports excluded metadata");
 assert(hit.snippets.length <= 3 && hit.snippets.every((snippet) => snippet.text.length <= 120), "snippets are short and bounded");
+const annotationHit = matchLibrarySearchPaper(paper, { ...emptyLibrarySearchQuery(), freeTextQuery: "highlighted" });
+assert(annotationHit.matched_fields.includes("annotation"), "annotation hits expose the Annotation field");
+assert(annotationHit.snippets.some((snippet) => snippet.field === "annotation" && snippet.text.includes("highlighted")), "annotation hits expose a short snippet");
+const annotationRows = filterLibrarySearchPapers([paper, duplicatePaper], { ...emptyLibrarySearchQuery(), freeTextQuery: "annotation" });
+assert(annotationRows.length === 1 && annotationRows[0].id === paper.id, "multiple annotation-bearing rows collapse to one canonical paper row");
 
 // The dropdown contains only Library-local suggestions; selecting scope does
 // not destroy an already-entered free-text expression.

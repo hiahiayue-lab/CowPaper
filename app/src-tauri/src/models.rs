@@ -648,6 +648,10 @@ pub struct LibraryPaper {
     pub effective_abstract: Option<String>,
     pub effective_chinese_abstract: Option<String>,
     pub note: Option<String>,
+    /// Aggregated annotation text for the Library Search projection. This is
+    /// optional so v0.2.x databases without the future annotation table keep
+    /// the exact existing Library payload shape semantically.
+    pub annotation_text: Option<String>,
     pub attachments: Vec<PaperAttachment>,
 }
 

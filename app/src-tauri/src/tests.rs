@@ -6198,6 +6198,75 @@ fn test_library_search_v19_fts_filters_effective_values_and_sync() {
 }
 
 #[test]
+fn v030_library_search_annotations_are_indexed_deduped_and_refreshable() {
+    let conn = mem_db();
+    conn.execute_batch(
+        "CREATE TABLE paper_annotations (
+            id INTEGER PRIMARY KEY,
+            paper_id INTEGER NOT NULL,
+            attachment_id INTEGER,
+            kind TEXT NOT NULL,
+            page_index INTEGER NOT NULL,
+            quoted_text TEXT,
+            comment TEXT,
+            translation TEXT
+        )",
+    )
+    .unwrap();
+    let jid = db::insert_journal(&conn, "Annotation Journal", Some("0025-1909"), None, None, None).unwrap();
+    let pid = match db::upsert_paper(
+        &conn,
+        jid,
+        &candidate(Some("10.1000/annotation-search"), "Canonical Annotation Paper", Some("Canonical abstract"), Some("crossref")),
+    )
+    .unwrap()
+    {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new paper"),
+    };
+    db::add_paper_to_library(&conn, pid, &[], &[], "annotation-test").unwrap();
+    conn.execute(
+        "INSERT INTO paper_annotations(id,paper_id,kind,page_index,quoted_text,comment,translation)
+         VALUES(1,?1,'highlight',2,'Reliable quoted text','first review note','可靠引文')",
+        params![pid],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO paper_annotations(id,paper_id,kind,page_index,quoted_text,comment,translation)
+         VALUES(2,?1,'underline',3,'Second annotation fragment','second review note',NULL)",
+        params![pid],
+    )
+    .unwrap();
+    db::refresh_library_search_document(&conn, pid).unwrap();
+
+    let ids = |query: &str| {
+        db::search_library(&conn, query, &[], &[], 100, 0, None)
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.paper_id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids("Reliable quoted"), vec![pid]);
+    assert_eq!(ids("second review"), vec![pid], "multiple annotations share one canonical FTS row");
+    assert_eq!(ids("可靠引文"), vec![pid], "annotation translations are searchable");
+    assert_eq!(ids("annotation-search"), Vec::<i64>::new(), "DOI remains excluded from search");
+    assert_eq!(
+        conn.query_row("SELECT annotation_text FROM library_search_documents WHERE paper_id=?1", params![pid], |row| row.get::<_, String>(0)).unwrap(),
+        "Reliable quoted text\nfirst review note\n可靠引文\nSecond annotation fragment\nsecond review note",
+    );
+
+    conn.execute("UPDATE paper_annotations SET comment='updated review note' WHERE id=1", []).unwrap();
+    db::refresh_library_search_document(&conn, pid).unwrap();
+    assert!(ids("first review note").is_empty(), "stale annotation comments leave the FTS row after refresh");
+    assert_eq!(ids("updated review"), vec![pid]);
+
+    let rows = db::list_library_papers(&conn, "all", 100).unwrap();
+    assert_eq!(rows.len(), 1, "annotation hydration does not duplicate Library rows");
+    assert_eq!(rows[0].annotation_text.as_deref(), Some("Reliable quoted text\nupdated review note\n可靠引文\nSecond annotation fragment\nsecond review note"));
+    assert!(db::get_paper(&conn, pid).unwrap().is_some(), "annotation search preserves canonical paper data");
+}
+
+#[test]
 fn rc2_library_search_runtime_mixed_language_and_incremental_index() {
     let conn = mem_db();
     let jid = db::insert_journal(&conn, "RC2 Runtime Journal", Some("0025-1909"), None, None, None).unwrap();

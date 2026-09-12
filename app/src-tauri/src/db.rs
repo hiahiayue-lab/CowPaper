@@ -1923,7 +1923,55 @@ pub fn fts5_capability(conn: &Connection) -> Result<bool> {
     Ok(compile_enabled && module_enabled)
 }
 
-fn refresh_library_search_document(conn: &Connection, paper_id: i64) -> Result<()> {
+/// Read the text-bearing parts of the annotation contract without making the
+/// search migration own the annotation schema. The PDF annotation work may be
+/// installed by a later forward migration; until then this is an empty,
+/// backward-compatible projection.
+fn library_annotation_text(conn: &Connection, paper_id: i64) -> Result<Option<String>> {
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='paper_annotations')",
+        [],
+        |row| row.get::<_, bool>(0),
+    )? {
+        return Ok(None);
+    }
+
+    let columns = ["paper_id", "id", "quoted_text", "comment", "translation"]
+        .into_iter()
+        .filter(|column| column_exists(conn, "paper_annotations", column))
+        .collect::<std::collections::HashSet<_>>();
+    if !columns.contains("paper_id") {
+        return Ok(None);
+    }
+    let text_columns = ["quoted_text", "comment", "translation"]
+        .into_iter()
+        .filter(|column| columns.contains(column))
+        .collect::<Vec<_>>();
+    if text_columns.is_empty() {
+        return Ok(None);
+    }
+
+    let order_by = if columns.contains("id") { " ORDER BY id" } else { "" };
+    let sql = format!(
+        "SELECT {} FROM paper_annotations WHERE paper_id=?1{}",
+        text_columns.join(", "),
+        order_by,
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query(params![paper_id])?;
+    let mut parts = Vec::new();
+    while let Some(row) = rows.next()? {
+        for index in 0..text_columns.len() {
+            let value: Option<String> = row.get(index)?;
+            if let Some(value) = clean_optional_text(value.as_deref()) {
+                parts.push(value);
+            }
+        }
+    }
+    Ok((!parts.is_empty()).then(|| parts.join("\n")))
+}
+
+pub(crate) fn refresh_library_search_document(conn: &Connection, paper_id: i64) -> Result<()> {
     // Canonical/PDF migration helpers can run before v14 Library tables exist
     // (for example while upgrading a v13 database). Search synchronization is
     // intentionally a no-op until the Library schema is present.
@@ -2060,6 +2108,7 @@ fn refresh_library_search_document(conn: &Connection, paper_id: i64) -> Result<(
     let authors = row.20.clone().or(canonical_authors);
     let note = row.23.clone().unwrap_or_default();
     let tags = row.33.clone();
+    let annotation_text = library_annotation_text(conn, paper_id)?;
     let override_text = [
         journal.as_deref(), publisher.as_deref(), publication_date.as_deref(),
         volume.as_deref(), issue.as_deref(), pages.as_deref(), doi.as_deref(),
@@ -2079,12 +2128,12 @@ fn refresh_library_search_document(conn: &Connection, paper_id: i64) -> Result<(
     ]);
     let content_text = library_search_group_text(&[
         effective_abstract.as_deref(), chinese_abstract.as_deref(), Some(note.as_str()),
-        Some(tags.as_str()),
+        Some(tags.as_str()), annotation_text.as_deref(),
     ]);
     let cjk_ngrams = library_search_cjk_bigrams(
         &[title.as_deref(), chinese_title.as_deref(), effective_abstract.as_deref(),
             chinese_abstract.as_deref(), Some(note.as_str()), Some(override_text.as_str()),
-            Some(tags.as_str())]
+            Some(tags.as_str()), annotation_text.as_deref()]
             .into_iter()
             .flatten()
             .collect::<Vec<_>>()
@@ -2095,10 +2144,10 @@ fn refresh_library_search_document(conn: &Connection, paper_id: i64) -> Result<(
         "INSERT INTO library_search_documents(
             paper_id,title,chinese_title,abstract,chinese_abstract,note,override_text,
             library_tags,annotation_text,cjk_ngrams,quick_text,metadata_text,content_text
-         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'',?9,?10,?11,?12)",
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
         params![
             paper_id, title, chinese_title, effective_abstract, chinese_abstract,
-            note, override_text, tags, cjk_ngrams, quick_text, metadata_text, content_text,
+            note, override_text, tags, annotation_text, cjk_ngrams, quick_text, metadata_text, content_text,
         ],
     )?;
     conn.execute(
@@ -2309,6 +2358,7 @@ fn library_paper(conn: &Connection, paper: Paper) -> Result<crate::models::Libra
     let effective_pages = metadata.as_ref().and_then(|m| m.pages_override.clone()).or_else(|| paper.pages.clone());
     let effective_doi = metadata.as_ref().and_then(|m| m.doi_override.clone()).or_else(|| paper.normalized_doi.clone());
     let effective_url = metadata.as_ref().and_then(|m| m.url_override.clone()).or_else(|| paper.url.clone());
+    let annotation_text = library_annotation_text(conn, paper.id)?;
     Ok(crate::models::LibraryPaper {
         effective_journal,
         effective_publisher,
@@ -2332,6 +2382,7 @@ fn library_paper(conn: &Connection, paper: Paper) -> Result<crate::models::Libra
         effective_abstract,
         effective_chinese_abstract,
         note,
+        annotation_text,
         attachments,
     })
 }

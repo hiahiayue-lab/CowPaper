@@ -267,6 +267,8 @@ interface LibraryPaper {
   effectiveAuthors: Author[];
   effectiveAbstract: string | null;
   effectiveChineseAbstract: string | null;
+  /** Search-only aggregate; populated when the annotation layer is present. */
+  annotationText?: string | null;
   effectiveDoi?: string | null;
   effectiveUrl?: string | null;
   note: string | null;
@@ -2296,6 +2298,7 @@ function librarySearchPaper(item: LibraryPaper): SearchPaper {
     note: item.note,
     abstract: item.effectiveAbstract ?? item.paper.abstractText,
     chineseAbstract: item.effectiveChineseAbstract ?? item.paper.chineseAbstract,
+    annotationText: item.annotationText,
     collectionIds: item.collections.map((collection) => collection.id),
     tagIds: item.tags.map((tag) => tag.id),
     tags: item.tags.map((tag) => tag.name),

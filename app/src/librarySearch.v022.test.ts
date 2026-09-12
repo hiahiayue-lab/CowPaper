@@ -41,9 +41,11 @@ const paper: SearchPaper = {
 const duplicate = { ...paper, title: "duplicate joined row" };
 
 // v0.2.2 state/API handoff: the wire query stays four-dimensional and the
-// searchable projection remains exactly the nine allowed fields.
+// original nine searchable fields remain intact; v0.3 adds annotations as a
+// separate searchable field.
 equal(Object.keys(emptyLibrarySearchQuery()).sort(), ["collectionIds", "fieldClauses", "freeTextQuery", "libraryTagIds"], "query shape is stable");
-equal(LIBRARY_SEARCH_FIELDS.length, 9, "searchable field count");
+equal(LIBRARY_SEARCH_FIELDS.length, 10, "searchable field count with annotations");
+assert(LIBRARY_SEARCH_FIELDS.slice(0, 9).length === 9, "v0.2.2 searchable fields remain intact");
 assert(LIBRARY_SEARCH_EXCLUDED_FIELDS.every((field) => !LIBRARY_SEARCH_FIELDS.includes(field as never)), "display metadata stays excluded");
 
 // Field filters are removable continuation tokens, with the canonical visual
