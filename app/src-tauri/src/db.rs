@@ -2699,7 +2699,7 @@ fn refresh_library_metadata_from_candidate_with_policy(
     candidate: &PaperCandidate,
     replace_existing: bool,
 ) -> Result<Vec<String>> {
-    if !library_item_exists(conn, paper_id)? {
+    if !paper_exists(conn, paper_id)? {
         return Err(rusqlite::Error::QueryReturnedNoRows);
     }
     let current_doi: Option<String> = conn.query_row(
@@ -3332,6 +3332,16 @@ fn collision_filename(filename: &str, number: usize) -> String {
     format!("{}{}{}", truncate_utf8(stem, max_stem_bytes), suffix, extension)
 }
 
+fn staged_original_stem(source_path: &Path, source_sha256: &str, paper_id: i64) -> Option<String> {
+    let stem = source_path.file_stem()?.to_str()?;
+    let prefix = format!(".cowpaper-staging-{paper_id}-");
+    let body = stem.strip_prefix(&prefix)?;
+    let hash_prefix = source_sha256.chars().take(12).collect::<String>();
+    body.strip_suffix(&format!("-{hash_prefix}"))
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+}
+
 fn copy_file_verified(source: &Path, source_sha256: &str, directory: &Path, filename: &str) -> Result<PathBuf> {
     std::fs::create_dir_all(directory).map_err(|_| rusqlite::Error::InvalidQuery)?;
     for number in 1..=10_000_usize {
@@ -3389,11 +3399,12 @@ fn prepare_managed_pdf(
     std::fs::create_dir_all(&directory).map_err(|_| rusqlite::Error::InvalidQuery)?;
     let directory = std::fs::canonicalize(&directory).map_err(|_| rusqlite::Error::InvalidQuery)?;
     let rendered = render_pdf_filename(&config.naming_template, &context);
-    let fallback = source_path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_string)
+    let fallback = staged_original_stem(source_path, source_sha256, paper_id)
+        .or_else(|| source_path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string))
         .unwrap_or_else(|| format!("paper-{paper_id}"));
     let filename = sanitize_filename(if rendered_filename_has_component(&rendered) { &rendered } else { &fallback });
     let preferred = directory.join(&filename);
@@ -3517,7 +3528,7 @@ fn linked_file(input: &str) -> Result<LinkedFile> {
         .and_then(|value| value.to_str())
         .unwrap_or("document.pdf")
         .to_string();
-    let metadata = parse_external_pdf_metadata(&absolute_path, &filename)?;
+    let metadata = recover_pdf_metadata(&absolute_path, &filename)?;
     let sha256 = sha256_file(&absolute_path)?;
     Ok(LinkedFile { absolute_path, filename, sha256, metadata })
 }
@@ -4133,6 +4144,46 @@ fn prepare_current_pdf_storage(
     }
 }
 
+/// Fast import may need provider enrichment after the attachment transaction
+/// returns. For COPY imports, keep the committed attachment on a hidden,
+/// verified staging copy until that enrichment can determine the final name;
+/// this prevents a provisional filename from becoming the visible managed
+/// filename. MOVE keeps its existing verified-copy semantics so the source is
+/// still protected until the DB commit.
+fn prepare_import_staging_storage(
+    conn: &Connection,
+    paper_id: i64,
+    file: &LinkedFile,
+) -> Result<Option<PreparedPdfStorage>> {
+    let config = pdf_storage_config(conn)?;
+    if config.mode != "copy" {
+        return Ok(None);
+    }
+    let root = PathBuf::from(config.library_root.trim());
+    std::fs::create_dir_all(&root).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let root = std::fs::canonicalize(&root).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let source_stem = file.absolute_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(sanitize_filename)
+        .and_then(|value| value.strip_suffix(".pdf").map(|value| truncate_utf8(value, 80)))
+        .unwrap_or_else(|| format!("paper-{paper_id}"));
+    let hash_prefix = file.sha256.chars().take(12).collect::<String>();
+    let filename = format!(".cowpaper-staging-{paper_id}-{source_stem}-{hash_prefix}.pdf");
+    let destination = copy_file_verified(&file.absolute_path, &file.sha256, &root, &filename)?;
+    let relative_path = managed_relative_path(&root, &destination)?;
+    Ok(Some(PreparedPdfStorage {
+        storage_mode: "managed".to_string(),
+        absolute_path: destination,
+        relative_path,
+        source_path: file.absolute_path.clone(),
+        source_sha256: file.sha256.clone(),
+        delete_source: false,
+        created_destination: true,
+    }))
+}
+
 fn cleanup_prepared_destination(prepared: &PreparedPdfStorage) {
     if prepared.created_destination {
         let _ = std::fs::remove_file(&prepared.absolute_path);
@@ -4576,11 +4627,17 @@ fn xml_metadata_value(text: &str, tags: &[&str]) -> Option<String> {
     None
 }
 
-fn first_doi(value: Option<&str>) -> Option<String> {
-    let value = value?;
+fn doi_candidates(value: Option<&str>) -> Vec<String> {
+    let Some(value) = value else { return Vec::new(); };
+    let lower_value = value.to_ascii_lowercase();
+    let mut candidates = Vec::new();
     let mut offset = 0;
-    while let Some(found) = value[offset..].to_ascii_lowercase().find("10.") {
+    while let Some(found) = lower_value[offset..].find("10.") {
         let start = offset + found;
+        if start > 0 && value.as_bytes()[start - 1].is_ascii_alphanumeric() {
+            offset = start + 3;
+            continue;
+        }
         let candidate = value[start..]
             .chars()
             .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '/' | '-' | '_' | ':' | ';' | '(' | ')'))
@@ -4598,7 +4655,9 @@ fn first_doi(value: Option<&str>) -> Option<String> {
         if valid_prefix {
             if let Some(doi) = crate::util::normalize_doi(candidate) {
                 if doi.starts_with("10.") && doi.contains('/') {
-                    return Some(doi);
+                    if !candidates.contains(&doi) {
+                        candidates.push(doi);
+                    }
                 }
             }
         }
@@ -4607,7 +4666,88 @@ fn first_doi(value: Option<&str>) -> Option<String> {
             break;
         }
     }
-    None
+    candidates
+}
+
+fn extend_doi_candidates(target: &mut Vec<String>, value: Option<&str>) {
+    for candidate in doi_candidates(value) {
+        if !target.contains(&candidate) {
+            target.push(candidate);
+        }
+    }
+}
+
+fn clean_pdf_candidate_text(value: Option<&str>) -> Option<String> {
+    let value = clean_optional_text(value)?;
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let lower = normalized.to_ascii_lowercase();
+    let compact = lower
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>();
+    let placeholder = matches!(compact.as_str(),
+        "unknown" | "unk" | "untitled" | "document" | "document1" |
+        "microsoftword" | "adobeacrobat" | "adobepdf" | "scanner" |
+        "scanned" | "scanneddocument" | "scan" | "n/a" | "na"
+    ) || lower.contains("microsoft word") || lower.contains("adobe acrobat")
+        || lower.starts_with("scanner ") || lower.starts_with("scanned document");
+    if placeholder || normalized.starts_with('/') || normalized.contains("\\") {
+        return None;
+    }
+    Some(normalized)
+}
+
+fn clean_pdf_title(value: Option<&str>, filename: &str) -> Option<String> {
+    let title = clean_pdf_candidate_text(value)?;
+    let filename_lower = filename.trim().to_ascii_lowercase();
+    let stem_lower = Path::new(filename)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let title_lower = title.to_ascii_lowercase();
+    if title_lower == filename_lower || (!stem_lower.is_empty() && title_lower == stem_lower)
+        || title_lower.ends_with(".pdf")
+        || title.chars().filter(|ch| ch.is_alphabetic()).count() < 3
+    {
+        return None;
+    }
+    Some(title)
+}
+
+fn resolve_pdf_doi(
+    metadata_candidates: &[String],
+    first_page: &[String],
+    bounded_text: &[String],
+) -> (Option<String>, Option<String>, Vec<String>) {
+    let mut all = Vec::new();
+    for candidate in metadata_candidates.iter().chain(first_page).chain(bounded_text) {
+        if !all.contains(candidate) {
+            all.push(candidate.clone());
+        }
+    }
+    // An explicit Info/XMP identifier is the strongest local evidence. More
+    // than one explicit DOI is ambiguous and must not silently pick one.
+    if metadata_candidates.len() == 1 {
+        return (metadata_candidates.first().cloned(), Some("pdf_metadata".into()), all);
+    }
+    if metadata_candidates.len() > 1 {
+        return (None, Some("ambiguous".into()), all);
+    }
+    if first_page.len() == 1 {
+        return (first_page.first().cloned(), Some("pdf_first_page".into()), all);
+    }
+    if first_page.len() > 1 {
+        return (None, Some("ambiguous".into()), all);
+    }
+    if bounded_text.len() == 1 {
+        return (bounded_text.first().cloned(), Some("pdf_text".into()), all);
+    }
+    if bounded_text.len() > 1 {
+        return (None, Some("ambiguous".into()), all);
+    }
+    (None, None, all)
 }
 
 fn author_key(author: &crate::models::Author) -> String {
@@ -4750,13 +4890,13 @@ fn pdf_first_page_text(path: &Path) -> Option<String> {
     doc.extract_text_with_limit(&[1], 512 * 1024).ok().filter(|text| !text.trim().is_empty())
 }
 
-fn first_page_title(text: &str) -> Option<String> {
+fn first_page_title(text: &str, filename: &str) -> Option<String> {
     for line in text.lines().map(str::trim).filter(|line| !line.is_empty()).take(16) {
         let lower = line.to_ascii_lowercase();
         if line.len() < 12 || line.len() > 240 || lower.contains("doi") || lower.contains("abstract")
             || lower.contains("keywords") || lower.contains("received") || lower.contains("published")
             || lower.contains('@') || parse_year_metadata(Some(line)).is_some() { continue; }
-        if line.split_whitespace().count() >= 2 { return clean_optional_text(Some(line)); }
+        if line.split_whitespace().count() >= 2 { return clean_pdf_title(Some(line), filename); }
     }
     None
 }
@@ -4795,7 +4935,10 @@ fn pdf_object_text(value: &lopdf::Object) -> Option<String> {
 /// modification dates are intentionally excluded: they describe the PDF file,
 /// not the publication year. Invalid/fixture PDFs retain the raw metadata
 /// fallback used by the existing import path.
-pub fn parse_external_pdf_metadata(path: &Path, filename: &str) -> Result<crate::models::ExternalPdfMetadata> {
+/// Shared deterministic PDF metadata recovery entry point. It performs only
+/// read-only local extraction; exact provider enrichment is layered on by the
+/// import/refresh callers after identity has been established.
+pub fn recover_pdf_metadata(path: &Path, filename: &str) -> Result<crate::models::ExternalPdfMetadata> {
     let bytes = std::fs::read(path).map_err(|_| rusqlite::Error::InvalidQuery)?;
     const PDF_TEXT_SCAN_LIMIT: usize = 1024 * 1024;
     let raw_text = String::from_utf8_lossy(&bytes);
@@ -4807,20 +4950,30 @@ pub fn parse_external_pdf_metadata(path: &Path, filename: &str) -> Result<crate:
         .or_else(|| xml_metadata_value(&xmp, &["dc:title", "title"]));
     let xmp_author = xmp_element_values(&xmp, &["creator"]).into_iter().next()
         .or_else(|| xml_metadata_value(&xmp, &["dc:creator", "creator", "Author"]));
-    let xmp_doi = xmp_element_values(&xmp, &["doi", "identifier"]).into_iter().find_map(|value| first_doi(Some(&value)))
-        .or_else(|| xml_metadata_value(&xmp, &["prism:doi", "bibo:doi", "doi"]).and_then(|v| first_doi(Some(&v))));
-    let title = info.as_ref().and_then(|value| value.title.clone())
-        .or_else(|| pdf_info_value(&raw_text, "Title"))
-        .or(xmp_title)
-        .or_else(|| first_page_title(&first_page));
+    let title = info.as_ref().and_then(|value| value.title.as_deref().and_then(|value| clean_pdf_title(Some(value), filename)))
+        .or_else(|| pdf_info_value(&raw_text, "Title").and_then(|value| clean_pdf_title(Some(&value), filename)))
+        .or_else(|| xmp_title.as_deref().and_then(|value| clean_pdf_title(Some(value), filename)))
+        .or_else(|| first_page_title(&first_page, filename));
     let author_value = info.as_ref().and_then(|value| value.author.clone())
         .or_else(|| pdf_info_value(&raw_text, "Author"))
-        .or(xmp_author);
-    let doi = first_doi(info.as_ref().and_then(|value| value.custom.get(b"DOI".as_slice())).and_then(pdf_object_text).as_deref())
-        .or_else(|| first_doi(pdf_info_value(&raw_text, "DOI").as_deref()))
-        .or(xmp_doi)
-        .or_else(|| first_doi(Some(&first_page)))
-        .or_else(|| first_doi(Some(&bounded_text)));
+        .or(xmp_author)
+        .and_then(|value| clean_pdf_candidate_text(Some(&value)));
+    let mut metadata_dois = Vec::new();
+    extend_doi_candidates(
+        &mut metadata_dois,
+        info.as_ref().and_then(|value| value.custom.get(b"DOI".as_slice())).and_then(pdf_object_text).as_deref(),
+    );
+    extend_doi_candidates(&mut metadata_dois, pdf_info_value(&raw_text, "DOI").as_deref());
+    for value in xmp_element_values(&xmp, &["doi", "identifier"]) {
+        extend_doi_candidates(&mut metadata_dois, Some(&value));
+    }
+    extend_doi_candidates(
+        &mut metadata_dois,
+        xml_metadata_value(&xmp, &["prism:doi", "bibo:doi", "doi"]).as_deref(),
+    );
+    let first_page_dois = doi_candidates(Some(&first_page));
+    let bounded_dois = doi_candidates(Some(&bounded_text));
+    let (doi, doi_source, doi_candidates) = resolve_pdf_doi(&metadata_dois, &first_page_dois, &bounded_dois);
     let scholarly_id = pdf_info_value(&raw_text, "OpenAlex")
         .or_else(|| pdf_info_value(&raw_text, "PMID"))
         .or_else(|| pdf_info_value(&raw_text, "PMCID"))
@@ -4850,6 +5003,12 @@ pub fn parse_external_pdf_metadata(path: &Path, filename: &str) -> Result<crate:
         "pdf_xmp",
         "XMP.dc:subject",
     ));
+    keywords.extend(parse_keyword_metadata(
+        pdf_info_value(&raw_text, "Subject").as_deref(),
+        "subject",
+        "pdf_info",
+        "Info.Subject",
+    ));
     for (position, keyword) in xmp_container_list_values(&xmp, "dc:subject").into_iter().enumerate() {
         keywords.push(crate::models::PaperKeywordInput { keyword, kind: "subject".to_string(), source: "pdf_xmp".to_string(), confidence: "MEDIUM".to_string(), source_locator: Some("XMP.dc:subject".to_string()), language: None, position: Some(position as i64) });
     }
@@ -4861,11 +5020,20 @@ pub fn parse_external_pdf_metadata(path: &Path, filename: &str) -> Result<crate:
         authors: if authors.is_empty() { first_page_authors(&first_page) } else { authors },
         year,
         doi,
+        doi_source,
+        doi_candidates,
         scholarly_id: clean_optional_text(scholarly_id.as_deref()),
         abstract_text,
         keywords,
         ..Default::default()
     })
+}
+
+/// Compatibility name retained for existing callers and tests. New import,
+/// relink, enrichment, and explicit refresh paths use `recover_pdf_metadata`
+/// directly so the shared pipeline remains obvious at call sites.
+pub fn parse_external_pdf_metadata(path: &Path, filename: &str) -> Result<crate::models::ExternalPdfMetadata> {
+    recover_pdf_metadata(path, filename)
 }
 
 fn title_author_year_candidates(
@@ -4945,6 +5113,7 @@ fn add_library_and_attach(
     paper_id: i64,
     file: &LinkedFile,
     added_source: &str,
+    stage_import: bool,
 ) -> Result<crate::models::PaperAttachment> {
     if !paper_exists(conn, paper_id)? {
         return Err(rusqlite::Error::QueryReturnedNoRows);
@@ -4957,7 +5126,16 @@ fn add_library_and_attach(
         refresh_library_search_document(conn, paper_id)?;
         return Ok(existing);
     }
-    let prepared = prepare_current_pdf_storage(conn, paper_id, file)?;
+    let prepared = if stage_import {
+        let staged = prepare_import_staging_storage(conn, paper_id, file)?;
+        if staged.is_some() {
+            staged
+        } else {
+            prepare_current_pdf_storage(conn, paper_id, file)?
+        }
+    } else {
+        prepare_current_pdf_storage(conn, paper_id, file)?
+    };
     let tx = conn.unchecked_transaction()?;
     let now = now_utc();
     tx.execute(
@@ -4994,46 +5172,65 @@ fn external_pdf_attachment_conflict(
         .any(|attachment| attachment.sha256.as_deref() != Some(sha256)))
 }
 
-/// Apply one exact-identity provider result to the local PDF metadata. Every
-/// field is fill-only: an existing value shown to the user is never silently
-/// replaced by a conflicting provider value.
+/// Apply one exact-identity provider result to the local PDF metadata. Exact
+/// DOI identity makes scholarly provider fields authoritative over embedded
+/// PDF candidates; Library user overrides remain in their separate metadata
+/// layer and therefore still win in the effective Library projection.
 pub(crate) fn merge_external_pdf_metadata_from_candidate(
     metadata: &mut crate::models::ExternalPdfMetadata,
     candidate: &PaperCandidate,
     source: &str,
 ) {
-    if metadata.doi.as_deref().and_then(crate::util::normalize_doi) != candidate.normalized_doi
-        || candidate.normalized_doi.is_none() { return; }
+    merge_external_pdf_metadata_from_candidate_with_policy(metadata, candidate, source, true);
+}
+
+fn merge_external_pdf_metadata_from_candidate_with_policy(
+    metadata: &mut crate::models::ExternalPdfMetadata,
+    candidate: &PaperCandidate,
+    source: &str,
+    replace_pdf_values: bool,
+) {
+    let same_doi = metadata.doi.as_deref().and_then(crate::util::normalize_doi)
+        == candidate.normalized_doi.as_deref().and_then(crate::util::normalize_doi);
+    if !same_doi || candidate.normalized_doi.is_none() { return; }
     let publication = publication_metadata(candidate);
-    metadata.journal = metadata.journal.take().or(publication.journal);
-    metadata.publisher = metadata.publisher.take().or(publication.publisher);
-    metadata.publication_date = metadata.publication_date.take().or(publication.publication_date);
-    metadata.volume = metadata.volume.take().or(publication.volume);
-    metadata.issue = metadata.issue.take().or(publication.issue);
-    metadata.pages = metadata.pages.take().or(publication.pages);
-    if metadata.title.as_deref().map(|v| v.trim().is_empty()).unwrap_or(true) {
+    if (replace_pdf_values || metadata.journal.is_none()) && publication.journal.is_some() {
+        metadata.journal = publication.journal;
+    }
+    if (replace_pdf_values || metadata.publisher.is_none()) && publication.publisher.is_some() {
+        metadata.publisher = publication.publisher;
+    }
+    if (replace_pdf_values || metadata.publication_date.is_none()) && publication.publication_date.is_some() {
+        metadata.publication_date = publication.publication_date;
+    }
+    if (replace_pdf_values || metadata.volume.is_none()) && publication.volume.is_some() {
+        metadata.volume = publication.volume;
+    }
+    if (replace_pdf_values || metadata.issue.is_none()) && publication.issue.is_some() {
+        metadata.issue = publication.issue;
+    }
+    if (replace_pdf_values || metadata.pages.is_none()) && publication.pages.is_some() {
+        metadata.pages = publication.pages;
+    }
+    if (replace_pdf_values || metadata.title.is_none()) && candidate.title.is_some() {
         metadata.title = candidate.title.clone();
     }
-    if metadata.authors.is_empty() && !candidate.authors.is_empty() {
+    if (replace_pdf_values || metadata.authors.is_empty()) && !candidate.authors.is_empty() {
         metadata.authors = candidate.authors.clone();
     }
-    if metadata.year.is_none() {
+    if (replace_pdf_values || metadata.year.is_none()) && candidate.year.is_some() {
         metadata.year = candidate.year;
     }
-    if metadata.doi.is_none() {
-        metadata.doi = candidate.normalized_doi.clone();
-    }
-    if metadata.abstract_provenance != "provider" {
+    if replace_pdf_values || metadata.abstract_provenance != "provider" {
         if let Some(text) = candidate.abstract_text.as_deref().filter(|s| !s.trim().is_empty()) {
             metadata.abstract_text = Some(text.to_string());
             metadata.abstract_provenance = "provider".into();
         }
     }
-    if metadata.scholarly_id.is_none() {
-        metadata.scholarly_id = candidate
-            .openalex_work_id
-            .clone()
-            .or_else(|| candidate.publisher_article_id.clone());
+    if replace_pdf_values || metadata.scholarly_id.is_none() {
+        metadata.scholarly_id = candidate.openalex_work_id.clone()
+            .or_else(|| candidate.publisher_article_id.clone())
+            .or_else(|| metadata.scholarly_id.clone());
     }
     if let Some(raw_json) = candidate.raw_json.as_deref() {
         metadata.keywords.extend(keyword_inputs_from_provider_json(source, raw_json));
@@ -5139,20 +5336,97 @@ fn persist_external_metadata(
         None,
     )?;
     insert_keyword_inputs(conn, paper_id, &metadata.keywords, Some(pdf_record_id))?;
-    for (source, candidate) in providers {
+    for (index, (_source, candidate)) in providers.iter().enumerate() {
         let doi: Option<String> = conn.query_row("SELECT normalized_doi FROM papers WHERE id=?1",params![paper_id],|r| r.get(0))?;
-        if doi != candidate.normalized_doi { continue; }
-        fill_publication_metadata(conn, paper_id, candidate)?;
-        insert_source_record(
-            conn,
-            paper_id,
-            source,
-            candidate.source_id.as_deref(),
-            candidate.raw_json.as_deref(),
-        )?;
+        let same_doi = doi.as_deref().and_then(crate::util::normalize_doi)
+            == candidate.normalized_doi.as_deref().and_then(crate::util::normalize_doi);
+        if !same_doi { continue; }
+        // Exact provider identity is authoritative over provisional PDF
+        // fields. The refresh helper writes the canonical/provider layer and
+        // leaves Library overrides untouched; it also records provenance.
+        let _ = if index == 0 {
+            refresh_library_metadata_from_candidate(conn, paper_id, candidate)?
+        } else {
+            supplement_library_metadata_from_candidate(conn, paper_id, candidate)?
+        };
     }
     refresh_library_search_document(conn, paper_id)?;
     Ok(())
+}
+
+/// Apply read-only PDF metadata discovered by the shared recovery pipeline to
+/// an existing Library Paper. This is deliberately fill-only for local PDF
+/// evidence; an exact provider refresh can subsequently replace provisional
+/// canonical fields. A recovered DOI is adopted only when it does not
+/// conflict with an existing canonical DOI or another Paper.
+pub(crate) fn apply_recovered_pdf_metadata(
+    conn: &Connection,
+    paper_id: i64,
+    metadata: &crate::models::ExternalPdfMetadata,
+) -> Result<Vec<String>> {
+    if !library_item_exists(conn, paper_id)? {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    let before = get_paper(conn, paper_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+    let current_doi: Option<String> = conn.query_row(
+        "SELECT normalized_doi FROM papers WHERE id=?1",
+        params![paper_id],
+        |row| row.get(0),
+    )?;
+    let recovered_doi = metadata.doi.as_deref().and_then(crate::util::normalize_doi);
+    if let (Some(current), Some(recovered)) = (current_doi.as_deref(), recovered_doi.as_deref()) {
+        if crate::util::normalize_doi(current).as_deref() != Some(recovered) {
+            return Err(rusqlite::Error::InvalidParameterName("doi_identity".into()));
+        }
+    }
+    let doi = recovered_doi.or_else(|| current_doi.clone());
+    if current_doi.is_none() {
+        if let Some(doi) = doi.as_deref() {
+            let owner: Option<i64> = conn.query_row(
+                "SELECT id FROM papers WHERE normalized_doi=?1 AND id<>?2",
+                params![doi, paper_id],
+                |row| row.get(0),
+            ).optional()?;
+            if owner.is_some() {
+                return Err(rusqlite::Error::InvalidParameterName("exact DOI duplicate requires manual review".into()));
+            }
+            conn.execute(
+                "UPDATE papers SET normalized_doi=?1, original_doi=COALESCE(original_doi,?1),
+                    url=COALESCE(url,?2), updated_at=?3 WHERE id=?4 AND normalized_doi IS NULL",
+                params![doi, format!("https://doi.org/{doi}"), now_utc(), paper_id],
+            )?;
+        }
+    }
+    let candidate = crate::models::PaperCandidate {
+        normalized_doi: doi.clone(),
+        original_doi: metadata.doi.clone().or_else(|| doi.clone()),
+        title: metadata.title.clone(),
+        authors: metadata.authors.clone(),
+        published_date: metadata.publication_date.clone(),
+        year: metadata.year,
+        abstract_text: metadata.abstract_text.clone(),
+        abstract_source: (metadata.abstract_text.is_some()).then(|| "pdf_structured".to_string()),
+        abstract_source_url: None,
+        url: doi.as_deref().map(|value| format!("https://doi.org/{value}")),
+        publisher_article_id: metadata.scholarly_id.clone(),
+        openalex_work_id: None,
+        discovery_source: "external_pdf_import".to_string(),
+        source_id: doi,
+        raw_json: None,
+    };
+    fill_missing_canonical_metadata_from_candidate(conn, paper_id, &candidate)?;
+    persist_external_metadata(conn, paper_id, metadata, &[])?;
+    // The local apply above is intentionally fill-only. Read the stable
+    // before/after projection once for a compact refresh result.
+    let after = get_paper(conn, paper_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+    let mut fields = Vec::new();
+    if before.title != after.title { fields.push("title".to_string()); }
+    if serde_json::to_string(&before.authors).ok() != serde_json::to_string(&after.authors).ok() { fields.push("authors".to_string()); }
+    if before.published_date != after.published_date { fields.push("publicationDate".to_string()); }
+    if before.year != after.year { fields.push("year".to_string()); }
+    if before.normalized_doi != after.normalized_doi { fields.push("doi".to_string()); }
+    if before.abstract_text != after.abstract_text { fields.push("abstract".to_string()); }
+    Ok(fields)
 }
 
 /// Import a local PDF into the canonical Paper graph using the fast-first
@@ -5216,7 +5490,7 @@ fn enqueue_pdf_enrichment(conn: &Connection, paper_id: i64, attachment_id: i64, 
 /// Complete the two-stage import filename after the initial background
 /// metadata resolution. This is only called by the import enrichment job; a
 /// later metadata edit never renames a managed PDF implicitly.
-fn finalize_import_managed_filename(conn: &Connection, attachment_id: i64) -> Result<()> {
+pub(crate) fn finalize_import_managed_filename(conn: &Connection, attachment_id: i64) -> Result<()> {
     let current = get_paper_attachment(conn, attachment_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
     if current.storage_mode != "managed" {
         return Ok(());
@@ -5246,8 +5520,9 @@ fn finalize_import_managed_filename(conn: &Connection, attachment_id: i64) -> Re
 }
 
 /// Background exact-DOI enrichment. Network I/O happens without the SQLite
-/// mutex held; all writes remain fill-only and are discarded for mismatched
-/// provider identities.
+/// mutex held; all writes are guarded by exact provider identity. Provider
+/// bibliographic fields may replace provisional PDF values, while Library
+/// overrides remain isolated.
 pub fn run_pdf_enrichment<R: Runtime>(
     db: &Arc<Mutex<Connection>>,
     app: &AppHandle<R>,
@@ -5276,7 +5551,7 @@ pub fn run_pdf_enrichment<R: Runtime>(
             params![attachment_id, paper_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
-        parse_external_pdf_metadata(Path::new(&path), &filename)
+        recover_pdf_metadata(Path::new(&path), &filename)
     })();
     let metadata = match local_metadata {
         Ok(metadata) => metadata,
@@ -5344,9 +5619,18 @@ pub fn run_pdf_enrichment<R: Runtime>(
         };
         fill_missing_canonical_metadata_from_candidate(&conn, paper_id, &local_candidate)?;
         let mut enriched = 0;
-        for (source, candidate) in &providers {
-            if candidate.normalized_doi.as_deref() != doi.as_deref() { continue; }
-            fill_missing_canonical_metadata_from_candidate(&conn, paper_id, candidate)?;
+        for (index, (source, candidate)) in providers.iter().enumerate() {
+            let same_doi = candidate.normalized_doi.as_deref().and_then(crate::util::normalize_doi)
+                == doi.as_deref().and_then(crate::util::normalize_doi);
+            if !same_doi { continue; }
+            // The DOI was confirmed exactly. Provider fields are canonical
+            // scholarly metadata and may replace provisional PDF values;
+            // Library overrides remain isolated in their own table.
+            if index == 0 {
+                refresh_library_metadata_from_candidate(&conn, paper_id, candidate)?;
+            } else {
+                supplement_library_metadata_from_candidate(&conn, paper_id, candidate)?;
+            }
             insert_source_record(&conn, paper_id, source, candidate.source_id.as_deref(), candidate.raw_json.as_deref())?;
             enriched += 1;
         }
@@ -5401,10 +5685,13 @@ fn import_prepared_external_pdf(
     allow_title_candidate_confirmation: bool,
 ) -> Result<crate::models::ExternalPdfImportResult> {
     let mut metadata = file.metadata.clone();
-    let mut providers: Vec<_> = providers.into_iter().filter(|(_, c)| c.normalized_doi.is_some() && c.normalized_doi == metadata.doi).collect();
+    let metadata_doi = metadata.doi.as_deref().and_then(crate::util::normalize_doi);
+    let mut providers: Vec<_> = providers.into_iter().filter(|(_, c)| {
+        metadata_doi.as_deref() == c.normalized_doi.as_deref().and_then(crate::util::normalize_doi).as_deref()
+    }).collect();
     providers.sort_by_key(|(source,_)| if source == "crossref" { 0 } else { 1 });
-    for (source, candidate) in &providers {
-        merge_external_pdf_metadata_from_candidate(&mut metadata, candidate, source);
+    for (index, (source, candidate)) in providers.iter().enumerate() {
+        merge_external_pdf_metadata_from_candidate_with_policy(&mut metadata, candidate, source, index == 0);
     }
 
     let same_file: Option<(i64, Option<String>)> = conn.query_row(
@@ -5450,7 +5737,7 @@ fn import_prepared_external_pdf(
             for (_, candidate) in &providers {
                 fill_missing_canonical_metadata_from_candidate(conn, paper_id, candidate)?;
             }
-            let attachment = add_library_and_attach(conn, paper_id, &file, "external_pdf_import")?;
+            let attachment = add_library_and_attach(conn, paper_id, &file, "external_pdf_import", providers.is_empty())?;
             persist_external_metadata(conn, paper_id, &metadata, &providers)?;
             return Ok(crate::models::ExternalPdfImportResult {
                 outcome: "existingDoi".to_string(),
@@ -5484,7 +5771,7 @@ fn import_prepared_external_pdf(
             for (_, candidate) in &providers {
                 fill_missing_canonical_metadata_from_candidate(conn, paper_id, candidate)?;
             }
-            let attachment = add_library_and_attach(conn, paper_id, &file, "external_pdf_import")?;
+            let attachment = add_library_and_attach(conn, paper_id, &file, "external_pdf_import", providers.is_empty())?;
             persist_external_metadata(conn, paper_id, &metadata, &providers)?;
             return Ok(crate::models::ExternalPdfImportResult {
                 outcome: "existingScholarlyId".to_string(),
@@ -5525,7 +5812,7 @@ fn import_prepared_external_pdf(
         for (_, candidate) in &providers {
             fill_missing_canonical_metadata_from_candidate(conn, paper_id, candidate)?;
         }
-        let attachment = add_library_and_attach(conn, paper_id, &file, "external_pdf_manual_confirmation")?;
+        let attachment = add_library_and_attach(conn, paper_id, &file, "external_pdf_manual_confirmation", providers.is_empty())?;
         persist_external_metadata(conn, paper_id, &metadata, &providers)?;
         return Ok(crate::models::ExternalPdfImportResult {
             outcome: "manualConfirmation".to_string(),
@@ -5578,7 +5865,7 @@ fn import_prepared_external_pdf(
         raw_json: providers.first().and_then(|(_, candidate)| candidate.raw_json.clone()),
     };
     let paper_id = insert_paper_without_identity_merge(conn, journal_id, &candidate)?;
-    let attachment = add_library_and_attach(conn, paper_id, &file, "external_pdf_import")?;
+    let attachment = add_library_and_attach(conn, paper_id, &file, "external_pdf_import", providers.is_empty())?;
     persist_external_metadata(conn, paper_id, &metadata, &providers)?;
     Ok(crate::models::ExternalPdfImportResult {
         outcome: "createdExternalPaper".to_string(),

@@ -8087,7 +8087,113 @@ fn test_external_pdf_parser_uses_bounded_doi_and_real_publication_fields_only() 
 }
 
 #[test]
-fn test_exact_provider_enrichment_is_fill_only_and_does_not_touch_recommendation_fields() {
+fn rc6_pdf_recovery_rejects_garbage_titles_and_ambiguous_dois() {
+    let garbage = test_pdf_path(
+        "rc6-garbage-pdf-metadata",
+        "%PDF-1.7\n1 0 obj << /Title (Microsoft Word) /Author (unknown) /Subject (Operations Research) /DOI (doi:10.5555/garbage) >>\n",
+    );
+    let recovered = db::recover_pdf_metadata(&garbage, "paper.pdf").unwrap();
+    assert_eq!(recovered.title, None, "software placeholder must not become a scholarly title");
+    assert_eq!(recovered.doi.as_deref(), Some("10.5555/garbage"));
+    assert_eq!(recovered.doi_source.as_deref(), Some("pdf_metadata"));
+    assert!(recovered.keywords.iter().any(|keyword| keyword.keyword == "Operations Research" && keyword.kind == "subject"));
+    std::fs::remove_file(garbage).unwrap();
+
+    let ambiguous = test_pdf_path(
+        "rc6-ambiguous-doi",
+        "%PDF-1.7\nTitle: Evidence Paper\nDOI: 10.5555/first\nReference DOI: 10.5555/second\n",
+    );
+    let recovered = db::recover_pdf_metadata(&ambiguous, "evidence.pdf").unwrap();
+    assert_eq!(recovered.doi, None, "multiple text DOI candidates must be rejected");
+    assert_eq!(recovered.doi_source.as_deref(), Some("ambiguous"));
+    assert_eq!(recovered.doi_candidates, vec!["10.5555/first", "10.5555/second"]);
+    std::fs::remove_file(ambiguous).unwrap();
+
+    let normalized = test_pdf_path(
+        "rc6-doi-normalization",
+        "%PDF-1.7\nDOI: https://doi.org/10.5555/ABC?utm_source=pdf).\n",
+    );
+    let recovered = db::recover_pdf_metadata(&normalized, "normalized.pdf").unwrap();
+    assert_eq!(recovered.doi.as_deref(), Some("10.5555/abc"));
+    std::fs::remove_file(normalized).unwrap();
+}
+
+#[test]
+fn rc6_exact_provider_metadata_is_available_before_managed_filename() {
+    let conn = mem_db();
+    let root = test_pdf_library("rc6-provider-filename");
+    set_pdf_storage_settings(&conn, "copy", &root, "{title} - {journal} - {year}.pdf", "none");
+    let path = test_pdf_path(
+        "rc6-provider-filename",
+        "%PDF-1.7\n1 0 obj << /Title (Embedded Placeholder) /DOI (10.5555/rc3) >>\n",
+    );
+    let provider = rc3_crossref();
+    let result = db::import_external_pdf_with_candidates(
+        &conn,
+        path.to_str().unwrap(),
+        None,
+        vec![("crossref".into(), provider)],
+    ).unwrap();
+    let attachment = result.attachment.unwrap();
+    assert_eq!(attachment.filename, "Publication metadata test - Journal of Evidence - 2026.pdf");
+    assert!(std::path::Path::new(&attachment.absolute_path).is_file());
+    assert!(path.is_file(), "copy mode must preserve the source PDF");
+    assert_eq!(result.metadata.title.as_deref(), Some("Publication metadata test"));
+    assert_eq!(result.metadata.journal.as_deref(), Some("Journal of Evidence"));
+    std::fs::remove_file(path).unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn rc6_fast_import_keeps_copy_on_staging_until_finalization() {
+    let conn = mem_db();
+    let root = test_pdf_library("rc6-staging");
+    set_pdf_storage_settings(&conn, "copy", &root, "{title}.pdf", "none");
+    let path = test_pdf_path(
+        "rc6-staging",
+        "%PDF-1.7\n1 0 obj << /Title (Staged Local Title) >>\n",
+    );
+    let result = db::import_external_pdf_fast(&conn, path.to_str().unwrap(), None).unwrap();
+    let attachment_id = result.attachment.unwrap().id;
+    let staged = db::get_paper_attachment(&conn, attachment_id).unwrap().unwrap();
+    assert!(staged.filename.starts_with(".cowpaper-staging-"));
+    assert!(std::path::Path::new(&staged.absolute_path).is_file());
+    assert!(path.is_file(), "staging copy must preserve the source");
+    db::finalize_import_managed_filename(&conn, attachment_id).unwrap();
+    let finalized = db::get_paper_attachment(&conn, attachment_id).unwrap().unwrap();
+    assert_eq!(finalized.filename, "Staged Local Title.pdf");
+    assert!(std::path::Path::new(&finalized.absolute_path).is_file());
+    assert!(!std::path::Path::new(&staged.absolute_path).exists());
+    assert!(path.is_file());
+    std::fs::remove_file(path).unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn rc6_local_recovery_adopts_exact_doi_without_creating_discovery_membership() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "External PDF Import", None, None, None, None).unwrap();
+    let paper_id = match db::upsert_paper(&conn, jid, &candidate(None, "Provisional paper", None, None)).unwrap() {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new paper"),
+    };
+    db::add_paper_to_library(&conn, paper_id, &[], &[], "external_pdf_import").unwrap();
+    let path = test_pdf_path(
+        "rc6-local-recovery",
+        "%PDF-1.7\n1 0 obj << /Title (Recovered Local Title) /DOI (10.5555/local-recovery) >>\n",
+    );
+    let attachment = db::attach_pdf_to_paper(&conn, paper_id, path.to_str().unwrap()).unwrap();
+    let metadata = db::recover_pdf_metadata(&path, &attachment.filename).unwrap();
+    let fields = db::apply_recovered_pdf_metadata(&conn, paper_id, &metadata).unwrap();
+    assert!(fields.contains(&"doi".to_string()));
+    assert_eq!(db::get_paper(&conn, paper_id).unwrap().unwrap().normalized_doi.as_deref(), Some("10.5555/local-recovery"));
+    assert!(db::is_library_only(&conn, paper_id).unwrap());
+    assert!(db::list_discovery_papers(&conn, None, 100).unwrap().is_empty());
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn test_exact_provider_enrichment_prefers_scholarly_fields_and_does_not_touch_recommendation_fields() {
     let mut local = crate::models::ExternalPdfMetadata {
         filename: "local.pdf".into(),
         title: Some("User Visible Title".into()),
@@ -8099,9 +8205,10 @@ fn test_exact_provider_enrichment_is_fill_only_and_does_not_touch_recommendation
     let mut provider = candidate(Some("10.1000/fill-only"), "Provider Title", Some("Provider abstract"), Some("crossref"));
     provider.raw_json = Some(r#"{"DOI":"10.1000/fill-only","subject":["Subject from Crossref"]}"#.into());
     db::merge_external_pdf_metadata_from_candidate(&mut local, &provider, "crossref");
-    assert_eq!(local.title.as_deref(), Some("User Visible Title"));
-    assert_eq!(local.authors[0].name.as_deref(), Some("User Author"));
-    assert_eq!(local.year, Some(2020));
+    assert_eq!(local.title.as_deref(), Some("Provider Title"));
+    assert_eq!(local.authors[0].given.as_deref(), Some("A"));
+    assert_eq!(local.authors[0].family.as_deref(), Some("B"));
+    assert_eq!(local.year, Some(2025));
     assert_eq!(local.abstract_text.as_deref(), Some("Provider abstract"));
     assert!(local.keywords.iter().all(|keyword| keyword.kind == "subject"));
 

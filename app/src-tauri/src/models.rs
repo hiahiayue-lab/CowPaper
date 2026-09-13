@@ -770,6 +770,15 @@ pub struct ExternalPdfMetadata {
     pub authors: Vec<Author>,
     pub year: Option<i32>,
     pub doi: Option<String>,
+    /// Evidence source for the exact identifier used during deterministic
+    /// recovery (PDF metadata, first-page text, or bounded PDF text).
+    #[serde(default)]
+    pub doi_source: Option<String>,
+    /// All distinct DOI candidates found in the selected evidence tiers. A
+    /// conflicting set is intentionally surfaced as `doi = null` instead of
+    /// choosing an arbitrary identifier.
+    #[serde(default)]
+    pub doi_candidates: Vec<String>,
     pub scholarly_id: Option<String>,
     pub abstract_text: Option<String>,
     /// Explicit PDF Info/XMP keyword evidence. It is never treated as an AI

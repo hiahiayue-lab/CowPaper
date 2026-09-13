@@ -1222,22 +1222,64 @@ fn update_library_item_metadata(
     set_library_item_metadata(paper_id, metadata, state)
 }
 
-/// Refresh one Library row through the existing exact-DOI provider path.
-/// Network work happens before taking the SQLite mutex; applying the results
-/// only touches canonical Paper metadata and never the Library-only edit layer.
+/// Refresh one Library row through the shared read-only PDF recovery path and
+/// the existing exact-DOI provider path. Network work happens without the
+/// SQLite mutex held; applying the results only touches canonical Paper
+/// metadata and never the Library-only edit layer.
 #[tauri::command]
 fn refresh_library_item_metadata(
     paper_id: i64,
     state: State<Db>,
 ) -> Result<models::LibraryMetadataRefreshResult, String> {
-    let doi = {
+    let (mut doi, local_metadata) = {
         let conn = state.inner().lock().unwrap();
         let paper = db::get_library_paper(&conn, paper_id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "论文不在文献库中".to_string())?;
-        paper.paper.normalized_doi
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| "这篇论文没有可用于精确刷新的 DOI".to_string())?
+        let attachment = db::list_paper_attachments(&conn, paper_id)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|attachment| attachment.kind == "pdf" && std::path::Path::new(&attachment.absolute_path).is_file());
+        let local_metadata = attachment.and_then(|attachment| {
+            db::recover_pdf_metadata(
+                std::path::Path::new(&attachment.absolute_path),
+                &attachment.filename,
+            ).ok()
+        });
+        (paper.paper.normalized_doi.filter(|value| !value.trim().is_empty()), local_metadata)
+    };
+
+    let mut refreshed_fields = Vec::new();
+    let mut sources = Vec::new();
+    if let Some(metadata) = local_metadata.as_ref() {
+        let conn = state.inner().lock().unwrap();
+        let fields = db::apply_recovered_pdf_metadata(&conn, paper_id, metadata)
+            .map_err(|error| match error {
+                rusqlite::Error::InvalidParameterName(name) if name == "doi_identity" => "PDF 中的 DOI 与当前论文不一致，未刷新".to_string(),
+                rusqlite::Error::InvalidParameterName(name) if name == "exact DOI duplicate requires manual review" => "PDF DOI 已属于另一篇论文，未自动合并".to_string(),
+                other => other.to_string(),
+            })?;
+        for field in fields {
+            if !refreshed_fields.contains(&field) {
+                refreshed_fields.push(field);
+            }
+        }
+        doi = db::get_paper(&conn, paper_id)
+            .map_err(|e| e.to_string())?
+            .and_then(|paper| paper.normalized_doi)
+            .filter(|value| !value.trim().is_empty());
+        sources.push("PDF".to_string());
+    }
+
+    let Some(doi) = doi else {
+        if local_metadata.is_none() {
+            return Err("这篇论文没有可用于精确刷新的 DOI".to_string());
+        }
+        let conn = state.inner().lock().unwrap();
+        let paper = db::get_library_paper(&conn, paper_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "刷新后无法读取文献库论文".to_string())?;
+        return Ok(models::LibraryMetadataRefreshResult { paper, sources, refreshed_fields });
     };
 
     let crossref = api::crossref::Crossref::new(MAILTO);
@@ -1254,7 +1296,18 @@ fn refresh_library_item_metadata(
         Ok(None) => {}
         Err(error) => errors.push(format!("OpenAlex：{error}")),
     }
+    candidates.retain(|(_, candidate)| {
+        candidate.normalized_doi.as_deref().and_then(crate::util::normalize_doi)
+            == crate::util::normalize_doi(&doi)
+    });
     if candidates.is_empty() {
+        if local_metadata.is_some() {
+            let conn = state.inner().lock().unwrap();
+            let paper = db::get_library_paper(&conn, paper_id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "刷新后无法读取文献库论文".to_string())?;
+            return Ok(models::LibraryMetadataRefreshResult { paper, sources, refreshed_fields });
+        }
         return Err(if errors.is_empty() {
             "未找到 DOI 对应的公开元数据".to_string()
         } else {
@@ -1263,8 +1316,6 @@ fn refresh_library_item_metadata(
     }
 
     let conn = state.inner().lock().unwrap();
-    let mut sources = Vec::new();
-    let mut refreshed_fields = Vec::new();
     for (index, (source, candidate)) in candidates.into_iter().enumerate() {
         let fields = if index == 0 {
             db::refresh_library_metadata_from_candidate(&conn, paper_id, &candidate)
