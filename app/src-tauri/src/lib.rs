@@ -2027,19 +2027,22 @@ fn get_ai_status(state: State<Db>) -> Result<models::AiStatus, String> {
 #[tauri::command]
 fn get_pending_ai_count(state: State<Db>) -> Result<i64, String> {
     let conn = state.inner().lock().unwrap();
-    db::count_pending_papers_in_discovery(&conn).map_err(|e| e.to_string())
+    let cycle_key = db::current_discovery_cycle_key(&conn);
+    db::count_pending_papers_in_current_discovery_batch(&conn, &cycle_key).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 fn get_failed_ai_count(state: State<Db>) -> Result<i64, String> {
     let conn = state.inner().lock().unwrap();
-    db::count_by_status_in_discovery(&conn, "analysisFailed").map_err(|e| e.to_string())
+    let cycle_key = db::current_discovery_cycle_key(&conn);
+    db::count_by_status_in_current_discovery_batch(&conn, "analysisFailed", &cycle_key).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 fn get_waiting_abstract_count(state: State<Db>) -> Result<i64, String> {
     let conn = state.inner().lock().unwrap();
-    db::count_waiting_for_abstract(&conn).map_err(|e| e.to_string())
+    let cycle_key = db::current_discovery_cycle_key(&conn);
+    db::count_waiting_for_abstract_in_current_discovery_batch(&conn, &cycle_key).map_err(|e| e.to_string())
 }
 
 fn start_abstract_recovery(app: AppHandle, db_arc: Db, paper_ids: Vec<i64>) -> Result<models::AbstractRecoveryBatch, String> {
@@ -2211,19 +2214,19 @@ fn valid_daily_sync_time(value: &str) -> bool {
 /// 聚合全局 Activity 状态（get_activity_state 命令与一致性测试共用）。
 /// pending_analysis / analysis_failed / waiting_for_abstract 为实时 DB 计数，
 /// 与 last_analysis（上一次批次的 total）严格区分，杜绝"上次 7 篇"被误读成"待处理 7 篇"。
-/// 缺摘要只属于本地今日 Discovery batch，并按 canonical paper id 去重。
+/// 缺摘要只属于当前 Today Discovery cycle，并按 canonical paper id 去重。
 pub(crate) fn build_activity_state(conn: &Connection) -> Result<models::ActivityState, String> {
     let retry_waiting = db::get_setting(conn, "queue.retry_waiting").unwrap_or_default() == "1";
-    let local_day = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let cycle_key = db::current_discovery_cycle_key(conn);
     Ok(models::ActivityState {
         sync_batch: db::get_running_sync_batch(conn).map_err(|e| e.to_string())?,
         analysis_batch: db::get_current_analysis_batch(conn).map_err(|e| e.to_string())?,
         last_sync: db::last_finished_sync_batch(conn).map_err(|e| e.to_string())?,
         last_analysis: db::last_finished_analysis_batch(conn).map_err(|e| e.to_string())?,
         retry_waiting,
-        pending_analysis: db::count_pending_papers_in_discovery(conn).unwrap_or(0),
-        analysis_failed: db::count_by_status_in_discovery(conn, "analysisFailed").unwrap_or(0),
-        waiting_for_abstract: db::count_waiting_for_abstract_in_discovery_batch(conn, &local_day).unwrap_or(0),
+        pending_analysis: db::count_pending_papers_in_current_discovery_batch(conn, &cycle_key).unwrap_or(0),
+        analysis_failed: db::count_by_status_in_current_discovery_batch(conn, "analysisFailed", &cycle_key).unwrap_or(0),
+        waiting_for_abstract: db::count_waiting_for_abstract_in_current_discovery_batch(conn, &cycle_key).unwrap_or(0),
     })
 }
 
@@ -2293,6 +2296,13 @@ pub fn run() {
             let db_path = data_dir.join("cowpaper.db");
             let conn = db::open(&db_path)?;
             db::init(&conn)?;
+            // One-time-per-startup safety pass for active Discovery analysis
+            // left by the pre-current-batch rerank bug. It is deliberately
+            // before queue recovery/coordinator startup and is idempotent.
+            let current_cycle_key = db::current_discovery_cycle_key(&conn);
+            if let Err(error) = db::reconcile_legacy_discovery_analysis_queue(&conn, &current_cycle_key) {
+                eprintln!("legacy Discovery analysis reconciliation failed: {}", error);
+            }
             // 上次进程若在同步期间退出，持久化的 running batch 已不可能继续；
             // 先收尾，避免它永久遮蔽随后完成的同步进度。
             let _ = db::recover_interrupted_sync_batches(&conn);

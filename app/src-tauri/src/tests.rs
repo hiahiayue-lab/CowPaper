@@ -574,6 +574,141 @@ fn test_queue_db_mechanics() {
 }
 
 #[test]
+fn legacy_discovery_queue_reconciliation_is_current_only_and_idempotent() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "Reconciliation Journal", Some("0025-1909"), None, None, None).unwrap();
+    let cycle = db::current_discovery_cycle_key(&conn);
+    let old_cycle = "2000-01-01";
+    let mut current = Vec::new();
+    let mut history = Vec::new();
+    for index in 0..6 {
+        let id = match db::upsert_paper(
+            &conn,
+            jid,
+            &candidate(
+                Some(&format!("10.1000/reconcile-{index}")),
+                &format!("Reconcile {index}"),
+                Some("complete abstract"),
+                Some("crossref"),
+            ),
+        ).unwrap() {
+            UpsertOutcome::New(id) => id,
+            _ => panic!("expected new paper"),
+        };
+        conn.execute("UPDATE papers SET first_seen_cycle=?1, analysis_status='queued' WHERE id=?2", params![if index < 3 { cycle.as_str() } else { old_cycle }, id]).unwrap();
+        if index < 3 {
+            current.push(id);
+        } else {
+            history.push(id);
+        }
+    }
+    let current_sync = db::create_sync_batch(&conn, "today").unwrap();
+    let history_sync = db::create_sync_batch(&conn, "history").unwrap();
+    db::add_sync_batch_papers(&conn, current_sync, &current, &[], &[]).unwrap();
+    db::add_sync_batch_papers(&conn, history_sync, &history, &[], &[]).unwrap();
+
+    // A Library-only paper is also present in the polluted batch, but is not
+    // a Discovery member and must never survive as queue work.
+    let library_id = match db::upsert_paper(
+        &conn,
+        jid,
+        &candidate(Some("10.1000/reconcile-library"), "Library only", Some("complete abstract"), Some("pdf")),
+    ).unwrap() {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new paper"),
+    };
+    db::add_paper_to_library(&conn, library_id, &[], &[], "external_pdf_import").unwrap();
+    conn.execute("UPDATE papers SET analysis_status='queued' WHERE id=?1", params![library_id]).unwrap();
+
+    let mut polluted = current.clone();
+    polluted.extend(history.iter().copied());
+    polluted.push(library_id);
+    let batch_id = db::create_analysis_batch(&conn, "tagConfigUpdate", None, None, None, None, &polluted).unwrap();
+    conn.execute(
+        "UPDATE papers SET total_score=4.2, tag_matches_json='[{\"tag\":\"historical\",\"score\":1.0}]', evidence_hash='keep-analysis', analyzed_at='2026-09-12T00:00:00Z' WHERE id=?1",
+        params![history[0]],
+    ).unwrap();
+    assert_eq!(db::count_active_queue_in_current_discovery_batch(&conn, &cycle).unwrap(), 3);
+
+    let first = db::reconcile_legacy_discovery_analysis_queue(&conn, &cycle).unwrap();
+    assert_eq!(first.cancelled_items, 7, "the contaminated mixed batch is cancelled as a unit");
+    assert_eq!(db::list_queued_ids(&conn, 100).unwrap(), current);
+    assert_eq!(db::count_active_queue(&conn).unwrap(), 3, "current analysis count is not polluted by history");
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM analysis_batch_items WHERE analysis_batch_id=?1 AND status IN ('queued','running') AND paper_id NOT IN (?2,?3,?4)", params![batch_id, current[0], current[1], current[2]], |row| row.get::<_, i64>(0)).unwrap(), 0);
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM papers WHERE id IN (?1,?2,?3,?4) AND analysis_status IN ('pendingAnalysis','queued','analyzing')", params![history[0], history[1], history[2], library_id], |row| row.get::<_, i64>(0)).unwrap(), 0);
+    assert_eq!(conn.query_row("SELECT total_score,tag_matches_json,evidence_hash FROM papers WHERE id=?1", params![history[0]], |row| Ok((row.get::<_, Option<f64>>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, Option<String>>(2)?))).unwrap(), (Some(4.2), Some("[{\"tag\":\"historical\",\"score\":1.0}]".to_string()), Some("keep-analysis".to_string())));
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM recommendation_items", [], |row| row.get::<_, i64>(0)).unwrap(), 0, "reconciliation does not touch recommendation history");
+
+    for id in &current {
+        db::set_paper_status(&conn, *id, "pendingAnalysis").unwrap();
+    }
+    assert_eq!(crate::build_activity_state(&conn).unwrap().pending_analysis, 3, "Activity counts only current Today pending papers");
+    for id in &current {
+        db::enqueue_paper(&conn, *id).unwrap();
+    }
+    assert_eq!(db::count_active_queue(&conn).unwrap(), 3);
+
+    // The queue admission guard also rejects a future stale caller scope,
+    // while still allowing a current Today paper to be re-enqueued.
+    db::set_paper_status(&conn, history[1], "pendingAnalysis").unwrap();
+    db::enqueue_paper(&conn, history[1]).unwrap();
+    assert_eq!(db::get_analysis_status(&conn, history[1]).unwrap().as_deref(), Some("pendingAnalysis"));
+    db::set_paper_status(&conn, current[0], "pendingAnalysis").unwrap();
+    db::enqueue_paper(&conn, current[0]).unwrap();
+    assert_eq!(db::get_analysis_status(&conn, current[0]).unwrap().as_deref(), Some("queued"));
+
+    let second = db::reconcile_legacy_discovery_analysis_queue(&conn, &cycle).unwrap();
+    assert_eq!(second, db::DiscoveryAnalysisReconciliation::default(), "second startup pass is a no-op");
+    assert_eq!(db::count_active_queue(&conn).unwrap(), 3);
+    let mut queued = db::list_queued_ids(&conn, 100).unwrap();
+    queued.sort_unstable();
+    assert_eq!(queued, current);
+}
+
+#[test]
+fn legacy_discovery_queue_reconciliation_empty_today_clears_persisted_counter() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "Empty Today Journal", Some("0025-1909"), None, None, None).unwrap();
+    let cycle = db::current_discovery_cycle_key(&conn);
+    let old_cycle = "2000-01-01";
+    let mut history = Vec::new();
+    for index in 0..3 {
+        let id = match db::upsert_paper(
+            &conn,
+            jid,
+            &candidate(Some(&format!("10.1000/reconcile-empty-{index}")), &format!("History only {index}"), Some("complete abstract"), Some("crossref")),
+        ).unwrap() {
+            UpsertOutcome::New(id) => id,
+            _ => panic!("expected new paper"),
+        };
+        conn.execute("UPDATE papers SET first_seen_cycle=?1, analysis_status='queued' WHERE id=?2", params![old_cycle, id]).unwrap();
+        history.push(id);
+    }
+    let sync = db::create_sync_batch(&conn, "history").unwrap();
+    db::add_sync_batch_papers(&conn, sync, &history, &[], &[]).unwrap();
+    let batch_id = db::create_analysis_batch(&conn, "syncAutoAnalysis", None, None, Some(sync), None, &history).unwrap();
+    db::set_setting(&conn, "queue.state", "paused").unwrap();
+    db::set_setting(&conn, "queue.batch_size", "782").unwrap();
+    db::set_setting(&conn, "ai.last_remaining", "782").unwrap();
+
+    let first = db::reconcile_legacy_discovery_analysis_queue(&conn, &cycle).unwrap();
+    assert_eq!(first.cancelled_items, 3);
+    assert_eq!(db::count_active_queue(&conn).unwrap(), 0);
+    assert!(db::list_queued_ids(&conn, 100).unwrap().is_empty());
+    assert_eq!(conn.query_row("SELECT status FROM analysis_batches WHERE id=?1", params![batch_id], |row| row.get::<_, String>(0)).unwrap(), "stopped");
+    assert_eq!(conn.query_row("SELECT remaining FROM analysis_batches WHERE id=?1", params![batch_id], |row| row.get::<_, i64>(0)).unwrap(), 0);
+    assert!(db::get_current_analysis_batch(&conn).unwrap().is_none());
+    assert_eq!(db::get_setting(&conn, "queue.state").as_deref(), Some("idle"));
+    assert_eq!(db::get_setting(&conn, "queue.batch_size").as_deref(), Some("0"));
+    assert_eq!(db::get_setting(&conn, "ai.last_remaining").as_deref(), Some("0"));
+    assert_eq!(db::count_pending_papers_in_current_discovery_batch(&conn, &cycle).unwrap(), 0);
+
+    let second = db::reconcile_legacy_discovery_analysis_queue(&conn, &cycle).unwrap();
+    assert_eq!(second, db::DiscoveryAnalysisReconciliation::default());
+    assert_eq!(db::count_active_queue(&conn).unwrap(), 0);
+}
+
+#[test]
 fn test_retry_logic() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;

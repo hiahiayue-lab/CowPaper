@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 use lopdf::{Document, LoadOptions, Object};
 use quick_xml::events::Event;
 use quick_xml::Reader;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -1468,6 +1468,202 @@ pub fn current_discovery_batch_paper_ids(conn: &Connection, cycle_key: &str) -> 
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params![cycle_key], |r| r.get::<_, i64>(0))?;
     rows.collect()
+}
+
+/// The one persisted positive membership key used by current Discovery UI and
+/// queue bookkeeping. This deliberately follows the recommendation cutoff,
+/// rather than the wall-clock calendar date.
+pub fn current_discovery_cycle_key(conn: &Connection) -> String {
+    let daily_check_time = get_setting(conn, "settings.daily_sync_time")
+        .unwrap_or_else(|| "09:00".to_string());
+    crate::recommendation::cycle_key_for(&chrono::Local::now(), &daily_check_time)
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct DiscoveryAnalysisReconciliation {
+    pub cancelled_items: usize,
+    pub papers_recovered_to_success: usize,
+    pub papers_recovered_to_waiting: usize,
+    pub papers_quarantined_as_failed: usize,
+    pub batches_stopped: usize,
+}
+
+/// Reconcile active Discovery analysis work left by the pre-current-batch
+/// rerank bug. Only persisted Discovery batch triggers that can represent
+/// that workflow are considered; explicit manual batches remain untouched.
+/// Library-only queued/analyzing papers are always invalid for this subsystem
+/// and are quarantined even when no AnalysisBatch row remains.
+///
+/// This runs before the queue coordinator starts, so changing an item from
+/// queued/running to cancelled cannot race a live worker. It never removes
+/// analysis fields or recommendation snapshots. A paper with a real result is
+/// restored to `analysisSucceeded`; a paper without an abstract returns to
+/// `waitingForAbstract`; an analyzable paper with no result is quarantined as
+/// `analysisFailed` so it cannot silently re-enter the AI queue.
+pub fn reconcile_legacy_discovery_analysis_queue(
+    conn: &Connection,
+    cycle_key: &str,
+) -> Result<DiscoveryAnalysisReconciliation> {
+    let current_ids = current_discovery_batch_paper_ids(conn, cycle_key)?
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let mut affected: HashMap<i64, Vec<i64>> = HashMap::new();
+    let mut stmt = conn.prepare(
+        "SELECT abi.analysis_batch_id, abi.paper_id
+         FROM analysis_batch_items abi
+         JOIN analysis_batches ab ON ab.id = abi.analysis_batch_id
+         WHERE ab.status IN ('running','paused')
+           AND abi.status IN ('queued','running')
+           AND ab.trigger IN ('tagConfigUpdate','syncAutoAnalysis','autoAfterSync','resumeRecovered')
+         ORDER BY abi.analysis_batch_id, abi.id",
+    )?;
+    let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
+    for row in rows {
+        let (batch_id, paper_id) = row?;
+        if !current_ids.contains(&paper_id) {
+            affected.entry(batch_id).or_default().push(paper_id);
+        }
+    }
+    let mut standalone_library_ids = Vec::new();
+    let mut library_stmt = conn.prepare(&format!(
+        "SELECT p.id FROM papers p
+         WHERE p.analysis_status IN ('queued','analyzing') AND {} ORDER BY p.id",
+        LIBRARY_ONLY_PREDICATE
+    ))?;
+    let library_rows = library_stmt.query_map([], |row| row.get::<_, i64>(0))?;
+    for row in library_rows {
+        standalone_library_ids.push(row?);
+    }
+    if affected.is_empty() && standalone_library_ids.is_empty() {
+        return Ok(DiscoveryAnalysisReconciliation::default());
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    let now = now_utc();
+    let mut report = DiscoveryAnalysisReconciliation::default();
+    let mut paper_ids = HashSet::new();
+    for (batch_id, ids) in &affected {
+        // Stop the contaminated batch as a unit. Current Today papers keep
+        // their paper-level queued/analyzing state and can be placed into a
+        // fresh current-only batch; their old batch item must not keep an
+        // obsolete mixed-scope batch alive.
+        let changed = tx.execute(
+            "UPDATE analysis_batch_items
+             SET status='cancelled', error_type='scopeReconciled',
+                 error_summary='Removed legacy Discovery rerank contamination',
+                 finished_at=?1
+             WHERE analysis_batch_id=?2 AND status IN ('queued','running')",
+            params![now, batch_id],
+        )?;
+        report.cancelled_items += changed;
+        for paper_id in ids {
+            paper_ids.insert(*paper_id);
+        }
+        recompute_analysis_aggregate(&tx, *batch_id)?;
+    }
+    paper_ids.extend(standalone_library_ids);
+
+    for paper_id in paper_ids {
+        let state = tx
+            .query_row(
+                "SELECT analysis_status, evidence_hash, analyzed_at, abstract, abstract_status
+                 FROM papers WHERE id=?1",
+                params![paper_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((status, evidence_hash, analyzed_at, abstract_text, abstract_status)) = state else {
+            continue;
+        };
+        if !matches!(status.as_str(), "queued" | "analyzing") {
+            continue;
+        }
+        let next = if evidence_hash.as_deref().is_some_and(|value| !value.trim().is_empty())
+            && analyzed_at.as_deref().is_some_and(|value| !value.trim().is_empty())
+        {
+            report.papers_recovered_to_success += 1;
+            ST_SUCCEEDED
+        } else if abstract_text.as_deref().is_none_or(|value| value.trim().is_empty())
+            || abstract_status.as_deref() == Some("not_expected")
+        {
+            report.papers_recovered_to_waiting += 1;
+            ST_WAITING_ABSTRACT
+        } else {
+            report.papers_quarantined_as_failed += 1;
+            "analysisFailed"
+        };
+        tx.execute(
+            "UPDATE papers SET analysis_status=?1, queued_at=NULL, updated_at=?2 WHERE id=?3",
+            params![next, now, paper_id],
+        )?;
+    }
+
+    for batch_id in affected.keys() {
+        tx.execute(
+            "UPDATE analysis_batches SET status='stopped', finished_at=?1,
+                error_summary=COALESCE(NULLIF(error_summary,''),'Legacy Discovery queue scope reconciled')
+             WHERE id=?2 AND status IN ('running','paused')",
+            params![now, batch_id],
+        )?;
+        report.batches_stopped += 1;
+    }
+    tx.commit()?;
+
+    // Remove stale persisted queue bookkeeping only when this reconciliation
+    // actually touched a legacy batch. This keeps ordinary/manual batches
+    // intact while preventing the old remaining count from resurfacing after
+    // restart. The canonical paper analysis columns are never cleared.
+    let current_active = count_active_queue_in_current_discovery_batch(conn, cycle_key)?;
+    let any_active: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM papers WHERE analysis_status IN ('queued','analyzing')",
+        [],
+        |row| row.get(0),
+    )?;
+    if current_active > 0 {
+        for (key, value) in [
+            ("queue.state", "paused"),
+            ("queue.analysis_batch_id", "0"),
+            ("queue.batch_size", "0"),
+            ("queue.success", "0"),
+            ("queue.failed", "0"),
+            ("queue.skipped", "0"),
+            ("queue.current_paper_id", ""),
+            ("queue.current_paper_started_at", ""),
+            ("queue.retry_waiting", "0"),
+            ("queue.retry_until", ""),
+            ("queue.last_error", ""),
+            ("ai.last_remaining", "0"),
+        ] {
+            set_setting(conn, key, value)?;
+        }
+        set_setting(conn, "queue.batch_size", &current_active.to_string())?;
+    } else if any_active == 0 {
+        for (key, value) in [
+            ("queue.state", "idle"),
+            ("queue.analysis_batch_id", "0"),
+            ("queue.batch_size", "0"),
+            ("queue.success", "0"),
+            ("queue.failed", "0"),
+            ("queue.skipped", "0"),
+            ("queue.current_paper_id", ""),
+            ("queue.current_paper_started_at", ""),
+            ("queue.retry_waiting", "0"),
+            ("queue.retry_until", ""),
+            ("queue.last_error", ""),
+            ("ai.last_remaining", "0"),
+        ] {
+            set_setting(conn, key, value)?;
+        }
+    }
+    Ok(report)
 }
 
 fn list_papers_filtered(conn: &Connection, journal_id: Option<i64>, limit: i64, discovery_only: bool) -> Result<Vec<Paper>> {
@@ -5817,6 +6013,26 @@ pub fn count_waiting_for_abstract(conn: &Connection) -> Result<i64> {
     )
 }
 
+/// Current Today missing-abstract count. Unlike the sync report's historical
+/// count, Activity must use the same explicit positive cycle membership as the
+/// Discovery work queue.
+pub fn count_waiting_for_abstract_in_current_discovery_batch(
+    conn: &Connection,
+    cycle_key: &str,
+) -> Result<i64> {
+    conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM papers p
+             WHERE p.first_seen_cycle = ?1
+               AND p.analysis_status = 'waitingForAbstract'
+               AND {}",
+            DISCOVERY_MEMBERSHIP_PREDICATE
+        ),
+        params![cycle_key],
+        |r| r.get(0),
+    )
+}
+
 /// Current missing-abstract papers from today's local Discovery batches.
 /// A paper can occur more than once, so Activity counts canonical paper ids.
 /// This is a live count and deliberately does not touch first-seen snapshots.
@@ -5836,7 +6052,7 @@ pub fn count_waiting_for_abstract_in_discovery_batch(
     )
 }
 
-/// 待分析（历史积压）数量：有摘要且尚未分析。
+/// 待分析数量：只计算当前 Today Discovery cycle 中有摘要且尚未分析的 Paper。
 pub fn count_pending_papers(conn: &Connection) -> Result<i64> {
     conn.query_row(
         "SELECT COUNT(*) FROM papers WHERE analysis_status = 'pendingAnalysis' AND abstract IS NOT NULL AND abstract != ''",
@@ -5846,15 +6062,23 @@ pub fn count_pending_papers(conn: &Connection) -> Result<i64> {
 }
 
 pub fn count_pending_papers_in_discovery(conn: &Connection) -> Result<i64> {
+    count_pending_papers_in_current_discovery_batch(conn, &current_discovery_cycle_key(conn))
+}
+
+pub fn count_pending_papers_in_current_discovery_batch(
+    conn: &Connection,
+    cycle_key: &str,
+) -> Result<i64> {
     conn.query_row(
         &format!(
             "SELECT COUNT(*) FROM papers p
-             WHERE p.analysis_status = 'pendingAnalysis'
+             WHERE p.first_seen_cycle = ?1
+               AND p.analysis_status = 'pendingAnalysis'
                AND p.abstract IS NOT NULL AND p.abstract != ''
                AND {}",
             DISCOVERY_MEMBERSHIP_PREDICATE
         ),
-        [],
+        params![cycle_key],
         |r| r.get(0),
     )
 }
@@ -6696,16 +6920,24 @@ pub fn list_pending_papers(conn: &Connection, paper_ids: Option<&[i64]>) -> Resu
 /// points.  Library-only papers are deliberately absent even when they have
 /// a complete abstract from local PDF enrichment.
 pub fn list_pending_discovery_papers(conn: &Connection) -> Result<Vec<Paper>> {
+    list_pending_papers_in_current_discovery_batch(conn, &current_discovery_cycle_key(conn))
+}
+
+pub fn list_pending_papers_in_current_discovery_batch(
+    conn: &Connection,
+    cycle_key: &str,
+) -> Result<Vec<Paper>> {
     let sql = format!(
         "SELECT p.*, COALESCE(NULLIF(trim(p.container_title), ''), j.name) AS journal_name
          FROM papers p JOIN journals j ON j.id = p.journal_id
-         WHERE p.analysis_status IN ('pendingAnalysis','analysisFailed')
+         WHERE p.first_seen_cycle = ?1
+           AND p.analysis_status IN ('pendingAnalysis','analysisFailed')
            AND p.abstract IS NOT NULL AND p.abstract != ''
            AND {}",
         DISCOVERY_MEMBERSHIP_PREDICATE
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([], row_to_paper)?;
+    let rows = stmt.query_map(params![cycle_key], row_to_paper)?;
     rows.collect()
 }
 
@@ -6923,46 +7155,78 @@ pub fn count_by_status(conn: &Connection, status: &str) -> Result<i64> {
 }
 
 pub fn count_by_status_in_discovery(conn: &Connection, status: &str) -> Result<i64> {
+    count_by_status_in_current_discovery_batch(conn, status, &current_discovery_cycle_key(conn))
+}
+
+pub fn count_by_status_in_current_discovery_batch(
+    conn: &Connection,
+    status: &str,
+    cycle_key: &str,
+) -> Result<i64> {
     conn.query_row(
         &format!(
             "SELECT COUNT(*) FROM papers p
-             WHERE p.analysis_status = ?1 AND {}",
+             WHERE p.first_seen_cycle = ?1
+               AND p.analysis_status = ?2 AND {}",
             DISCOVERY_MEMBERSHIP_PREDICATE
         ),
-        params![status],
+        params![cycle_key, status],
         |r| r.get(0),
     )
 }
 
 /// 队列中尚未完成的论文数（queued + analyzing）。
 pub fn count_active_queue(conn: &Connection) -> Result<i64> {
+    count_active_queue_in_current_discovery_batch(conn, &current_discovery_cycle_key(conn))
+}
+
+pub fn count_active_queue_in_current_discovery_batch(
+    conn: &Connection,
+    cycle_key: &str,
+) -> Result<i64> {
     conn.query_row(
         &format!(
             "SELECT COUNT(*) FROM papers p
-             WHERE p.analysis_status IN ('queued','analyzing') AND {}",
+             WHERE p.first_seen_cycle = ?1
+               AND p.analysis_status IN ('queued','analyzing') AND {}",
             DISCOVERY_MEMBERSHIP_PREDICATE
         ),
-        [],
+        params![cycle_key],
         |r| r.get(0),
     )
 }
 
 pub fn list_queued_ids(conn: &Connection, limit: i64) -> Result<Vec<i64>> {
+    list_queued_ids_in_current_discovery_batch(conn, limit, &current_discovery_cycle_key(conn))
+}
+
+pub fn list_queued_ids_in_current_discovery_batch(
+    conn: &Connection,
+    limit: i64,
+    cycle_key: &str,
+) -> Result<Vec<i64>> {
     let sql = format!(
         "SELECT p.id FROM papers p
-         WHERE p.analysis_status = 'queued' AND {} ORDER BY p.queued_at ASC, p.id ASC LIMIT ?1",
+         WHERE p.first_seen_cycle = ?1
+           AND p.analysis_status = 'queued' AND {} ORDER BY p.queued_at ASC, p.id ASC LIMIT ?2",
         DISCOVERY_MEMBERSHIP_PREDICATE
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params![limit], |r| r.get::<_, i64>(0))?;
+    let rows = stmt.query_map(params![cycle_key, limit], |r| r.get::<_, i64>(0))?;
     rows.collect()
 }
 
 /// 仅把 pendingAnalysis 论文入队（已成功/已入队的不重复入队）。
 pub fn enqueue_paper(conn: &Connection, id: i64) -> Result<()> {
+    let cycle_key = current_discovery_cycle_key(conn);
     conn.execute(
-        "UPDATE papers SET analysis_status = 'queued', queued_at = ?1, retry_count = 0, updated_at = ?1 WHERE id = ?2 AND analysis_status = 'pendingAnalysis'",
-        params![now_utc(), id],
+        &format!(
+            "UPDATE papers AS p SET analysis_status = 'queued', queued_at = ?1, retry_count = 0, updated_at = ?1
+             WHERE p.id = ?2 AND p.analysis_status = 'pendingAnalysis'
+               AND p.first_seen_cycle = ?3 AND {}",
+            DISCOVERY_MEMBERSHIP_PREDICATE
+        ),
+        params![now_utc(), id, cycle_key],
     )?;
     Ok(())
 }
@@ -6977,33 +7241,42 @@ pub fn set_paper_status(conn: &Connection, id: i64, status: &str) -> Result<()> 
 
 /// 停止：未完成的 queued/analyzing 论文退回 pendingAnalysis（不得标为失败）。
 pub fn revert_active_to_pending(conn: &Connection) -> Result<()> {
+    let cycle_key = current_discovery_cycle_key(conn);
     conn.execute(
-        "UPDATE papers SET analysis_status = 'pendingAnalysis', updated_at = ?1 WHERE analysis_status IN ('queued','analyzing')",
-        params![now_utc()],
+        &format!(
+            "UPDATE papers AS p SET analysis_status = 'pendingAnalysis', updated_at = ?1
+             WHERE p.first_seen_cycle = ?2
+               AND p.analysis_status IN ('queued','analyzing') AND {}",
+            DISCOVERY_MEMBERSHIP_PREDICATE
+        ),
+        params![now_utc(), cycle_key],
     )?;
     Ok(())
 }
 
 /// 启动恢复：中断的 analyzing 论文退回 queued（作为剩余任务继续）。
 pub fn recover_analyzing_to_queued(conn: &Connection) -> Result<()> {
+    let cycle_key = current_discovery_cycle_key(conn);
     // Any interrupted Library-only work is quarantined back to pending first.
     // It must never be reintroduced into the Discovery queue merely because
     // an old process left an `analyzing` status behind.
     conn.execute(
         &format!(
             "UPDATE papers AS p SET analysis_status = 'pendingAnalysis', queued_at = NULL, updated_at = ?1
-             WHERE p.analysis_status = 'analyzing' AND NOT ({})",
+             WHERE p.analysis_status = 'analyzing'
+               AND NOT (p.first_seen_cycle = ?2 AND {})",
             DISCOVERY_MEMBERSHIP_PREDICATE
         ),
-        params![now_utc()],
+        params![now_utc(), cycle_key],
     )?;
     conn.execute(
         &format!(
             "UPDATE papers AS p SET analysis_status = 'queued', queued_at = ?1, updated_at = ?1
-             WHERE p.analysis_status = 'analyzing' AND {}",
+             WHERE p.analysis_status = 'analyzing'
+               AND p.first_seen_cycle = ?2 AND {}",
             DISCOVERY_MEMBERSHIP_PREDICATE
         ),
-        params![now_utc()],
+        params![now_utc(), cycle_key],
     )?;
     Ok(())
 }
@@ -7025,13 +7298,21 @@ pub fn list_failed_ids(conn: &Connection) -> Result<Vec<i64>> {
 }
 
 pub fn list_failed_ids_in_discovery(conn: &Connection) -> Result<Vec<i64>> {
+    list_failed_ids_in_current_discovery_batch(conn, &current_discovery_cycle_key(conn))
+}
+
+pub fn list_failed_ids_in_current_discovery_batch(
+    conn: &Connection,
+    cycle_key: &str,
+) -> Result<Vec<i64>> {
     let sql = format!(
         "SELECT p.id FROM papers p
-         WHERE p.analysis_status = 'analysisFailed' AND {} ORDER BY p.id",
+         WHERE p.first_seen_cycle = ?1
+           AND p.analysis_status = 'analysisFailed' AND {} ORDER BY p.id",
         DISCOVERY_MEMBERSHIP_PREDICATE
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+    let rows = stmt.query_map(params![cycle_key], |r| r.get::<_, i64>(0))?;
     rows.collect()
 }
 
@@ -7971,10 +8252,15 @@ pub fn paper_ids_with_tag_names_in_current_discovery_batch(
 
 /// Tag-only 入队：允许从 succeeded/failed/pendingAnalysis 进入 queued（不限于 pendingAnalysis）。
 pub fn enqueue_for_tag_update(conn: &Connection, id: i64) -> Result<()> {
+    let cycle_key = current_discovery_cycle_key(conn);
     conn.execute(
-        "UPDATE papers SET analysis_status = 'queued', queued_at = ?1, retry_count = 0, updated_at = ?1
-         WHERE id = ?2 AND analysis_status IN ('analysisSucceeded','analysisFailed','pendingAnalysis')",
-        params![now_utc(), id],
+        &format!(
+            "UPDATE papers AS p SET analysis_status = 'queued', queued_at = ?1, retry_count = 0, updated_at = ?1
+             WHERE p.id = ?2 AND p.analysis_status IN ('analysisSucceeded','analysisFailed','pendingAnalysis')
+               AND p.first_seen_cycle = ?3 AND {}",
+            DISCOVERY_MEMBERSHIP_PREDICATE
+        ),
+        params![now_utc(), id, cycle_key],
     )?;
     Ok(())
 }
