@@ -1668,8 +1668,12 @@ interface RenderPaperOptions {
 function renderPaperCard(p: Paper, opts: RenderPaperOptions): string {
   const cardInstanceId = `${opts.context}:paper:${p.id}`;
   cardPaperState.set(cardInstanceId, p);
+  const isHistory = opts.context.startsWith("history:");
   const cls = p.isIgnored ? "card paper ignored" : "card paper";
-  const status = p.analysisStatus === "analysisSucceeded" ? "" : `<span class="chip muted-chip">${statusLabel(p.analysisStatus)}</span>`;
+  // Recommendation history has no status/tag-match snapshot in the v20
+  // schema. Never render those live canonical fields as if they were the
+  // historical state; score/rank below come from recommendation_items.
+  const status = !isHistory && p.analysisStatus !== "analysisSucceeded" ? `<span class="chip muted-chip">${statusLabel(p.analysisStatus)}</span>` : "";
   const titleZh = p.chineseTitle ? `<div class="paper-title">${escapeHtml(p.chineseTitle)}</div>` : "";
   const titleEn = p.chineseTitle
     ? `<div class="paper-title-en">${escapeHtml(p.title || "")}</div>`
@@ -1683,10 +1687,10 @@ function renderPaperCard(p: Paper, opts: RenderPaperOptions): string {
   const summary = p.oneSentenceSummary
     ? `<div class="paper-summary">${escapeHtml(p.oneSentenceSummary)}${partialAiNote}</div>`
     : partialAiNote;
-  const displayScore = opts.scoreOverride ?? p.totalScore;
+  const displayScore = opts.scoreOverride ?? (isHistory ? null : p.totalScore);
   const scoreBadge = displayScore != null ? `<span class="score-badge">总分 ${displayScore.toFixed(1)}</span>` : "";
   // 研究标签评分 + 总分同一 score row（标签在前、总分最后）
-  const scoreRow = `<div class="score-row">${tagChips(p.tagMatches)}${scoreBadge}</div>`;
+  const scoreRow = `<div class="score-row">${isHistory ? "" : tagChips(p.tagMatches)}${scoreBadge}</div>`;
   // 历史快照行：固定用当日 rank / 当日 score_snapshot（当前分不显示，避免混乱）
   const rankLine =
     opts.rank != null && opts.scoreSnapshot != null

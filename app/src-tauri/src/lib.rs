@@ -746,7 +746,8 @@ fn save_tag_config(items: Vec<models::TagDraftItem>, mode: String, state: State<
     }
     // immediate：先持久化（diff 需要新 active 生成）
     let conn = state.inner().lock().unwrap();
-    let mut res = tag_config::save_immediate_config(&conn, &items)?;
+    let current_cycle_key = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let mut res = tag_config::save_immediate_config_in_current_discovery_batch(&conn, &items, &current_cycle_key)?;
     // AI-needed：added + semanticChanged（active tags 语义）
     let need_ai: Vec<String> = res
         .diff
@@ -763,8 +764,13 @@ fn save_tag_config(items: Vec<models::TagDraftItem>, mode: String, state: State<
             .filter(|(_, name, _)| need_ai.iter().any(|n| n == name))
             .cloned()
             .collect();
-        // eligible papers：有摘要且非已分析成功（或 hash stale）—— 简化：所有有摘要且 tag 缺失/stale
-        let paper_ids = db::papers_needing_tag_scores_in_discovery(&conn, &targets).map_err(|e| e.to_string())?;
+        // Only the explicit current Today batch may receive tag-only AI work.
+        let paper_ids = db::papers_needing_tag_scores_in_current_discovery_batch(
+            &conn,
+            &targets,
+            &current_cycle_key,
+        )
+        .map_err(|e| e.to_string())?;
         res.ai_needed_papers = paper_ids.len() as i64;
         if !paper_ids.is_empty() && !targets.is_empty() {
             queue.cmd_tx
@@ -857,7 +863,12 @@ fn activate_scheduled_tag_config_if_due(conn: &rusqlite::Connection, queue: &AiQ
         .collect();
     // 本地重算 removed/disabled
     if !diff.removed.is_empty() || !diff.disabled.is_empty() {
-        let local = db::paper_ids_with_tag_names(conn, &diff.removed, &diff.disabled)
+        let local = db::paper_ids_with_tag_names_in_current_discovery_batch(
+            conn,
+            &diff.removed,
+            &diff.disabled,
+            current_cycle_key,
+        )
             .map_err(|e| e.to_string())?;
         let active = tag_config::active_tags(conn)?;
         for pid in local {
@@ -872,7 +883,12 @@ fn activate_scheduled_tag_config_if_due(conn: &rusqlite::Connection, queue: &AiQ
             .filter(|(_, name, _)| need_ai.iter().any(|n| n == name))
             .cloned()
             .collect();
-        let paper_ids = db::papers_needing_tag_scores_in_discovery(conn, &targets).map_err(|e| e.to_string())?;
+        let paper_ids = db::papers_needing_tag_scores_in_current_discovery_batch(
+            conn,
+            &targets,
+            current_cycle_key,
+        )
+        .map_err(|e| e.to_string())?;
         if !paper_ids.is_empty() && !targets.is_empty() {
             let _ = queue.cmd_tx.send(crate::ai_queue::QueueCommand::TagOnlyBatch {
                 paper_ids,

@@ -1451,6 +1451,25 @@ pub fn discovery_eligible_ids(conn: &Connection, paper_ids: &[i64]) -> Result<Ve
     rows.collect()
 }
 
+/// Return the explicit membership of the current Today Discovery batch.
+///
+/// `first_seen_cycle` is the persisted Today membership used by the Today
+/// view (`list_papers_for_first_seen_cycle`).  It is a positive, immutable
+/// Discovery-batch marker; unlike `created_at` or a `history=false` filter it
+/// does not guess membership from age or absence.  The independent Discovery
+/// membership predicate also keeps Library-only papers out of this scope.
+pub fn current_discovery_batch_paper_ids(conn: &Connection, cycle_key: &str) -> Result<Vec<i64>> {
+    let sql = format!(
+        "SELECT p.id FROM papers p
+         WHERE p.first_seen_cycle = ?1 AND {}
+         ORDER BY p.id ASC",
+        DISCOVERY_MEMBERSHIP_PREDICATE
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![cycle_key], |r| r.get::<_, i64>(0))?;
+    rows.collect()
+}
+
 fn list_papers_filtered(conn: &Connection, journal_id: Option<i64>, limit: i64, discovery_only: bool) -> Result<Vec<Paper>> {
     let sql = format!(
         "SELECT p.*, COALESCE(NULLIF(trim(p.container_title), ''), j.name) AS journal_name FROM papers p
@@ -7801,6 +7820,22 @@ pub fn papers_needing_tag_scores_in_discovery(
     discovery_eligible_ids(conn, &ids)
 }
 
+/// Tag-only rerank scope for the explicit current Today Discovery batch.
+/// Historical Discovery papers are intentionally not candidates, even when
+/// their cached tag semantic hash is stale.
+pub fn papers_needing_tag_scores_in_current_discovery_batch(
+    conn: &Connection,
+    tags: &[(i64, String, String)],
+    cycle_key: &str,
+) -> Result<Vec<i64>> {
+    let current = current_discovery_batch_paper_ids(conn, cycle_key)?;
+    if current.is_empty() {
+        return Ok(Vec::new());
+    }
+    let needs = papers_needing_tag_scores(conn, tags)?;
+    Ok(needs.into_iter().filter(|id| current.contains(id)).collect())
+}
+
 /// 含指定 tag 名（removed/disabled）的 paper id 列表（本地重算用）。
 pub fn paper_ids_with_tag_names(conn: &Connection, removed: &[String], disabled: &[String]) -> Result<Vec<i64>> {
     let names: Vec<&str> = removed.iter().chain(disabled.iter()).map(|s| s.as_str()).collect();
@@ -7823,6 +7858,24 @@ pub fn paper_ids_with_tag_names(conn: &Connection, removed: &[String], disabled:
         }
     }
     Ok(out)
+}
+
+/// Local score recomputation counterpart to
+/// [`papers_needing_tag_scores_in_current_discovery_batch`].  Removing or
+/// disabling a Research Tag must not rewrite live canonical scores for
+/// historical Discovery papers during a manual current-batch rerank.
+pub fn paper_ids_with_tag_names_in_current_discovery_batch(
+    conn: &Connection,
+    removed: &[String],
+    disabled: &[String],
+    cycle_key: &str,
+) -> Result<Vec<i64>> {
+    let current = current_discovery_batch_paper_ids(conn, cycle_key)?;
+    if current.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids = paper_ids_with_tag_names(conn, removed, disabled)?;
+    Ok(ids.into_iter().filter(|id| current.contains(id)).collect())
 }
 
 /// Tag-only 入队：允许从 succeeded/failed/pendingAnalysis 进入 queued（不限于 pendingAnalysis）。

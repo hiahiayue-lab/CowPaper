@@ -172,6 +172,25 @@ pub fn save_scheduled_config(conn: &Connection, draft: &[TagDraftItem], effectiv
 /// 立即保存：写 tags 表（active）→ 新 active version → diff → 本地重算 → 返回 diff。
 /// AI-needed（added/semanticChanged）由调用方（命令层）启动 tag-only batch。
 pub fn save_immediate_config(conn: &Connection, draft: &[TagDraftItem]) -> Result<SaveTagConfigResult, String> {
+    save_immediate_config_inner(conn, draft, None)
+}
+
+/// Immediate config save used by the manual current-Today rerank command.
+/// Removed/disabled tags are recomputed only for the same explicit batch that
+/// is eligible for tag-only AI scoring; historical papers are not rewritten.
+pub fn save_immediate_config_in_current_discovery_batch(
+    conn: &Connection,
+    draft: &[TagDraftItem],
+    cycle_key: &str,
+) -> Result<SaveTagConfigResult, String> {
+    save_immediate_config_inner(conn, draft, Some(cycle_key))
+}
+
+fn save_immediate_config_inner(
+    conn: &Connection,
+    draft: &[TagDraftItem],
+    current_cycle_key: Option<&str>,
+) -> Result<SaveTagConfigResult, String> {
     // old = 保存前 tags 表当前状态（active 语义以 tags 表为准；version items 仅为历史快照）
     let old_tags = db::list_tags(conn).map_err(|e| e.to_string())?;
     let old_items: Vec<TagConfigItem> = old_tags
@@ -223,8 +242,17 @@ pub fn save_immediate_config(conn: &Connection, draft: &[TagDraftItem]) -> Resul
     let active = active_tags(conn)?;
     let mut local_paper_ids: Vec<i64> = Vec::new();
     if !diff.removed.is_empty() || !diff.disabled.is_empty() {
-        local_paper_ids = db::paper_ids_with_tag_names(conn, &diff.removed, &diff.disabled)
-            .map_err(|e| e.to_string())?;
+        local_paper_ids = match current_cycle_key {
+            Some(cycle_key) => db::paper_ids_with_tag_names_in_current_discovery_batch(
+                conn,
+                &diff.removed,
+                &diff.disabled,
+                cycle_key,
+            )
+            .map_err(|e| e.to_string())?,
+            None => db::paper_ids_with_tag_names(conn, &diff.removed, &diff.disabled)
+                .map_err(|e| e.to_string())?,
+        };
     }
     for pid in &local_paper_ids {
         recompute_paper_total_score(conn, *pid, &active).map_err(|e| e.to_string())?;

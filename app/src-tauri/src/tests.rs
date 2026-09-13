@@ -4833,6 +4833,118 @@ fn test_tag_only_merge_and_papers_needing() {
     assert!((s - 1.2).abs() < 1e-9, "total 1.2，实际 {}", s);
 }
 
+/// v0.3.0 RC blocker regression: a Research Tag rerank is scoped to the
+/// explicit current Today batch, not every historical sync_batch_papers row.
+/// Today = A/B/C/X; history-only = H1/H2/H3; the Library-only paper is also
+/// excluded even though it has a complete abstract and needs the tag score.
+#[test]
+fn test_current_discovery_batch_rerank_scope_excludes_history_and_library() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "Rerank scope", Some("0025-1909"), None, None, None).unwrap();
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let history = "2000-01-01";
+    let make = |doi: &str, title: &str| seed_paper_with_score(&conn, jid, doi, title, 1.0);
+
+    let a = make("10.1000/rerank-a", "A");
+    let b = make("10.1000/rerank-b", "B");
+    let c = make("10.1000/rerank-c", "C");
+    let x = make("10.1000/rerank-x", "X");
+    let h1 = make("10.1000/rerank-h1", "H1");
+    let h2 = make("10.1000/rerank-h2", "H2");
+    let h3 = make("10.1000/rerank-h3", "H3");
+    for id in [h1, h2, h3] {
+        conn.execute("UPDATE papers SET first_seen_cycle=?1 WHERE id=?2", params![history, id]).unwrap();
+    }
+
+    let mut library = candidate(
+        Some("10.1000/rerank-library-only"),
+        "Library only",
+        Some("complete library abstract"),
+        Some("pdf_structured"),
+    );
+    library.discovery_source = "external_pdf_import".into();
+    let library_id = match db::upsert_paper(&conn, jid, &library).unwrap() {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new library-only paper"),
+    };
+    db::add_paper_to_library(&conn, library_id, &[], &[], "external_pdf_import").unwrap();
+    assert!(db::is_library_only(&conn, library_id).unwrap());
+
+    let tag = db::add_tag(&conn, "Current batch tag", Some("rerank scope")).unwrap();
+    let targets = vec![(tag.id, "Current batch tag".to_string(), "rerank scope".to_string())];
+
+    // This is the old production selection: it proves why the historical
+    // leakage happened while preserving the generic helper for other callers.
+    let old_scope = db::papers_needing_tag_scores_in_discovery(&conn, &targets).unwrap();
+    assert!(old_scope.contains(&h1) && old_scope.contains(&h2) && old_scope.contains(&h3));
+    assert!(!old_scope.contains(&library_id));
+
+    let expected = vec![a, b, c, x];
+    assert_eq!(
+        db::current_discovery_batch_paper_ids(&conn, &today).unwrap(),
+        expected,
+        "Today scope must be explicit first_seen_cycle membership plus Discovery membership"
+    );
+    assert_eq!(
+        db::papers_needing_tag_scores_in_current_discovery_batch(&conn, &targets, &today).unwrap(),
+        expected,
+        "tag-only AI queue must contain A/B/C/X only"
+    );
+    assert_eq!(
+        db::papers_needing_tag_scores_in_current_discovery_batch(&conn, &targets, &today).unwrap(),
+        expected,
+        "repeated manual rerank must keep the same current-batch scope"
+    );
+    assert!(db::paper_ids_with_tag_names_in_current_discovery_batch(&conn, &["Current batch tag".into()], &[], &today).unwrap().is_empty(), "no tag match rows yet");
+    assert!(!expected.iter().any(|id| [h1, h2, h3, library_id].contains(id)));
+
+    // The same scope applies to local recomputation when a tag is disabled:
+    // current Today canonical scores may change, but historical canonical
+    // scores must not be rewritten as a side effect of today's rerank.
+    let hash = crate::tag_config::tag_semantic_hash(tag.id, "Current batch tag", "rerank scope");
+    let match_json = serde_json::json!([
+        {"tag":"Current batch tag","score":1.0,"tagId":tag.id,"semanticHash":hash}
+    ]).to_string();
+    for id in [a, h1] {
+        conn.execute("UPDATE papers SET tag_matches_json=?1, total_score=1.0 WHERE id=?2", params![&match_json, id]).unwrap();
+    }
+    crate::tag_config::save_immediate_config_in_current_discovery_batch(
+        &conn,
+        &[crate::models::TagDraftItem {
+            id: tag.id,
+            name: "Current batch tag".into(),
+            description: Some("rerank scope".into()),
+            enabled: false,
+            deleted: false,
+        }],
+        &today,
+    )
+    .unwrap();
+    let current_score: f64 = conn.query_row("SELECT total_score FROM papers WHERE id=?1", params![a], |r| r.get(0)).unwrap();
+    let history_score: f64 = conn.query_row("SELECT total_score FROM papers WHERE id=?1", params![h1], |r| r.get(0)).unwrap();
+    assert_eq!(current_score, 0.0, "Today 的 disabled tag 可本地重算");
+    assert_eq!(history_score, 1.0, "历史论文不得被当前 rerank 的本地重算改写");
+}
+
+/// The existing recommendation snapshot remains authoritative for historical
+/// rank/score when the canonical paper analysis fields are changed later.
+#[test]
+fn test_rerank_does_not_mutate_history_score_snapshot() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "History snapshot", Some("0025-1909"), None, None, None).unwrap();
+    let paper = seed_paper_with_score(&conn, jid, "10.1000/history-snapshot", "History", 2.0);
+    let run = db::create_recommendation_run(&conn, "2000-01-01", "finalized").unwrap();
+    conn.execute(
+        "INSERT INTO recommendation_items (run_id,paper_id,rank,score_snapshot,added_at) VALUES (?1,?2,1,7.5,?3)",
+        params![run, paper, db::now_utc()],
+    )
+    .unwrap();
+    db::save_analysis(&conn, paper, "新标题", "新摘要", "新总结", "[]", 9.9, "m", "v1", "new-hash").unwrap();
+    let item = db::list_recommendation_items(&conn, run).unwrap().pop().unwrap();
+    assert_eq!(item.rank, 1);
+    assert_eq!(item.score_snapshot, 7.5, "History 必须读取 recommendation_items.score_snapshot");
+}
+
 #[test]
 fn test_tag_config_does_not_change_finalized_history() {
     use crate::models::TagDraftItem;
