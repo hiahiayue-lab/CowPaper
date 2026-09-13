@@ -7026,10 +7026,49 @@ pub fn save_analysis(
     prompt_version: &str,
     evidence_hash: &str,
 ) -> Result<()> {
-    conn.execute(
+    let _ = save_analysis_if_batch_active(
+        conn,
+        None,
+        id,
+        chinese_title,
+        chinese_abstract,
+        one_sentence_summary,
+        tag_matches_json,
+        total_score,
+        model,
+        prompt_version,
+        evidence_hash,
+    )?;
+    Ok(())
+}
+
+/// Save a canonical analysis only while its batch item is still running.
+///
+/// The item status is the durable cancellation guard.  The conditional UPDATE
+/// prevents a DeepSeek response that returns after Stop from writing into
+/// `papers`; callers can treat `false` as a cancelled/invalidated response.
+#[allow(clippy::too_many_arguments)]
+pub fn save_analysis_if_batch_active(
+    conn: &Connection,
+    batch_id: Option<i64>,
+    id: i64,
+    chinese_title: &str,
+    chinese_abstract: &str,
+    one_sentence_summary: &str,
+    tag_matches_json: &str,
+    total_score: f64,
+    model: &str,
+    prompt_version: &str,
+    evidence_hash: &str,
+) -> Result<bool> {
+    let changed = conn.execute(
         "UPDATE papers SET chinese_title=?1, chinese_abstract=?2, one_sentence_summary=?3, tag_matches_json=?4, \
          total_score=?5, model_name=?6, prompt_version=?7, evidence_hash=?8, analyzed_at=?9, analysis_status='analysisSucceeded', updated_at=?10 \
-         WHERE id=?11",
+         WHERE id=?11
+           AND (?12 IS NULL OR EXISTS (
+               SELECT 1 FROM analysis_batch_items abi
+               WHERE abi.analysis_batch_id=?12 AND abi.paper_id=papers.id AND abi.status='running'
+           ))",
         params![
             chinese_title,
             chinese_abstract,
@@ -7041,11 +7080,14 @@ pub fn save_analysis(
             evidence_hash,
             now_utc(),
             now_utc(),
-            id
+            id,
+            batch_id,
         ],
     )?;
-    refresh_library_search_document(conn, id)?;
-    Ok(())
+    if changed == 1 {
+        refresh_library_search_document(conn, id)?;
+    }
+    Ok(changed == 1)
 }
 
 pub fn mark_analysis_failed(conn: &Connection, id: i64) -> Result<()> {
@@ -7655,11 +7697,135 @@ pub fn set_item_started(conn: &Connection, batch_id: i64, paper_id: i64, attempt
     Ok(())
 }
 
+/// Whether a worker is still allowed to commit output for this batch item.
+/// Stop transitions the item out of `running` before workers are allowed to
+/// observe their late response, which makes this a durable cancellation guard.
+pub fn analysis_item_is_active(conn: &Connection, batch_id: i64, paper_id: i64) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM analysis_batch_items
+            WHERE analysis_batch_id=?1 AND paper_id=?2 AND status IN ('queued','running')
+        )",
+        params![batch_id, paper_id],
+        |row| row.get(0),
+    )
+}
+
 pub fn cancel_queued_items(conn: &Connection, batch_id: i64) -> Result<()> {
     conn.execute(
         "UPDATE analysis_batch_items SET status='cancelled', finished_at=?1 WHERE analysis_batch_id=?2 AND status IN ('queued','running')",
         params![now_utc(), batch_id],
     )?;
+    Ok(())
+}
+
+/// Stop exactly one analysis batch.
+///
+/// This is deliberately separate from the legacy current-batch
+/// reconciliation. It cancels only this batch's queued/running items, then
+/// returns their paper-level work state to a safe non-active state. Canonical
+/// analysis fields are intentionally untouched: the current schema does not
+/// record enough before/after provenance to prove that a saved result belongs
+/// exclusively to this batch.
+pub fn stop_analysis_batch(conn: &Connection, batch_id: i64) -> Result<()> {
+    if batch_id <= 0 {
+        return Ok(());
+    }
+
+    // Resolve Today membership before opening the write transaction. This is
+    // the same explicit positive membership used by Discovery queue queries;
+    // no date or history-negative heuristic is introduced here.
+    let cycle_key = current_discovery_cycle_key(conn);
+    let current_ids: HashSet<i64> = current_discovery_batch_paper_ids(conn, &cycle_key)?
+        .into_iter()
+        .collect();
+
+    let tx = conn.unchecked_transaction()?;
+    let now = now_utc();
+    let mut active_papers = Vec::new();
+    {
+        let mut stmt = tx.prepare(
+            "SELECT DISTINCT p.id, p.abstract, p.abstract_status, p.evidence_hash, p.analyzed_at
+             FROM analysis_batch_items abi
+             JOIN papers p ON p.id=abi.paper_id
+             WHERE abi.analysis_batch_id=?1 AND abi.status IN ('queued','running')",
+        )?;
+        let rows = stmt.query_map(params![batch_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })?;
+        for row in rows {
+            active_papers.push(row?);
+        }
+    }
+
+    tx.execute(
+        "UPDATE analysis_batch_items
+         SET status='cancelled', error_type='userCancelled',
+             error_summary='Analysis batch stopped by user', finished_at=?1
+         WHERE analysis_batch_id=?2 AND status IN ('queued','running')",
+        params![now, batch_id],
+    )?;
+
+    for (paper_id, abstract_text, abstract_status, evidence_hash, analyzed_at) in active_papers {
+        // A paper can be present in another active batch. Only release its
+        // paper-level active state when no other worker owns it.
+        let owned_elsewhere: bool = tx.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM analysis_batch_items
+                WHERE paper_id=?1 AND analysis_batch_id<>?2 AND status IN ('queued','running')
+            )",
+            params![paper_id, batch_id],
+            |row| row.get(0),
+        )?;
+        if owned_elsewhere {
+            continue;
+        }
+
+        let has_abstract = abstract_text
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty());
+        let next_status = if current_ids.contains(&paper_id) {
+            if has_abstract && abstract_status.as_deref() != Some("not_expected") {
+                ST_PENDING
+            } else {
+                ST_WAITING_ABSTRACT
+            }
+        } else if evidence_hash
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+            && analyzed_at
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+        {
+            // A non-Discovery paper must not be left active, but an existing
+            // canonical result is still legitimate user data and is retained.
+            ST_SUCCEEDED
+        } else if has_abstract && abstract_status.as_deref() != Some("not_expected") {
+            "analysisFailed"
+        } else {
+            ST_WAITING_ABSTRACT
+        };
+        tx.execute(
+            "UPDATE papers SET analysis_status=?1, queued_at=NULL, retry_count=0, updated_at=?2
+             WHERE id=?3 AND analysis_status IN ('queued','analyzing')",
+            params![next_status, now, paper_id],
+        )?;
+    }
+
+    recompute_analysis_aggregate(&tx, batch_id)?;
+    tx.execute(
+        "UPDATE analysis_batches SET status='stopped', finished_at=?1,
+            error_summary=COALESCE(NULLIF(error_summary,''),'Analysis batch stopped by user')
+         WHERE id=?2 AND status IN ('running','paused','stopping')",
+        params![now, batch_id],
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -8100,7 +8266,36 @@ pub fn set_paper_tag_scores(
     scores: &[(i64, f64)],
     semantic: &[(i64, String, String)],
 ) -> Result<()> {
-    let json: Option<String> = conn
+    let _ = set_paper_tag_scores_if_batch_active(conn, None, paper_id, scores, semantic)?;
+    Ok(())
+}
+
+/// Tag-only counterpart of [`save_analysis_if_batch_active`]. The read/merge/
+/// write sequence runs in one SQLite transaction so Stop and a late tag-only
+/// response cannot interleave into an unconditional canonical-field update.
+pub fn set_paper_tag_scores_if_batch_active(
+    conn: &Connection,
+    batch_id: Option<i64>,
+    paper_id: i64,
+    scores: &[(i64, f64)],
+    semantic: &[(i64, String, String)],
+) -> Result<bool> {
+    let tx = conn.unchecked_transaction()?;
+    if let Some(batch_id) = batch_id {
+        let active: bool = tx.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM analysis_batch_items
+                WHERE analysis_batch_id=?1 AND paper_id=?2 AND status='running'
+            )",
+            params![batch_id, paper_id],
+            |row| row.get(0),
+        )?;
+        if !active {
+            tx.commit()?;
+            return Ok(false);
+        }
+    }
+    let json: Option<String> = tx
         .query_row("SELECT tag_matches_json FROM papers WHERE id = ?1", params![paper_id], |r| r.get(0))
         .optional()?
         .flatten();
@@ -8138,15 +8333,16 @@ pub fn set_paper_tag_scores(
         }
     }
     let new_json = serde_json::to_string(&matches).unwrap_or_else(|_| "[]".to_string());
-    conn.execute(
+    tx.execute(
         "UPDATE papers SET tag_matches_json = ?1, updated_at = ?2 WHERE id = ?3",
         params![new_json, now_utc(), paper_id],
     )?;
     // 本地重算 total_score（active enabled + hash 匹配）；失败不阻塞评分写回
-    if let Ok(active) = crate::tag_config::active_tags(conn) {
-        let _ = crate::tag_config::recompute_paper_total_score(conn, paper_id, &active);
+    if let Ok(active) = crate::tag_config::active_tags(&tx) {
+        let _ = crate::tag_config::recompute_paper_total_score(&tx, paper_id, &active);
     }
-    Ok(())
+    tx.commit()?;
+    Ok(true)
 }
 
 /// 需要 tag-only 评分的论文（有摘要；缺 requested tag 的 score 或 semantic hash stale）。

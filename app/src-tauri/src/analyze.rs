@@ -100,6 +100,35 @@ pub fn analyze_paper_once(
     abstract_quality: &str,
     ctx: &AnalyzeContext,
 ) -> Result<bool, AiError> {
+    analyze_paper_once_for_batch(
+        conn,
+        ds,
+        api_key,
+        model,
+        paper_id,
+        title,
+        abstract_text,
+        abstract_quality,
+        ctx,
+        None,
+    )
+}
+
+/// Batch-aware analysis entry point. `batch_id` activates the durable item
+/// status guard at the canonical write; the legacy wrapper above remains for
+/// non-queue callers and tests.
+pub fn analyze_paper_once_for_batch(
+    conn: &Arc<Mutex<Connection>>,
+    ds: &DeepSeek,
+    api_key: &str,
+    model: &str,
+    paper_id: i64,
+    title: &str,
+    abstract_text: &str,
+    abstract_quality: &str,
+    ctx: &AnalyzeContext,
+    batch_id: Option<i64>,
+) -> Result<bool, AiError> {
     if title.trim().is_empty() || abstract_text.trim().is_empty() {
         return Err(AiError::Paper("缺少标题或摘要".to_string()));
     }
@@ -139,8 +168,9 @@ pub fn analyze_paper_once(
 
     {
         let c = conn.lock().unwrap();
-        db::save_analysis(
+        let saved = db::save_analysis_if_batch_active(
             &c,
+            batch_id,
             paper_id,
             &out.chinese_title,
             &out.chinese_abstract,
@@ -152,6 +182,12 @@ pub fn analyze_paper_once(
             &evidence_hash,
         )
         .map_err(|e| AiError::Paper(e.to_string()))?;
+        if !saved {
+            // Stop may have invalidated the item while the request was in
+            // flight. Do not expose the late response as a normal success;
+            // the coordinator will ignore its terminal message as well.
+            return Ok(false);
+        }
         // totalScore 必须与当前有效（active+hash 匹配）评分一致：以统一规则本地重算
         if let Ok(active) = crate::tag_config::active_tags(&c) {
             let _ = crate::tag_config::recompute_paper_total_score(&c, paper_id, &active);
@@ -172,6 +208,32 @@ pub fn tag_only_analyze(
     abstract_text: &str,
     abstract_quality: &str,
     tags: &[(i64, String, String)],
+) -> Result<Vec<(i64, f64)>, AiError> {
+    tag_only_analyze_for_batch(
+        conn,
+        ds,
+        api_key,
+        model,
+        paper_id,
+        title,
+        abstract_text,
+        abstract_quality,
+        tags,
+        None,
+    )
+}
+
+pub fn tag_only_analyze_for_batch(
+    conn: &Arc<Mutex<Connection>>,
+    ds: &DeepSeek,
+    api_key: &str,
+    model: &str,
+    paper_id: i64,
+    title: &str,
+    abstract_text: &str,
+    abstract_quality: &str,
+    tags: &[(i64, String, String)],
+    batch_id: Option<i64>,
 ) -> Result<Vec<(i64, f64)>, AiError> {
     // 不变式：没有真实摘要绝不调用 AI（防止任何 title→AI→abstract 路径）。
     if title.trim().is_empty() || abstract_text.trim().is_empty() {
@@ -194,7 +256,11 @@ pub fn tag_only_analyze(
     }
     {
         let c = conn.lock().unwrap();
-        db::set_paper_tag_scores(&c, paper_id, &scores, tags).map_err(|e| AiError::Paper(e.to_string()))?;
+        let saved = db::set_paper_tag_scores_if_batch_active(&c, batch_id, paper_id, &scores, tags)
+            .map_err(|e| AiError::Paper(e.to_string()))?;
+        if !saved {
+            return Ok(Vec::new());
+        }
     }
     Ok(scores)
 }

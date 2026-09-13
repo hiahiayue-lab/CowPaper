@@ -3884,7 +3884,13 @@ function renderWorkCenter() {
   } else {
     syncBtn.disabled = false;
     syncBtn.textContent = "检查新论文";
-    if (s.state === "running" || s.state === "pausing") {
+    if (s.state === "stopping") {
+      cls = "running";
+      compact = "正在停止";
+      detail = "正在停止本轮 AI 分析…";
+      aiBtn.disabled = true;
+      aiBtn.textContent = "停止中…";
+    } else if (s.state === "running" || s.state === "pausing") {
       cls = "running";
       const cur = s.currentPaperTitle
         ? ` · 当前：${s.currentPaperTitle.length > 42 ? s.currentPaperTitle.slice(0, 42) + "…" : s.currentPaperTitle}`
@@ -3931,7 +3937,21 @@ function renderWorkCenter() {
   statusEl.setAttribute("aria-label", detail.replace(/<[^>]+>/g, ""));
   statusEl.setAttribute("title", `${detail.replace(/<[^>]+>/g, "")} · 点击查看详情`);
   statusEl.setAttribute("data-status-detail", detail.replace(/<[^>]+>/g, ""));
-  if (detailEl) detailEl.textContent = detail.replace(/<[^>]+>/g, "");
+  if (detailEl) {
+    detailEl.textContent = detail.replace(/<[^>]+>/g, "");
+    const canStop = !syncRunning && ["running", "pausing", "paused"].includes(s.state);
+    if (canStop) {
+      const actions = document.createElement("div");
+      actions.className = "status-popover-actions";
+      const stop = document.createElement("button");
+      stop.type = "button";
+      stop.className = "ghost small";
+      stop.dataset.action = "ai-stop";
+      stop.textContent = "停止本轮分析";
+      actions.appendChild(stop);
+      detailEl.appendChild(actions);
+    }
+  }
 }
 
 /// Work Center 的 AI 按钮：按当前上下文分发（暂停 / 继续 / 重试失败 / 开始分析）。
@@ -4055,9 +4075,9 @@ async function renderActivityDetail() {
     const dur = b.startedAt && b.finishedAt ? fmtDur(Math.max(0, Math.round((new Date(b.finishedAt).getTime() - new Date(b.startedAt).getTime()) / 1000))) : "—";
     const controls =
       b.status === "running"
-        ? `<button class="ghost small" data-action="ai-pause">暂停</button><button class="ghost small" data-action="ai-stop">停止本次任务</button>`
+        ? `<button class="ghost small" data-action="ai-pause">暂停</button><button class="ghost small" data-action="ai-stop">停止本轮分析</button>`
         : b.status === "paused"
-          ? `<button class="primary small" data-action="ai-resume">继续分析</button><button class="ghost small" data-action="ai-stop">停止本次任务</button>`
+          ? `<button class="primary small" data-action="ai-resume">继续分析</button><button class="ghost small" data-action="ai-stop">停止本轮分析</button>`
           : b.failed > 0
             ? `<button class="ghost small" data-action="ai-retry" data-batch="${b.id}">重试失败论文</button>`
             : "";
@@ -4354,9 +4374,9 @@ async function resumeAi() {
 }
 async function stopAi() {
   const ok = await showConfirmModal({
-    title: "停止 AI 分析",
-    message: "停止本次分析？\n已完成结果会保留，未完成论文回到待分析。",
-    confirmText: "停止",
+    title: "停止本轮分析",
+    message: "停止当前分析，排队和进行中的任务将被取消。已保存的分析结果会保留。\n不会删除论文、PDF、Library membership、Collections、Tags、metadata、摘要或 History recommendation snapshot。",
+    confirmText: "停止分析",
     cancelText: "取消",
   });
   if (!ok) return; // 正常取消

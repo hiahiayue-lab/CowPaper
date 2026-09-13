@@ -574,6 +574,136 @@ fn test_queue_db_mechanics() {
 }
 
 #[test]
+fn stop_analysis_batch_cancels_only_active_items_and_is_idempotent() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "Stop batch journal", Some("0025-1909"), None, None, None).unwrap();
+    let cycle = db::current_discovery_cycle_key(&conn);
+    let mut ids = Vec::new();
+    for index in 0..5 {
+        let id = match db::upsert_paper(
+            &conn,
+            jid,
+            &candidate(
+                Some(&format!("10.1000/stop-batch-{index}")),
+                &format!("Stop batch {index}"),
+                Some("real abstract"),
+                Some("crossref"),
+            ),
+        ).unwrap() {
+            UpsertOutcome::New(id) => id,
+            _ => panic!("expected new paper"),
+        };
+        conn.execute(
+            "UPDATE papers SET first_seen_cycle=?1 WHERE id=?2",
+            params![cycle, id],
+        ).unwrap();
+        ids.push(id);
+    }
+    let sync = db::create_sync_batch(&conn, "today").unwrap();
+    db::add_sync_batch_papers(&conn, sync, &ids, &[], &[]).unwrap();
+    let batch_id = db::create_analysis_batch(&conn, "manual", Some("m"), Some("v1"), None, None, &ids).unwrap();
+
+    // A/B completed before Stop. Their canonical analysis output is a
+    // legitimate pre-existing result and must remain untouched.
+    conn.execute(
+        "UPDATE papers SET analysis_status='analysisSucceeded', total_score=4.2,
+            tag_matches_json='[{\"tag\":\"keep\",\"score\":1.0}]',
+            one_sentence_summary='keep summary', evidence_hash='keep-a-b',
+            analyzed_at='2026-09-12T00:00:00Z' WHERE id IN (?1,?2)",
+        params![ids[0], ids[1]],
+    ).unwrap();
+    for id in &ids[..2] {
+        db::set_item_status(&conn, batch_id, *id, "succeeded", None, None, None, Some(&db::now_utc())).unwrap();
+    }
+    // C is running; D/E are queued.
+    conn.execute(
+        "UPDATE papers SET analysis_status='analyzing' WHERE id=?1",
+        params![ids[2]],
+    ).unwrap();
+    db::set_item_started(&conn, batch_id, ids[2], 1).unwrap();
+    for id in &ids[3..] {
+        conn.execute("UPDATE papers SET analysis_status='queued' WHERE id=?1", params![id]).unwrap();
+    }
+
+    db::stop_analysis_batch(&conn, batch_id).unwrap();
+    let batch = db::get_analysis_batch(&conn, batch_id).unwrap().unwrap();
+    assert_eq!(batch.status, "stopped");
+    assert_eq!(batch.remaining, 0);
+    assert_eq!(batch.completed, 5);
+    assert_eq!(batch.succeeded, 2);
+    assert_eq!(batch.failed, 0);
+    assert_eq!(batch.skipped, 0);
+    assert_eq!(db::count_active_queue(&conn).unwrap(), 0);
+    let items = db::list_analysis_batch_items(&conn, batch_id).unwrap();
+    assert_eq!(items.iter().filter(|item| item.status == "cancelled").count(), 3);
+    assert_eq!(items.iter().filter(|item| item.status == "succeeded").count(), 2);
+    assert!(ids[2..].iter().all(|id| db::get_analysis_status(&conn, *id).unwrap().as_deref() == Some("pendingAnalysis")));
+    assert_eq!(conn.query_row(
+        "SELECT total_score,tag_matches_json,one_sentence_summary,evidence_hash FROM papers WHERE id=?1",
+        params![ids[0]],
+        |row| Ok((row.get::<_, Option<f64>>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, Option<String>>(3)?)),
+    ).unwrap(), (
+        Some(4.2),
+        Some("[{\"tag\":\"keep\",\"score\":1.0}]".to_string()),
+        Some("keep summary".to_string()),
+        Some("keep-a-b".to_string()),
+    ));
+
+    // A second stop is a no-op: no new item transitions and no data changes.
+    db::stop_analysis_batch(&conn, batch_id).unwrap();
+    let second = db::get_analysis_batch(&conn, batch_id).unwrap().unwrap();
+    assert_eq!(second.status, "stopped");
+    assert_eq!(second.remaining, 0);
+    assert_eq!(db::list_analysis_batch_items(&conn, batch_id).unwrap().iter().filter(|item| item.status == "cancelled").count(), 3);
+}
+
+#[test]
+fn late_analysis_response_cannot_write_after_batch_stop() {
+    let conn = mem_db();
+    let paper_id = test_paper(&conn, "10.1000/stop-late-response", "Late response");
+    let sync = db::create_sync_batch(&conn, "today").unwrap();
+    db::add_sync_batch_papers(&conn, sync, &[paper_id], &[], &[]).unwrap();
+    let batch_id = db::create_analysis_batch(&conn, "manual", Some("m"), Some("v1"), None, None, &[paper_id]).unwrap();
+    conn.execute(
+        "UPDATE papers SET analysis_status='analyzing', total_score=1.1,
+            tag_matches_json='[{\"tag\":\"old\",\"score\":0.2}]',
+            one_sentence_summary='old result', evidence_hash='old-hash',
+            analyzed_at='2026-09-11T00:00:00Z' WHERE id=?1",
+        params![paper_id],
+    ).unwrap();
+    db::set_item_started(&conn, batch_id, paper_id, 1).unwrap();
+    assert!(db::analysis_item_is_active(&conn, batch_id, paper_id).unwrap());
+
+    db::stop_analysis_batch(&conn, batch_id).unwrap();
+    assert!(!db::analysis_item_is_active(&conn, batch_id, paper_id).unwrap());
+    let saved = db::save_analysis_if_batch_active(
+        &conn,
+        Some(batch_id),
+        paper_id,
+        "late title",
+        "late abstract",
+        "late summary",
+        "[{\"tag\":\"late\",\"score\":1.0}]",
+        5.0,
+        "m",
+        "v1",
+        "late-hash",
+    ).unwrap();
+    assert!(!saved, "a late worker response must be rejected after Stop");
+    assert_eq!(conn.query_row(
+        "SELECT analysis_status,total_score,tag_matches_json,one_sentence_summary,evidence_hash FROM papers WHERE id=?1",
+        params![paper_id],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<f64>>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, Option<String>>(3)?, row.get::<_, Option<String>>(4)?)),
+    ).unwrap(), (
+        "pendingAnalysis".to_string(),
+        Some(1.1),
+        Some("[{\"tag\":\"old\",\"score\":0.2}]".to_string()),
+        Some("old result".to_string()),
+        Some("old-hash".to_string()),
+    ));
+}
+
+#[test]
 fn legacy_discovery_queue_reconciliation_is_current_only_and_idempotent() {
     let conn = mem_db();
     let jid = db::insert_journal(&conn, "Reconciliation Journal", Some("0025-1909"), None, None, None).unwrap();
@@ -1001,6 +1131,13 @@ fn test_ai_queue_scenarios() {
     while analyzing_count(&conn) < 2 && Instant::now() < dl {
         std::thread::sleep(Duration::from_millis(20));
     }
+    let dl_completed = Instant::now() + Duration::from_secs(10);
+    while {
+        let c = conn.lock().unwrap();
+        db::count_by_status(&c, "analysisSucceeded").unwrap() < 2
+    } && Instant::now() < dl_completed {
+        std::thread::sleep(Duration::from_millis(20));
+    }
     cmd_tx.send(QueueCommand::Stop).unwrap();
     let _ = wait(&conn, Duration::from_secs(10), &|s, conn| {
         if s.state != "idle" {
@@ -1025,7 +1162,7 @@ fn test_ai_queue_scenarios() {
         assert_eq!(lr.final_status, "stopped", "D: 停止后终态应为 stopped（实际 {}）", lr.final_status);
         assert_eq!(lr.total, 20);
         assert_eq!(lr.success, 2, "D: 已完成结果保留");
-        assert_eq!(lr.remaining, 18, "D: 未执行论文数应计为 remaining=18（实际 {}）", lr.remaining);
+        assert_eq!(lr.remaining, 0, "D: Stop 后 active remaining 应归零（实际 {}）", lr.remaining);
     }
     // D: batch stopped + 未执行 item = cancelled（不标 failed）
     {

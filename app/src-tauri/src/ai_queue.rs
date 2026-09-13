@@ -173,15 +173,18 @@ pub fn coordinator_loop<R: Runtime>(
                         ABC_COMPLETED
                     };
                     if b.final_status == "stopped" {
-                        let _ = db::cancel_queued_items(&c, b.analysis_batch_id);
-                        let _ = db::recompute_analysis_aggregate(&c, b.analysis_batch_id);
+                        let _ = db::stop_analysis_batch(&c, b.analysis_batch_id);
                     }
                     let _ = db::set_analysis_batch_status(
                         &c,
                         b.analysis_batch_id,
                         final_status,
                         Some(&db::now_utc()),
-                        b.last_error.as_deref(),
+                        if b.final_status == "stopped" {
+                            Some("Analysis batch stopped by user")
+                        } else {
+                            b.last_error.as_deref()
+                        },
                     );
                 }
                 // 记录上一次 AI 运行摘要（保留到下一次运行完成，供 idle 展示）
@@ -197,7 +200,11 @@ pub fn coordinator_loop<R: Runtime>(
                     set("ai.last_started_at", &b.batch_started_at_iso);
                     set("ai.last_finished_at", &now_iso());
                     set("ai.last_final_status", &b.final_status);
-                    let remaining = b.size - b.success - b.failed - b.skipped;
+                    let remaining = if b.final_status == "stopped" {
+                        0
+                    } else {
+                        b.size - b.success - b.failed - b.skipped
+                    };
                     set("ai.last_remaining", &remaining.max(0).to_string());
                     match &b.last_error {
                         Some(e) => set("ai.last_error_summary", e),
@@ -433,6 +440,14 @@ fn handle_command<R: Runtime>(
         QueueCommand::Stop => match state.as_str() {
             QS_RUNNING | QS_PAUSING => {
                 pick_new.store(false, Ordering::SeqCst);
+                if let Some(b) = batch {
+                    let c = conn.lock().unwrap();
+                    if let Err(e) = db::stop_analysis_batch(&c, b.analysis_batch_id) {
+                        let _ = app.emit("ai://error", format!("无法安全停止分析：{}", e));
+                        pick_new.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                }
                 *state = QS_STOPPING.to_string();
                 if let Some(b) = batch {
                     persist_queue_state(conn, state, b);
@@ -440,13 +455,13 @@ fn handle_command<R: Runtime>(
                 }
             }
             QS_PAUSED => {
-                let c = conn.lock().unwrap();
-                let _ = db::revert_active_to_pending(&c);
                 if let Some(b) = batch {
-                    let _ = db::cancel_queued_items(&c, b.analysis_batch_id);
-                    let _ = db::set_analysis_batch_status(&c, b.analysis_batch_id, ABC_STOPPED, Some(&db::now_utc()), None);
+                    let c = conn.lock().unwrap();
+                    if let Err(e) = db::stop_analysis_batch(&c, b.analysis_batch_id) {
+                        let _ = app.emit("ai://error", format!("无法安全停止分析：{}", e));
+                        return;
+                    }
                 }
-                drop(c);
                 if let Some(b) = batch {
                     b.done = true;
                     b.final_state = QS_IDLE.to_string();
@@ -540,6 +555,9 @@ fn step_batch<R: Runtime>(
                 attempt,
             } => {
                 let c = conn.lock().unwrap();
+                if !db::analysis_item_is_active(&c, b.analysis_batch_id, paper_id).unwrap_or(false) {
+                    continue;
+                }
                 let _ = db::set_retry_count(&c, paper_id, attempt as i64);
                 let _ = db::set_item_status(
                     &c,
@@ -569,6 +587,18 @@ fn step_batch<R: Runtime>(
                 b.last_progress_at_iso = now_iso();
                 b.retry_paper = None;
                 b.retry_until_iso = None;
+                let item_active = {
+                    let c = conn.lock().unwrap();
+                    db::analysis_item_is_active(&c, b.analysis_batch_id, paper_id).unwrap_or(false)
+                };
+                if !item_active {
+                    // Stop cancelled the item while its worker was in flight.
+                    // Its response must not advance counters or rewrite paper
+                    // status after cancellation.
+                    b.current = None;
+                    emit_progress(app, conn, state, b);
+                    continue;
+                }
                 match outcome {
                     Ok(true) => {
                         b.success += 1;
@@ -654,8 +684,9 @@ fn step_batch<R: Runtime>(
             let ctx2 = b.ctx.clone();
             let creds2 = b.creds.clone();
             let tag_only2 = b.tag_only_tags.clone();
+            let batch_id = b.analysis_batch_id;
             std::thread::spawn(move || {
-                worker_run(conn2, wtx, creds2, pid, ctx2, tag_only2);
+                worker_run(conn2, wtx, creds2, pid, ctx2, tag_only2, batch_id);
             });
             emit_progress(app, conn, state, b);
         }
@@ -681,7 +712,7 @@ fn step_batch<R: Runtime>(
             }
             QS_STOPPING => {
                 let c = conn.lock().unwrap();
-                let _ = db::revert_active_to_pending(&c);
+                let _ = db::stop_analysis_batch(&c, b.analysis_batch_id);
                 drop(c);
                 b.done = true;
                 b.final_state = QS_IDLE.to_string();
@@ -736,6 +767,7 @@ fn worker_run(
     paper_id: i64,
     ctx: Arc<AnalyzeContext>,
     tag_only_tags: Option<Vec<(i64, String, String)>>,
+    batch_id: i64,
 ) {
     let (api_key, model) = creds;
     let (title, abstract_text, abstract_quality) = {
@@ -747,6 +779,15 @@ fn worker_run(
     let ds = DeepSeek::new();
     let outcome = run_with_retry(
         || {
+            // Stop invalidates the item before workers are allowed to make a
+            // new attempt. An already in-flight HTTP request is protected at
+            // its canonical write by the same item-status guard.
+            {
+                let c = conn.lock().unwrap();
+                if !db::analysis_item_is_active(&c, batch_id, paper_id).unwrap_or(false) {
+                    return Err(AiError::Paper("分析批次已取消".to_string()));
+                }
+            }
             // 测试钩子：每次尝试前检查 mock（可模拟限流/失败/成功序列）
             #[cfg(test)]
             {
@@ -756,7 +797,7 @@ fn worker_run(
                 }
             }
             if let Some(tags) = &tag_only_tags {
-                analyze::tag_only_analyze(
+                analyze::tag_only_analyze_for_batch(
                     &conn,
                     &ds,
                     &api_key,
@@ -766,10 +807,11 @@ fn worker_run(
                     &abstract_text,
                     &abstract_quality,
                     tags,
+                    Some(batch_id),
                 )
                 .map(|_| true)
             } else {
-                analyze::analyze_paper_once(
+                analyze::analyze_paper_once_for_batch(
                     &conn,
                     &ds,
                     &api_key,
@@ -779,6 +821,7 @@ fn worker_run(
                     &abstract_text,
                     &abstract_quality,
                     &ctx,
+                    Some(batch_id),
                 )
             }
         },
