@@ -509,6 +509,7 @@ interface RecommendationItemView {
   paperId: number;
   rank: number;
   scoreSnapshot: number;
+  tagMatchesSnapshot: TagMatch[] | null;
   paper: Paper;
 }
 
@@ -1662,6 +1663,8 @@ interface RenderPaperOptions {
   scoreSnapshot?: number;
   /// 历史总分覆盖（用 score_snapshot，避免显示当前分造成混淆）
   scoreOverride?: number;
+  /// 历史标签解释覆盖；只来自 recommendation_items snapshot，NULL 不显示。
+  tagMatchesOverride?: TagMatch[] | null;
 }
 
 /// 统一 Paper Card（今日推荐 / 所有论文 / 收藏 / 历史共用；不维护各自残缺版本）。
@@ -1670,9 +1673,8 @@ function renderPaperCard(p: Paper, opts: RenderPaperOptions): string {
   cardPaperState.set(cardInstanceId, p);
   const isHistory = opts.context.startsWith("history:");
   const cls = p.isIgnored ? "card paper ignored" : "card paper";
-  // Recommendation history has no status/tag-match snapshot in the v20
-  // schema. Never render those live canonical fields as if they were the
-  // historical state; score/rank below come from recommendation_items.
+  // History must never render mutable Paper tag matches. Its optional
+  // explanation comes only from recommendation_items.tag_matches_snapshot_json.
   const status = !isHistory && p.analysisStatus !== "analysisSucceeded" ? `<span class="chip muted-chip">${statusLabel(p.analysisStatus)}</span>` : "";
   const titleZh = p.chineseTitle ? `<div class="paper-title">${escapeHtml(p.chineseTitle)}</div>` : "";
   const titleEn = p.chineseTitle
@@ -1690,7 +1692,8 @@ function renderPaperCard(p: Paper, opts: RenderPaperOptions): string {
   const displayScore = opts.scoreOverride ?? (isHistory ? null : p.totalScore);
   const scoreBadge = displayScore != null ? `<span class="score-badge">总分 ${displayScore.toFixed(1)}</span>` : "";
   // 研究标签评分 + 总分同一 score row（标签在前、总分最后）
-  const scoreRow = `<div class="score-row">${isHistory ? "" : tagChips(p.tagMatches)}${scoreBadge}</div>`;
+  const displayedTagMatches = isHistory ? (opts.tagMatchesOverride ?? []) : p.tagMatches;
+  const scoreRow = `<div class="score-row">${tagChips(displayedTagMatches)}${scoreBadge}</div>`;
   // 历史快照行：固定用当日 rank / 当日 score_snapshot（当前分不显示，避免混乱）
   const rankLine =
     opts.rank != null && opts.scoreSnapshot != null
@@ -1873,7 +1876,7 @@ async function renderRecommendHistory() {
           <span class="segmented"><button class="seg ${historyTab === "recommend" ? "on" : ""}" data-action="history-tab" data-tab="recommend">推荐</button><button class="seg ${historyTab === "missing" ? "on" : ""}" data-action="history-tab" data-tab="missing">缺摘要</button></span></div>`;
       if (historyTab === "recommend") {
         const view = await invoke<RecommendationRunView | null>("get_daily_recommendation_run", { cycleKey: historyCycleKey });
-        list.innerHTML = view?.items.length ? view.items.map((v) => renderPaperCard(v.paper, { withAbstract: true, context: `history:${historyCycleKey}:recommend:${view.run.id}`, rank: v.rank, scoreSnapshot: v.scoreSnapshot, scoreOverride: v.scoreSnapshot })).join("") : '<li class="empty">该日暂无推荐</li>';
+        list.innerHTML = view?.items.length ? view.items.map((v) => renderPaperCard(v.paper, { withAbstract: true, context: `history:${historyCycleKey}:recommend:${view.run.id}`, rank: v.rank, scoreSnapshot: v.scoreSnapshot, scoreOverride: v.scoreSnapshot, tagMatchesOverride: v.tagMatchesSnapshot })).join("") : '<li class="empty">该日暂无推荐</li>';
       } else {
         const ps = await invoke<Paper[]>("list_daily_papers", { cycleKey: historyCycleKey, missingOnly: historyTab === "missing" });
         const missingIds = ps.map((p) => p.id).join(",");

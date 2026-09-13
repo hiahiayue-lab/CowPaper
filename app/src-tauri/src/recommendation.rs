@@ -4,7 +4,7 @@
 //! - cycle_key = 本地时区日期：当本地时间未到当日 cutoff 时，当前周期仍是"昨天"的日期。
 //! - 同一 Paper 一生只进入一个推荐周期（recommendation_items.UNIQUE(paper_id) 硬约束 +
 //!   查询 NOT EXISTS 双重保证）。
-//! - open run 随 AI 完成/手动同步自动刷新（rank/score_snapshot 可更新）；
+//! - open run 随 AI 完成/手动同步自动刷新（rank/score_snapshot/tag snapshot 可更新）；
 //!   finalized run 冻结（不再修改 membership/rank/score）。
 //! - 全部由 Rust/DB 负责，前端不得自行推导历史推荐。
 
@@ -88,7 +88,7 @@ pub fn refresh_current_recommendations(
         .collect::<Vec<_>>()
         .join(",");
     let sql = format!(
-        "SELECT p.id, COALESCE(p.total_score, 0) FROM papers p
+        "SELECT p.id, COALESCE(p.total_score, 0), p.tag_matches_json FROM papers p
          WHERE p.analysis_status = 'analysisSucceeded'
            AND {}
            AND p.total_score IS NOT NULL AND p.is_ignored = 0
@@ -106,15 +106,29 @@ pub fn refresh_current_recommendations(
         .prepare(&sql)
         .map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?)))
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, f64>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })
         .map_err(|e| e.to_string())?;
     let mut rank: i64 = 1;
     for row in rows {
-        let (pid, score) = row.map_err(|e| e.to_string())?;
+        let (pid, score, tag_matches_json) = row.map_err(|e| e.to_string())?;
+        // Copy only the persisted analysis result. Invalid/legacy shapes are
+        // conservatively represented as NULL, never rebuilt from live tags.
+        let snapshot = tag_matches_json.and_then(|json| {
+            serde_json::from_str::<Vec<crate::models::TagMatch>>(&json)
+                .ok()
+                .map(|_| json)
+        });
         let _ = tx.execute(
-            "INSERT OR IGNORE INTO recommendation_items (run_id, paper_id, rank, score_snapshot, added_at)
-             VALUES (?1,?2,?3,?4,?5)",
-            params![run_id, pid, rank, score, now_iso],
+            "INSERT OR IGNORE INTO recommendation_items
+                (run_id, paper_id, rank, score_snapshot, tag_matches_snapshot_json, added_at)
+             VALUES (?1,?2,?3,?4,?5,?6)",
+            params![run_id, pid, rank, score, snapshot, now_iso],
         );
         rank += 1;
     }
@@ -148,6 +162,10 @@ pub fn run_items_with_papers(
             paper_id: it.paper_id,
             rank: it.rank,
             score_snapshot: it.score_snapshot,
+            tag_matches_snapshot: it
+                .tag_matches_snapshot_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str(json).ok()),
             paper,
         });
     }

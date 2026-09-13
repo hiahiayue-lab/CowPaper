@@ -175,7 +175,8 @@ pub struct RecommendationRun {
     pub journal_count: i64,
 }
 
-/// 推荐项（只存 paper_id + rank + score_snapshot，不复制 Paper 内容）。
+/// 推荐项：保存推荐时的排序、分数和可选的 Research Tag 解释快照。
+/// `tag_matches_snapshot_json` 对 v20 历史行保持 NULL；它永远不是 live Paper cache。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecommendationItem {
@@ -184,6 +185,7 @@ pub struct RecommendationItem {
     pub paper_id: i64,
     pub rank: i64,
     pub score_snapshot: f64,
+    pub tag_matches_snapshot_json: Option<String>,
     pub added_at: String,
 }
 
@@ -195,6 +197,8 @@ pub struct RecommendationItemView {
     pub paper_id: i64,
     pub rank: i64,
     pub score_snapshot: f64,
+    /// Self-contained tag label/score snapshot; NULL means historical detail unavailable.
+    pub tag_matches_snapshot: Option<Vec<TagMatch>>,
     pub paper: Paper,
 }
 

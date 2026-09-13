@@ -101,10 +101,11 @@ pub fn open(path: &Path) -> Result<Connection> {
 /// v16 为 canonical bibliographic keywords；v17 为出版字段；v18 为 RC5
 /// Library overrides、collection-scoped tags 与 PDF enrichment jobs；v19 为
 /// Library full-text search projection；v20 为 attachment-scoped PDF
-/// annotation import and scan state.
+/// annotation import and scan state；v21 为 recommendation historical
+/// Research Tag match snapshots.
 /// 生产构建中仅由迁移系统隐式使用；测试中直接断言。
 #[allow(dead_code)]
-pub const SCHEMA_VERSION: i64 = 20;
+pub const SCHEMA_VERSION: i64 = 21;
 
 pub fn init(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
@@ -5865,6 +5866,7 @@ fn migrations() -> Vec<(i64, &'static str, fn(&Connection) -> Result<()>)> {
         (18, "library-rc5-overrides-scoped-tags-pdf-enrichment", migrate_to_v18),
         (19, "library-full-text-search", migrate_to_v19),
         (20, "attachment-scoped-pdf-annotations", migrate_to_v20),
+        (21, "recommendation-tag-match-snapshots", migrate_to_v21),
     ]
 }
 
@@ -7490,7 +7492,7 @@ pub fn list_recommendation_runs(conn: &Connection) -> Result<Vec<RecommendationR
 
 pub fn list_recommendation_items(conn: &Connection, run_id: i64) -> Result<Vec<RecommendationItem>> {
     let mut stmt = conn.prepare(
-        "SELECT id, run_id, paper_id, rank, score_snapshot, added_at
+        "SELECT id, run_id, paper_id, rank, score_snapshot, tag_matches_snapshot_json, added_at
          FROM recommendation_items WHERE run_id = ?1 ORDER BY rank ASC",
     )?;
     let rows = stmt.query_map(params![run_id], |r| {
@@ -7500,7 +7502,8 @@ pub fn list_recommendation_items(conn: &Connection, run_id: i64) -> Result<Vec<R
             paper_id: r.get(2)?,
             rank: r.get(3)?,
             score_snapshot: r.get(4)?,
-            added_at: r.get(5)?,
+            tag_matches_snapshot_json: r.get(5)?,
+            added_at: r.get(6)?,
         })
     })?;
     rows.collect()
@@ -8074,6 +8077,22 @@ fn migrate_to_v20(conn: &Connection) -> Result<()> {
             ON paper_annotations(attachment_id, extraction_status);
         "#,
     )?;
+    Ok(())
+}
+
+/// v21: freeze the Research Tag explanation shown with a recommendation.
+///
+/// This is intentionally additive and does not backfill existing rows from
+/// `papers.tag_matches_json`: that column is mutable live analysis state and
+/// cannot reconstruct what a historical recommendation showed. New/current
+/// recommendation rows write the self-contained JSON at snapshot time.
+fn migrate_to_v21(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "recommendation_items", "tag_matches_snapshot_json") {
+        conn.execute(
+            "ALTER TABLE recommendation_items ADD COLUMN tag_matches_snapshot_json TEXT",
+            [],
+        )?;
+    }
     Ok(())
 }
 

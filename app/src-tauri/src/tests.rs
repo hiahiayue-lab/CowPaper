@@ -3080,7 +3080,7 @@ fn test_migration_v2_to_v3_preserves_data() {
 
     // 迁移到 v3
     db::init(&conn).unwrap();
-    assert_eq!(db::SCHEMA_VERSION, 20);
+    assert_eq!(db::SCHEMA_VERSION, 21);
 
     // 8) 旧 issn 迁移进 journal_identifiers（类型按列，不猜）
     let ids = db::list_journal_identifiers(&conn, jid).unwrap();
@@ -3121,7 +3121,7 @@ fn test_database_restart_persistence() {
     {
         let conn = db::open(&path).unwrap();
         db::init(&conn).unwrap(); // 幂等：user_version=3 不重复迁移
-        assert_eq!(db::SCHEMA_VERSION, 20);
+        assert_eq!(db::SCHEMA_VERSION, 21);
         let j = db::get_journal(&conn, 1).unwrap().expect("期刊持久化");
         assert_eq!(j.print_issn.as_deref(), Some("0025-1909"));
         assert_eq!(j.identifiers.len(), 1);
@@ -3752,7 +3752,7 @@ fn test_migration_v4_abstract_quality_init() {
     .unwrap();
 
     db::init(&conn).unwrap();
-    assert_eq!(db::SCHEMA_VERSION, 20);
+    assert_eq!(db::SCHEMA_VERSION, 21);
 
     let papers = db::list_papers(&conn, Some(jid), 100).unwrap();
     assert_eq!(papers.len(), 3, "迁移不得丢论文");
@@ -4449,7 +4449,7 @@ fn test_updater_config_requires_signed_cross_platform_artifacts() {
     assert_eq!(endpoints.len(), 1);
     assert!(endpoints[0].as_str().unwrap().starts_with("https://github.com/"));
     assert!(endpoints[0].as_str().unwrap().ends_with("/latest/download/latest.json"));
-    assert_eq!(db::SCHEMA_VERSION, 20, "updater must not claim migration ownership");
+    assert_eq!(db::SCHEMA_VERSION, 21, "updater must not claim migration ownership");
 }
 
 #[test]
@@ -4624,6 +4624,152 @@ fn test_recommendation_does_not_change_total_score() {
         .unwrap();
     assert_eq!(before, after, "recommendation snapshot 不得改变 totalScore");
     assert_eq!(after, 1.5);
+}
+
+// ================= v21: Historical Research Tag Match Snapshots =================
+
+fn recommendation_snapshot_json(conn: &rusqlite::Connection, run_id: i64, paper_id: i64) -> Option<String> {
+    conn.query_row(
+        "SELECT tag_matches_snapshot_json FROM recommendation_items WHERE run_id=?1 AND paper_id=?2",
+        params![run_id, paper_id],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+#[test]
+fn test_v21_snapshot_is_self_contained_and_history_ignores_live_tags() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "v21 snapshot", Some("0025-1909"), None, None, None).unwrap();
+    let paper = seed_paper_with_score(&conn, jid, "10.1000/v21-t1", "Snapshot", 1.0);
+    let t1 = serde_json::json!([{"tag":"Original label","score":0.8,"tagId":101,"semanticHash":"old"}]).to_string();
+    let t2 = serde_json::json!([{"tag":"Renamed label","score":0.2,"tagId":101,"semanticHash":"new"}]).to_string();
+    conn.execute("UPDATE papers SET tag_matches_json=?1 WHERE id=?2", params![&t1, paper]).unwrap();
+
+    let run = crate::recommendation::refresh_current_recommendations(&conn, &local_dt(2026, 8, 26, 15, 0), "09:00").unwrap();
+    assert_eq!(recommendation_snapshot_json(&conn, run, paper).as_deref(), Some(t1.as_str()));
+    // Finalize before changing live canonical analysis state.
+    let _ = crate::recommendation::ensure_current_recommendation_cycle(&conn, &local_dt(2026, 8, 27, 9, 0), "09:00").unwrap();
+    conn.execute("UPDATE papers SET tag_matches_json=?1 WHERE id=?2", params![&t2, paper]).unwrap();
+
+    let item = crate::recommendation::run_items_with_papers(&conn, run).unwrap().pop().unwrap();
+    let snapshot = item.tag_matches_snapshot.expect("历史 snapshot 应可解析");
+    assert_eq!(snapshot[0].tag, "Original label");
+    assert_eq!(snapshot[0].score, 0.8);
+    assert_eq!(recommendation_snapshot_json(&conn, run, paper).as_deref(), Some(t1.as_str()));
+}
+
+#[test]
+fn test_v20_to_v21_preserves_rows_leaves_old_snapshot_null_and_is_idempotent() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "v20 upgrade", Some("0025-1909"), None, None, None).unwrap();
+    let paper = seed_paper_with_score(&conn, jid, "10.1000/v21-legacy", "Legacy", 2.0);
+    let run = db::create_recommendation_run(&conn, "2000-01-01", "finalized").unwrap();
+    conn.execute(
+        "INSERT INTO recommendation_items (run_id,paper_id,rank,score_snapshot,tag_matches_snapshot_json,added_at) VALUES (?1,?2,1,2.0,?3,?4)",
+        params![run, paper, serde_json::json!([{"tag":"old","score":1.0}]).to_string(), db::now_utc()],
+    ).unwrap();
+    let before_items: i64 = conn.query_row("SELECT COUNT(*) FROM recommendation_items", [], |r| r.get(0)).unwrap();
+    let before_papers: i64 = conn.query_row("SELECT COUNT(*) FROM papers", [], |r| r.get(0)).unwrap();
+    // Recreate the actual v20 shape and user_version, then exercise the real
+    // init/migration path. The live paper cache must never backfill history.
+    conn.execute("ALTER TABLE recommendation_items DROP COLUMN tag_matches_snapshot_json", []).unwrap();
+    conn.pragma_update(None, "user_version", 20).unwrap();
+    let live = serde_json::json!([{"tag":"current live","score":0.1}]).to_string();
+    conn.execute("UPDATE papers SET tag_matches_json=?1 WHERE id=?2", params![live, paper]).unwrap();
+
+    db::init(&conn).unwrap();
+    assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 21);
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM recommendation_items", [], |r| r.get::<_, i64>(0)).unwrap(), before_items);
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM papers", [], |r| r.get::<_, i64>(0)).unwrap(), before_papers);
+    assert!(recommendation_snapshot_json(&conn, run, paper).is_none(), "v20 history must remain NULL");
+    assert_eq!(conn.query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0)).unwrap(), "ok");
+    let mut fk = conn.prepare("PRAGMA foreign_key_check").unwrap();
+    assert_eq!(fk.query([]).unwrap().next().unwrap().is_none(), true);
+    db::init(&conn).unwrap();
+    assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 21);
+    assert!(recommendation_snapshot_json(&conn, run, paper).is_none());
+}
+
+#[test]
+fn test_v21_snapshot_survives_tag_rename_delete_and_current_rerank_does_not_touch_history() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "v21 freeze", Some("0025-1909"), None, None, None).unwrap();
+    let history_paper = seed_paper_with_score(&conn, jid, "10.1000/v21-h", "History", 4.0);
+    let tag = db::add_tag(&conn, "Historical label", Some("historical explanation")).unwrap();
+    let history_json = serde_json::json!([{"tag":"Historical label","score":1.0,"tagId":tag.id,"semanticHash":"historical"}]).to_string();
+    conn.execute("UPDATE papers SET tag_matches_json=?1 WHERE id=?2", params![&history_json, history_paper]).unwrap();
+    let history_run = db::create_recommendation_run(&conn, "2000-01-02", "finalized").unwrap();
+    conn.execute(
+        "INSERT INTO recommendation_items (run_id,paper_id,rank,score_snapshot,tag_matches_snapshot_json,added_at) VALUES (?1,?2,1,4.0,?3,?4)",
+        params![history_run, history_paper, &history_json, db::now_utc()],
+    ).unwrap();
+    let history_before = recommendation_snapshot_json(&conn, history_run, history_paper).unwrap();
+    db::delete_tag(&conn, tag.id).unwrap();
+    conn.execute("UPDATE papers SET tag_matches_json='[{\"tag\":\"live replacement\",\"score\":0.0}]' WHERE id=?1", params![history_paper]).unwrap();
+
+    let current_paper = seed_paper_with_score(&conn, jid, "10.1000/v21-current", "Current", 3.0);
+    let current_json_t1 = serde_json::json!([{"tag":"Current T1","score":0.4}]).to_string();
+    let current_json_t2 = serde_json::json!([{"tag":"Current T2","score":0.9}]).to_string();
+    conn.execute("UPDATE papers SET tag_matches_json=?1 WHERE id=?2", params![&current_json_t1, current_paper]).unwrap();
+    let current_run = crate::recommendation::refresh_current_recommendations(&conn, &local_dt(2026, 8, 28, 15, 0), "09:00").unwrap();
+    assert_eq!(recommendation_snapshot_json(&conn, current_run, current_paper).as_deref(), Some(current_json_t1.as_str()));
+    conn.execute("UPDATE papers SET tag_matches_json=?1,total_score=9.0 WHERE id=?2", params![&current_json_t2, current_paper]).unwrap();
+    let _ = crate::recommendation::refresh_current_recommendations(&conn, &local_dt(2026, 8, 28, 16, 0), "09:00").unwrap();
+    assert_eq!(recommendation_snapshot_json(&conn, current_run, current_paper).as_deref(), Some(current_json_t2.as_str()));
+
+    let history_item = crate::recommendation::run_items_with_papers(&conn, history_run).unwrap().pop().unwrap();
+    assert_eq!(history_item.tag_matches_snapshot.expect("历史 snapshot 应可解析")[0].tag, "Historical label");
+    assert_eq!(recommendation_snapshot_json(&conn, history_run, history_paper).as_deref(), Some(history_before.as_str()));
+}
+
+#[test]
+fn test_v21_current_batch_snapshot_updates_history_only_bytes_stay_frozen() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "v21 rerank integration", Some("0025-1909"), None, None, None).unwrap();
+    let history_ids = [
+        seed_paper_with_score(&conn, jid, "10.1000/v21-h1", "H1", 1.0),
+        seed_paper_with_score(&conn, jid, "10.1000/v21-h2", "H2", 1.0),
+        seed_paper_with_score(&conn, jid, "10.1000/v21-h3", "H3", 1.0),
+    ];
+    let history_run = db::create_recommendation_run(&conn, "2000-01-03", "finalized").unwrap();
+    let history_snapshots: Vec<String> = history_ids.iter().enumerate().map(|(i, id)| {
+        let json = serde_json::json!([{"tag":format!("H{} historical", i + 1),"score":0.3,"tagId":i + 1}]).to_string();
+        conn.execute("UPDATE papers SET tag_matches_json=?1 WHERE id=?2", params![&json, id]).unwrap();
+        conn.execute(
+            "INSERT INTO recommendation_items (run_id,paper_id,rank,score_snapshot,tag_matches_snapshot_json,added_at) VALUES (?1,?2,?3,?4,?5,?6)",
+            params![history_run, id, i as i64 + 1, 1.0, &json, db::now_utc()],
+        ).unwrap();
+        json
+    }).collect();
+
+    let today_ids = [
+        seed_paper_with_score(&conn, jid, "10.1000/v21-a", "A", 2.0),
+        seed_paper_with_score(&conn, jid, "10.1000/v21-b", "B", 2.0),
+        seed_paper_with_score(&conn, jid, "10.1000/v21-c", "C", 2.0),
+        seed_paper_with_score(&conn, jid, "10.1000/v21-x", "X", 2.0),
+    ];
+    let current_t1 = serde_json::json!([{"tag":"Today T1","score":0.2}]).to_string();
+    let current_t2 = serde_json::json!([{"tag":"Today T2","score":0.9}]).to_string();
+    for id in today_ids {
+        conn.execute("UPDATE papers SET tag_matches_json=?1 WHERE id=?2", params![&current_t1, id]).unwrap();
+    }
+    let current_run = crate::recommendation::refresh_current_recommendations(&conn, &local_dt(2026, 8, 28, 15, 0), "09:00").unwrap();
+    assert_eq!(db::list_recommendation_items(&conn, current_run).unwrap().len(), 4);
+    let history_ranks_before: Vec<i64> = db::list_recommendation_items(&conn, history_run).unwrap().iter().map(|i| i.rank).collect();
+    for id in today_ids {
+        conn.execute("UPDATE papers SET tag_matches_json=?1,total_score=9.0 WHERE id=?2", params![&current_t2, id]).unwrap();
+    }
+    let _ = crate::recommendation::refresh_current_recommendations(&conn, &local_dt(2026, 8, 28, 16, 0), "09:00").unwrap();
+    for id in today_ids {
+        assert_eq!(recommendation_snapshot_json(&conn, current_run, id).as_deref(), Some(current_t2.as_str()));
+    }
+    let history_items = db::list_recommendation_items(&conn, history_run).unwrap();
+    assert_eq!(history_items.iter().map(|i| i.rank).collect::<Vec<_>>(), history_ranks_before);
+    assert_eq!(history_items.iter().map(|i| i.paper_id).collect::<Vec<_>>(), history_ids);
+    for (id, expected) in history_ids.iter().zip(history_snapshots.iter()) {
+        assert_eq!(recommendation_snapshot_json(&conn, history_run, *id).as_deref(), Some(expected.as_str()));
+    }
 }
 
 // ================= Round 6.4：User Collections =================
