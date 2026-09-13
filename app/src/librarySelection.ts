@@ -59,3 +59,10 @@ export function reduceLibrarySelection(
 export function clearLibrarySelection(): LibrarySelectionState {
   return { selectedIds: [], anchorId: null };
 }
+
+/** Resolve the payload for a Paper-originated drag. Selection membership is
+ * deliberately separate from the Collection/Tag navigation drag payload. */
+export function resolveLibraryPaperDragIds(selectedIds: readonly number[], sourceId: number): number[] {
+  const selected = [...new Set(selectedIds.filter((id) => id > 0))];
+  return selected.includes(sourceId) && selected.length ? selected : [sourceId];
+}

@@ -1,4 +1,4 @@
-import { clearLibrarySelection, reduceLibrarySelection } from "./librarySelection.ts";
+import { clearLibrarySelection, reduceLibrarySelection, resolveLibraryPaperDragIds } from "./librarySelection.ts";
 
 const visible = [1, 2, 3, 4, 5];
 let state = clearLibrarySelection();
@@ -20,5 +20,9 @@ if (state.selectedIds.join(",") !== "1,2,3,5") throw new Error("additive shift s
 
 state = reduceLibrarySelection({ selectedIds: [1, 99], anchorId: 99 }, 3, [1, 2, 3], { shiftKey: true });
 if (state.selectedIds.join(",") !== "3" || state.anchorId !== 3) throw new Error("hidden scope selection failed");
+
+if (resolveLibraryPaperDragIds([1, 2, 3], 2).join(",") !== "1,2,3") throw new Error("selected Paper drag payload failed");
+if (resolveLibraryPaperDragIds([1, 2], 3).join(",") !== "3") throw new Error("unselected Paper drag payload failed");
+if (resolveLibraryPaperDragIds([2, 2, 3], 2).join(",") !== "2,3") throw new Error("Paper drag payload normalization failed");
 
 console.log("library selection tests passed");

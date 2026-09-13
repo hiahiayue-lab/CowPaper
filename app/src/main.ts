@@ -52,7 +52,7 @@ import {
   titleTranslationControlState,
   type InspectorActionFeedback,
 } from "./titleTranslation";
-import { reduceLibrarySelection } from "./librarySelection";
+import { reduceLibrarySelection, resolveLibraryPaperDragIds } from "./librarySelection";
 
 interface Journal {
   id: number;
@@ -3471,7 +3471,8 @@ function clearLibraryDragFeedback(): void {
 }
 
 class PaperRowDrag {
-  private state: { paperId: number; startX: number; startY: number; active: boolean } | null = null;
+  private state: { paperId: number; paperIds: number[]; startX: number; startY: number; active: boolean } | null = null;
+  private preview: HTMLElement | null = null;
 
   install(): void {
     document.addEventListener("pointerdown", this.onDown);
@@ -3489,15 +3490,55 @@ class PaperRowDrag {
       releaseLibraryDrag("paper-row");
       return;
     }
-    this.state = { paperId: Number(row.dataset.paperId), startX: event.clientX, startY: event.clientY, active: false };
+    const paperId = Number(row.dataset.paperId);
+    this.state = {
+      paperId,
+      paperIds: resolveLibraryPaperDragIds(selectedLibraryPaperIds, paperId),
+      startX: event.clientX,
+      startY: event.clientY,
+      active: false,
+    };
   };
+
+  private ensureSingleSelection(state: NonNullable<PaperRowDrag["state"]>): void {
+    if (state.paperIds.length !== 1 || state.paperIds[0] !== state.paperId) return;
+    if (selectedLibraryPaperIds.length === 1 && selectedLibraryPaperIds[0] === state.paperId) return;
+    selectedLibraryPaperIds = [state.paperId];
+    librarySelectionAnchorId = state.paperId;
+    selectLibraryPaperId(state.paperId);
+    librarySelectedAttachmentId = null;
+    libraryInspectorCollapsed = false;
+    renderLibrary();
+  }
+
+  private showPreview(state: NonNullable<PaperRowDrag["state"]>, event: PointerEvent): void {
+    if (!this.preview) {
+      this.preview = document.createElement("div");
+      this.preview.className = "library-paper-drag-preview";
+      this.preview.setAttribute("aria-hidden", "true");
+      document.body.append(this.preview);
+    }
+    const first = libraryPapers.find((item) => item.paper.id === state.paperIds[0]);
+    this.preview.textContent = state.paperIds.length > 1
+      ? `${state.paperIds.length} 篇文献`
+      : first ? libraryEnglishTitle(first) : "1 篇文献";
+    this.preview.style.left = `${event.clientX + 12}px`;
+    this.preview.style.top = `${event.clientY + 12}px`;
+  }
+
+  private hidePreview(): void {
+    this.preview?.remove();
+    this.preview = null;
+  }
 
   private onMove = (event: PointerEvent): void => {
     const state = this.state;
     if (!state) return;
     if (!state.active && Math.hypot(event.clientX - state.startX, event.clientY - state.startY) < 6) return;
+    if (!state.active) this.ensureSingleSelection(state);
     state.active = true;
     document.body.classList.add("is-dragging-library-paper");
+    this.showPreview(state, event);
     document.querySelectorAll(".membership-drop-hover").forEach((el) => el.classList.remove("membership-drop-hover"));
     const target = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>("[data-drop-kind]");
     if (target) target.classList.add("membership-drop-hover");
@@ -3508,6 +3549,7 @@ class PaperRowDrag {
     const state = this.state;
     this.state = null;
     document.body.classList.remove("is-dragging-library-paper");
+    this.hidePreview();
     const target = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>("[data-drop-kind]");
     clearLibraryDragFeedback();
     releaseLibraryDrag("paper-row");
@@ -3518,12 +3560,20 @@ class PaperRowDrag {
     const kind = target.dataset.dropKind === "collection" ? "collection" : target.dataset.dropKind === "tag" ? "tag" : null;
     const id = Number(kind === "collection" ? target.dataset.collectionId : target.dataset.tagId);
     if (!kind || !Number.isInteger(id)) return;
-    void addLibraryRelation(state.paperId, kind, id).catch((error) => setStatus("添加关系失败：" + String(error), "error"));
+    const message = kind === "collection" ? "已批量添加到文集" : "已批量添加 Library Tag";
+    void runBulkLibraryCommand(
+      kind === "collection" ? "add_papers_to_collection" : "add_tags_to_papers",
+      kind === "collection"
+        ? { paperIds: state.paperIds, collectionId: id }
+        : { paperIds: state.paperIds, tagIds: [id] },
+      message,
+    );
   };
 
   private onCancel = (): void => {
     this.state = null;
     document.body.classList.remove("is-dragging-library-paper");
+    this.hidePreview();
     clearLibraryDragFeedback();
     releaseLibraryDrag("paper-row");
   };
