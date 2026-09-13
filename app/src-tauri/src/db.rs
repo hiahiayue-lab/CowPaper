@@ -6215,8 +6215,10 @@ fn migrate_to_v7(conn: &Connection) -> Result<()> {
 
 /// v6：每日推荐时间线与历史。
 /// - recommendation_runs：每日周期（cycle_key=本地时区日期，open/finalized）
-/// - recommendation_items：rank + score_snapshot；UNIQUE(run_id, paper_id)；
-///   UNIQUE(paper_id) 硬约束——同一 Paper 一生只进入一个推荐周期
+/// - recommendation_items：rank + score_snapshot；UNIQUE(run_id, paper_id)。
+///   v6 originally also added UNIQUE(paper_id); v21 removes that legacy
+///   cross-run restriction so one Paper can have independent Today and
+///   History snapshots.
 fn migrate_to_v6(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
@@ -8087,13 +8089,93 @@ fn migrate_to_v20(conn: &Connection) -> Result<()> {
 /// cannot reconstruct what a historical recommendation showed. New/current
 /// recommendation rows write the self-contained JSON at snapshot time.
 fn migrate_to_v21(conn: &Connection) -> Result<()> {
-    if !column_exists(conn, "recommendation_items", "tag_matches_snapshot_json") {
+    let has_snapshot_column = column_exists(conn, "recommendation_items", "tag_matches_snapshot_json");
+    let has_legacy_paper_unique = has_single_column_unique_index(conn, "recommendation_items", "paper_id")?;
+
+    if !has_snapshot_column && !has_legacy_paper_unique {
+        conn.execute(
+            "ALTER TABLE recommendation_items ADD COLUMN tag_matches_snapshot_json TEXT",
+            [],
+        )?;
+        return Ok(());
+    }
+
+    if has_legacy_paper_unique {
+        // SQLite cannot drop a table-level UNIQUE constraint in place. Rebuild
+        // only this additive snapshot table inside the migration transaction.
+        // Explicit ids and all user rows are copied verbatim; the per-run
+        // uniqueness and both foreign keys remain enforced. A failed rebuild
+        // rolls back atomically through run_migrations, and the pre-v21 DB is
+        // recoverable from the normal user backup before any v21 dual rows are
+        // created.
+        conn.execute_batch(
+            "CREATE TABLE recommendation_items_v21_rebuild (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL REFERENCES recommendation_runs(id) ON DELETE CASCADE,
+                paper_id INTEGER NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+                rank INTEGER NOT NULL,
+                score_snapshot REAL NOT NULL,
+                added_at TEXT NOT NULL,
+                tag_matches_snapshot_json TEXT,
+                UNIQUE (run_id, paper_id)
+            )",
+        )?;
+            if has_snapshot_column {
+                conn.execute(
+                    "INSERT INTO recommendation_items_v21_rebuild
+                     (id, run_id, paper_id, rank, score_snapshot, added_at, tag_matches_snapshot_json)
+                     SELECT id, run_id, paper_id, rank, score_snapshot, added_at,
+                            tag_matches_snapshot_json
+                     FROM recommendation_items",
+                    [],
+                )?;
+            } else {
+                conn.execute(
+                    "INSERT INTO recommendation_items_v21_rebuild
+                     (id, run_id, paper_id, rank, score_snapshot, added_at, tag_matches_snapshot_json)
+                     SELECT id, run_id, paper_id, rank, score_snapshot, added_at,
+                            NULL
+                     FROM recommendation_items",
+                    [],
+                )?;
+            }
+        conn.execute_batch(
+            "DROP TABLE recommendation_items;
+             ALTER TABLE recommendation_items_v21_rebuild RENAME TO recommendation_items;
+             CREATE INDEX IF NOT EXISTS idx_ri_run ON recommendation_items(run_id, rank);
+             CREATE INDEX IF NOT EXISTS idx_ri_paper ON recommendation_items(paper_id);",
+        )?;
+    } else if !has_snapshot_column {
         conn.execute(
             "ALTER TABLE recommendation_items ADD COLUMN tag_matches_snapshot_json TEXT",
             [],
         )?;
     }
     Ok(())
+}
+
+/// Return whether SQLite created a single-column UNIQUE index for `column`.
+/// This detects the legacy table-level UNIQUE(paper_id) without depending on
+/// formatting of sqlite_master SQL or on an auto-index name.
+fn has_single_column_unique_index(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut list = conn.prepare(&format!("PRAGMA index_list({table})"))?;
+    let indexes = list
+        .query_map([], |row| Ok((row.get::<_, String>(1)?, row.get::<_, i64>(2)?)))?
+        .collect::<Result<Vec<_>>>()?;
+    for (index_name, is_unique) in indexes {
+        if is_unique == 0 {
+            continue;
+        }
+        let escaped = index_name.replace('\'', "''");
+        let mut info = conn.prepare(&format!("PRAGMA index_info('{escaped}')"))?;
+        let columns = info
+            .query_map([], |row| row.get::<_, String>(2))?
+            .collect::<Result<Vec<_>>>()?;
+        if columns.len() == 1 && columns[0] == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn update_abstract_provenance(conn: &Connection, id: i64) -> Result<()> {

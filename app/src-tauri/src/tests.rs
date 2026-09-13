@@ -150,12 +150,12 @@ fn test_annotation_v19_to_v20_migration_preserves_existing_records() {
     .unwrap();
 
     db::init(&conn).unwrap();
-    assert_eq!(conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 20);
+    assert_eq!(conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 21);
     assert_eq!(conn.query_row("SELECT paper_id FROM paper_attachments WHERE id=?1", params![attachment_id], |row| row.get::<_, i64>(0)).unwrap(), paper_id);
     assert_eq!(db::get_setting(&conn, "annotation-migration-sentinel").as_deref(), Some("keep"));
     assert_eq!(conn.query_row("SELECT COUNT(*) FROM paper_annotations", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
     db::init(&conn).unwrap();
-    assert_eq!(conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 20);
+    assert_eq!(conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 21);
 }
 
 #[test]
@@ -4499,7 +4499,7 @@ fn test_recommendation_paper_membership_and_next_day_exclusion() {
     let items2 = db::list_recommendation_items(&conn, r2).unwrap();
     assert_eq!(items2.len(), 1, "8-27 只含 C（A/B 不重复）");
     assert_eq!(items2[0].paper_id, pc);
-    // A 一生只在一个周期（UNIQUE paper_id）
+    // A 不会在次日重复进入：它不属于次日的显式 Today batch。
     let cnt: i64 = conn
         .query_row("SELECT COUNT(*) FROM recommendation_items WHERE paper_id = ?1", params![pa], |r| r.get(0))
         .unwrap();
@@ -4770,6 +4770,43 @@ fn test_v21_current_batch_snapshot_updates_history_only_bytes_stay_frozen() {
     for (id, expected) in history_ids.iter().zip(history_snapshots.iter()) {
         assert_eq!(recommendation_snapshot_json(&conn, history_run, *id).as_deref(), Some(expected.as_str()));
     }
+}
+
+#[test]
+fn test_v21_allows_today_and_history_snapshots_for_same_paper() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "v21 dual membership", Some("0025-1909"), None, None, None).unwrap();
+    let paper = seed_paper_with_score(&conn, jid, "10.1000/v21-dual", "X", 2.0);
+    // The fixture explicitly proves current Today membership. The old
+    // recommendation_items UNIQUE(paper_id) would make the history row below
+    // block the current row even though the current batch owns X.
+    conn.execute("UPDATE papers SET first_seen_cycle='2026-08-28' WHERE id=?1", params![paper]).unwrap();
+    let history_json = serde_json::json!([{"tag":"Historical T1","score":0.3,"tagId":7,"semanticHash":"history"}]).to_string();
+    let current_json = serde_json::json!([{"tag":"Today T1","score":0.9,"tagId":7,"semanticHash":"today"}]).to_string();
+    conn.execute("UPDATE papers SET tag_matches_json=?1 WHERE id=?2", params![&history_json, paper]).unwrap();
+    let history_run = db::create_recommendation_run(&conn, "2026-08-27", "finalized").unwrap();
+    conn.execute(
+        "INSERT INTO recommendation_items (run_id,paper_id,rank,score_snapshot,tag_matches_snapshot_json,added_at) VALUES (?1,?2,1,2.0,?3,?4)",
+        params![history_run, paper, &history_json, db::now_utc()],
+    ).unwrap();
+
+    conn.execute("UPDATE papers SET tag_matches_json=?1,total_score=9.0 WHERE id=?2", params![&current_json, paper]).unwrap();
+    let current_run = crate::recommendation::refresh_current_recommendations(&conn, &local_dt(2026, 8, 28, 15, 0), "09:00").unwrap();
+    assert_ne!(current_run, history_run);
+    assert_eq!(db::list_recommendation_items(&conn, current_run).unwrap().len(), 1);
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM recommendation_items WHERE paper_id=?1", params![paper], |r| r.get::<_, i64>(0)).unwrap(), 2);
+
+    let duplicate_same_run = conn.execute(
+        "INSERT INTO recommendation_items (run_id,paper_id,rank,score_snapshot,tag_matches_snapshot_json,added_at) VALUES (?1,?2,2,9.0,?3,?4)",
+        params![current_run, paper, &current_json, db::now_utc()],
+    );
+    assert!(duplicate_same_run.is_err(), "UNIQUE(run_id,paper_id) must remain enforced");
+
+    let history_before = recommendation_snapshot_json(&conn, history_run, paper).unwrap();
+    conn.execute("UPDATE papers SET tag_matches_json=?1,total_score=1.0 WHERE id=?2", params![&history_json, paper]).unwrap();
+    crate::recommendation::refresh_current_recommendations(&conn, &local_dt(2026, 8, 28, 16, 0), "09:00").unwrap();
+    assert_eq!(recommendation_snapshot_json(&conn, history_run, paper).as_deref(), Some(history_before.as_str()));
+    assert_eq!(recommendation_snapshot_json(&conn, current_run, paper).as_deref(), Some(history_json.as_str()));
 }
 
 // ================= Round 6.4：User Collections =================
@@ -6318,7 +6355,7 @@ fn test_library_migration_v13_to_v16_preserves_existing_data() {
 
     db::init(&conn).unwrap();
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-    assert_eq!(version, 20);
+    assert_eq!(version, 21);
     let paper = db::get_paper(&conn, pid).unwrap().unwrap();
     assert_eq!(paper.abstract_text.as_deref(), Some("preserved abstract"));
     assert_eq!(paper.chinese_title.as_deref(), Some("保留中文标题"));
@@ -6332,7 +6369,7 @@ fn test_library_migration_v13_to_v16_preserves_existing_data() {
 
     db::init(&conn).unwrap();
     let version_again: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-    assert_eq!(version_again, 20);
+    assert_eq!(version_again, 21);
     for table in [
         "library_items",
         "library_collections",
@@ -6367,7 +6404,7 @@ fn test_migration_v14_to_v16_creates_attachment_metadata_and_keyword_tables() {
     conn.execute("DROP TABLE paper_attachments", []).unwrap();
     conn.pragma_update(None, "user_version", 14).unwrap();
     db::init(&conn).unwrap();
-    assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 20);
+    assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 21);
     assert!(db::get_library_membership(&conn, pid).unwrap().is_some(), "v15 不得破坏 v14 Library membership");
     for table in ["paper_attachments", "library_item_metadata", "paper_keywords"] {
         assert!(conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)", params![table], |r| r.get::<_, bool>(0)).unwrap());
@@ -7879,7 +7916,7 @@ fn rc3_v16_to_v17_preserves_canonical_keywords_library_and_untrusted_history() {
         INSERT INTO library_item_metadata(paper_id,chinese_abstract_override,note,updated_at) VALUES(1,'旧个人翻译','Keep note','now');
         INSERT INTO paper_keywords(paper_id,keyword,normalized_keyword,kind,source,confidence,retrieved_at,created_at) VALUES(1,'Evidence','evidence','subject','crossref','HIGH','now','now');").unwrap();
     db::init(&conn).unwrap();db::init(&conn).unwrap();
-    assert_eq!(conn.query_row("PRAGMA user_version",[],|r|r.get::<_,i64>(0)).unwrap(),20);
+    assert_eq!(conn.query_row("PRAGMA user_version",[],|r|r.get::<_,i64>(0)).unwrap(),21);
     let p=db::get_paper(&conn,1).unwrap().unwrap();
     assert_eq!(p.abstract_text.as_deref(),Some("INFORMS Management Science 2026:1-17"));assert_eq!(p.abstract_provenance,"legacy_unverified");assert_eq!(p.total_score,Some(4.8));assert_eq!(p.keywords.len(),1);
     let library=db::get_library_paper(&conn,1).unwrap().unwrap();

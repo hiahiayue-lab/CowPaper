@@ -2,8 +2,8 @@
 //!
 //! - 推荐周期 cutoff = Settings 的每日检查时间（daily_check_time，默认 09:00）。
 //! - cycle_key = 本地时区日期：当本地时间未到当日 cutoff 时，当前周期仍是"昨天"的日期。
-//! - 同一 Paper 一生只进入一个推荐周期（recommendation_items.UNIQUE(paper_id) 硬约束 +
-//!   查询 NOT EXISTS 双重保证）。
+//! - 同一 run 内 Paper 唯一（recommendation_items.UNIQUE(run_id, paper_id)）；
+//!   v21 允许同一 Paper 在不同 run 保留独立的历史/当前 snapshot。
 //! - open run 随 AI 完成/手动同步自动刷新（rank/score_snapshot/tag snapshot 可更新）；
 //!   finalized run 冻结（不再修改 membership/rank/score）。
 //! - 全部由 Rust/DB 负责，前端不得自行推导历史推荐。
@@ -74,6 +74,7 @@ pub fn refresh_current_recommendations(
     if run.status != RC_OPEN {
         return Ok(run_id); // finalized：冻结
     }
+    let cycle_key = cycle_key_for(now, daily_check_time);
     let now_iso = db::now_utc();
     let tx = conn
         .unchecked_transaction()
@@ -97,7 +98,8 @@ pub fn refresh_current_recommendations(
            AND COALESCE(TRIM(p.one_sentence_summary), '') != ''
            AND p.evidence_hash IS NOT NULL
            AND p.content_kind NOT IN ({})
-           AND NOT EXISTS (SELECT 1 FROM recommendation_items ri WHERE ri.paper_id = p.id)
+           AND (NOT EXISTS (SELECT 1 FROM recommendation_items ri WHERE ri.paper_id = p.id)
+                OR p.first_seen_cycle = ?1)
         ORDER BY p.total_score DESC, p.published_date DESC, p.id DESC",
         db::DISCOVERY_MEMBERSHIP_PREDICATE,
         excluded,
@@ -106,7 +108,7 @@ pub fn refresh_current_recommendations(
         .prepare(&sql)
         .map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map([], |r| {
+        .query_map(params![cycle_key], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, f64>(1)?,
