@@ -32,10 +32,13 @@ import {
 } from "./librarySearch";
 import {
   INSPECTOR_TABS,
+  annotationFilterOptions,
+  filterLibraryAnnotations,
   normalizeLibraryAnnotations,
   renderLibraryAnnotationCard,
   resolveAnnotationPanelState,
   resolveInspectorTab,
+  type AnnotationFilter,
   type InspectorTab,
   type LibraryAnnotation,
 } from "./libraryAnnotations";
@@ -561,6 +564,9 @@ let libraryActionRequestSeq = 0;
 let libraryTitleTranslationPointerHandled = false;
 let libraryAnnotations = new Map<number, LibraryAnnotation[]>();
 let libraryAnnotationState = new Map<number, "unread" | "loading" | "loaded" | "error">();
+let libraryAnnotationFilter: AnnotationFilter = "all";
+const expandedLibraryAnnotationTextKeys = new Set<string>();
+let expandedLibraryAnnotationPaperId: number | null = null;
 /** Inspector tab is front-end session state only: no DB field, no migration. */
 let libraryInspectorTab: InspectorTab | null = null;
 let libraryAnnotationErrors = new Map<number, string>();
@@ -595,6 +601,14 @@ let preferredPdfReader = "system";
 let currentAppVersion = "0.3.0";
 let pendingUpdate: Update | null = null;
 let updateBusy = false;
+
+function selectLibraryPaperId(paperId: number | null): void {
+  if (selectedLibraryPaperId !== paperId) {
+    expandedLibraryAnnotationTextKeys.clear();
+    expandedLibraryAnnotationPaperId = null;
+  }
+  selectedLibraryPaperId = paperId;
+}
 
 function clearLibraryScope(): void {
   libraryScope = null;
@@ -2478,7 +2492,7 @@ async function selectLibrarySearchSuggestion(suggestion: LibrarySearchState["sug
     librarySearchState = { ...librarySearchState, phase: "closed", activeSuggestionIndex: -1 };
     librarySearchResultIds = null;
     librarySearchMatches.clear();
-    selectedLibraryPaperId = suggestion.paperId;
+    selectLibraryPaperId(suggestion.paperId);
     renderLibrary();
     document.querySelector<HTMLElement>(`[data-action="library-select-paper"][data-paper-id="${suggestion.paperId}"]`)?.scrollIntoView({ block: "nearest" });
     return;
@@ -2645,6 +2659,10 @@ function invalidateLibraryAnnotations(paperId: number): void {
   libraryAnnotations.delete(paperId);
   libraryAnnotationState.delete(paperId);
   libraryAnnotationErrors.delete(paperId);
+  if (expandedLibraryAnnotationPaperId === paperId) {
+    expandedLibraryAnnotationTextKeys.clear();
+    expandedLibraryAnnotationPaperId = null;
+  }
 }
 
 /** Compact two-tab bar for the Inspector. No pill, no segmented CTA. */
@@ -2661,7 +2679,13 @@ function renderInspectorTabs(active: InspectorTab, paperId: number): string {
  */
 function renderLibraryAnnotationTab(item: LibraryPaper): string {
   const paperId = item.paper.id;
+  if (expandedLibraryAnnotationPaperId !== paperId) {
+    expandedLibraryAnnotationTextKeys.clear();
+    expandedLibraryAnnotationPaperId = paperId;
+  }
   const annotations = libraryAnnotations.get(paperId) || [];
+  const filteredAnnotations = filterLibraryAnnotations(annotations, libraryAnnotationFilter);
+  const filterOptions = annotationFilterOptions(annotations, libraryAnnotationFilter);
   const panel = resolveAnnotationPanelState({
     attachmentCount: item.attachments.length,
     usableAttachmentCount: item.attachments.filter((attachment) => !attachment.missing).length,
@@ -2673,9 +2697,19 @@ function renderLibraryAnnotationTab(item: LibraryPaper): string {
     disabled: !panel.canRead,
     busy: panel.kind === "reading",
   });
-  const head = `<div class="inspector-section-head"><h3>标注</h3><div class="inspector-section-actions"><span class="muted small">${panel.kind === "list" ? `${panel.count} 条` : "PDF 标注"}</span>${readAction}</div></div>`;
+  const head = `<div class="inspector-section-head"><h3>标注</h3><div class="inspector-section-actions"><span class="muted small">${panel.kind === "list" ? `${filteredAnnotations.length} 条` : "PDF 标注"}</span>${readAction}</div></div>`;
+  const filterBar = panel.kind === "list"
+    ? `<div class="library-annotation-filters" role="toolbar" aria-label="按类型筛选标注">${filterOptions.map((option) => `<button type="button" class="library-annotation-filter${libraryAnnotationFilter === option.id ? " active" : ""}" data-action="library-annotation-filter" data-annotation-filter="${option.id}" aria-pressed="${libraryAnnotationFilter === option.id}">${option.label}</button>`).join("")}</div>`
+    : "";
   if (panel.kind === "list") {
-    return `<section class="inspector-group inspector-annotations" id="library-inspector-panel" role="tabpanel" aria-label="标注">${head}<div class="library-annotation-list">${annotations.map(renderLibraryAnnotationCard).join("")}</div></section>`;
+    const body = filteredAnnotations.length
+      ? `<div class="library-annotation-list">${filteredAnnotations.map((annotation) => renderLibraryAnnotationCard(annotation, {
+          showAttachmentName: item.attachments.length > 1,
+          quoteExpanded: expandedLibraryAnnotationTextKeys.has(`${annotation.id}:quote`),
+          noteExpanded: expandedLibraryAnnotationTextKeys.has(`${annotation.id}:note`),
+        })).join("")}</div>`
+      : `<div class="library-annotation-filter-empty">没有此类型的标注</div>`;
+    return `<section class="inspector-group inspector-annotations" id="library-inspector-panel" role="tabpanel" aria-label="标注">${head}${filterBar}${body}</section>`;
   }
   const body = panel.tone === "error"
     ? `<div class="inspector-inline-error" role="status">${escapeHtml(panel.message)}</div>`
@@ -2695,7 +2729,9 @@ async function loadLibraryAnnotations(paperId: number, force = false): Promise<b
   try {
     const result = await invoke<unknown>("list_paper_annotations", { paperId });
     if (requestId !== libraryAnnotationRequestSeq) return false;
-    libraryAnnotations.set(paperId, normalizeLibraryAnnotations(result));
+    const attachmentNames = new Map(item.attachments.map((attachment) => [attachment.id, attachment.filename]));
+    const attachmentOrder = new Map(item.attachments.map((attachment, index) => [attachment.id, index]));
+    libraryAnnotations.set(paperId, normalizeLibraryAnnotations(result, { attachmentNames, attachmentOrder }));
     libraryAnnotationState.set(paperId, "loaded");
     const currentItem = libraryPapers.find((candidate) => candidate.paper.id === paperId);
     if (selectedLibraryPaperId === paperId && currentItem) renderLibraryInspector(currentItem);
@@ -2733,7 +2769,7 @@ function renderLibrary() {
   const list = $("library-list");
   if (!list) return;
   if (!visiblePapers.some(item => item.paper.id === selectedLibraryPaperId)) {
-    selectedLibraryPaperId = visiblePapers[0]?.paper.id ?? null;
+    selectLibraryPaperId(visiblePapers[0]?.paper.id ?? null);
     libraryInspectorAbstractLang = visiblePapers[0]?.effectiveChineseAbstract?.trim() ? "zh" : "en";
   }
   list.innerHTML = visiblePapers.length ? visiblePapers.map((item) => {
@@ -2767,10 +2803,10 @@ function renderLibrary() {
   }
   const selected = visiblePapers.find((item) => item.paper.id === selectedLibraryPaperId) || visiblePapers[0];
   if (selected) {
-    selectedLibraryPaperId = selected.paper.id;
+    selectLibraryPaperId(selected.paper.id);
     renderLibraryInspector(selected);
   } else {
-    selectedLibraryPaperId = null;
+    selectLibraryPaperId(null);
     $("library-inspector").innerHTML = '<div class="empty">选择一篇文献查看详情</div>';
   }
   renderLibraryDropState();
@@ -2866,7 +2902,7 @@ async function refreshLibraryMetadata(paperId: number): Promise<void> {
   setStatus("正在从公开来源更新引用元数据…", "running");
   try {
     const result = await invoke<LibraryMetadataRefreshResult>("refresh_library_item_metadata", { paperId });
-    selectedLibraryPaperId = paperId;
+    selectLibraryPaperId(paperId);
     await Promise.all([loadPapers(), loadLibraryData(libraryView)]);
     const sourceText = result.sources.join(" / ");
     const message = result.refreshedFields.length ? `引用元数据已更新 · ${sourceText}` : `引用元数据已是最新 · ${sourceText}`;
@@ -2926,7 +2962,7 @@ function externalPdfOutcomeLabel(outcome: string): string {
 }
 
 async function refreshLibrarySelection(paperId: number) {
-  selectedLibraryPaperId = paperId;
+  selectLibraryPaperId(paperId);
   libraryInspectorCollapsed = false;
   clearLibraryScope();
   libraryView = "all";
@@ -2968,7 +3004,7 @@ async function openLibraryDoubleClickAttachment(target: HTMLElement, event: Mous
   event.preventDefault();
   event.stopPropagation();
   librarySelectedAttachmentId = match.attachment.id;
-  selectedLibraryPaperId = match.paperId;
+  selectLibraryPaperId(match.paperId);
   if (match.attachment.missing) return;
   try {
     setStatus("正在打开 PDF…", "running");
@@ -3062,7 +3098,7 @@ async function attachPdfToPaper(paperId: number) {
     const refreshView = activeWorkspace === "library" ? libraryView : "all";
     await Promise.all([loadPapers(), loadLibraryData(refreshView)]);
     if (activeWorkspace === "library") {
-      selectedLibraryPaperId = paperId;
+      selectLibraryPaperId(paperId);
       libraryInspectorCollapsed = false;
       renderLibrary();
     }
@@ -3188,7 +3224,7 @@ async function processLibraryDrop(files: LibraryDroppedFile[], targetPaperId: nu
   if (succeeded > 0) {
     await Promise.all([loadPapers(), loadLibraryData(libraryView)]);
     if (targetPaperId != null) {
-      selectedLibraryPaperId = targetPaperId;
+      selectLibraryPaperId(targetPaperId);
       libraryInspectorCollapsed = false;
       renderLibrary();
     }
@@ -5169,7 +5205,7 @@ async function setupListeners() {
     const selectAttachment = t.closest("[data-action='library-select-attachment']") as HTMLElement | null;
     if (selectAttachment && !t.closest(".attachment-actions")) {
       librarySelectedAttachmentId = Number(selectAttachment.dataset.attachmentId);
-      selectedLibraryPaperId = Number(selectAttachment.dataset.paperId);
+      selectLibraryPaperId(Number(selectAttachment.dataset.paperId));
       libraryInspectorCollapsed = false;
       renderLibrary();
       return;
@@ -5204,7 +5240,7 @@ async function setupListeners() {
       doSwitch("library-all");
       await loadLibraryData("all");
       if (card) {
-        selectedLibraryPaperId = parseInt(card.dataset.paperId!, 10);
+        selectLibraryPaperId(parseInt(card.dataset.paperId!, 10));
         renderLibrary();
       }
       return;
@@ -5254,7 +5290,7 @@ async function setupListeners() {
         librarySuppressNextClick = false;
         return;
       }
-      selectedLibraryPaperId = parseInt(librarySelect.dataset.paperId!, 10);
+      selectLibraryPaperId(parseInt(librarySelect.dataset.paperId!, 10));
       librarySelectedAttachmentId = null;
       libraryInspectorCollapsed = false;
       libraryInspectorAbstractLang = libraryPapers.find(item => item.paper.id === selectedLibraryPaperId)?.effectiveChineseAbstract?.trim() ? "zh" : "en";
@@ -5473,6 +5509,7 @@ async function setupListeners() {
     const annotationRefresh = t.closest<HTMLButtonElement>("[data-action='library-refresh-annotations']");
     if (annotationRefresh) {
       const paperId = Number(annotationRefresh.dataset.paperId);
+      expandedLibraryAnnotationTextKeys.clear();
       annotationRefresh.disabled = true;
       const currentItem = libraryPapers.find((candidate) => candidate.paper.id === paperId);
       const refreshes = currentItem?.attachments
@@ -5483,12 +5520,34 @@ async function setupListeners() {
       setStatus(ok ? "PDF 标注已刷新" : "PDF 标注刷新失败", ok ? "done" : "error");
       return;
     }
+    const annotationFilter = t.closest<HTMLButtonElement>("[data-action='library-annotation-filter']");
+    if (annotationFilter) {
+      const next = annotationFilter.dataset.annotationFilter;
+      if (next === "all" || next === "highlight" || next === "underline" || next === "note") {
+        libraryAnnotationFilter = next;
+        const item = libraryPapers.find((candidate) => candidate.paper.id === selectedLibraryPaperId);
+        if (item) renderLibraryInspector(item);
+      }
+      return;
+    }
+    const annotationTextToggle = t.closest<HTMLButtonElement>("[data-action='library-toggle-annotation-text']");
+    if (annotationTextToggle) {
+      const annotationId = annotationTextToggle.dataset.annotationId;
+      const field = annotationTextToggle.dataset.annotationField;
+      if (!annotationId || (field !== "quote" && field !== "note")) return;
+      const key = `${annotationId}:${field}`;
+      if (expandedLibraryAnnotationTextKeys.has(key)) expandedLibraryAnnotationTextKeys.delete(key);
+      else expandedLibraryAnnotationTextKeys.add(key);
+      const item = libraryPapers.find((candidate) => candidate.paper.id === selectedLibraryPaperId);
+      if (item) renderLibraryInspector(item);
+      return;
+    }
     const libraryRemove = t.closest("[data-action='library-remove']") as HTMLElement | null;
     if (libraryRemove) {
       const ok = await requestLibraryInlineAction("移出文献库？论文与原始 PDF 均保留。", "移出", "取消");
       if (!ok) return;
       await invoke("remove_paper_from_library", { paperId: parseInt(libraryRemove.dataset.paperId!, 10) });
-      selectedLibraryPaperId = null;
+      selectLibraryPaperId(null);
       librarySelectedAttachmentId = null;
       await Promise.all([loadPapers(), loadLibraryData(libraryView)]);
       setStatus("已移出文献库", "done");

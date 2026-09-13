@@ -3001,6 +3001,43 @@ body.library-workspace .inspector-annotations .inspector-section-head {
   margin-top: 7px;
 }
 
+.library-annotation-filters {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  margin: 5px 0 1px;
+  border-bottom: 1px solid var(--ui-divider);
+}
+
+.library-annotation-filter {
+  min-height: 23px;
+  padding: 2px 7px 4px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--ui-secondary);
+  font: inherit;
+  font-size: 10px;
+  line-height: 15px;
+  cursor: pointer;
+}
+
+.library-annotation-filter:hover {
+  color: var(--ui-text);
+}
+
+.library-annotation-filter.active {
+  border-bottom-color: var(--ui-accent);
+  color: var(--ui-accent);
+  font-weight: 600;
+}
+
+.library-annotation-filter:focus-visible,
+.library-annotation-expand:focus-visible {
+  outline: 2px solid var(--ui-focus);
+  outline-offset: 1px;
+}
+
 .library-annotation-card {
   min-width: 0;
   padding: 7px 0 8px;
@@ -3066,6 +3103,37 @@ body.library-workspace .inspector-annotations .inspector-section-head {
   font-size: 12px;
   line-height: 1.55;
   white-space: pre-wrap;
+}
+
+.library-annotation-excerpt.is-collapsed,
+.library-annotation-note-text.is-collapsed {
+  max-height: 9.3em;
+  overflow: hidden;
+}
+
+.library-annotation-expand {
+  display: block;
+  padding: 1px 0;
+  margin-top: 2px;
+  border: 0;
+  background: transparent;
+  color: var(--ui-accent);
+  font: inherit;
+  font-size: 10px;
+  line-height: 15px;
+  cursor: pointer;
+}
+
+.library-annotation-expand:hover {
+  color: var(--ui-text);
+  text-decoration: underline;
+}
+
+.library-annotation-filter-empty {
+  padding: 12px 0 4px;
+  color: var(--ui-secondary);
+  font-size: 11px;
+  line-height: 16px;
 }
 
 .library-annotation-quote {

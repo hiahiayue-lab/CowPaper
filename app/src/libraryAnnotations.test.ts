@@ -1,6 +1,8 @@
 import {
+  annotationFilterOptions,
   annotationKindLabel,
   annotationStatusLabel,
+  filterLibraryAnnotations,
   INSPECTOR_TABS,
   normalizeLibraryAnnotations,
   renderLibraryAnnotationCard,
@@ -66,6 +68,36 @@ if (unrecovered.includes(`>${"暂无可验证的页面摘录"}<`)) throw new Err
 
 // No comment, no comment section.
 if (renderLibraryAnnotationCard({ ...annotations[0], note: null }).includes("批注")) throw new Error("an empty comment section must not be rendered");
+
+// Page order is derived from the first QuadPoints region (PDF Y is inverted
+// for visual ordering), then falls back to the stable annotation id.
+const ordered = normalizeLibraryAnnotations([
+  { ...annotations[0], id: "right", pageIndex: 0, rawMetadataJson: JSON.stringify({ quadPoints: [100, 100, 120, 100, 100, 90, 120, 90] }) },
+  { ...annotations[0], id: "next-page", pageIndex: 1, rawMetadataJson: JSON.stringify({ quadPoints: [1, 100, 20, 100, 1, 90, 20, 90] }) },
+  { ...annotations[0], id: "left", pageIndex: 0, rawMetadataJson: JSON.stringify({ quadPoints: [10, 100, 30, 100, 10, 90, 30, 90] }) },
+  { ...annotations[0], id: "second-attachment", attachmentId: 8, pageIndex: 0, rawMetadataJson: JSON.stringify({ quadPoints: [1, 100, 20, 100, 1, 90, 20, 90] }) },
+], { attachmentOrder: new Map([[7, 0], [8, 1]]) });
+if (ordered.map((annotation) => annotation.id).join("|") !== "left|right|next-page|second-attachment") throw new Error("annotation attachment/page/geometry ordering must be deterministic");
+
+const filterFixtures = normalizeLibraryAnnotations([
+  { ...annotations[0], id: "filter-highlight", kind: "highlight" },
+  { ...annotations[0], id: "filter-underline", kind: "underline" },
+  { ...annotations[0], id: "filter-note", kind: "text" },
+  { ...annotations[0], id: "filter-strikeout", kind: "strikeout" },
+]);
+if (annotationFilterOptions(filterFixtures).map((option) => option.id).join("|") !== "all|highlight|underline|note") throw new Error("annotation filters must map supported kinds to compact user categories");
+if (filterLibraryAnnotations(filterFixtures, "highlight").length !== 1) throw new Error("highlight filter mismatch");
+if (filterLibraryAnnotations(filterFixtures, "underline").length !== 1) throw new Error("underline filter mismatch");
+if (filterLibraryAnnotations(filterFixtures, "note").length !== 2) throw new Error("note filter must include text and strikeout annotations");
+
+const longText = Array.from({ length: 7 }, (_, index) => `Long annotation line ${index + 1}`).join("\n");
+const collapsed = renderLibraryAnnotationCard({ ...annotations[0], excerpt: longText, note: longText }, { showAttachmentName: false });
+if (!collapsed.includes("library-annotation-excerpt is-collapsed") || !collapsed.includes("library-annotation-note-text is-collapsed")) throw new Error("long quote and comment must collapse by default");
+if (!collapsed.includes('data-annotation-field="quote"') || !collapsed.includes('data-annotation-field="note"')) throw new Error("long text needs explicit expand controls");
+if (collapsed.includes("paper.pdf")) throw new Error("single-attachment annotation cards should hide repeated attachment names");
+const expanded = renderLibraryAnnotationCard({ ...annotations[0], excerpt: longText, note: longText }, { quoteExpanded: true, noteExpanded: true });
+if (expanded.includes("library-annotation-excerpt is-collapsed") || expanded.includes("library-annotation-note-text is-collapsed")) throw new Error("expanded annotation text must show the full block");
+if (!expanded.includes(">收起</button>")) throw new Error("expanded annotation text needs a collapse control");
 
 console.log("Library annotation rendering contract passed");
 
