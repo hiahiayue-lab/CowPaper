@@ -2337,6 +2337,12 @@ interface BackendLibrarySearchHit {
   paperId: number;
   rank: number;
   relevance: number;
+  annotationHits?: Array<{
+    id: number;
+    quotedText: string | null;
+    comment: string | null;
+    translation: string | null;
+  }>;
 }
 
 function backendLibrarySearchText(query: LibrarySearchQuery): string {
@@ -2372,6 +2378,7 @@ function getLibrarySearchAdapter(): LibrarySearchApi {
         const item = byId.get(hit.paperId);
         if (!item) continue;
         const paper = librarySearchPaper(item);
+        if (Array.isArray(hit.annotationHits)) paper.annotationHits = hit.annotationHits;
         // The backend returns a safe superset for field clauses. This exact
         // check is also what keeps title/abstract/tag evidence aligned with
         // the current effective Library row.

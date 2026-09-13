@@ -698,12 +698,23 @@ pub struct LibraryMetadataRefreshResult {
 /// existing LibraryPaper projection when they need the full row.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct LibrarySearchAnnotationHit {
+    pub id: i64,
+    pub quoted_text: Option<String>,
+    pub comment: Option<String>,
+    pub translation: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LibrarySearchResult {
     pub paper_id: i64,
     /// Raw FTS5 BM25 rank (lower is better, matching SQLite's `rank`).
     pub rank: f64,
     /// Convenience score with the natural ordering (higher is better).
     pub relevance: f64,
+    /// Structured annotation values for source-faithful result snippets.
+    pub annotation_hits: Vec<LibrarySearchAnnotationHit>,
 }
 
 /// Metadata discovered from a local PDF without making any network or AI

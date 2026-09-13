@@ -6742,6 +6742,11 @@ fn v030_library_search_annotations_are_indexed_deduped_and_refreshable() {
     assert_eq!(ids("second review"), vec![pid], "multiple annotations share one canonical FTS row");
     assert_eq!(ids("可靠引文"), vec![pid], "annotation translations are searchable");
     assert_eq!(ids("annotation-search"), Vec::<i64>::new(), "DOI remains excluded from search");
+    let structured_hits = db::search_library(&conn, "Reliable quoted", &[], &[], 100, 0, None).unwrap();
+    assert_eq!(structured_hits.len(), 1);
+    assert_eq!(structured_hits[0].annotation_hits.len(), 2, "one ranked Paper carries its annotation hit context in one bulk result");
+    assert_eq!(structured_hits[0].annotation_hits[0].quoted_text.as_deref(), Some("Reliable quoted text"));
+    assert_eq!(structured_hits[0].annotation_hits[0].comment.as_deref(), Some("first review note"));
     assert_eq!(
         conn.query_row("SELECT annotation_text FROM library_search_documents WHERE paper_id=?1", params![pid], |row| row.get::<_, String>(0)).unwrap(),
         "Reliable quoted text\nfirst review note\n可靠引文\nSecond annotation fragment\nsecond review note",

@@ -1991,6 +1991,58 @@ fn library_annotation_text(conn: &Connection, paper_id: i64) -> Result<Option<St
     Ok((!parts.is_empty()).then(|| parts.join("\n")))
 }
 
+/// Return annotation fields for a set of already-ranked Library hits in one
+/// query. The FTS projection intentionally remains aggregated for matching;
+/// this structured side channel lets the UI render the actual field that
+/// matched instead of guessing from the aggregate text.
+fn library_search_annotation_hits(
+    conn: &Connection,
+    paper_ids: &[i64],
+) -> Result<std::collections::HashMap<i64, Vec<crate::models::LibrarySearchAnnotationHit>>> {
+    let has_table: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='paper_annotations')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_table || paper_ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    let placeholders = (1..=paper_ids.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT paper_id,id,quoted_text,comment,translation
+         FROM paper_annotations
+         WHERE paper_id IN ({placeholders})
+         ORDER BY paper_id,id"
+    );
+    let args = paper_ids
+        .iter()
+        .copied()
+        .map(rusqlite::types::Value::Integer)
+        .collect::<Vec<_>>();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            crate::models::LibrarySearchAnnotationHit {
+                id: row.get(1)?,
+                quoted_text: row.get(2)?,
+                comment: row.get(3)?,
+                translation: row.get(4)?,
+            },
+        ))
+    })?;
+    let mut by_paper = std::collections::HashMap::new();
+    for row in rows {
+        let (paper_id, annotation) = row?;
+        by_paper.entry(paper_id).or_insert_with(Vec::new).push(annotation);
+    }
+    Ok(by_paper)
+}
+
 pub(crate) fn refresh_library_search_document(conn: &Connection, paper_id: i64) -> Result<()> {
     // Canonical/PDF migration helpers can run before v14 Library tables exist
     // (for example while upgrading a v13 database). Search synchronization is
@@ -2302,9 +2354,18 @@ pub fn search_library(
             paper_id: row.get(0)?,
             rank,
             relevance: -rank,
+            annotation_hits: Vec::new(),
         })
     })?;
-    rows.collect()
+    let mut results = rows.collect::<Result<Vec<_>>>()?;
+    if !query_text.trim().is_empty() {
+        let paper_ids = results.iter().map(|result| result.paper_id).collect::<Vec<_>>();
+        let mut annotation_hits = library_search_annotation_hits(conn, &paper_ids)?;
+        for result in &mut results {
+            result.annotation_hits = annotation_hits.remove(&result.paper_id).unwrap_or_default();
+        }
+    }
+    Ok(results)
 }
 
 

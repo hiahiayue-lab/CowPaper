@@ -68,6 +68,16 @@ export interface SearchLibraryTag {
   color?: string | null;
 }
 
+export type LibrarySearchAnnotationSource = "quoted_text" | "comment" | "translation";
+
+/** One persisted annotation projection returned with a search hit. */
+export interface LibrarySearchAnnotationHit {
+  id?: number;
+  quotedText?: string | null;
+  comment?: string | null;
+  translation?: string | null;
+}
+
 export interface SearchPaper {
   id: number;
   title?: string | null;
@@ -86,6 +96,8 @@ export interface SearchPaper {
   chineseAbstract?: string | null;
   /** Aggregated quoted text, comments, and translations from annotations. */
   annotationText?: string | null;
+  /** Structured annotation values used to keep result snippets source-faithful. */
+  annotationHits?: readonly LibrarySearchAnnotationHit[];
   collectionIds?: number[];
   tagIds?: number[];
   tags?: string[];
@@ -137,6 +149,8 @@ export interface LibrarySearchSnippet {
   field: LibrarySearchField;
   /** A compact, display-safe excerpt. It is not an HTML fragment. */
   text: string;
+  /** Set for Annotation snippets so the UI never has to infer the hit source. */
+  source?: LibrarySearchAnnotationSource;
 }
 
 export interface LibrarySearchHit {
@@ -547,11 +561,46 @@ function matchingFields(paper: SearchPaper, query: LibrarySearchQuery): LibraryS
   const values = librarySearchFieldValues(paper);
   const freeTerms = searchTerms(query.freeTextQuery);
   return LIBRARY_SEARCH_FIELDS.filter((field) => {
+    if (field === "annotation" && Array.isArray(paper.annotationHits)) {
+      return paper.annotationHits.some((annotation) => annotationSearchValues(annotation).some(({ value }) => {
+        const matchesFreeText = freeTerms.some((term) => normalizedText(value).includes(term));
+        const matchesFieldClause = query.fieldClauses.some((clause) => clause.field === field && fieldContainsTerms(value, searchTerms(clause.query)));
+        return matchesFreeText || matchesFieldClause;
+      }));
+    }
     const value = values[field];
     const matchesFreeText = freeTerms.some((term) => normalizedText(value).includes(term));
     const matchesFieldClause = query.fieldClauses.some((clause) => clause.field === field && fieldContainsTerms(value, searchTerms(clause.query)));
     return matchesFreeText || matchesFieldClause;
   });
+}
+
+type AnnotationSearchValue = {
+  source?: LibrarySearchAnnotationSource;
+  value: string;
+  order: number;
+};
+
+function annotationSearchValues(annotation: LibrarySearchAnnotationHit): AnnotationSearchValue[] {
+  return [
+    ["quoted_text", annotation.quotedText],
+    ["comment", annotation.comment],
+    ["translation", annotation.translation],
+  ].flatMap(([source, value], index) => {
+    const text = valueText(value).trim();
+    return text ? [{ source: source as LibrarySearchAnnotationSource, value: text, order: index }] : [];
+  });
+}
+
+function paperAnnotationSearchValues(paper: SearchPaper): AnnotationSearchValue[] {
+  if (Array.isArray(paper.annotationHits)) {
+    return paper.annotationHits.flatMap((annotation, annotationIndex) => annotationSearchValues(annotation).map((value) => ({
+      ...value,
+      order: annotationIndex * 3 + value.order,
+    })));
+  }
+  const value = valueText(paper.annotationText).trim();
+  return value ? [{ value, order: 0 }] : [];
 }
 
 const MAX_SEARCH_SNIPPET_LENGTH = 120;
@@ -570,14 +619,51 @@ function shortSearchSnippet(value: string, terms: readonly string[]): string {
   return `${hasPrefix ? "…" : ""}${clean.slice(start, end)}${hasSuffix ? "…" : ""}`;
 }
 
+function searchSnippetScore(value: string, terms: readonly string[]): number {
+  const haystack = normalizedText(value);
+  const matches = terms.filter((term) => haystack.includes(term));
+  if (!matches.length) return Number.NEGATIVE_INFINITY;
+  const first = matches
+    .map((term) => haystack.indexOf(term))
+    .sort((a, b) => a - b)[0] ?? Number.MAX_SAFE_INTEGER;
+  return matches.length * 1000 + (matches.length === terms.length ? 100 : 0) - first / 1000;
+}
+
+type SearchSnippetCandidate = {
+  field: LibrarySearchField;
+  text: string;
+  source?: LibrarySearchAnnotationSource;
+  score: number;
+  order: number;
+};
+
 /** Build UI metadata without changing canonical Paper data. */
 export function matchLibrarySearchPaper(paper: SearchPaper, query: LibrarySearchQueryInput, rank?: number, relevance?: number): LibrarySearchHit {
   const normalized = normalizeLibrarySearchQuery(query);
   const fields = matchingFields(paper, normalized);
   const values = librarySearchFieldValues(paper);
-  const snippets = fields
-    .map((field) => ({ field, text: shortSearchSnippet(values[field], fieldTermsForQuery(field, normalized)) }))
+  const candidates: SearchSnippetCandidate[] = [];
+  fields.forEach((field, fieldIndex) => {
+    const terms = fieldTermsForQuery(field, normalized);
+    if (field === "annotation") {
+      paperAnnotationSearchValues(paper).forEach((annotation) => {
+        const text = shortSearchSnippet(annotation.value, terms);
+        candidates.push({
+            field,
+            text,
+            ...(annotation.source ? { source: annotation.source } : {}),
+            score: searchSnippetScore(annotation.value, terms),
+            order: fieldIndex * 10000 + annotation.order,
+        });
+      });
+      return;
+    }
+    const text = shortSearchSnippet(values[field], terms);
+    candidates.push({ field, text, score: searchSnippetScore(values[field], terms), order: fieldIndex * 10000 });
+  });
+  const snippets = candidates
     .filter((snippet) => snippet.text)
+    .sort((a, b) => b.score - a.score || a.order - b.order)
     .slice(0, MAX_SEARCH_SNIPPETS);
   return { paperId: paper.id, ...(rank == null ? {} : { rank }), ...(relevance == null ? {} : { relevance }), matched_fields: fields, snippets };
 }

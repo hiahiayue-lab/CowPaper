@@ -98,6 +98,21 @@ assert(hit.snippets.length <= 3 && hit.snippets.every((snippet) => snippet.text.
 const annotationHit = matchLibrarySearchPaper(paper, { ...emptyLibrarySearchQuery(), freeTextQuery: "highlighted" });
 assert(annotationHit.matched_fields.includes("annotation"), "annotation hits expose the Annotation field");
 assert(annotationHit.snippets.some((snippet) => snippet.field === "annotation" && snippet.text.includes("highlighted")), "annotation hits expose a short snippet");
+
+const structuredAnnotationPaper: SearchPaper = {
+  ...paper,
+  annotationText: "Codification need not reduce scarcity. Reviewer comment about incentives.",
+  annotationHits: [
+    { id: 1, quotedText: "Codification need not reduce scarcity.", comment: "Reviewer comment about incentives." },
+    { id: 2, quotedText: "scope and intensity", comment: "3 develop is not the highlighted text." },
+  ],
+};
+const quotedTextHit = matchLibrarySearchPaper(structuredAnnotationPaper, { ...emptyLibrarySearchQuery(), freeTextQuery: "scarcity" });
+assert(quotedTextHit.snippets.some((snippet) => snippet.field === "annotation" && snippet.source === "quoted_text" && snippet.text.includes("Codification need not reduce scarcity")), "quoted_text hit uses the quoted_text snippet");
+const commentHit = matchLibrarySearchPaper(structuredAnnotationPaper, { ...emptyLibrarySearchQuery(), freeTextQuery: "incentives" });
+assert(commentHit.snippets.some((snippet) => snippet.field === "annotation" && snippet.source === "comment" && snippet.text.includes("Reviewer comment about incentives")), "comment hit uses the comment snippet");
+const secondAnnotationHit = matchLibrarySearchPaper(structuredAnnotationPaper, { ...emptyLibrarySearchQuery(), freeTextQuery: "scope" });
+assert(secondAnnotationHit.snippets.some((snippet) => snippet.source === "quoted_text" && snippet.text === "scope and intensity"), "multiple annotation hits select the actual matching annotation");
 const annotationRows = filterLibrarySearchPapers([paper, duplicatePaper], { ...emptyLibrarySearchQuery(), freeTextQuery: "annotation" });
 assert(annotationRows.length === 1 && annotationRows[0].id === paper.id, "multiple annotation-bearing rows collapse to one canonical paper row");
 
