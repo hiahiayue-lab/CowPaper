@@ -989,7 +989,7 @@ async function selectPdfLibraryRoot(): Promise<void> {
       renderPdfTemplateExample();
     }
   } catch (error) {
-    setStatus(`选择 PDF 文件库目录失败：${String(error)}`, "error");
+    setStatus(`选择文献库文件夹失败：${String(error)}`, "error");
   }
 }
 
@@ -2625,7 +2625,14 @@ function renderLibraryFacets(): void {
 }
 
 function renderLibraryAttachmentActions(attachment: PaperAttachment): string {
-  return `<span class="attachment-actions">${attachment.missing ? "" : `<button type="button" class="ghost small" data-action="library-open-pdf" data-attachment-id="${attachment.id}">打开</button><button type="button" class="ghost small" data-action="library-reveal-pdf" data-attachment-id="${attachment.id}">显示位置</button>`}<button type="button" class="ghost small" data-action="library-relink-pdf" data-attachment-id="${attachment.id}">重新链接</button><button type="button" class="ghost small danger" data-action="library-detach-pdf" data-attachment-id="${attachment.id}">解除关联</button></span>`;
+  const configuredMode = settings?.pdfFileHandlingMode;
+  const managementMode = configuredMode === "copy" || configuredMode === "move"
+    ? configuredMode
+    : null;
+  const manage = !attachment.missing && managementMode
+    ? `<button type="button" class="ghost small" data-action="library-manage-pdf" data-attachment-id="${attachment.id}" title="按当前文献库规则整理 PDF">整理</button>`
+    : "";
+  return `<span class="attachment-actions">${attachment.missing ? "" : `<button type="button" class="ghost small" data-action="library-open-pdf" data-attachment-id="${attachment.id}">打开</button><button type="button" class="ghost small" data-action="library-reveal-pdf" data-attachment-id="${attachment.id}">显示位置</button>`}${manage}<button type="button" class="ghost small" data-action="library-relink-pdf" data-attachment-id="${attachment.id}">重新链接</button><button type="button" class="ghost small danger" data-action="library-detach-pdf" data-attachment-id="${attachment.id}">解除关联</button></span>`;
 }
 
 function renderLibraryAttachmentChild(item: LibraryPaper, attachment: PaperAttachment): string {
@@ -2796,7 +2803,7 @@ function renderLibraryInspector(item: LibraryPaper) {
   const attachmentRows = item.attachments.length
     ? item.attachments.map((attachment) => {
       const selected = librarySelectedAttachmentId === attachment.id;
-      return `<div class="attachment-row${attachment.missing ? " missing" : ""}${selected ? " selected" : ""}" data-attachment-id="${attachment.id}" data-action="library-select-attachment" data-paper-id="${item.paper.id}" data-library-context-kind="attachment" data-library-context-id="${attachment.id}" role="button" tabindex="0" aria-selected="${selected}" title="点击选择 PDF；双击打开"><div class="attachment-main"><span class="attachment-icon" aria-hidden="true">PDF</span><div class="attachment-copy"><strong title="${escapeHtml(attachment.absolutePath)}">${escapeHtml(attachment.filename)}</strong><span class="muted small">${attachment.missing ? "PDF 文件已移动 / 找不到文件" : attachment.storageMode === "managed" ? "已纳入 CowPaper 文件库 · managed" : "已链接 · 原文件保留"}</span></div></div>${renderLibraryAttachmentActions(attachment)}</div>`;
+      return `<div class="attachment-row${attachment.missing ? " missing" : ""}${selected ? " selected" : ""}" data-attachment-id="${attachment.id}" data-action="library-select-attachment" data-paper-id="${item.paper.id}" data-library-context-kind="attachment" data-library-context-id="${attachment.id}" role="button" tabindex="0" aria-selected="${selected}" title="点击选择 PDF；双击打开"><div class="attachment-main"><span class="attachment-icon" aria-hidden="true">PDF</span><div class="attachment-copy"><strong title="${escapeHtml(attachment.absolutePath)}">${escapeHtml(attachment.filename)}</strong><span class="muted small">${attachment.missing ? "PDF 文件已移动 / 找不到文件" : attachment.storageMode === "managed" ? "已保存到文献库文件夹" : "已链接 · 原文件保留"}</span></div></div>${renderLibraryAttachmentActions(attachment)}</div>`;
     }).join("")
     : '<div class="inspector-placeholder"><span class="placeholder-icon" aria-hidden="true">⌑</span><span>尚未添加 PDF 附件。</span></div>';
   const attachmentBusy = libraryPdfBusyPaperId === p.id;
@@ -3583,12 +3590,16 @@ function openLibraryContextMenu(kind: LibraryContextTarget, id: number, x: numbe
   const tag = kind === "tag" ? libraryTags.find((item) => item.id === id) : null;
   const attachment = kind === "attachment" ? libraryPapers.flatMap((item) => item.attachments).find((item) => item.id === id) : null;
   const paper = kind === "paper" ? libraryPapers.find((item) => item.paper.id === id) : null;
+  const configuredMode = settings?.pdfFileHandlingMode;
+  const manageAttachment = attachment && !attachment.missing && (configuredMode === "copy" || configuredMode === "move")
+    ? `<button type="button" role="menuitem" data-action="library-manage-pdf" data-attachment-id="${id}">按当前规则整理</button>`
+    : "";
   if (collection) {
     menu.innerHTML = `<div class="library-context-title">${escapeHtml(collection.name)}</div><button type="button" role="menuitem" data-action="library-filter-collection" data-collection-id="${id}">打开文集</button>${collection.parentId == null ? `<button type="button" role="menuitem" data-action="library-create-child" data-parent-id="${id}">新建子文集</button>` : ""}<button type="button" role="menuitem" data-action="library-rename-collection" data-collection-id="${id}">重命名文集</button><button type="button" role="menuitem" class="danger" data-action="library-delete-collection" data-collection-id="${id}">删除文集</button>`;
   } else if (tag) {
     menu.innerHTML = `<div class="library-context-title">${escapeHtml(tag.name)}</div><button type="button" role="menuitem" data-action="library-filter-tag" data-tag-id="${id}">筛选此标签</button><button type="button" role="menuitem" data-action="library-rename-tag" data-tag-id="${id}">重命名 Library Tag</button><label class="library-context-color" role="menuitem">选择颜色<input type="color" value="${escapeHtml(tag.color || "#9ca3af")}" data-action="library-set-tag-color" data-tag-id="${id}" aria-label="选择 Library Tag 颜色" /></label><button type="button" role="menuitem" class="danger" data-action="library-delete-tag" data-tag-id="${id}">删除标签</button>`;
   } else if (attachment) {
-    menu.innerHTML = `<div class="library-context-title">${escapeHtml(attachment.filename)}</div>${attachment.missing ? "" : `<button type="button" role="menuitem" data-action="library-open-pdf" data-attachment-id="${id}">打开</button><button type="button" role="menuitem" data-action="library-reveal-pdf" data-attachment-id="${id}">显示位置</button>`}<button type="button" role="menuitem" data-action="library-relink-pdf" data-attachment-id="${id}">重新链接</button><button type="button" role="menuitem" class="danger" data-action="library-detach-pdf" data-attachment-id="${id}">解除关联</button>`;
+    menu.innerHTML = `<div class="library-context-title">${escapeHtml(attachment.filename)}</div>${attachment.missing ? "" : `<button type="button" role="menuitem" data-action="library-open-pdf" data-attachment-id="${id}">打开</button><button type="button" role="menuitem" data-action="library-reveal-pdf" data-attachment-id="${id}">显示位置</button>`}${manageAttachment}<button type="button" role="menuitem" data-action="library-relink-pdf" data-attachment-id="${id}">重新链接</button><button type="button" role="menuitem" class="danger" data-action="library-detach-pdf" data-attachment-id="${id}">解除关联</button>`;
   } else if (paper) {
     menu.innerHTML = `<div class="library-context-title">${escapeHtml(libraryEnglishTitle(paper))}</div><button type="button" role="menuitem" class="danger" data-action="library-remove" data-paper-id="${id}">移出文献库</button>`;
   } else {
@@ -4657,7 +4668,7 @@ async function saveSettings() {
     return;
   }
   if (s.pdfFileHandlingMode !== "none" && !s.pdfLibraryRoot) {
-    $("settings-msg").textContent = "copy / move 模式需要先选择 Library root directory";
+    $("settings-msg").textContent = "copy / move 模式需要先选择文献库文件夹";
     $("settings-msg").className = "error small";
     return;
   }
@@ -5508,6 +5519,35 @@ async function setupListeners() {
     const attachLibraryPdf = t.closest("[data-action='library-attach-pdf']") as HTMLElement | null;
     if (attachLibraryPdf) {
       await attachPdfToPaper(Number(attachLibraryPdf.dataset.paperId));
+      return;
+    }
+    const managePdf = t.closest("[data-action='library-manage-pdf']") as HTMLButtonElement | null;
+    if (managePdf) {
+      const mode = settings?.pdfFileHandlingMode;
+      if (mode !== "copy" && mode !== "move") {
+        setStatus("当前为保持原文件链接，无需整理", "done");
+        return;
+      }
+      const confirmed = await requestLibraryInlineAction(
+        mode === "move"
+          ? "按当前规则移动到文献库文件夹？原路径文件将不再保留。"
+          : "按当前规则拷贝到文献库文件夹？原文件保留。",
+        mode === "move" ? "移动并整理" : "拷贝并整理",
+        "取消",
+      );
+      if (!confirmed) return;
+      managePdf.disabled = true;
+      managePdf.textContent = mode === "move" ? "移动中…" : "拷贝中…";
+      try {
+        setStatus(mode === "move" ? "正在移动 PDF 到文献库文件夹…" : "正在拷贝 PDF 到文献库文件夹…", "running");
+        await invoke("manage_pdf_attachment", { attachmentId: Number(managePdf.dataset.attachmentId), mode });
+        await loadLibraryData(libraryView);
+        setStatus(mode === "move" ? "PDF 已移动到文献库文件夹" : "PDF 已拷贝到文献库文件夹", "done");
+      } catch (error) {
+        setStatus(`整理 PDF 失败：${String(error)}`, "error");
+        managePdf.disabled = false;
+        managePdf.textContent = "整理";
+      }
       return;
     }
     const openPdf = t.closest("[data-action='library-open-pdf']") as HTMLElement | null;

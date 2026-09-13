@@ -7520,6 +7520,101 @@ fn test_pdf_filename_sanitization_collision_and_empty_fields() {
 }
 
 #[test]
+fn test_pdf_filename_template_cleans_missing_middle_fields_and_falls_back_to_source_stem() {
+    let conn = mem_db();
+    let pid = test_paper(&conn, "10.1000/storage-template-fallback", "Paper Title");
+    db::add_paper_to_library(&conn, pid, &[], &[], "test").unwrap();
+    let source = test_pdf_path("LaborAsCapital", "%PDF-1.7\n");
+    let root = test_pdf_library("template-fallback");
+    set_pdf_storage_settings(&conn, "copy", &root, "{title} - {journal} - {year}.pdf", "none");
+    conn.execute(
+        "UPDATE papers SET container_title=NULL, year=NULL, authors_json='[]' WHERE id=?1",
+        params![pid],
+    ).unwrap();
+    conn.execute(
+        "UPDATE journals SET name='External PDF Import' WHERE id=(SELECT journal_id FROM papers WHERE id=?1)",
+        params![pid],
+    ).unwrap();
+    let attachment = db::attach_pdf_to_paper(&conn, pid, source.to_str().unwrap()).unwrap();
+    assert_eq!(attachment.filename, "Paper Title.pdf");
+    assert!(!attachment.filename.contains("  "));
+
+    db::set_library_item_metadata(&conn, pid, &crate::models::LibraryItemMetadataInput {
+        title_override: Some("Override Title".into()),
+        journal_override: Some("Override Journal".into()),
+        year_override: Some(1999),
+        authors_override: Some(vec![Author { given: None, family: None, name: Some("Override Author".into()) }]),
+        ..Default::default()
+    }).unwrap();
+    set_pdf_storage_settings(&conn, "copy", &root, "{title} - {journal} - {first_author} - {year}.pdf", "none");
+    let source_with_overrides = test_pdf_path("metadata-overrides", "%PDF-1.7\n");
+    let with_overrides = db::attach_pdf_to_paper(&conn, pid, source_with_overrides.to_str().unwrap()).unwrap();
+    assert_eq!(with_overrides.filename, "Override Title - Override Journal - Override Author - 1999.pdf");
+
+    let pid_without_metadata = test_paper(&conn, "10.1000/storage-template-source", "Temporary title");
+    conn.execute(
+        "UPDATE papers SET title=NULL, title_norm=NULL, container_title=NULL, year=NULL, authors_json='[]' WHERE id=?1",
+        params![pid_without_metadata],
+    ).unwrap();
+    conn.execute(
+        "UPDATE journals SET name='External PDF Import' WHERE id=(SELECT journal_id FROM papers WHERE id=?1)",
+        params![pid_without_metadata],
+    ).unwrap();
+    let source_without_metadata = test_pdf_path("source-stem-fallback", "%PDF-1.7\n");
+    let source_stem = source_without_metadata.file_stem().unwrap().to_str().unwrap().to_string();
+    let fallback = db::attach_pdf_to_paper(&conn, pid_without_metadata, source_without_metadata.to_str().unwrap()).unwrap();
+    assert_eq!(fallback.filename, format!("{source_stem}.pdf"));
+    assert!(source_without_metadata.exists());
+
+    let _ = std::fs::remove_file(source);
+    let _ = std::fs::remove_file(source_with_overrides);
+    let _ = std::fs::remove_file(source_without_metadata);
+    let _ = std::fs::remove_file(attachment.absolute_path);
+    let _ = std::fs::remove_file(with_overrides.absolute_path);
+    let _ = std::fs::remove_file(fallback.absolute_path);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn test_relink_pdf_respects_current_file_handling_policy() {
+    let conn = mem_db();
+    let pid = test_paper(&conn, "10.1000/storage-relink-policy", "Relink Policy Paper");
+    let first = test_pdf_path("relink-first", "%PDF-1.7\nfirst\n");
+    let second = test_pdf_path("relink-copy", "%PDF-1.7\nsecond\n");
+    let third = test_pdf_path("relink-move", "%PDF-1.7\nthird\n");
+    let fourth = test_pdf_path("relink-keep", "%PDF-1.7\nfourth\n");
+    let root = test_pdf_library("relink-policy");
+
+    set_pdf_storage_settings(&conn, "none", &root, "{title}.pdf", "none");
+    let linked = db::attach_pdf_to_paper(&conn, pid, first.to_str().unwrap()).unwrap();
+    assert_eq!(db::relink_pdf(&conn, linked.id, second.to_str().unwrap()).unwrap().storage_mode, "linked");
+    assert!(second.exists());
+
+    set_pdf_storage_settings(&conn, "copy", &root, "{title}.pdf", "none");
+    let copied = db::relink_pdf(&conn, linked.id, second.to_str().unwrap()).unwrap();
+    assert_eq!(copied.storage_mode, "managed");
+    assert!(std::path::Path::new(&copied.absolute_path).is_file());
+    assert!(second.exists());
+
+    set_pdf_storage_settings(&conn, "move", &root, "{title} moved.pdf", "none");
+    let moved = db::relink_pdf(&conn, linked.id, third.to_str().unwrap()).unwrap();
+    assert_eq!(moved.storage_mode, "managed");
+    assert!(!third.exists());
+    assert!(std::path::Path::new(&moved.absolute_path).is_file());
+
+    set_pdf_storage_settings(&conn, "none", &root, "{title}.pdf", "none");
+    let kept = db::relink_pdf(&conn, linked.id, fourth.to_str().unwrap()).unwrap();
+    assert_eq!(kept.storage_mode, "linked");
+    assert_eq!(kept.relative_path, None);
+    assert_eq!(std::path::Path::new(&kept.absolute_path), std::fs::canonicalize(&fourth).unwrap().as_path());
+
+    let _ = std::fs::remove_file(first);
+    let _ = std::fs::remove_file(second);
+    let _ = std::fs::remove_file(fourth);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn test_pdf_storage_year_subfolder() {
     let conn = mem_db();
     let pid = test_paper(&conn, "10.1000/storage-year", "Year Paper");

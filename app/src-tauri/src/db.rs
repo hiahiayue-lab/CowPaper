@@ -3028,10 +3028,10 @@ pub fn validate_pdf_storage_settings(
     if mode != "none" {
         let root = Path::new(library_root.trim());
         if library_root.trim().is_empty() {
-            return Err("copy/move 模式必须配置 Library root directory".to_string());
+            return Err("copy/move 模式必须配置文献库文件夹".to_string());
         }
         if !root.is_absolute() {
-            return Err("Library root directory 必须是绝对路径".to_string());
+            return Err("文献库文件夹必须是绝对路径".to_string());
         }
     }
     Ok(())
@@ -3093,13 +3093,21 @@ fn paper_naming_context(conn: &Connection, paper_id: i64) -> Result<PdfNamingCon
         "SELECT p.title, p.authors_json, p.year, p.normalized_doi, p.original_doi,
                 p.discovery_source,
                 COALESCE(NULLIF(trim(p.container_title), ''), NULLIF(j.name, 'External PDF Import')),
-                m.journal_override, m.source_override, m.year_override, m.doi_override
+                m.title_override, m.authors_override, m.journal_override, m.source_override,
+                m.year_override, m.doi_override
          FROM papers p LEFT JOIN journals j ON j.id = p.journal_id
          LEFT JOIN library_item_metadata m ON m.paper_id=p.id
          WHERE p.id=?1",
         params![paper_id],
         |row| {
-            let authors_json: Option<String> = row.get(1)?;
+            let title = row
+                .get::<_, Option<String>>(7)?
+                .and_then(|value| clean_optional_text(Some(&value)))
+                .or_else(|| row.get::<_, Option<String>>(0).ok().flatten().and_then(|value| clean_optional_text(Some(&value))))
+                .unwrap_or_default();
+            let authors_json: Option<String> = row
+                .get::<_, Option<String>>(8)?
+                .or(row.get::<_, Option<String>>(1)?);
             let authors: Vec<Author> = authors_json
                 .as_deref()
                 .and_then(|value| serde_json::from_str(value).ok())
@@ -3110,16 +3118,28 @@ fn paper_naming_context(conn: &Connection, paper_id: i64) -> Result<PdfNamingCon
                 .filter(|value| !value.is_empty())
                 .collect();
             let canonical_journal = legacy_bibliographic_source(row.get::<_, Option<String>>(6)?.as_deref()).unwrap_or_default();
-            let journal = row.get::<_, Option<String>>(7)?.unwrap_or(canonical_journal);
-            let source = row.get::<_, Option<String>>(8)?.or_else(|| row.get(5).ok()).unwrap_or_default();
+            let journal = row
+                .get::<_, Option<String>>(9)?
+                .and_then(|value| clean_optional_text(Some(&value)))
+                .unwrap_or_else(|| canonical_journal.clone());
+            // `discovery_source` is provenance (for example
+            // `external_pdf_import`), never a bibliographic source token.
+            let source = row
+                .get::<_, Option<String>>(10)?
+                .and_then(|value| clean_optional_text(Some(&value)))
+                .unwrap_or_else(|| journal.clone());
             Ok(PdfNamingContext {
-                title: row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                title,
                 journal: journal.clone(),
                 source: if source.trim().is_empty() { journal } else { source },
-                year: row.get::<_, Option<i32>>(9)?.or(row.get(2)?).map(|value| value.to_string()).unwrap_or_default(),
+                year: row
+                    .get::<_, Option<i32>>(11)?
+                    .or(row.get::<_, Option<i32>>(2)?)
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
                 authors: author_names.join(", "),
                 first_author: author_names.first().cloned().unwrap_or_default(),
-                doi: row.get::<_, Option<String>>(10)?.or(row.get(3)?).or(row.get(4)?).unwrap_or_default(),
+                doi: row.get::<_, Option<String>>(12)?.or(row.get(3)?).or(row.get(4)?).unwrap_or_default(),
             })
         },
     )
@@ -3140,10 +3160,6 @@ fn template_token_value<'a>(token: &str, context: &'a PdfNamingContext) -> Optio
 
 fn is_template_separator(ch: char) -> bool {
     matches!(ch, '-' | '–' | '—' | '_')
-}
-
-fn has_trailing_template_separator(value: &str) -> bool {
-    value.trim_end().chars().last().is_some_and(is_template_separator)
 }
 
 fn strip_leading_template_separator(value: &str) -> String {
@@ -3179,6 +3195,24 @@ fn trim_trailing_template_separator_before_extension(value: &mut String) {
     *value = format!("{}{}", stem.trim_end(), &value[extension_start..]);
 }
 
+fn trim_trailing_template_separator(value: &mut String) {
+    let mut trimmed = value.trim_end().to_string();
+    while trimmed.chars().last().is_some_and(is_template_separator) {
+        trimmed.pop();
+        while trimmed.chars().last().is_some_and(|ch| ch.is_whitespace()) {
+            trimmed.pop();
+        }
+    }
+    *value = trimmed;
+}
+
+fn rendered_filename_has_component(value: &str) -> bool {
+    let extension_start = value.to_ascii_lowercase().rfind(".pdf").unwrap_or(value.len());
+    value[..extension_start]
+        .chars()
+        .any(|ch| !ch.is_whitespace() && !is_template_separator(ch))
+}
+
 fn render_pdf_filename(template: &str, context: &PdfNamingContext) -> String {
     let mut output = String::new();
     let mut cursor = 0;
@@ -3209,7 +3243,13 @@ fn render_pdf_filename(template: &str, context: &PdfNamingContext) -> String {
         let token = &template[open + 1..close];
         if let Some(value) = template_token_value(token, context) {
             if value.trim().is_empty() {
-                skip_leading_separator = !has_trailing_template_separator(&output);
+                let had_content = !output.trim().is_empty();
+                trim_trailing_template_separator(&mut output);
+                // A missing first field must also remove the separator that
+                // follows it. For a missing middle field, retain the next
+                // separator so `Title - {journal} - 2025` becomes
+                // `Title - 2025`, not `Title2025`.
+                skip_leading_separator = !had_content;
             } else {
                 output.push_str(value.trim());
                 skip_leading_separator = false;
@@ -3217,13 +3257,15 @@ fn render_pdf_filename(template: &str, context: &PdfNamingContext) -> String {
         } else {
             // Unknown tokens are treated as empty fields so a future template
             // token can never leak braces or an unsafe path component to disk.
-            skip_leading_separator = !has_trailing_template_separator(&output);
+            let had_content = !output.trim().is_empty();
+            trim_trailing_template_separator(&mut output);
+            skip_leading_separator = !had_content;
         }
         cursor = close + 1;
     }
     trim_trailing_template_separator_before_extension(&mut output);
     let output = output.trim().to_string();
-    if output.is_empty() { "document.pdf".to_string() } else { output }
+    output
 }
 
 fn truncate_utf8(value: &str, max_bytes: usize) -> String {
@@ -3346,7 +3388,14 @@ fn prepare_managed_pdf(
     let directory = managed_destination_directory(&root, &config.subfolder_rule, &context);
     std::fs::create_dir_all(&directory).map_err(|_| rusqlite::Error::InvalidQuery)?;
     let directory = std::fs::canonicalize(&directory).map_err(|_| rusqlite::Error::InvalidQuery)?;
-    let filename = sanitize_filename(&render_pdf_filename(&config.naming_template, &context));
+    let rendered = render_pdf_filename(&config.naming_template, &context);
+    let fallback = source_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("paper-{paper_id}"));
+    let filename = sanitize_filename(if rendered_filename_has_component(&rendered) { &rendered } else { &fallback });
     let preferred = directory.join(&filename);
     let source_is_preferred = source_path == preferred.as_path()
         || std::fs::canonicalize(&preferred).ok().is_some_and(|path| path.as_path() == source_path);
@@ -4197,15 +4246,30 @@ pub fn relink_pdf(
 ) -> Result<crate::models::PaperAttachment> {
     let file = linked_file(path)?;
     let current = get_paper_attachment(conn, attachment_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
-    if current.storage_mode != "linked" {
-        return Err(rusqlite::Error::InvalidParameterName("storage_mode".into()));
+    let config = pdf_storage_config(conn)?;
+    if config.mode == "none" {
+        conn.execute(
+            "UPDATE paper_attachments SET storage_mode='linked', absolute_path=?1, relative_path=NULL,
+                url=NULL, filename=?2, mime_type='application/pdf', sha256=?3, updated_at=?4
+             WHERE id=?5",
+            params![file.absolute_path.to_string_lossy().as_ref(), file.filename, file.sha256, now_utc(), attachment_id],
+        )?;
+    } else {
+        let prepared = prepare_managed_pdf(conn, current.paper_id, &file.absolute_path, &file.sha256, &config.mode)?;
+        let tx = conn.unchecked_transaction()?;
+        if let Err(error) = update_attachment_as_managed(&tx, attachment_id, &prepared) {
+            cleanup_prepared_destination(&prepared);
+            return Err(error);
+        }
+        if let Err(error) = tx.commit() {
+            cleanup_prepared_destination(&prepared);
+            return Err(error);
+        }
+        // MOVE is implemented as verified copy → committed path update →
+        // source removal. A failure here leaves both files available and the
+        // attachment already points at the verified destination.
+        finalize_prepared_storage(conn, &prepared)?;
     }
-    conn.execute(
-        "UPDATE paper_attachments SET absolute_path=?1, relative_path=NULL,
-            url=NULL, filename=?2, mime_type='application/pdf', sha256=?3, updated_at=?4
-         WHERE id=?5",
-        params![file.absolute_path.to_string_lossy().as_ref(), file.filename, file.sha256, now_utc(), attachment_id],
-    )?;
     let _ = refresh_pdf_annotations(conn, attachment_id);
     get_paper_attachment(conn, attachment_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
 }
@@ -4666,8 +4730,7 @@ pub fn parse_external_pdf_metadata(path: &Path, filename: &str) -> Result<crate:
     let title = info.as_ref().and_then(|value| value.title.clone())
         .or_else(|| pdf_info_value(&raw_text, "Title"))
         .or(xmp_title)
-        .or_else(|| first_page_title(&first_page))
-        .or_else(|| Path::new(filename).file_stem().and_then(|value| value.to_str()).map(str::to_string));
+        .or_else(|| first_page_title(&first_page));
     let author_value = info.as_ref().and_then(|value| value.author.clone())
         .or_else(|| pdf_info_value(&raw_text, "Author"))
         .or(xmp_author);
@@ -5068,6 +5131,38 @@ fn enqueue_pdf_enrichment(conn: &Connection, paper_id: i64, attachment_id: i64, 
     )
 }
 
+/// Complete the two-stage import filename after the initial background
+/// metadata resolution. This is only called by the import enrichment job; a
+/// later metadata edit never renames a managed PDF implicitly.
+fn finalize_import_managed_filename(conn: &Connection, attachment_id: i64) -> Result<()> {
+    let current = get_paper_attachment(conn, attachment_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+    if current.storage_mode != "managed" {
+        return Ok(());
+    }
+    let config = pdf_storage_config(conn)?;
+    if config.mode == "none" {
+        return Ok(());
+    }
+    let source_path = resolve_linked_pdf_path(&current.absolute_path)?;
+    let source_sha256 = sha256_file(&source_path)?;
+    let prepared = prepare_managed_pdf(conn, current.paper_id, &source_path, &source_sha256, "move")?;
+    if prepared.absolute_path == source_path {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    if let Err(error) = update_attachment_as_managed(&tx, attachment_id, &prepared) {
+        cleanup_prepared_destination(&prepared);
+        return Err(error);
+    }
+    if let Err(error) = tx.commit() {
+        cleanup_prepared_destination(&prepared);
+        return Err(error);
+    }
+    finalize_prepared_storage(conn, &prepared)?;
+    refresh_library_search_document(conn, current.paper_id)?;
+    Ok(())
+}
+
 /// Background exact-DOI enrichment. Network I/O happens without the SQLite
 /// mutex held; all writes remain fill-only and are discarded for mismatched
 /// provider identities.
@@ -5180,7 +5275,24 @@ pub fn run_pdf_enrichment<R: Runtime>(
         Ok(enriched)
     })();
     match write_result {
-        Ok(enriched) => emit("pdf://enrichment-completed", serde_json::json!({"paperId": paper_id, "attachmentId": attachment_id, "providerCount": enriched})),
+        Ok(enriched) => {
+            let rename_result = db.lock()
+                .map_err(|_| rusqlite::Error::InvalidQuery)
+                .and_then(|conn| finalize_import_managed_filename(&conn, attachment_id));
+            match rename_result {
+                Ok(()) => emit("pdf://enrichment-completed", serde_json::json!({"paperId": paper_id, "attachmentId": attachment_id, "providerCount": enriched})),
+                Err(error) => {
+                    let message = format!("PDF 最终命名失败: {error}");
+                    if let Ok(conn) = db.lock() {
+                        let _ = conn.execute(
+                            "UPDATE pdf_enrichment_jobs SET status='failed', error=?1, updated_at=?2 WHERE attachment_id=?3",
+                            params![message, now_utc(), attachment_id],
+                        );
+                    }
+                    emit("pdf://enrichment-failed", serde_json::json!({"paperId": paper_id, "attachmentId": attachment_id, "error": message}));
+                }
+            }
+        }
         Err(error) => {
             let message = error.to_string();
             if let Ok(conn) = db.lock() {
