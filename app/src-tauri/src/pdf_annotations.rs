@@ -780,6 +780,22 @@ fn glyph_overlap_ratio(glyph: &Glyph, quad: &Rect) -> f32 {
     (intersection_width.max(0.0) * intersection_height.max(0.0)) / (width * height)
 }
 
+/// Refuse a quote when the quad ends inside a decoded text run. PDF writers
+/// occasionally emit a quad that visually covers a complete phrase while the
+/// recovered glyph geometry stops in the middle of the final word. Saving that
+/// prefix is worse than losing the quote, so only a whitespace boundary (or
+/// the end of the line) is accepted.
+fn has_tight_text_continuation(all_glyphs: &[&Glyph], selected: &[&Glyph], right: f32) -> bool {
+    let Some(last) = selected.last() else { return false };
+    let tolerance = last.size.max(1.0) * 0.12;
+    all_glyphs.iter().any(|glyph| {
+        !glyph.text.chars().all(char::is_whitespace)
+            && glyph.x0 >= right - tolerance
+            && (glyph.y0 - last.y0).abs() <= last.size.max(glyph.size).max(1.0) * 0.5
+            && glyph.x0 - right <= tolerance
+    })
+}
+
 /// Recover the page text that a set of annotation quads actually covers.
 ///
 /// Conservative by construction: glyphs come from real positions and real
@@ -800,7 +816,7 @@ fn quote_for_quads(glyphs: &[Glyph], quads: &[Rect]) -> Option<String> {
         }) {
             return None;
         }
-        let mut selected = visible_glyphs.into_iter().filter(|glyph| glyph_in_quad(glyph, quad)).collect::<Vec<_>>();
+        let mut selected = visible_glyphs.iter().copied().filter(|glyph| glyph_in_quad(glyph, quad)).collect::<Vec<_>>();
         if selected.is_empty() {
             return None;
         }
@@ -855,6 +871,9 @@ fn quote_for_quads(glyphs: &[Glyph], quads: &[Rect]) -> Option<String> {
         let left = selected.iter().map(|glyph| glyph.x0).fold(f32::INFINITY, f32::min);
         let right = selected.iter().map(|glyph| glyph.x1).fold(f32::NEG_INFINITY, f32::max);
         let top = selected.iter().map(|glyph| glyph.y1).fold(f32::NEG_INFINITY, f32::max);
+        if has_tight_text_continuation(&visible_glyphs, &selected, right) {
+            return None;
+        }
         // The quad must actually be *filled* with text we could type. Summing the
         // glyph advances (rather than their outer span) rejects a sparse selection
         // where a couple of stray glyphs straddle a wide quad — the signature of an
@@ -923,8 +942,9 @@ mod tests {
             test_glyph("need", 54.0, 70.0, 0.0, 8.0),
             test_glyph(" ", 70.0, 74.0, 0.0, 8.0),
             test_glyph("no", 74.0, 84.0, 0.0, 8.0),
+            test_glyph("t", 84.0, 89.0, 0.0, 8.0),
         ];
-        let quad = Rect { x0: 0.0, y0: 0.0, x1: 130.0, y1: 8.0 };
+        let quad = Rect { x0: 0.0, y0: 0.0, x1: 84.0, y1: 8.0 };
         assert_eq!(quote_for_quads(&glyphs, &[quad]), None);
     }
 
