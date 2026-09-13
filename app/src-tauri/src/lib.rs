@@ -1355,6 +1355,14 @@ fn manage_pdf_attachment(
 }
 
 #[tauri::command]
+fn organize_library_pdfs(
+    state: State<Db>,
+) -> Result<models::PdfOrganizationSummary, String> {
+    let conn = state.inner().lock().unwrap();
+    db::organize_library_pdfs(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn rename_managed_pdf(
     attachment_id: i64,
     state: State<Db>,
@@ -2470,6 +2478,7 @@ pub fn run() {
             relink_pdf,
             reorganize_pdf,
             manage_pdf_attachment,
+            organize_library_pdfs,
             rename_managed_pdf,
             open_pdf,
             open_pdf_with_preferred_reader,

@@ -377,6 +377,15 @@ interface Settings {
   preferredPdfReader: string;
 }
 
+interface PdfOrganizationSummary {
+  mode: "none" | "copy" | "move" | string;
+  total: number;
+  organized: number;
+  skipped: number;
+  failed: number;
+  failures: Array<{ attachmentId: number; paperId: number; error: string }>;
+}
+
 interface SyncProgress {
   batchId: number;
   trigger: string;
@@ -583,6 +592,7 @@ let abstractLang: "zh" | "en" = "zh";
 let libraryInspectorAbstractLang: "zh" | "en" = "zh";
 let libraryInspectorCollapsed = false;
 let libraryPdfBusyPaperId: number | null = null;
+let libraryPdfOrganizationBusy = false;
 let libraryMetadataRefreshBusyPaperId: number | null = null;
 let libraryPdfImportBusy = false;
 let libraryDropTargetPaperId: number | null = null;
@@ -3131,6 +3141,72 @@ function requestLibraryInlineAction(message: string, confirmText: string, cancel
   });
 }
 
+async function organizeExistingLibraryPdfs(): Promise<void> {
+  const button = $("organize-existing-pdfs") as HTMLButtonElement | null;
+  const status = $("pdf-organize-status");
+  if (!button || libraryPdfOrganizationBusy) return;
+  const mode = settings?.pdfFileHandlingMode;
+  if (!settings || (mode !== "none" && mode !== "copy" && mode !== "move")) {
+    if (status) {
+      status.textContent = "请先保存有效的 PDF 文件处理设置";
+      status.className = "error small";
+    }
+    return;
+  }
+  const draftMatchesSaved =
+    ($("set-pdf-file-handling-mode") as HTMLSelectElement).value === settings.pdfFileHandlingMode
+    && ($("set-pdf-library-root") as HTMLInputElement).value.trim() === settings.pdfLibraryRoot
+    && ($("set-pdf-naming-template") as HTMLInputElement).value === settings.pdfNamingTemplate
+    && ($("set-pdf-subfolder-rule") as HTMLSelectElement).value === settings.pdfSubfolderRule;
+  if (!draftMatchesSaved) {
+    if (status) {
+      status.textContent = "请先保存当前文献库设置，再整理已有 PDF";
+      status.className = "error small";
+    }
+    return;
+  }
+  if (mode === "none") {
+    if (status) {
+      status.textContent = "当前为保持原文件链接，无需整理";
+      status.className = "muted small";
+    }
+    return;
+  }
+  const confirmed = await requestLibraryInlineAction(
+    mode === "move"
+      ? "按当前规则移动文献库中已关联的 PDF？文件写入并提交成功后，原路径文件将不再保留。"
+      : "按当前规则拷贝文献库中已关联的 PDF？原文件保留，之后 CowPaper 使用文献库中的副本。",
+    mode === "move" ? "移动并整理" : "拷贝并整理",
+    "取消",
+  );
+  if (!confirmed) return;
+  libraryPdfOrganizationBusy = true;
+  button.disabled = true;
+  button.textContent = mode === "move" ? "移动整理中…" : "拷贝整理中…";
+  if (status) {
+    status.textContent = "正在整理文献库中的 PDF…";
+    status.className = "muted small";
+  }
+  try {
+    const result = await invoke<PdfOrganizationSummary>("organize_library_pdfs");
+    await loadLibraryData(libraryView);
+    const failureText = result.failed ? `，失败 ${result.failed}` : "";
+    if (status) {
+      status.textContent = `整理完成：处理 ${result.organized} 个，跳过 ${result.skipped} 个${failureText}`;
+      status.className = result.failed ? "error small" : "ok small";
+    }
+  } catch (error) {
+    if (status) {
+      status.textContent = `整理失败：${String(error)}`;
+      status.className = "error small";
+    }
+  } finally {
+    libraryPdfOrganizationBusy = false;
+    button.disabled = false;
+    button.textContent = "整理现有 PDF…";
+  }
+}
+
 async function attachPdfPathToPaper(paperId: number, path: string, isLibraryPaper: boolean): Promise<PaperAttachment> {
   const existing = await invoke<PaperAttachment[]>("list_paper_attachments", { paperId });
   if (existing.length) {
@@ -5157,6 +5233,10 @@ async function setupListeners() {
     }
     if (t.closest("[data-action='select-pdf-library-root']")) {
       await selectPdfLibraryRoot();
+      return;
+    }
+    if (t.closest("[data-action='organize-existing-pdfs']")) {
+      await organizeExistingLibraryPdfs();
       return;
     }
     if (t.closest("[data-action='reset-pdf-library-root']")) {

@@ -535,6 +535,28 @@ pub struct PaperAttachment {
     pub annotation_scanned_at: Option<String>,
 }
 
+/// Summary returned by the explicit Library-wide PDF organization action.
+/// Each attachment is processed independently so one missing/unreadable file
+/// cannot roll back or hide successful safe moves for other Library items.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PdfOrganizationSummary {
+    pub mode: String,
+    pub total: i64,
+    pub organized: i64,
+    pub skipped: i64,
+    pub failed: i64,
+    pub failures: Vec<PdfOrganizationFailure>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PdfOrganizationFailure {
+    pub attachment_id: i64,
+    pub paper_id: i64,
+    pub error: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PdfAnnotationRefreshResult {

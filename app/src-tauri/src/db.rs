@@ -4324,6 +4324,88 @@ fn manage_existing_attachment(
     get_paper_attachment(conn, attachment_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
 }
 
+fn library_pdf_attachment_ids(conn: &Connection) -> Result<Vec<i64>> {
+    conn.prepare(
+        "SELECT a.id
+         FROM paper_attachments a
+         JOIN library_items li ON li.paper_id = a.paper_id
+         WHERE a.kind='pdf'
+         ORDER BY a.paper_id, a.id",
+    )?
+    .query_map([], |row| row.get::<_, i64>(0))?
+    .collect()
+}
+
+fn canonical_path_is_inside(root: &Path, path: &Path) -> bool {
+    std::fs::canonicalize(path)
+        .ok()
+        .is_some_and(|canonical| canonical.starts_with(root))
+}
+
+/// Explicitly organize every PDF currently attached to a Library Paper.
+///
+/// This is intentionally separate from the single-attachment action and is
+/// never called by settings writes. The Library membership join is the scope
+/// authority: Discovery-only papers and arbitrary files on disk are not
+/// inspected. Already-managed files inside the current root are skipped so a
+/// second run makes no copies, renames, or path changes.
+pub fn organize_library_pdfs(conn: &Connection) -> Result<crate::models::PdfOrganizationSummary> {
+    let config = pdf_storage_config(conn)?;
+    let ids = library_pdf_attachment_ids(conn)?;
+    let total = ids.len() as i64;
+    if config.mode == "none" {
+        return Ok(crate::models::PdfOrganizationSummary {
+            mode: config.mode,
+            total,
+            organized: 0,
+            skipped: total,
+            failed: 0,
+            failures: Vec::new(),
+        });
+    }
+
+    let root = PathBuf::from(config.library_root.trim());
+    std::fs::create_dir_all(&root).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let root = std::fs::canonicalize(&root).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let mut organized = 0_i64;
+    let mut skipped = 0_i64;
+    let mut failures = Vec::new();
+
+    for attachment_id in ids {
+        let Some(current) = get_paper_attachment(conn, attachment_id)? else {
+            failures.push(crate::models::PdfOrganizationFailure {
+                attachment_id,
+                paper_id: 0,
+                error: "attachment_not_found".to_string(),
+            });
+            continue;
+        };
+        let already_managed = current.storage_mode == "managed"
+            && canonical_path_is_inside(&root, Path::new(&current.absolute_path));
+        if already_managed {
+            skipped += 1;
+            continue;
+        }
+        match manage_existing_attachment(conn, attachment_id, &config.mode) {
+            Ok(_) => organized += 1,
+            Err(error) => failures.push(crate::models::PdfOrganizationFailure {
+                attachment_id,
+                paper_id: current.paper_id,
+                error: error.to_string(),
+            }),
+        }
+    }
+
+    Ok(crate::models::PdfOrganizationSummary {
+        mode: config.mode,
+        total,
+        organized,
+        skipped,
+        failed: failures.len() as i64,
+        failures,
+    })
+}
+
 /// Explicitly reorganize one existing linked/managed attachment into the
 /// configured library. Settings changes never call this implicitly.
 pub fn reorganize_pdf(

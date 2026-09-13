@@ -7658,6 +7658,118 @@ fn test_linked_to_managed_copy_and_move_are_explicit() {
 }
 
 #[test]
+fn bulk_organize_library_pdfs_copies_only_library_scope_and_is_idempotent() {
+    let conn = mem_db();
+    let library_paper = test_paper(&conn, "10.1000/bulk-library", "Bulk Library Paper");
+    let discovery_only_paper = test_paper(&conn, "10.1000/bulk-discovery", "Discovery Only Paper");
+    db::add_paper_to_library(&conn, library_paper, &[], &[], "manual").unwrap();
+    let source = test_pdf_path("bulk-library-source", "%PDF-1.7\n");
+    let discovery_source = test_pdf_path("bulk-discovery-source", "%PDF-1.7\n");
+
+    db::set_setting(&conn, "settings.pdf_file_handling_mode", "none").unwrap();
+    let attachment = db::attach_pdf_to_paper(&conn, library_paper, source.to_str().unwrap()).unwrap();
+    let discovery_attachment = db::attach_pdf_to_paper(&conn, discovery_only_paper, discovery_source.to_str().unwrap()).unwrap();
+    let annotation = db::upsert_paper_annotation(
+        &conn,
+        library_paper,
+        attachment.id,
+        &annotation_input(Some("bulk-stable-annotation"), Some("keep this annotation"), None),
+    ).unwrap();
+    let root = test_pdf_library("bulk-copy");
+    set_pdf_storage_settings(&conn, "copy", &root, "{title}.pdf", "none");
+
+    let first = db::organize_library_pdfs(&conn).unwrap();
+    assert_eq!(first.total, 1, "bulk scope is current Library attachments only");
+    assert_eq!(first.organized, 1);
+    assert_eq!(first.skipped, 0);
+    assert_eq!(first.failed, 0);
+    let copied = db::get_paper_attachment(&conn, attachment.id).unwrap().unwrap();
+    assert_eq!(copied.id, attachment.id, "organization updates the existing attachment row");
+    assert_eq!(copied.storage_mode, "managed");
+    assert!(source.is_file(), "copy keeps the source PDF");
+    assert!(std::path::Path::new(&copied.absolute_path).is_file());
+    assert!(std::path::Path::new(&copied.absolute_path).starts_with(std::fs::canonicalize(&root).unwrap()));
+    assert_eq!(db::list_paper_annotations(&conn, library_paper, None).unwrap()[0].id, annotation.id);
+    assert_eq!(db::get_paper_attachment(&conn, discovery_attachment.id).unwrap().unwrap().storage_mode, "linked");
+    assert!(discovery_source.is_file(), "Discovery-only attachments are outside the bulk scope");
+
+    let first_path = copied.absolute_path.clone();
+    let second = db::organize_library_pdfs(&conn).unwrap();
+    assert_eq!(second.total, 1);
+    assert_eq!(second.organized, 0);
+    assert_eq!(second.skipped, 1);
+    assert_eq!(second.failed, 0);
+    let stable = db::get_paper_attachment(&conn, attachment.id).unwrap().unwrap();
+    assert_eq!(stable.absolute_path, first_path);
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1, "second run must not create a collision copy");
+
+    let _ = std::fs::remove_file(source);
+    let _ = std::fs::remove_file(discovery_source);
+    let _ = std::fs::remove_file(first_path);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn bulk_organize_library_pdfs_moves_managed_file_after_root_change_without_new_attachment() {
+    let conn = mem_db();
+    let paper_id = test_paper(&conn, "10.1000/bulk-root-change", "Bulk Root Change");
+    db::add_paper_to_library(&conn, paper_id, &[], &[], "manual").unwrap();
+    let source = test_pdf_path("bulk-root-change-source", "%PDF-1.7\n");
+    db::set_setting(&conn, "settings.pdf_file_handling_mode", "none").unwrap();
+    let attachment = db::attach_pdf_to_paper(&conn, paper_id, source.to_str().unwrap()).unwrap();
+    let old_root = test_pdf_library("bulk-old-root");
+    let new_root = test_pdf_library("bulk-new-root");
+    set_pdf_storage_settings(&conn, "copy", &old_root, "{title}.pdf", "none");
+    let copied = db::organize_library_pdfs(&conn).unwrap();
+    assert_eq!(copied.organized, 1);
+    let old_managed_path = std::path::PathBuf::from(&db::get_paper_attachment(&conn, attachment.id).unwrap().unwrap().absolute_path);
+
+    set_pdf_storage_settings(&conn, "move", &new_root, "{title}.pdf", "none");
+    let moved = db::organize_library_pdfs(&conn).unwrap();
+    assert_eq!(moved.organized, 1, "an explicit root change reorganizes an old managed path");
+    assert_eq!(moved.failed, 0);
+    assert!(!old_managed_path.exists(), "move removes only the previously managed source after commit");
+    let current = db::get_paper_attachment(&conn, attachment.id).unwrap().unwrap();
+    assert_eq!(current.id, attachment.id);
+    assert_eq!(current.storage_mode, "managed");
+    assert!(std::path::Path::new(&current.absolute_path).starts_with(std::fs::canonicalize(&new_root).unwrap()));
+    assert!(std::path::Path::new(&current.absolute_path).is_file());
+    assert!(source.is_file(), "the original external source from the earlier copy remains untouched");
+    assert_eq!(db::list_paper_attachments(&conn, paper_id).unwrap().len(), 1);
+
+    let _ = std::fs::remove_file(source);
+    let _ = std::fs::remove_file(current.absolute_path);
+    let _ = std::fs::remove_dir_all(old_root);
+    let _ = std::fs::remove_dir_all(new_root);
+}
+
+#[test]
+fn bulk_organize_library_pdfs_keep_mode_is_a_noop() {
+    let conn = mem_db();
+    let paper_id = test_paper(&conn, "10.1000/bulk-keep", "Bulk Keep");
+    db::add_paper_to_library(&conn, paper_id, &[], &[], "manual").unwrap();
+    let source = test_pdf_path("bulk-keep-source", "%PDF-1.7\n");
+    db::set_setting(&conn, "settings.pdf_file_handling_mode", "none").unwrap();
+    let attachment = db::attach_pdf_to_paper(&conn, paper_id, source.to_str().unwrap()).unwrap();
+    let root = test_pdf_library("bulk-keep");
+    set_pdf_storage_settings(&conn, "none", &root, "{title}.pdf", "none");
+
+    let result = db::organize_library_pdfs(&conn).unwrap();
+    assert_eq!(result.mode, "none");
+    assert_eq!(result.total, 1);
+    assert_eq!(result.organized, 0);
+    assert_eq!(result.skipped, 1);
+    assert_eq!(result.failed, 0);
+    let unchanged = db::get_paper_attachment(&conn, attachment.id).unwrap().unwrap();
+    assert_eq!(unchanged.storage_mode, "linked");
+    assert_eq!(std::path::Path::new(&unchanged.absolute_path), std::fs::canonicalize(&source).unwrap().as_path());
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+
+    let _ = std::fs::remove_file(source);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn test_managed_detach_does_not_delete_file() {
     let conn = mem_db();
     let pid = test_paper(&conn, "10.1000/storage-detach", "Detach Managed Paper");
