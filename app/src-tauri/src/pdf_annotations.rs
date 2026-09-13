@@ -29,6 +29,8 @@ pub(crate) struct ExtractedAnnotation {
     pub fingerprint: String,
     pub extraction_status: String,
     pub raw_metadata_json: String,
+    pub quadpoints: Option<Vec<f64>>,
+    pub rect: Option<Vec<f64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -196,14 +198,20 @@ pub(crate) fn scan_path(path: &Path) -> PdfAnnotationScan {
             let rect = number_array(&doc, annotation.get(b"Rect").ok());
             let quad_points = number_array(&doc, annotation.get(b"QuadPoints").ok());
             let quads = quad_points.as_ref().and_then(|points| {
-                if points.len() % 8 != 0 {
-                    None
-                } else {
-                    Some(points.chunks_exact(8).filter_map(rect_from_quad).collect::<Vec<_>>())
+                if points.is_empty() || points.len() % 8 != 0 {
+                    return None;
                 }
+                let parsed = points
+                    .chunks_exact(8)
+                    .map(rect_from_quad)
+                    .collect::<Option<Vec<_>>>()?;
+                (!parsed.is_empty()).then_some(parsed)
             });
+            // A text-markup annotation without a complete set of QuadPoints is
+            // not safely recoverable. Rect is navigation metadata, never a
+            // quote-selection fallback.
             let malformed_quads = MARKUP_KINDS.contains(&kind.as_str())
-                && quad_points.as_ref().is_some_and(|points| points.is_empty() || points.len() % 8 != 0);
+                && (quad_points.is_none() || quads.is_none());
             let quoted_text = if MARKUP_KINDS.contains(&kind.as_str()) {
                 quads.as_ref().and_then(|items| quote_for_quads(&glyphs, items))
             } else {
@@ -225,18 +233,14 @@ pub(crate) fn scan_path(path: &Path) -> PdfAnnotationScan {
                 "inReplyTo": reference_value(annotation.get(b"IRT").ok()),
                 "subtype": kind,
             });
-            let identity_material = if let Some(external_id) = external_id.as_deref() {
-                format!("nm\n{}\n{}\n{}", page_number - 1, kind, external_id)
-            } else {
-                format!(
-                    "fallback\n{}\n{}\n{}\n{}\n{}",
-                    page_number - 1,
-                    kind,
-                    canonical_numbers(rect.as_deref()),
-                    canonical_numbers(quad_points.as_deref()),
-                    normalize_text(quoted_text.as_deref().or(comment.as_deref()).unwrap_or("")),
-                )
-            };
+            let identity_material = stable_identity_material(
+                page_number.saturating_sub(1),
+                &kind,
+                external_id.as_deref(),
+                object_id,
+                rect.as_deref(),
+                quad_points.as_deref(),
+            );
             extracted.push(ExtractedAnnotation {
                 external_annotation_id: external_id,
                 kind,
@@ -250,6 +254,8 @@ pub(crate) fn scan_path(path: &Path) -> PdfAnnotationScan {
                 fingerprint: fingerprint(&identity_material),
                 extraction_status: extraction_status.into(),
                 raw_metadata_json: raw_metadata.to_string(),
+                quadpoints: quad_points.clone().map(|values| values.into_iter().map(f64::from).collect()),
+                rect: rect.clone().map(|values| values.into_iter().map(f64::from).collect()),
             });
         }
     }
@@ -271,11 +277,10 @@ pub(crate) fn scan_path(path: &Path) -> PdfAnnotationScan {
         });
         if duplicate_nm || seen.insert(item.fingerprint.clone(), 1).is_some() {
             let fallback = format!(
-                "duplicate-fallback\n{}\n{}\n{}\n{}",
+                "duplicate-fallback\n{}\n{}\n{}",
                 item.page_index,
                 item.kind,
                 item.raw_metadata_json,
-                normalize_text(item.quoted_text.as_deref().or(item.comment.as_deref()).unwrap_or("")),
             );
             item.fingerprint = fingerprint(&fallback);
             let ordinal = seen.entry(item.fingerprint.clone()).or_default();
@@ -373,6 +378,30 @@ fn reference_value(value: Option<&Object>) -> Value {
 
 fn canonical_numbers(values: Option<&[f32]>) -> String {
     values.map(|items| items.iter().map(|value| format!("{value:.3}")).collect::<Vec<_>>().join(",")).unwrap_or_default()
+}
+
+/// Identity material is deliberately limited to source-PDF structure. Text
+/// extraction, comments, translations, and status are mutable derived values
+/// and must never make the same PDF annotation look like a new annotation.
+fn stable_identity_material(
+    page_index: u32,
+    kind: &str,
+    external_id: Option<&str>,
+    object_id: Option<ObjectId>,
+    rect: Option<&[f32]>,
+    quad_points: Option<&[f32]>,
+) -> String {
+    if let Some(external_id) = external_id.filter(|value| !value.is_empty()) {
+        return format!("v2\nnm\n{page_index}\n{kind}\n{external_id}");
+    }
+    if let Some((number, generation)) = object_id {
+        return format!("v2\nobject\n{page_index}\n{kind}\n{number}\n{generation}");
+    }
+    format!(
+        "v2\ngeometry\n{page_index}\n{kind}\n{}\n{}",
+        canonical_numbers(rect),
+        canonical_numbers(quad_points),
+    )
 }
 
 fn normalize_text(value: &str) -> String {
@@ -724,11 +753,31 @@ fn runs_interleave(selected: &[&Glyph]) -> bool {
 }
 
 fn glyph_in_quad(glyph: &Glyph, quad: &Rect) -> bool {
+    let width = (glyph.x1 - glyph.x0).max(0.001);
     let height = (glyph.y1 - glyph.y0).max(0.001);
-    let centre = (glyph.x0 + glyph.x1) / 2.0;
-    let overlap = glyph.y1.min(quad.y1) - glyph.y0.max(quad.y0);
-    let tolerance = glyph.size.max(1.0) * 0.25;
-    centre >= quad.x0 - tolerance && centre <= quad.x1 + tolerance && overlap >= height * 0.4
+    let intersection_width = glyph.x1.min(quad.x1) - glyph.x0.max(quad.x0);
+    let intersection_height = glyph.y1.min(quad.y1) - glyph.y0.max(quad.y0);
+    let intersection = intersection_width.max(0.0) * intersection_height.max(0.0);
+    let centre_x = (glyph.x0 + glyph.x1) / 2.0;
+    let centre_y = (glyph.y0 + glyph.y1) / 2.0;
+    let tolerance = glyph.size.max(1.0) * 0.05;
+    // QuadPoints usually follow the font's visible ascent/descent rather than
+    // the synthetic full glyph box used by a content-stream walker. A 65%
+    // glyph-area floor remains strict about cut characters without rejecting
+    // valid annotations whose quad is shorter than that synthetic box.
+    intersection >= width * height * 0.65
+        && centre_x >= quad.x0 - tolerance
+        && centre_x <= quad.x1 + tolerance
+        && centre_y >= quad.y0 - tolerance
+        && centre_y <= quad.y1 + tolerance
+}
+
+fn glyph_overlap_ratio(glyph: &Glyph, quad: &Rect) -> f32 {
+    let width = (glyph.x1 - glyph.x0).max(0.001);
+    let height = (glyph.y1 - glyph.y0).max(0.001);
+    let intersection_width = glyph.x1.min(quad.x1) - glyph.x0.max(quad.x0);
+    let intersection_height = glyph.y1.min(quad.y1) - glyph.y0.max(quad.y0);
+    (intersection_width.max(0.0) * intersection_height.max(0.0)) / (width * height)
 }
 
 /// Recover the page text that a set of annotation quads actually covers.
@@ -740,9 +789,20 @@ fn glyph_in_quad(glyph: &Glyph, quad: &Rect) -> bool {
 fn quote_for_quads(glyphs: &[Glyph], quads: &[Rect]) -> Option<String> {
     let mut fragments: Vec<(f32, f32, String)> = Vec::new();
     for quad in quads {
-        let mut selected = glyphs.iter().filter(|glyph| glyph_in_quad(glyph, quad)).collect::<Vec<_>>();
+        let visible_glyphs = if glyphs.iter().any(|glyph| glyph.render_mode != 3) {
+            glyphs.iter().filter(|glyph| glyph.render_mode != 3).collect::<Vec<_>>()
+        } else {
+            glyphs.iter().collect::<Vec<_>>()
+        };
+        if visible_glyphs.iter().any(|glyph| {
+            let overlap = glyph_overlap_ratio(glyph, quad);
+            overlap > 0.15 && !glyph_in_quad(glyph, quad)
+        }) {
+            return None;
+        }
+        let mut selected = visible_glyphs.into_iter().filter(|glyph| glyph_in_quad(glyph, quad)).collect::<Vec<_>>();
         if selected.is_empty() {
-            continue;
+            return None;
         }
         // A page may carry a hidden duplicate text layer (invisible Tr 3) on top
         // of the real one. When both are inside the quad, the visible layer is
@@ -766,12 +826,21 @@ fn quote_for_quads(glyphs: &[Glyph], quads: &[Rect]) -> Option<String> {
                 a.x0.total_cmp(&b.x0)
             }
         });
+        let min_y = selected.iter().map(|glyph| glyph.y0).fold(f32::INFINITY, f32::min);
+        let max_y = selected.iter().map(|glyph| glyph.y1).fold(f32::NEG_INFINITY, f32::max);
+        let line_height = selected.iter().map(|glyph| glyph.size).fold(1.0, f32::max);
+        if max_y - min_y > line_height * 1.25 {
+            return None;
+        }
         let mut text = String::new();
         let mut previous: Option<&Glyph> = None;
         for glyph in &selected {
             if let Some(previous) = previous {
                 let new_line = (glyph.y0 - previous.y0).abs() > previous.size.max(1.0) * 0.5;
                 let gap = glyph.x0 - previous.x1;
+                if new_line || gap < -previous.size.max(1.0) * 0.20 {
+                    return None;
+                }
                 if (new_line || gap > previous.size.max(1.0) * 0.22) && !text.ends_with(' ') {
                     text.push(' ');
                 }
@@ -784,13 +853,24 @@ fn quote_for_quads(glyphs: &[Glyph], quads: &[Rect]) -> Option<String> {
             continue;
         }
         let left = selected.iter().map(|glyph| glyph.x0).fold(f32::INFINITY, f32::min);
+        let right = selected.iter().map(|glyph| glyph.x1).fold(f32::NEG_INFINITY, f32::max);
         let top = selected.iter().map(|glyph| glyph.y1).fold(f32::NEG_INFINITY, f32::max);
         // The quad must actually be *filled* with text we could type. Summing the
         // glyph advances (rather than their outer span) rejects a sparse selection
         // where a couple of stray glyphs straddle a wide quad — the signature of an
         // imprecise text layer — instead of emitting a fragment as a quote.
         let typed: f32 = selected.iter().map(|glyph| (glyph.x1 - glyph.x0).max(0.0)).sum();
-        if typed < (quad.x1 - quad.x0).max(0.001) * 0.5 {
+        let quad_width = (quad.x1 - quad.x0).max(0.001);
+        // Annotation writers commonly pad the quad by roughly one character
+        // advance; allow that bounded margin while still rejecting a missing
+        // suffix/prefix whose gap is several glyphs wide.
+        let edge_tolerance = line_height * 0.60;
+        let covered_width = (right.min(quad.x1) - left.max(quad.x0)).max(0.0);
+        if typed < quad_width * 0.70
+            || covered_width < quad_width * 0.70
+            || left - quad.x0 > edge_tolerance
+            || quad.x1 - right > edge_tolerance
+        {
             return None;
         }
         fragments.push((top, left, text));
@@ -819,5 +899,60 @@ mod tests {
         let rect = rect_from_quad(&[10.0, 30.0, 50.0, 30.0, 10.0, 10.0, 50.0, 10.0]).unwrap();
         assert_eq!((rect.x0, rect.y0, rect.x1, rect.y1), (10.0, 10.0, 50.0, 30.0));
         assert!(rect_from_quad(&[1.0, 2.0]).is_none());
+    }
+
+    fn test_glyph(text: &str, x0: f32, x1: f32, y0: f32, y1: f32) -> Glyph {
+        Glyph {
+            text: text.to_string(),
+            x0,
+            y0,
+            x1,
+            y1,
+            size: 10.0,
+            certain: true,
+            render_mode: 0,
+            run: 1,
+        }
+    }
+
+    #[test]
+    fn quote_rejects_a_known_prefix_instead_of_saving_partial_text() {
+        let glyphs = vec![
+            test_glyph("Codification", 0.0, 50.0, 0.0, 8.0),
+            test_glyph(" ", 50.0, 54.0, 0.0, 8.0),
+            test_glyph("need", 54.0, 70.0, 0.0, 8.0),
+            test_glyph(" ", 70.0, 74.0, 0.0, 8.0),
+            test_glyph("no", 74.0, 84.0, 0.0, 8.0),
+        ];
+        let quad = Rect { x0: 0.0, y0: 0.0, x1: 130.0, y1: 8.0 };
+        assert_eq!(quote_for_quads(&glyphs, &[quad]), None);
+    }
+
+    #[test]
+    fn quote_rejects_text_that_is_outside_the_annotation_quad() {
+        let glyphs = vec![
+            test_glyph("scope", 40.0, 65.0, 0.0, 8.0),
+            test_glyph(" ", 65.0, 69.0, 0.0, 8.0),
+            test_glyph("and", 69.0, 84.0, 0.0, 8.0),
+            test_glyph(" ", 84.0, 88.0, 0.0, 8.0),
+            test_glyph("intensity", 88.0, 125.0, 0.0, 8.0),
+            // This is the erroneous nearby recovery observed in production.
+            test_glyph("3", 36.0, 46.0, 0.0, 8.0),
+            test_glyph(" ", 10.0, 14.0, 0.0, 8.0),
+            test_glyph("develop", 14.0, 38.0, 0.0, 8.0),
+        ];
+        let quad = Rect { x0: 40.0, y0: 0.0, x1: 125.0, y1: 8.0 };
+        assert_eq!(quote_for_quads(&glyphs, &[quad]), None);
+    }
+
+    #[test]
+    fn quote_orders_independent_quad_fragments_by_page_geometry() {
+        let glyphs = vec![
+            test_glyph("second", 0.0, 30.0, 0.0, 8.0),
+            test_glyph("first", 0.0, 25.0, 20.0, 28.0),
+        ];
+        let lower = Rect { x0: 0.0, y0: 0.0, x1: 30.0, y1: 8.0 };
+        let upper = Rect { x0: 0.0, y0: 20.0, x1: 25.0, y1: 28.0 };
+        assert_eq!(quote_for_quads(&glyphs, &[lower, upper]).as_deref(), Some("first second"));
     }
 }

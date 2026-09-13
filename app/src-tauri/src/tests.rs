@@ -209,6 +209,56 @@ fn test_annotation_refresh_deduplicates_fallback_and_keeps_attachment_identity()
 }
 
 #[test]
+fn test_annotation_identity_reconciles_quote_changes_and_legacy_duplicates() {
+    let conn = mem_db();
+    let paper_id = test_paper(&conn, "10.1000/annotation-stable-id", "Stable Annotation Identity");
+    let attachment_id = test_attachment(&conn, paper_id, "stable.pdf");
+    let geometry = vec![10.0, 20.0, 80.0, 20.0, 10.0, 10.0, 80.0, 10.0];
+    let raw = r#"{"objectId":[77,0],"quadPoints":[10,20,80,20,10,10,80,10],"subtype":"Highlight"}"#;
+    let mut first = annotation_input(None, Some("review note"), Some(geometry.clone()));
+    first.quoted_text = None;
+    first.extraction_status = "no_text".to_string();
+    first.raw_metadata_json = Some(raw.to_string());
+    let inserted = db::upsert_paper_annotation(&conn, paper_id, attachment_id, &first).unwrap();
+    let canonical_id = inserted.id;
+    conn.execute(
+        "UPDATE paper_annotations SET fingerprint='v1-legacy-quote-dependent' WHERE id=?1",
+        params![canonical_id],
+    )
+    .unwrap();
+
+    let mut improved = first.clone();
+    improved.quoted_text = Some("Codification need not reduce scarcity.".to_string());
+    improved.extraction_status = "extracted".to_string();
+    let updated = db::upsert_paper_annotation(&conn, paper_id, attachment_id, &improved).unwrap();
+    assert_eq!(updated.id, canonical_id, "NULL -> text must update the logical row in place");
+    assert_eq!(updated.quoted_text.as_deref(), Some("Codification need not reduce scarcity."));
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM paper_annotations WHERE attachment_id=?1", params![attachment_id], |row| row.get::<_, i64>(0)).unwrap(), 1);
+
+    // Simulate a v20 stale/extracted pair left by the old quote-dependent key.
+    conn.execute(
+        "INSERT INTO paper_annotations(
+            paper_id,attachment_id,kind,page_index,quoted_text,comment,imported_at,
+            updated_at,fingerprint,source_sha256,extraction_status,raw_metadata_json
+         ) VALUES(?1,?2,'highlight',2,NULL,'review note','2026-09-12T00:00:00Z',
+                   '2026-09-12T00:00:00Z','v1-stale-extracted-pair','','stale',?3)",
+        params![paper_id, attachment_id, raw],
+    )
+    .unwrap();
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM paper_annotations WHERE attachment_id=?1", params![attachment_id], |row| row.get::<_, i64>(0)).unwrap(), 2);
+
+    let refreshed = db::refresh_paper_annotations(&conn, paper_id, attachment_id, &[improved.clone()]).unwrap();
+    assert_eq!(refreshed.len(), 1, "refresh must converge stale/extracted derived duplicates");
+    assert_eq!(refreshed[0].id, canonical_id);
+    assert_eq!(refreshed[0].quoted_text.as_deref(), Some("Codification need not reduce scarcity."));
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM paper_annotations WHERE attachment_id=?1", params![attachment_id], |row| row.get::<_, i64>(0)).unwrap(), 1);
+    let second_refresh = db::refresh_paper_annotations(&conn, paper_id, attachment_id, &[improved]).unwrap();
+    assert_eq!(second_refresh.len(), 1);
+    assert_eq!(second_refresh[0].id, canonical_id);
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM paper_annotations WHERE attachment_id=?1", params![attachment_id], |row| row.get::<_, i64>(0)).unwrap(), 1);
+}
+
+#[test]
 fn test_annotation_delete_is_paper_scoped_and_does_not_delete_pdf() {
     let conn = mem_db();
     let paper_id = test_paper(&conn, "10.1000/annotation-delete", "Annotation delete");

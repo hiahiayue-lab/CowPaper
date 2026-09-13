@@ -38,7 +38,7 @@
   `paper_attachments.id`; absolute paths are never annotation identity.
 - `/NM` is preferred only when unique within attachment + page. Re-extraction
   otherwise uses a versioned SHA-256 fingerprint over attachment, page, kind,
-  quantized geometry, normalized excerpt, and normalized comment. A unique
+  quantized geometry or stable PDF object reference. A unique
   geometry match may absorb a comment edit; ambiguous matches are retained.
 - Refresh is additive and idempotent: it upserts supplied rows in one
   transaction and never deletes absent rows. Deletion is an explicit,

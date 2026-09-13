@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Runtime};
-use unicode_normalization::UnicodeNormalization;
 
 use crate::models::{
     AnalysisBatch, AnalysisBatchItem, Author, Journal, Paper, PaperCandidate,
@@ -3260,17 +3259,6 @@ const ANNOTATION_STATUSES: [&str; 7] = [
     "extracted", "no_text", "scanned", "encrypted", "malformed", "unsupported", "missing_attachment",
 ];
 
-fn normalize_annotation_text(value: Option<&str>) -> String {
-    value
-        .unwrap_or_default()
-        .nfkc()
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
-}
-
 fn quantize_annotation_geometry(points: Option<&[f64]>) -> Option<Vec<i64>> {
     let points = points?;
     if points.is_empty() || points.iter().any(|point| !point.is_finite()) {
@@ -3285,6 +3273,40 @@ fn annotation_digest(value: &serde_json::Value) -> String {
     format!("{:x}", Sha256::digest(serde_json::to_vec(value).unwrap_or_default()))
 }
 
+fn annotation_object_identity(input: &PaperAnnotationInput) -> Option<String> {
+    let raw = input.raw_metadata_json.as_deref()?.parse::<serde_json::Value>().ok()?;
+    let object_id = raw.get("objectId").or_else(|| raw.get("object_id"))?.as_array()?;
+    if object_id.len() != 2 {
+        return None;
+    }
+    let number = object_id[0].as_i64()?;
+    let generation = object_id[1].as_i64()?;
+    Some(format!("object:{number}:{generation}"))
+}
+
+fn annotation_identity_key(
+    attachment_id: i64,
+    input: &PaperAnnotationInput,
+    use_external_identity: bool,
+) -> String {
+    let source = if use_external_identity {
+        input
+            .external_annotation_id
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .map(|value| format!("nm:{value}"))
+    } else {
+        None
+    }
+    .or_else(|| annotation_object_identity(input))
+    .or_else(|| {
+        quantize_annotation_geometry(input.quadpoints.as_deref().or(input.rect.as_deref()))
+            .map(|geometry| format!("geometry:{geometry:?}"))
+    })
+    .unwrap_or_else(|| "unidentified".to_string());
+    format!("attachment:{attachment_id}:page:{}:kind:{}:{source}", input.page_index, input.kind)
+}
+
 fn annotation_fingerprints(
     attachment_id: i64,
     input: &PaperAnnotationInput,
@@ -3294,7 +3316,7 @@ fn annotation_fingerprints(
     let geometry = quantize_annotation_geometry(points);
     let geometry_fingerprint = geometry.as_ref().map(|geometry| {
         format!(
-            "v1:geometry:{}",
+            "v2:geometry:{}",
             annotation_digest(&serde_json::json!({
                 "attachment_id": attachment_id,
                 "page_index": input.page_index,
@@ -3303,23 +3325,11 @@ fn annotation_fingerprints(
             }))
         )
     });
-    let fingerprint = if use_external_identity {
-        let external_id = input.external_annotation_id.as_deref().unwrap_or_default();
-        format!("v1:nm:{}:{}:{}", attachment_id, input.page_index, external_id)
-    } else {
-        format!(
-            "v1:fp:{}",
-            annotation_digest(&serde_json::json!({
-                "version": 1,
-                "attachment_id": attachment_id,
-                "page_index": input.page_index,
-                "kind": input.kind,
-                "quantized_quadpoints": geometry,
-                "normalized_quoted_text": normalize_annotation_text(input.quoted_text.as_deref()),
-                "normalized_comment": normalize_annotation_text(input.comment.as_deref()),
-            }))
-        )
-    };
+    let identity = annotation_identity_key(attachment_id, input, use_external_identity);
+    let fingerprint = format!(
+        "v2:identity:{}",
+        annotation_digest(&serde_json::json!({"identity": identity}))
+    );
     (fingerprint, geometry_fingerprint)
 }
 
@@ -3410,7 +3420,19 @@ fn get_paper_annotation(conn: &Connection, annotation_id: i64) -> Result<Option<
     .optional()
 }
 
-fn matching_annotation_id(
+fn annotation_geometry_from_raw(raw_metadata_json: Option<&str>) -> Option<Vec<f64>> {
+    let raw = raw_metadata_json?.parse::<serde_json::Value>().ok()?;
+    ["quadPoints", "quadpoints", "rect", "Rect"]
+        .iter()
+        .find_map(|key| {
+            raw.get(*key)?.as_array().map(|values| {
+                values.iter().filter_map(serde_json::Value::as_f64).collect::<Vec<_>>()
+            })
+        })
+        .filter(|values| !values.is_empty())
+}
+
+fn matching_annotation_ids(
     conn: &Connection,
     paper_id: i64,
     attachment_id: i64,
@@ -3418,61 +3440,48 @@ fn matching_annotation_id(
     fingerprint: &str,
     geometry_fingerprint: Option<&str>,
     allow_external_identity: bool,
-) -> Result<Option<i64>> {
-    if allow_external_identity {
-        if let Some(external_id) = input.external_annotation_id.as_deref().filter(|id| !id.is_empty()) {
-            let mut stmt = conn.prepare(
-                "SELECT id FROM paper_annotations
-                 WHERE paper_id=?1 AND attachment_id=?2 AND page_index=?3 AND external_annotation_id=?4
-                 ORDER BY id",
-            )?;
-            let ids: Vec<i64> = stmt
-                .query_map(params![paper_id, attachment_id, input.page_index, external_id], |row| row.get(0))?
-                .collect::<Result<Vec<_>>>()?;
-            if ids.len() == 1 {
-                return Ok(ids.first().copied());
-            }
-            // The spike explicitly treats duplicate page-scoped /NM values as
-            // ambiguous. Fall through to the versioned fingerprint instead of
-            // silently updating one arbitrary row.
+) -> Result<Vec<i64>> {
+    let source_identity = annotation_identity_key(attachment_id, input, allow_external_identity);
+    let mut stmt = conn.prepare(
+        "SELECT id, external_annotation_id, fingerprint, geometry_fingerprint,
+                raw_metadata_json
+         FROM paper_annotations
+         WHERE paper_id=?1 AND attachment_id=?2 AND page_index=?3 AND kind=?4
+         ORDER BY id",
+    )?;
+    let mut ids = Vec::new();
+    let rows = stmt.query_map(
+        params![paper_id, attachment_id, input.page_index, input.kind],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        },
+    )?;
+    for row in rows {
+        let (id, external_id, row_fingerprint, row_geometry_fingerprint, raw_metadata_json) = row?;
+        let row_geometry = annotation_geometry_from_raw(raw_metadata_json.as_deref());
+        let row_input = PaperAnnotationInput {
+            external_annotation_id: external_id,
+            kind: input.kind.clone(),
+            page_index: input.page_index,
+            raw_metadata_json,
+            quadpoints: row_geometry,
+            ..PaperAnnotationInput::default()
+        };
+        let row_identity = annotation_identity_key(attachment_id, &row_input, allow_external_identity);
+        let geometry_match = geometry_fingerprint
+            .zip(row_geometry_fingerprint.as_deref())
+            .is_some_and(|(left, right)| left == right);
+        if row_fingerprint == fingerprint || row_identity == source_identity || geometry_match {
+            ids.push(id);
         }
     }
-
-    if let Some(id) = conn
-        .query_row(
-            "SELECT id FROM paper_annotations
-             WHERE paper_id=?1 AND attachment_id=?2 AND fingerprint=?3",
-            params![paper_id, attachment_id, fingerprint],
-            |row| row.get(0),
-        )
-        .optional()?
-    {
-        return Ok(Some(id));
-    }
-
-    // A no-/NM import can still receive a stable /NM after a PDF is rewritten,
-    // and a comment edit should update the unique geometry match. Never fuzzy
-    // merge a source with an ambiguous /NM in the same refresh batch.
-    if allow_external_identity {
-        if let Some(geometry_fingerprint) = geometry_fingerprint {
-            let mut stmt = conn.prepare(
-                "SELECT id FROM paper_annotations
-                 WHERE paper_id=?1 AND attachment_id=?2 AND page_index=?3 AND kind=?4
-                   AND geometry_fingerprint=?5
-                 ORDER BY id",
-            )?;
-            let ids: Vec<i64> = stmt
-                .query_map(
-                    params![paper_id, attachment_id, input.page_index, input.kind, geometry_fingerprint],
-                    |row| row.get(0),
-                )?
-                .collect::<Result<Vec<_>>>()?;
-            if ids.len() == 1 {
-                return Ok(ids.first().copied());
-            }
-        }
-    }
-    Ok(None)
+    Ok(ids)
 }
 
 fn upsert_paper_annotation_inner(
@@ -3489,7 +3498,7 @@ fn upsert_paper_annotation_inner(
     let use_external_identity = allow_external_identity
         && external_annotation_row_count(conn, paper_id, attachment_id, input)? <= 1;
     let (fingerprint, geometry_fingerprint) = annotation_fingerprints(attachment_id, input, use_external_identity);
-    let existing = matching_annotation_id(
+    let matching_ids = matching_annotation_ids(
         conn,
         paper_id,
         attachment_id,
@@ -3498,6 +3507,17 @@ fn upsert_paper_annotation_inner(
         geometry_fingerprint.as_deref(),
         use_external_identity,
     )?;
+    // A prior v20 refresh could have created one stale and one extracted row
+    // when quoted_text changed. Keep the oldest row as the canonical derived
+    // record and collapse the rest; these rows are an index, never the PDF's
+    // user annotations.
+    let existing = matching_ids.first().copied();
+    for duplicate_id in matching_ids.iter().skip(1) {
+        conn.execute(
+            "DELETE FROM paper_annotations WHERE id=?1 AND paper_id=?2 AND attachment_id=?3",
+            params![duplicate_id, paper_id, attachment_id],
+        )?;
+    }
     let raw_metadata_json = input.raw_metadata_json.as_deref();
     if let Some(id) = existing {
         conn.execute(
@@ -3691,67 +3711,72 @@ pub fn refresh_pdf_annotations(
         });
     }
 
+    let mut external_counts = HashMap::<(i64, String), usize>::new();
+    for item in &scan.annotations {
+        if let Some(external_id) = item.external_annotation_id.as_deref().filter(|id| !id.is_empty()) {
+            *external_counts.entry((item.page_index, external_id.to_string())).or_default() += 1;
+        }
+    }
     let tx = conn.unchecked_transaction()?;
-    let existing: Vec<(String, String)> = {
-        let mut stmt = tx.prepare("SELECT fingerprint, extraction_status FROM paper_annotations WHERE attachment_id=?1")?;
-        let rows = stmt.query_map(params![attachment_id], |row| Ok((row.get(0)?, row.get(1)?)))?.collect::<Result<Vec<_>>>()?;
+    let existing: HashMap<i64, (String, String)> = {
+        let mut stmt = tx.prepare("SELECT id, source_sha256, extraction_status FROM paper_annotations WHERE attachment_id=?1")?;
+        let rows = stmt
+            .query_map(params![attachment_id], |row| Ok((row.get(0)?, (row.get(1)?, row.get(2)?))))?
+            .collect::<Result<HashMap<_, _>>>()?;
         rows
     };
-    let mut seen = std::collections::HashSet::new();
+    let mut seen_ids = std::collections::HashSet::new();
     let mut imported = 0_i64;
     let mut updated = 0_i64;
     let mut unchanged = 0_i64;
     for item in &scan.annotations {
-        let was_present: Option<(String, String)> = tx.query_row(
-            "SELECT source_sha256, extraction_status FROM paper_annotations
-             WHERE attachment_id=?1 AND fingerprint=?2",
-            params![attachment_id, item.fingerprint],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        ).optional()?;
-        let imported_at = now.clone();
         let normalized_kind = item.kind.to_ascii_lowercase();
-        tx.execute(
-            "INSERT INTO paper_annotations (
-                paper_id, attachment_id, external_annotation_id, kind, page_index,
-                color, quoted_text, comment, author, pdf_created_at, pdf_modified_at,
-                imported_at, updated_at, fingerprint, source_sha256,
-                extraction_status, source_app, raw_metadata_json
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12,?13,?14,?15,NULL,?16)
-             ON CONFLICT(attachment_id, fingerprint) DO UPDATE SET
-                paper_id=excluded.paper_id,
-                external_annotation_id=excluded.external_annotation_id,
-                kind=excluded.kind,
-                page_index=excluded.page_index,
-                color=excluded.color,
-                quoted_text=excluded.quoted_text,
-                comment=excluded.comment,
-                author=excluded.author,
-                pdf_created_at=excluded.pdf_created_at,
-                pdf_modified_at=excluded.pdf_modified_at,
-                updated_at=excluded.updated_at,
-                source_sha256=excluded.source_sha256,
-                extraction_status=excluded.extraction_status,
-                raw_metadata_json=excluded.raw_metadata_json",
-            params![
-                paper_id,
-                attachment_id,
-                item.external_annotation_id,
-                normalized_kind,
-                item.page_index,
-                item.color,
-                item.quoted_text,
-                item.comment,
-                item.author,
-                item.pdf_created_at,
-                item.pdf_modified_at,
-                imported_at,
-                item.fingerprint,
-                source_sha256,
-                item.extraction_status,
-                item.raw_metadata_json,
-            ],
+        let input = PaperAnnotationInput {
+            external_annotation_id: item.external_annotation_id.clone(),
+            kind: normalized_kind,
+            page_index: item.page_index,
+            color: item.color.clone(),
+            quoted_text: item.quoted_text.clone(),
+            comment: item.comment.clone(),
+            author: item.author.clone(),
+            created_at: item.pdf_created_at.clone(),
+            modified_at: item.pdf_modified_at.clone(),
+            extraction_status: item.extraction_status.clone(),
+            source_app: None,
+            raw_metadata_json: Some(item.raw_metadata_json.clone()),
+            quadpoints: item.quadpoints.clone(),
+            rect: item.rect.clone(),
+        };
+        let external_is_unique = input
+            .external_annotation_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .and_then(|id| external_counts.get(&(input.page_index, id.to_string())))
+            .map_or(true, |count| *count == 1);
+        let (fingerprint, geometry_fingerprint) = annotation_fingerprints(attachment_id, &input, external_is_unique);
+        let matching_ids = matching_annotation_ids(
+            &tx,
+            paper_id,
+            attachment_id,
+            &input,
+            &fingerprint,
+            geometry_fingerprint.as_deref(),
+            external_is_unique,
         )?;
-        seen.insert(item.fingerprint.clone());
+        let existing_id = matching_ids.first().copied();
+        let was_present = existing_id.and_then(|id| existing.get(&id).cloned());
+        for duplicate_id in matching_ids.iter().skip(1) {
+            tx.execute(
+                "DELETE FROM paper_annotations WHERE id=?1 AND paper_id=?2 AND attachment_id=?3",
+                params![duplicate_id, paper_id, attachment_id],
+            )?;
+        }
+        let id = upsert_paper_annotation_inner(&tx, paper_id, attachment_id, &input, external_is_unique)?;
+        tx.execute(
+            "UPDATE paper_annotations SET source_sha256=?1 WHERE id=?2 AND attachment_id=?3",
+            params![source_sha256, id, attachment_id],
+        )?;
+        seen_ids.insert(id);
         match was_present {
             None => imported += 1,
             Some((old_hash, old_status)) if old_hash == source_sha256 && old_status == item.extraction_status => unchanged += 1,
@@ -3759,12 +3784,12 @@ pub fn refresh_pdf_annotations(
         }
     }
     let mut stale = 0_i64;
-    for (fingerprint, status) in existing {
-        if !seen.contains(&fingerprint) && status != "stale" {
+    for (id, (_, status)) in existing {
+        if !seen_ids.contains(&id) && status != "stale" {
             stale += tx.execute(
                 "UPDATE paper_annotations SET extraction_status='stale', updated_at=?1
-                 WHERE attachment_id=?2 AND fingerprint=?3",
-                params![now, attachment_id, fingerprint],
+                 WHERE attachment_id=?2 AND id=?3",
+                params![now, attachment_id, id],
             )? as i64;
         }
     }

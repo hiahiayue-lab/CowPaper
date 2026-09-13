@@ -31,9 +31,10 @@ Supported kinds are `highlight`, `underline`, `strikeout`, `text`, and
 2. A unique `/NM` uses `v1:nm:{attachment_id}:{page_index}:{NM}`. `/NM` is
    treated as page-scoped and is never used when duplicate source IDs are
    present in a batch or already ambiguous in storage.
-3. The fallback uses a versioned SHA-256 over attachment, page, kind,
-   half-point-quantized geometry, NFKC/whitespace/case-folded quote, and
-   comment. Raw source values remain unchanged for display.
+3. The fallback uses a versioned SHA-256 over attachment, page, kind, and
+   half-point-quantized geometry (or the source PDF object reference). Raw
+   source values remain unchanged for display; quote, comment, translation,
+   and extraction status are mutable derived values and never affect identity.
 4. A unique geometry match may absorb a comment edit. Ambiguous geometry is
    never merged automatically.
 5. Refresh is additive and idempotent. Rows absent from a later extraction are

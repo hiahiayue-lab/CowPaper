@@ -21,10 +21,10 @@ text therefore have a comment but no fabricated quote.
 ## Identity and refresh
 
 paper_annotations is keyed by paper_id plus the owning paper_attachments.id.
-A page-scoped /NM is preferred for identity and is combined with page index and
-subtype. When /NM is missing or duplicated, a versioned fingerprint of
-subtype, page, geometry, quote, and comment is used. The file path is never an
-identity key.
+A page-scoped /NM is preferred for identity and is combined with attachment,
+page index, and subtype. When /NM is missing or duplicated, a stable PDF
+object reference or geometry is used. The file path, quoted_text, comment,
+translation, and extraction status are never identity keys.
 
 Attach, relink, managed-copy/move, and the explicit
 refresh_pdf_annotations(attachmentId) command run the same scan. Repeated
