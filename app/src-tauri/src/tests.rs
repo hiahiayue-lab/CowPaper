@@ -8392,6 +8392,71 @@ fn rc3_add_relations_is_idempotent_and_keeps_existing_memberships() {
 }
 
 #[test]
+fn rc4_bulk_library_organization_is_transactional_and_isolated() {
+    let conn = mem_db();
+    let a = test_paper(&conn, "10.5555/bulk-a", "Bulk A");
+    let b = test_paper(&conn, "10.5555/bulk-b", "Bulk B");
+    let c = test_paper(&conn, "10.5555/bulk-c", "Bulk C");
+    let collection = db::create_library_collection(&conn, "Bulk Collection", None).unwrap();
+    let tag_one = db::create_library_tag(&conn, "Bulk Tag One", None).unwrap();
+    let tag_two = db::create_library_tag(&conn, "Bulk Tag Two", None).unwrap();
+    for paper_id in [a, b, c] {
+        db::add_paper_to_library(&conn, paper_id, &[], &[], "bulk-test").unwrap();
+    }
+    conn.execute(
+        "UPDATE papers SET total_score=4.7, tag_matches_json='[{\"tag\":\"Research\",\"score\":1}]', analysis_status='analysisSucceeded' WHERE id=?1",
+        params![a],
+    ).unwrap();
+    let canonical_before: (Option<f64>, Option<String>, String) = conn.query_row(
+        "SELECT total_score, tag_matches_json, analysis_status FROM papers WHERE id=?1",
+        params![a],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).unwrap();
+
+    let added = db::add_papers_to_collection(&conn, &[a, b, c], collection.id).unwrap();
+    assert_eq!(added.paper_count, 3);
+    assert_eq!(added.changed, 3);
+    let repeated = db::add_papers_to_collection(&conn, &[a, b, c], collection.id).unwrap();
+    assert_eq!(repeated.changed, 0, "重复批量加入必须是 no-op");
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM library_collection_items WHERE collection_id=?1", params![collection.id], |row| row.get::<_, i64>(0)).unwrap(), 3);
+
+    let tagged = db::add_tags_to_papers(&conn, &[a, b, c], &[tag_one.id, tag_two.id]).unwrap();
+    assert_eq!(tagged.relation_count, 6);
+    assert_eq!(tagged.changed, 6);
+    let repeated_tags = db::add_tags_to_papers(&conn, &[a, b, c], &[tag_one.id, tag_two.id]).unwrap();
+    assert_eq!(repeated_tags.changed, 0, "重复批量加标签必须是 no-op");
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM library_item_tags", [], |row| row.get::<_, i64>(0)).unwrap(), 6);
+
+    let removed_tag = db::remove_tags_from_papers(&conn, &[a, b, c], &[tag_one.id]).unwrap();
+    assert_eq!(removed_tag.changed, 3);
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM library_item_tags WHERE tag_id=?1", params![tag_one.id], |row| row.get::<_, i64>(0)).unwrap(), 0);
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM library_item_tags WHERE tag_id=?1", params![tag_two.id], |row| row.get::<_, i64>(0)).unwrap(), 3);
+
+    let source = test_pdf_path("rc4-bulk-library-source", "%PDF-1.7\nBulk source\n");
+    db::attach_pdf_to_paper(&conn, a, source.to_str().unwrap()).unwrap();
+    let removed_from_collection = db::remove_papers_from_collection(&conn, &[a, b], collection.id).unwrap();
+    assert_eq!(removed_from_collection.changed, 2);
+    assert!(db::get_library_membership(&conn, a).unwrap().is_some(), "离开文集不得移出 Library");
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM library_collection_items WHERE collection_id=?1", params![collection.id], |row| row.get::<_, i64>(0)).unwrap(), 1);
+
+    let removed = db::remove_papers_from_library(&conn, &[a, b]).unwrap();
+    assert_eq!(removed.changed, 2);
+    for paper_id in [a, b] {
+        assert!(db::get_paper(&conn, paper_id).unwrap().is_some(), "bulk 移出不得删除 canonical Paper");
+        assert!(db::get_library_membership(&conn, paper_id).unwrap().is_none());
+    }
+    assert!(source.exists(), "bulk 移出不得删除源 PDF");
+    let canonical_after: (Option<f64>, Option<String>, String) = conn.query_row(
+        "SELECT total_score, tag_matches_json, analysis_status FROM papers WHERE id=?1",
+        params![a],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).unwrap();
+    assert_eq!(canonical_after, canonical_before, "Library 批量操作不得影响 Research/推荐字段");
+    assert!(db::get_library_membership(&conn, c).unwrap().is_some(), "未选择的 Library Paper 不得被批量操作误伤");
+    std::fs::remove_file(source).unwrap();
+}
+
+#[test]
 fn rc3_v16_to_v17_preserves_canonical_keywords_library_and_untrusted_history() {
     let conn=Connection::open_in_memory().unwrap();db::init_test_schema_at_version(&conn,16).unwrap();
     let jid=db::insert_journal(&conn,"Migration Journal",None,None,None,None).unwrap();

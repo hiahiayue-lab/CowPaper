@@ -508,6 +508,18 @@ pub struct LibraryMembership {
     pub tag_ids: Vec<i64>,
 }
 
+/// Summary returned by one transactional Library relation mutation. The
+/// operation accepts canonical paper ids as a set; the frontend never needs
+/// to issue one Tauri command per selected Paper.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkLibraryOperationResult {
+    pub paper_count: i64,
+    pub relation_count: i64,
+    pub changed: i64,
+    pub already_present: i64,
+}
+
 /// A linked or managed file relation owned by CowPaper. Managed rows point to
 /// a verified file in the configured library and retain a relative path for
 /// future library portability.

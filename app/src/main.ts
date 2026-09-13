@@ -52,6 +52,7 @@ import {
   titleTranslationControlState,
   type InspectorActionFeedback,
 } from "./titleTranslation";
+import { reduceLibrarySelection } from "./librarySelection";
 
 interface Journal {
   id: number;
@@ -550,6 +551,8 @@ let libraryTagFacets: LibraryTagFacet[] = [];
 let librarySidebarCounts: LibrarySidebarCounts = { allCount: 0, recentCount: 0, uncategorizedCount: 0, collectionCounts: [] };
 let libraryView: "all" | "recent" | "unfiled" = "all";
 let selectedLibraryPaperId: number | null = null;
+let selectedLibraryPaperIds: number[] = [];
+let librarySelectionAnchorId: number | null = null;
 let libraryScope: { kind: "collection"; id: number } | null = null;
 let librarySelectedTagIds: number[] = [];
 let librarySearchState: LibrarySearchState = createLibrarySearchState();
@@ -600,6 +603,9 @@ let libraryDropActive = false;
 let libraryDropQueue: LibraryDropItem[] = [];
 let libraryInlineCreate: { kind: "collection" | "tag"; parentId: number | null } | null = null;
 let libraryRelationEditor: { kind: "collection" | "tag"; paperId: number } | null = null;
+type LibraryBulkPickerKind = "collection" | "add-tags" | "remove-tags";
+let libraryBulkPicker: { kind: LibraryBulkPickerKind; selectedTagIds: number[] } | null = null;
+let libraryBulkMoreOpen = false;
 let librarySelectedAttachmentId: number | null = null;
 let libraryContextMenu: HTMLElement | null = null;
 let libraryColumnWidths: Record<LibraryColumn, number>;
@@ -620,7 +626,44 @@ function selectLibraryPaperId(paperId: number | null): void {
   selectedLibraryPaperId = paperId;
 }
 
+function clearLibrarySelection(): void {
+  selectedLibraryPaperIds = [];
+  librarySelectionAnchorId = null;
+  libraryBulkPicker = null;
+  libraryBulkMoreOpen = false;
+}
+
+function currentVisibleLibraryPaperIds(): number[] {
+  const scoped = librarySearchResultIds
+    ? libraryPapers.filter((item) => librarySearchResultIds!.has(item.paper.id))
+    : libraryPapers;
+  return canonicalLibraryRows(scoped).map((item) => item.paper.id);
+}
+
+function selectLibraryPaperFromEvent(paperId: number, event: MouseEvent): void {
+  const next = reduceLibrarySelection(
+    { selectedIds: selectedLibraryPaperIds, anchorId: librarySelectionAnchorId },
+    paperId,
+    currentVisibleLibraryPaperIds(),
+    { metaKey: event.metaKey, ctrlKey: event.ctrlKey, shiftKey: event.shiftKey },
+  );
+  selectedLibraryPaperIds = next.selectedIds;
+  librarySelectionAnchorId = next.anchorId;
+  const leadId = next.selectedIds.length
+    ? next.selectedIds.includes(paperId) ? paperId : next.selectedIds[next.selectedIds.length - 1]
+    : null;
+  selectLibraryPaperId(leadId);
+  librarySelectedAttachmentId = null;
+  libraryInspectorCollapsed = false;
+  libraryBulkPicker = null;
+  libraryBulkMoreOpen = false;
+  const item = libraryPapers.find((candidate) => candidate.paper.id === paperId);
+  if (item) libraryInspectorAbstractLang = item.effectiveChineseAbstract?.trim() ? "zh" : "en";
+  renderLibrary();
+}
+
 function clearLibraryScope(): void {
+  clearLibrarySelection();
   libraryScope = null;
   librarySelectedTagIds = [];
   librarySearchState = {
@@ -2507,6 +2550,7 @@ async function selectLibrarySearchSuggestion(suggestion: LibrarySearchState["sug
     document.querySelector<HTMLElement>(`[data-action="library-select-paper"][data-paper-id="${suggestion.paperId}"]`)?.scrollIntoView({ block: "nearest" });
     return;
   }
+  clearLibrarySelection();
   librarySearchState = reduceLibrarySearchState(librarySearchState, { type: "SELECT_SUGGESTION", suggestion });
   // A token chosen from suggestions is the Search Box scope. Do not leave a
   // stale singleton Sidebar highlight suggesting an additional hidden filter.
@@ -2530,6 +2574,7 @@ async function selectLibrarySearchSuggestion(suggestion: LibrarySearchState["sug
 }
 
 function clearLibrarySearch(): void {
+  clearLibrarySelection();
   librarySearchState = reduceLibrarySearchState(librarySearchState, { type: "CLEAR" });
   libraryScope = null;
   librarySelectedTagIds = [];
@@ -2773,6 +2818,13 @@ function renderLibrary() {
   // the browser where Collection+Tag could accidentally become OR semantics.
   const scopedPapers = librarySearchResultIds ? libraryPapers.filter((item) => librarySearchResultIds!.has(item.paper.id)) : libraryPapers;
   const visiblePapers = canonicalLibraryRows(scopedPapers);
+  const visiblePaperIds = visiblePapers.map((item) => item.paper.id);
+  const visiblePaperIdSet = new Set(visiblePaperIds);
+  const reconciledSelection = selectedLibraryPaperIds.filter((id) => visiblePaperIdSet.has(id));
+  if (reconciledSelection.length !== selectedLibraryPaperIds.length) {
+    selectedLibraryPaperIds = reconciledSelection;
+    if (!selectedLibraryPaperIds.length) librarySelectionAnchorId = null;
+  }
   const visibleAttachmentIds = new Set(visiblePapers.flatMap((item) => item.attachments.map((attachment) => attachment.id)));
   if (librarySelectedAttachmentId != null && !visibleAttachmentIds.has(librarySelectedAttachmentId)) librarySelectedAttachmentId = null;
   if (count) count.textContent = `${visiblePapers.length} 篇`;
@@ -2783,7 +2835,10 @@ function renderLibrary() {
     libraryInspectorAbstractLang = visiblePapers[0]?.effectiveChineseAbstract?.trim() ? "zh" : "en";
   }
   list.innerHTML = visiblePapers.length ? visiblePapers.map((item) => {
-    const selected = item.paper.id === selectedLibraryPaperId ? " selected" : "";
+    const isSelected = selectedLibraryPaperIds.length > 0
+      ? selectedLibraryPaperIds.includes(item.paper.id)
+      : item.paper.id === selectedLibraryPaperId;
+    const selected = isSelected ? " selected" : "";
     const chineseTitle = libraryChineseTitle(item);
     const note = libraryNote(item);
     const source = librarySource(item);
@@ -2811,8 +2866,11 @@ function renderLibrary() {
     renderLibraryDropState();
     return;
   }
-  const selected = visiblePapers.find((item) => item.paper.id === selectedLibraryPaperId) || visiblePapers[0];
-  if (selected) {
+  const inspectorPaperId = selectedLibraryPaperIds.length === 1 ? selectedLibraryPaperIds[0] : selectedLibraryPaperId;
+  const selected = visiblePapers.find((item) => item.paper.id === inspectorPaperId) || visiblePapers[0];
+  if (selectedLibraryPaperIds.length > 1) {
+    renderLibraryBulkInspector();
+  } else if (selected) {
     selectLibraryPaperId(selected.paper.id);
     renderLibraryInspector(selected);
   } else {
@@ -2837,6 +2895,65 @@ async function addLibraryRelation(paperId: number, kind: "collection" | "tag", i
   await invoke(kind === "collection" ? "add_paper_to_collection" : "add_paper_library_tag", kind === "collection" ? { paperId, collectionId: id } : { paperId, tagId: id });
   await loadLibraryData(libraryView);
   setStatus(kind === "collection" ? "已添加到文集，原文集归类已保留" : "已添加 Library Tag", "done");
+}
+
+function selectedLibraryItems(): LibraryPaper[] {
+  const selected = new Set(selectedLibraryPaperIds);
+  return libraryPapers.filter((item) => selected.has(item.paper.id));
+}
+
+function selectedLibraryTagIdsForBulk(): number[] {
+  return [...new Set(selectedLibraryItems().flatMap((item) => item.tags.map((tag) => tag.id)))].sort((a, b) => a - b);
+}
+
+async function runBulkLibraryCommand(command: string, args: Record<string, unknown>, message: string, reloadPapers = false): Promise<void> {
+  try {
+    const result = await invoke<{ changed: number }>(command, args);
+    libraryBulkPicker = null;
+    libraryBulkMoreOpen = false;
+    if (command === "remove_papers_from_library") {
+      clearLibrarySelection();
+      selectLibraryPaperId(null);
+      librarySelectedAttachmentId = null;
+    }
+    if (reloadPapers) await Promise.all([loadPapers(), loadLibraryData(libraryView)]);
+    else await loadLibraryData(libraryView);
+    setStatus(`${message}${result.changed ? ` · ${result.changed} 项已更新` : " · 无需变更"}`, "done");
+  } catch (error) {
+    setStatus(`批量文库操作失败：${String(error)}`, "error");
+  }
+}
+
+function openLibraryBulkPicker(kind: LibraryBulkPickerKind): void {
+  libraryBulkMoreOpen = false;
+  libraryBulkPicker = { kind, selectedTagIds: [] };
+  renderLibrary();
+}
+
+function renderLibraryBulkPicker(): string {
+  if (!libraryBulkPicker) return "";
+  if (libraryBulkPicker.kind === "collection") {
+    const options = libraryCollections.map((collection) => `<button type="button" class="bulk-picker-option" data-action="library-bulk-select-collection" data-collection-id="${collection.id}"><span class="folder-symbol" aria-hidden="true"></span>${escapeHtml(collection.name)}</button>`).join("");
+    return `<div class="library-bulk-picker"><div class="bulk-picker-title">选择文集</div><div class="bulk-picker-options">${options || '<span class="muted small">暂无文集</span>'}</div><button type="button" class="ghost small" data-action="library-bulk-cancel-picker">取消</button></div>`;
+  }
+  const availableIds = libraryBulkPicker.kind === "remove-tags" ? selectedLibraryTagIdsForBulk() : libraryTags.map((tag) => tag.id);
+  const options = availableIds.map((id) => {
+    const tag = libraryTags.find((item) => item.id === id);
+    if (!tag) return "";
+    const selected = libraryBulkPicker!.selectedTagIds.includes(id);
+    return `<button type="button" class="bulk-picker-option${selected ? " selected" : ""}" data-action="library-bulk-toggle-tag" data-tag-id="${id}" aria-pressed="${selected}"><span class="tag-dot" style="background:${escapeHtml(tag.color || "#9ca3af")}" aria-hidden="true"></span>${escapeHtml(tag.name)}${selected ? " ✓" : ""}</button>`;
+  }).join("");
+  const label = libraryBulkPicker.kind === "remove-tags" ? "选择要移除的标签" : "选择要添加的标签";
+  const action = libraryBulkPicker.kind === "remove-tags" ? "library-bulk-remove-tags" : "library-bulk-add-tags";
+  return `<div class="library-bulk-picker"><div class="bulk-picker-title">${label}</div><div class="bulk-picker-options">${options || '<span class="muted small">暂无可用标签</span>'}</div><div class="bulk-picker-actions"><button type="button" class="ghost small" data-action="library-bulk-cancel-picker">取消</button><button type="button" class="ghost small" data-action="${action}"${libraryBulkPicker.selectedTagIds.length ? "" : " disabled"}>${libraryBulkPicker.kind === "remove-tags" ? "移除" : "添加"}</button></div></div>`;
+}
+
+function renderLibraryBulkInspector(): void {
+  const count = selectedLibraryPaperIds.length;
+  const currentCollection = libraryScope?.kind === "collection" ? libraryCollections.find((collection) => collection.id === libraryScope!.id) : null;
+  const more = libraryBulkMoreOpen ? `<div class="bulk-more-menu"><button type="button" data-action="library-bulk-remove-collection"${currentCollection ? "" : " disabled"}>${currentCollection ? `从「${escapeHtml(currentCollection.name)}」移除` : "从当前文集移除"}</button><button type="button" data-action="library-bulk-open-remove-tags">移除标签…</button><button type="button" class="danger" data-action="library-bulk-remove-library">从文献库移除</button></div>` : "";
+  const picker = renderLibraryBulkPicker();
+  $("library-inspector").innerHTML = `<div class="inspector-head"><span class="muted small">文库</span></div><section class="inspector-group library-bulk-inspector"><div class="bulk-selection-heading"><strong>已选择 ${count} 篇文献</strong><span class="muted small">批量组织不会影响推荐或研究标签</span></div><div class="bulk-action-row"><button type="button" class="ghost small" data-action="library-bulk-open-collection">添加到文集…</button><button type="button" class="ghost small" data-action="library-bulk-open-add-tags">添加标签…</button><span class="bulk-more-wrap"><button type="button" class="ghost small" data-action="library-bulk-toggle-more">更多…</button>${more}</span></div>${picker}</section>`;
 }
 
 function renderLibraryInspector(item: LibraryPaper) {
@@ -3713,7 +3830,13 @@ function openLibraryContextMenu(kind: LibraryContextTarget, id: number, x: numbe
   } else if (attachment) {
     menu.innerHTML = `<div class="library-context-title">${escapeHtml(attachment.filename)}</div>${attachment.missing ? "" : `<button type="button" role="menuitem" data-action="library-open-pdf" data-attachment-id="${id}">打开</button><button type="button" role="menuitem" data-action="library-reveal-pdf" data-attachment-id="${id}">显示位置</button>`}${manageAttachment}<button type="button" role="menuitem" data-action="library-relink-pdf" data-attachment-id="${id}">重新链接</button><button type="button" role="menuitem" class="danger" data-action="library-detach-pdf" data-attachment-id="${id}">解除关联</button>`;
   } else if (paper) {
-    menu.innerHTML = `<div class="library-context-title">${escapeHtml(libraryEnglishTitle(paper))}</div><button type="button" role="menuitem" class="danger" data-action="library-remove" data-paper-id="${id}">移出文献库</button>`;
+    const paperIds = selectedLibraryPaperIds.includes(id) ? selectedLibraryPaperIds : [id];
+    if (paperIds.length > 1) {
+      const currentCollection = libraryScope?.kind === "collection" ? libraryCollections.find((collection) => collection.id === libraryScope!.id) : null;
+      menu.innerHTML = `<div class="library-context-title">已选择 ${paperIds.length} 篇文献</div><button type="button" role="menuitem" data-action="library-bulk-open-collection">添加到文集…</button><button type="button" role="menuitem" data-action="library-bulk-open-add-tags">添加标签…</button>${currentCollection ? `<button type="button" role="menuitem" data-action="library-bulk-remove-collection">从当前文集移除</button>` : ""}<button type="button" role="menuitem" data-action="library-bulk-open-remove-tags">移除标签…</button><button type="button" role="menuitem" class="danger" data-action="library-bulk-remove-library">从文献库移除</button>`;
+    } else {
+      menu.innerHTML = `<div class="library-context-title">${escapeHtml(libraryEnglishTitle(paper))}</div><button type="button" role="menuitem" class="danger" data-action="library-remove" data-paper-id="${id}">移出文献库</button>`;
+    }
   } else {
     return;
   }
@@ -3809,7 +3932,16 @@ function installLibraryNavigationInteractions(): void {
     event.preventDefault();
     const kind = target.dataset.libraryContextKind as LibraryContextTarget;
     const id = Number(target.dataset.libraryContextId || target.dataset.attachmentId);
-    if (Number.isInteger(id)) openLibraryContextMenu(kind, id, event.clientX, event.clientY);
+    if (Number.isInteger(id)) {
+      if (kind === "paper" && !selectedLibraryPaperIds.includes(id)) {
+        selectedLibraryPaperIds = [id];
+        librarySelectionAnchorId = id;
+        selectLibraryPaperId(id);
+        librarySelectedAttachmentId = null;
+        renderLibrary();
+      }
+      openLibraryContextMenu(kind, id, event.clientX, event.clientY);
+    }
   });
   document.addEventListener("pointerdown", (event) => {
     if (!(event.target as HTMLElement).closest(".library-context-menu")) closeLibraryContextMenu();
@@ -4941,6 +5073,7 @@ async function setupListeners() {
   document.addEventListener("input", (ev) => {
     const el = ev.target as HTMLInputElement;
     if (el.id === "library-search-input") {
+      clearLibrarySelection();
       librarySearchState = reduceLibrarySearchState(librarySearchState, { type: "INPUT", text: el.value });
       if (!librarySearchState.isComposing) {
         refreshLibrarySearchSuggestions();
@@ -5167,6 +5300,7 @@ async function setupListeners() {
     }
     const removeToken = t.closest("[data-action='library-search-remove-token']") as HTMLElement | null;
     if (removeToken) {
+      clearLibrarySelection();
       const kind = removeToken.dataset.tokenKind;
       const id = Number(removeToken.dataset.tokenId);
       if (kind === "field") {
@@ -5370,16 +5504,78 @@ async function setupListeners() {
         librarySuppressNextClick = false;
         return;
       }
-      selectLibraryPaperId(parseInt(librarySelect.dataset.paperId!, 10));
-      librarySelectedAttachmentId = null;
-      libraryInspectorCollapsed = false;
-      libraryInspectorAbstractLang = libraryPapers.find(item => item.paper.id === selectedLibraryPaperId)?.effectiveChineseAbstract?.trim() ? "zh" : "en";
+      selectLibraryPaperFromEvent(parseInt(librarySelect.dataset.paperId!, 10), ev);
+      return;
+    }
+    if (t.closest("[data-action='library-bulk-open-collection']")) {
+      openLibraryBulkPicker("collection");
+      return;
+    }
+    if (t.closest("[data-action='library-bulk-open-add-tags']")) {
+      openLibraryBulkPicker("add-tags");
+      return;
+    }
+    if (t.closest("[data-action='library-bulk-toggle-more']")) {
+      libraryBulkMoreOpen = !libraryBulkMoreOpen;
+      libraryBulkPicker = null;
       renderLibrary();
+      return;
+    }
+    if (t.closest("[data-action='library-bulk-cancel-picker']")) {
+      libraryBulkPicker = null;
+      renderLibrary();
+      return;
+    }
+    const bulkSelectCollection = t.closest("[data-action='library-bulk-select-collection']") as HTMLElement | null;
+    if (bulkSelectCollection) {
+      const collectionId = Number(bulkSelectCollection.dataset.collectionId);
+      if (Number.isInteger(collectionId) && selectedLibraryPaperIds.length) {
+        await runBulkLibraryCommand("add_papers_to_collection", { paperIds: [...selectedLibraryPaperIds], collectionId }, "已添加到文集");
+      }
+      return;
+    }
+    const bulkToggleTag = t.closest("[data-action='library-bulk-toggle-tag']") as HTMLElement | null;
+    if (bulkToggleTag && libraryBulkPicker) {
+      const tagId = Number(bulkToggleTag.dataset.tagId);
+      if (Number.isInteger(tagId)) {
+        libraryBulkPicker.selectedTagIds = libraryBulkPicker.selectedTagIds.includes(tagId)
+          ? libraryBulkPicker.selectedTagIds.filter((id) => id !== tagId)
+          : [...libraryBulkPicker.selectedTagIds, tagId];
+        renderLibrary();
+      }
+      return;
+    }
+    if (t.closest("[data-action='library-bulk-add-tags']") && libraryBulkPicker?.kind === "add-tags") {
+      await runBulkLibraryCommand("add_tags_to_papers", { paperIds: [...selectedLibraryPaperIds], tagIds: [...libraryBulkPicker.selectedTagIds] }, "已添加 Library Tag");
+      return;
+    }
+    if (t.closest("[data-action='library-bulk-remove-tags']") && libraryBulkPicker?.kind === "remove-tags") {
+      await runBulkLibraryCommand("remove_tags_from_papers", { paperIds: [...selectedLibraryPaperIds], tagIds: [...libraryBulkPicker.selectedTagIds] }, "已移除 Library Tag");
+      return;
+    }
+    if (t.closest("[data-action='library-bulk-open-remove-tags']")) {
+      openLibraryBulkPicker("remove-tags");
+      return;
+    }
+    if (t.closest("[data-action='library-bulk-remove-collection']")) {
+      const collectionId = libraryScope?.kind === "collection" ? libraryScope.id : null;
+      if (collectionId != null) {
+        await runBulkLibraryCommand("remove_papers_from_collection", { paperIds: [...selectedLibraryPaperIds], collectionId }, "已从当前文集移除");
+      }
+      return;
+    }
+    if (t.closest("[data-action='library-bulk-remove-library']")) {
+      const count = selectedLibraryPaperIds.length;
+      const confirmed = await requestLibraryInlineAction(`将 ${count} 篇文献从文献库移除？论文、Discovery 历史和原始 PDF 均保留。`, "移出文献库", "取消");
+      if (confirmed && count) {
+        await runBulkLibraryCommand("remove_papers_from_library", { paperIds: [...selectedLibraryPaperIds] }, "已从文献库移除", true);
+      }
       return;
     }
     const collectionFilter = t.closest("[data-action='library-filter-collection']") as HTMLElement | null;
     if (collectionFilter) {
       const id = parseInt(collectionFilter.dataset.collectionId!, 10);
+      clearLibrarySelection();
       libraryScope = { kind: "collection", id };
       librarySearchState = {
         ...librarySearchState,
@@ -5396,6 +5592,7 @@ async function setupListeners() {
     if (navigateCollection) {
       const id = Number(navigateCollection.dataset.id);
       if (!Number.isInteger(id)) return;
+      clearLibrarySelection();
       libraryScope = { kind: "collection", id };
       librarySelectedTagIds = [];
       librarySearchState = {
@@ -5413,6 +5610,7 @@ async function setupListeners() {
     if (navigateTag) {
       const id = Number(navigateTag.dataset.id);
       if (!Number.isInteger(id)) return;
+      clearLibrarySelection();
       librarySelectedTagIds = librarySelectedTagIds.includes(id) ? librarySelectedTagIds : [...librarySelectedTagIds, id];
       librarySearchState = {
         ...librarySearchState,
@@ -5470,6 +5668,7 @@ async function setupListeners() {
     const tagFilter = t.closest("[data-action='library-filter-tag']") as HTMLElement | null;
     if (tagFilter) {
       const id = parseInt(tagFilter.dataset.tagId!, 10);
+      clearLibrarySelection();
       const activeTagIds = librarySearchState.query.libraryTagIds || librarySelectedTagIds;
       librarySelectedTagIds = activeTagIds.includes(id)
         ? activeTagIds.filter((tagId) => tagId !== id)

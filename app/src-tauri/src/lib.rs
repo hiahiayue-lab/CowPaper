@@ -1022,6 +1022,55 @@ fn remove_paper_from_library(paper_id: i64, state: State<Db>) -> Result<bool, St
 }
 
 #[tauri::command]
+fn add_papers_to_collection(
+    paper_ids: Vec<i64>,
+    collection_id: i64,
+    state: State<Db>,
+) -> Result<models::BulkLibraryOperationResult, String> {
+    let conn = state.inner().lock().unwrap();
+    db::add_papers_to_collection(&conn, &paper_ids, collection_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn remove_papers_from_collection(
+    paper_ids: Vec<i64>,
+    collection_id: i64,
+    state: State<Db>,
+) -> Result<models::BulkLibraryOperationResult, String> {
+    let conn = state.inner().lock().unwrap();
+    db::remove_papers_from_collection(&conn, &paper_ids, collection_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn add_tags_to_papers(
+    paper_ids: Vec<i64>,
+    tag_ids: Vec<i64>,
+    state: State<Db>,
+) -> Result<models::BulkLibraryOperationResult, String> {
+    let conn = state.inner().lock().unwrap();
+    db::add_tags_to_papers(&conn, &paper_ids, &tag_ids).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn remove_tags_from_papers(
+    paper_ids: Vec<i64>,
+    tag_ids: Vec<i64>,
+    state: State<Db>,
+) -> Result<models::BulkLibraryOperationResult, String> {
+    let conn = state.inner().lock().unwrap();
+    db::remove_tags_from_papers(&conn, &paper_ids, &tag_ids).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn remove_papers_from_library(
+    paper_ids: Vec<i64>,
+    state: State<Db>,
+) -> Result<models::BulkLibraryOperationResult, String> {
+    let conn = state.inner().lock().unwrap();
+    db::remove_papers_from_library(&conn, &paper_ids).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn set_paper_collections(paper_id: i64, collection_ids: Vec<i64>, state: State<Db>) -> Result<(), String> {
     let conn = state.inner().lock().unwrap();
     db::set_paper_collections(&conn, paper_id, &collection_ids).map_err(|e| e.to_string())
@@ -2444,6 +2493,11 @@ pub fn run() {
             get_library_membership,
             add_paper_to_library,
             remove_paper_from_library,
+            add_papers_to_collection,
+            remove_papers_from_collection,
+            add_tags_to_papers,
+            remove_tags_from_papers,
+            remove_papers_from_library,
             set_paper_collections,
             set_paper_library_tags,
             list_library_collections,

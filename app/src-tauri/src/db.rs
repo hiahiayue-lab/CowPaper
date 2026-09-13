@@ -5673,15 +5673,152 @@ pub fn add_paper_to_library(
 }
 
 pub fn remove_paper_from_library(conn: &Connection, paper_id: i64) -> Result<bool> {
+    Ok(remove_papers_from_library(conn, &[paper_id])?.changed == 1)
+}
+
+fn normalized_library_paper_ids(conn: &Connection, paper_ids: &[i64]) -> Result<Vec<i64>> {
+    let mut seen = HashSet::new();
+    let ids = paper_ids
+        .iter()
+        .copied()
+        .filter(|id| *id > 0 && seen.insert(*id))
+        .collect::<Vec<_>>();
+    for paper_id in &ids {
+        if !library_item_exists(conn, *paper_id)? {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
+    }
+    Ok(ids)
+}
+
+fn bulk_library_result(paper_count: usize, relation_count: usize, changed: usize) -> crate::models::BulkLibraryOperationResult {
+    crate::models::BulkLibraryOperationResult {
+        paper_count: paper_count as i64,
+        relation_count: relation_count as i64,
+        changed: changed as i64,
+        already_present: relation_count.saturating_sub(changed) as i64,
+    }
+}
+
+/// Refresh all affected Library search projections after one committed
+/// relation transaction. There is one backend operation and one DB transaction
+/// for the relation mutation; callers never loop over Tauri commands.
+fn refresh_library_search_documents(conn: &Connection, paper_ids: &[i64]) -> Result<()> {
+    for paper_id in paper_ids.iter().copied() {
+        refresh_library_search_document(conn, paper_id)?;
+    }
+    Ok(())
+}
+
+pub fn add_papers_to_collection(
+    conn: &Connection,
+    paper_ids: &[i64],
+    collection_id: i64,
+) -> Result<crate::models::BulkLibraryOperationResult> {
+    let ids = normalized_library_paper_ids(conn, paper_ids)?;
     let tx = conn.unchecked_transaction()?;
-    let changed = tx.execute("DELETE FROM library_items WHERE paper_id = ?1", params![paper_id])?;
-    // Keep membership cleanup explicit so this invariant also holds for
-    // test/legacy connections that do not enable SQLite foreign keys.
-    tx.execute("DELETE FROM library_collection_items WHERE paper_id = ?1", params![paper_id])?;
-    tx.execute("DELETE FROM library_item_tags WHERE paper_id = ?1", params![paper_id])?;
+    validate_collection_ids(&tx, &[collection_id])?;
+    let now = now_utc();
+    let mut changed = 0usize;
+    for paper_id in ids.iter().copied() {
+        changed += tx.execute(
+            "INSERT OR IGNORE INTO library_collection_items (collection_id, paper_id, added_at)
+             VALUES (?1, ?2, ?3)",
+            params![collection_id, paper_id, now],
+        )?;
+    }
     tx.commit()?;
-    refresh_library_search_document(conn, paper_id)?;
-    Ok(changed == 1)
+    refresh_library_search_documents(conn, &ids)?;
+    Ok(bulk_library_result(ids.len(), ids.len(), changed))
+}
+
+pub fn remove_papers_from_collection(
+    conn: &Connection,
+    paper_ids: &[i64],
+    collection_id: i64,
+) -> Result<crate::models::BulkLibraryOperationResult> {
+    let ids = normalized_library_paper_ids(conn, paper_ids)?;
+    let tx = conn.unchecked_transaction()?;
+    validate_collection_ids(&tx, &[collection_id])?;
+    let mut changed = 0usize;
+    for paper_id in ids.iter().copied() {
+        changed += tx.execute(
+            "DELETE FROM library_collection_items WHERE collection_id=?1 AND paper_id=?2",
+            params![collection_id, paper_id],
+        )?;
+    }
+    tx.commit()?;
+    refresh_library_search_documents(conn, &ids)?;
+    Ok(bulk_library_result(ids.len(), ids.len(), changed))
+}
+
+pub fn add_tags_to_papers(
+    conn: &Connection,
+    paper_ids: &[i64],
+    tag_ids: &[i64],
+) -> Result<crate::models::BulkLibraryOperationResult> {
+    let ids = normalized_library_paper_ids(conn, paper_ids)?;
+    let mut seen_tags = HashSet::new();
+    let tags = tag_ids.iter().copied().filter(|id| *id > 0 && seen_tags.insert(*id)).collect::<Vec<_>>();
+    let tx = conn.unchecked_transaction()?;
+    validate_library_tag_ids(&tx, &tags)?;
+    let now = now_utc();
+    let mut changed = 0usize;
+    for paper_id in ids.iter().copied() {
+        for tag_id in tags.iter().copied() {
+            changed += tx.execute(
+                "INSERT OR IGNORE INTO library_item_tags (paper_id, tag_id, added_at)
+                 VALUES (?1, ?2, ?3)",
+                params![paper_id, tag_id, now],
+            )?;
+        }
+    }
+    tx.commit()?;
+    refresh_library_search_documents(conn, &ids)?;
+    Ok(bulk_library_result(ids.len(), ids.len().saturating_mul(tags.len()), changed))
+}
+
+pub fn remove_tags_from_papers(
+    conn: &Connection,
+    paper_ids: &[i64],
+    tag_ids: &[i64],
+) -> Result<crate::models::BulkLibraryOperationResult> {
+    let ids = normalized_library_paper_ids(conn, paper_ids)?;
+    let mut seen_tags = HashSet::new();
+    let tags = tag_ids.iter().copied().filter(|id| *id > 0 && seen_tags.insert(*id)).collect::<Vec<_>>();
+    let tx = conn.unchecked_transaction()?;
+    validate_library_tag_ids(&tx, &tags)?;
+    let mut changed = 0usize;
+    for paper_id in ids.iter().copied() {
+        for tag_id in tags.iter().copied() {
+            changed += tx.execute(
+                "DELETE FROM library_item_tags WHERE paper_id=?1 AND tag_id=?2",
+                params![paper_id, tag_id],
+            )?;
+        }
+    }
+    tx.commit()?;
+    refresh_library_search_documents(conn, &ids)?;
+    Ok(bulk_library_result(ids.len(), ids.len().saturating_mul(tags.len()), changed))
+}
+
+pub fn remove_papers_from_library(
+    conn: &Connection,
+    paper_ids: &[i64],
+) -> Result<crate::models::BulkLibraryOperationResult> {
+    let ids = normalized_library_paper_ids(conn, paper_ids)?;
+    let tx = conn.unchecked_transaction()?;
+    let mut changed = 0usize;
+    for paper_id in ids.iter().copied() {
+        changed += tx.execute("DELETE FROM library_items WHERE paper_id = ?1", params![paper_id])?;
+        // Keep membership cleanup explicit so this invariant also holds for
+        // test/legacy connections that do not enable SQLite foreign keys.
+        tx.execute("DELETE FROM library_collection_items WHERE paper_id = ?1", params![paper_id])?;
+        tx.execute("DELETE FROM library_item_tags WHERE paper_id = ?1", params![paper_id])?;
+    }
+    tx.commit()?;
+    refresh_library_search_documents(conn, &ids)?;
+    Ok(bulk_library_result(ids.len(), ids.len(), changed))
 }
 
 pub fn set_paper_collections(conn: &Connection, paper_id: i64, collection_ids: &[i64]) -> Result<()> {
