@@ -746,7 +746,8 @@ fn save_tag_config(items: Vec<models::TagDraftItem>, mode: String, state: State<
     }
     // immediate：先持久化（diff 需要新 active 生成）
     let conn = state.inner().lock().unwrap();
-    let current_cycle_key = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let dtime = current_daily_check_time(&conn);
+    let current_cycle_key = recommendation::cycle_key_for(&chrono::Local::now(), &dtime);
     let mut res = tag_config::save_immediate_config_in_current_discovery_batch(&conn, &items, &current_cycle_key)?;
     // AI-needed：added + semanticChanged（active tags 语义）
     let need_ai: Vec<String> = res
