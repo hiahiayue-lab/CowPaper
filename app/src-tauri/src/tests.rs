@@ -4089,7 +4089,30 @@ fn test_upgrade_reanalysis_orchestration() {
         assert_eq!(p.evidence_hash, None, "evidenceHash 清空 → 旧分析 stale");
         assert_eq!(p.total_score, Some(0.6), "旧 AI 结果保留，直到新分析覆盖");
     }
-    // 真实 enqueue：UPDATE 必须生效（不再是 0 rows），论文进入 queued
+    // Discovery history membership alone is not enough: a Paper outside the
+    // current Today cycle must remain pending instead of entering the queue.
+    let sync = db::create_sync_batch(&conn, "upgrade-reanalysis").unwrap();
+    db::add_sync_batch_papers(&conn, sync, &[id], &[], &[]).unwrap();
+    conn.execute(
+        "UPDATE papers SET first_seen_cycle='2000-01-01' WHERE id=?1",
+        params![id],
+    )
+    .unwrap();
+    db::enqueue_paper(&conn, id).unwrap();
+    assert_eq!(
+        db::get_analysis_status(&conn, id).unwrap().as_deref(),
+        Some("pendingAnalysis"),
+        "History-only Paper 不得进入当前分析队列",
+    );
+
+    // Once the same Paper has explicit current Today membership, the real
+    // enqueue path must transition pendingAnalysis to queued.
+    let current_cycle = db::current_discovery_cycle_key(&conn);
+    conn.execute(
+        "UPDATE papers SET first_seen_cycle=?1 WHERE id=?2",
+        params![current_cycle, id],
+    )
+    .unwrap();
     db::enqueue_paper(&conn, id).unwrap();
     {
         let st = db::get_analysis_status(&conn, id).unwrap();
@@ -8002,13 +8025,22 @@ fn test_external_pdf_import_uses_managed_storage_without_second_canonical_paper(
     let result = db::import_external_pdf(&conn, path.to_str().unwrap(), None).unwrap();
     assert_eq!(result.outcome, "createdExternalPaper");
     let pid = result.paper_id.unwrap();
-    let attachment = result.attachment.unwrap();
+    assert_eq!(result.metadata.title.as_deref(), Some("External Managed Paper"));
+    assert_eq!(result.metadata.year, None);
+    let attachment_id = result.attachment.as_ref().unwrap().id;
+    db::finalize_import_managed_filename(&conn, attachment_id).unwrap();
+    let attachment = db::list_paper_attachments(&conn, pid).unwrap().remove(0);
     assert_eq!(attachment.paper_id, pid);
     assert_eq!(attachment.storage_mode, "managed");
     assert!(path.exists(), "external import 的 copy 必须保留源 PDF");
     assert!(std::path::Path::new(&attachment.absolute_path).is_file());
     assert_eq!(conn.query_row("SELECT COUNT(*) FROM papers", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
-    assert!(std::path::Path::new(attachment.relative_path.as_deref().unwrap()).starts_with("Unknown"));
+    let expected_relative = std::path::Path::new("Unknown").join("External Managed Paper.pdf");
+    assert_eq!(std::path::Path::new(attachment.relative_path.as_deref().unwrap()), expected_relative);
+    assert_eq!(
+        std::path::Path::new(&attachment.absolute_path),
+        std::fs::canonicalize(&root).unwrap().join(expected_relative),
+    );
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(attachment.absolute_path);
     let _ = std::fs::remove_dir_all(root);
