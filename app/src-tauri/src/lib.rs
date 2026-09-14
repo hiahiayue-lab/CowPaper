@@ -1382,22 +1382,72 @@ fn list_attachment_annotations(
     db::list_attachment_annotations(&conn, attachment_id).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-fn refresh_pdf_annotations(
+async fn run_pdf_annotation_operation_with_worker<F>(
+    db: Db,
     attachment_id: i64,
-    state: State<Db>,
+    force: bool,
+    worker: F,
+) -> Result<models::PdfAnnotationRefreshResult, String>
+where
+    F: FnOnce(db::PdfAnnotationScanPlan)
+        -> std::result::Result<db::PdfAnnotationWorkerResult, String>
+        + Send
+        + 'static,
+{
+    // Only the attachment state read and the in-flight reservation happen
+    // while the shared SQLite mutex is held. The reservation itself is an
+    // in-memory guard and is intentionally allowed to live across the await.
+    let reservation = {
+        let conn = db.lock().map_err(|_| "数据库锁定失败".to_string())?;
+        db::prepare_pdf_annotation_scan(&conn, attachment_id, force)
+            .map_err(|error| error.to_string())?
+    };
+    if reservation.already_running() {
+        return Ok(reservation.in_progress_result());
+    }
+
+    let plan = reservation.plan.clone();
+    let worker_result = tauri::async_runtime::spawn_blocking(move || worker(plan))
+        .await
+        .map_err(|error| format!("PDF 标注任务失败：{error}"))?
+        .map_err(|error| error.to_string())?;
+
+    // Re-acquire the DB mutex only after all file I/O and PDF extraction have
+    // completed. finish_pdf_annotation_scan verifies that the attachment path
+    // and Paper identity are still the same before writing the result.
+    let conn = db.lock().map_err(|_| "数据库锁定失败".to_string())?;
+    db::finish_pdf_annotation_scan(&conn, &reservation.plan, worker_result)
+        .map_err(|error| error.to_string())
+}
+
+async fn run_pdf_annotation_operation(
+    db: Db,
+    attachment_id: i64,
+    force: bool,
 ) -> Result<models::PdfAnnotationRefreshResult, String> {
-    let conn = state.inner().lock().unwrap();
-    db::refresh_pdf_annotations(&conn, attachment_id).map_err(|e| e.to_string())
+    run_pdf_annotation_operation_with_worker(
+        db,
+        attachment_id,
+        force,
+        |plan| db::scan_pdf_annotation_file(&plan),
+    )
+    .await
 }
 
 #[tauri::command]
-fn ensure_pdf_annotations(
+async fn refresh_pdf_annotations(
     attachment_id: i64,
-    state: State<Db>,
+    state: State<'_, Db>,
 ) -> Result<models::PdfAnnotationRefreshResult, String> {
-    let conn = state.inner().lock().unwrap();
-    db::ensure_pdf_annotations(&conn, attachment_id).map_err(|e| e.to_string())
+    run_pdf_annotation_operation(state.inner().clone(), attachment_id, true).await
+}
+
+#[tauri::command]
+async fn ensure_pdf_annotations(
+    attachment_id: i64,
+    state: State<'_, Db>,
+) -> Result<models::PdfAnnotationRefreshResult, String> {
+    run_pdf_annotation_operation(state.inner().clone(), attachment_id, false).await
 }
 
 #[tauri::command]

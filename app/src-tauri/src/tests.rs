@@ -114,6 +114,109 @@ fn test_attachment(conn: &Connection, paper_id: i64, filename: &str) -> i64 {
     conn.last_insert_rowid()
 }
 
+#[test]
+fn test_pdf_annotation_async_worker_keeps_runtime_available() {
+    let conn = mem_db();
+    let paper_id = test_paper(&conn, "10.1000/annotation-background", "Annotation background");
+    let attachment_id = test_attachment(&conn, paper_id, "background.pdf");
+    let db = Arc::new(std::sync::Mutex::new(conn));
+    let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+    let release = Arc::new(std::sync::Barrier::new(2));
+    let worker_release = release.clone();
+
+    let operation = crate::run_pdf_annotation_operation_with_worker(
+        db.clone(),
+        attachment_id,
+        true,
+        move |plan| {
+            started_tx.send(()).unwrap();
+            worker_release.wait();
+            db::scan_pdf_annotation_file(&plan)
+        },
+    );
+    let result = tauri::async_runtime::block_on(async {
+        let operation = tauri::async_runtime::spawn(operation);
+        let started = tauri::async_runtime::spawn_blocking(move || {
+            started_rx.recv_timeout(std::time::Duration::from_secs(2)).is_ok()
+        });
+        let lightweight = tauri::async_runtime::spawn(async { 7_i32 });
+        let lightweight_value = lightweight.await.unwrap();
+        let worker_started = started.await.unwrap();
+        assert_eq!(lightweight_value, 7, "the runtime must remain available while the worker is blocked");
+        assert!(worker_started, "the scan must have reached the blocking worker");
+        release.wait();
+        operation.await.unwrap()
+    });
+
+    assert_eq!(result.unwrap().status, "missing_attachment");
+}
+
+#[test]
+fn test_pdf_annotation_background_result_is_attachment_scoped() {
+    let conn = mem_db();
+    let first_paper = test_paper(&conn, "10.1000/annotation-background-first", "First attachment");
+    let second_paper = test_paper(&conn, "10.1000/annotation-background-second", "Second attachment");
+    let first_attachment = test_attachment(&conn, first_paper, "first-background.pdf");
+    let second_attachment = test_attachment(&conn, second_paper, "second-background.pdf");
+    let db = Arc::new(std::sync::Mutex::new(conn));
+    let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+    let release = Arc::new(std::sync::Barrier::new(2));
+    let worker_release = release.clone();
+
+    let operation = crate::run_pdf_annotation_operation_with_worker(
+        db.clone(),
+        first_attachment,
+        true,
+        move |_plan| {
+            started_tx.send(()).unwrap();
+            worker_release.wait();
+            Ok(db::PdfAnnotationWorkerResult::Missing {
+                stored_sha256: None,
+            })
+        },
+    );
+    let result = tauri::async_runtime::block_on(async {
+        let operation = tauri::async_runtime::spawn(operation);
+        tauri::async_runtime::spawn_blocking(move || {
+            started_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        })
+        .await
+        .unwrap();
+
+        // A UI selection change is unrelated to the attachment-owned worker.
+        let selected_attachment = second_attachment;
+        let selected_status = {
+            let conn = db.lock().unwrap();
+            db::get_paper_attachment(&conn, selected_attachment).unwrap().unwrap().annotation_status
+        };
+        assert_eq!(selected_status, "never_scanned");
+        release.wait();
+        operation.await.unwrap()
+    });
+
+    assert_eq!(result.unwrap().attachment_id, first_attachment);
+    let conn = db.lock().unwrap();
+    assert_eq!(db::get_paper_attachment(&conn, first_attachment).unwrap().unwrap().annotation_status, "missing_attachment");
+    assert_eq!(db::get_paper_attachment(&conn, second_attachment).unwrap().unwrap().annotation_status, "never_scanned");
+}
+
+#[test]
+fn test_pdf_annotation_reservation_deduplicates_workers() {
+    let conn = mem_db();
+    let paper_id = test_paper(&conn, "10.1000/annotation-reservation", "Annotation reservation");
+    let attachment_id = test_attachment(&conn, paper_id, "reservation.pdf");
+
+    let first = db::prepare_pdf_annotation_scan(&conn, attachment_id, true).unwrap();
+    assert!(!first.already_running());
+    let second = db::prepare_pdf_annotation_scan(&conn, attachment_id, true).unwrap();
+    assert!(second.already_running());
+    assert_eq!(second.in_progress_result().status, "in_progress");
+
+    drop(first);
+    let third = db::prepare_pdf_annotation_scan(&conn, attachment_id, true).unwrap();
+    assert!(!third.already_running());
+}
+
 fn annotation_input(
     external_annotation_id: Option<&str>,
     comment: Option<&str>,

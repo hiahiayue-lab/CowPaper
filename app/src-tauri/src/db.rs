@@ -148,6 +148,44 @@ fn claim_annotation_scan(conn: &Connection, attachment_id: i64) -> Result<Option
     Ok(Some(AnnotationScanGuard { database_key, attachment_id }))
 }
 
+/// Owned state captured during the short DB phase before annotation work is
+/// moved to a blocking worker. It intentionally contains no Connection or DB
+/// guard, so file I/O and PDF parsing cannot accidentally retain the SQLite
+/// mutex.
+#[derive(Debug, Clone)]
+pub(crate) struct PdfAnnotationScanPlan {
+    attachment_id: i64,
+    paper_id: i64,
+    path: PathBuf,
+    stored_sha256: Option<String>,
+    status: String,
+    error: Option<String>,
+    scanned_at: Option<String>,
+    extractor_rescan_before: String,
+    force: bool,
+}
+
+pub(crate) struct PdfAnnotationScanReservation {
+    pub(crate) plan: PdfAnnotationScanPlan,
+    guard: Option<AnnotationScanGuard>,
+}
+
+impl PdfAnnotationScanReservation {
+    pub(crate) fn already_running(&self) -> bool {
+        self.guard.is_none()
+    }
+
+    pub(crate) fn in_progress_result(&self) -> crate::models::PdfAnnotationRefreshResult {
+        crate::models::PdfAnnotationRefreshResult {
+            attachment_id: self.plan.attachment_id,
+            source_sha256: self.plan.stored_sha256.clone(),
+            status: "in_progress".into(),
+            error: None,
+            ..Default::default()
+        }
+    }
+}
+
 pub fn init(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
     run_migrations(conn)?;
@@ -4045,172 +4083,264 @@ pub fn list_attachment_annotations(conn: &Connection, attachment_id: i64) -> Res
     rows
 }
 
+/// Reserve one attachment for annotation extraction during a short DB read.
+/// The returned plan owns all values needed by the blocking worker; the
+/// SQLite connection is not retained in the plan. `force` is used only by the
+/// explicit refresh action and bypasses the unchanged-file fast path.
+pub(crate) fn prepare_pdf_annotation_scan(
+    conn: &Connection,
+    attachment_id: i64,
+    force: bool,
+) -> Result<PdfAnnotationScanReservation> {
+    let extractor_rescan_before = annotation_extractor_rescan_before(conn)?;
+    let attachment: Option<(i64, String, Option<String>, String, Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT paper_id, absolute_path, sha256, annotation_status, annotation_error, annotation_scanned_at
+             FROM paper_attachments WHERE id=?1",
+            params![attachment_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+        )
+        .optional()?;
+    let Some((paper_id, path, stored_sha256, status, error, scanned_at)) = attachment else {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    };
+    let plan = PdfAnnotationScanPlan {
+        attachment_id,
+        paper_id,
+        path: PathBuf::from(path),
+        stored_sha256,
+        status,
+        error,
+        scanned_at,
+        extractor_rescan_before,
+        force,
+    };
+    let guard = claim_annotation_scan(conn, attachment_id)?;
+    Ok(PdfAnnotationScanReservation { plan, guard })
+}
+
+pub(crate) enum PdfAnnotationWorkerResult {
+    Missing { stored_sha256: Option<String> },
+    Skipped { current_sha256: String },
+    Scanned { source_sha256: String, scan: crate::pdf_annotations::PdfAnnotationScan },
+}
+
+/// Perform every potentially blocking file operation outside the DB phase.
+/// This is deliberately independent of Connection so it can be called from a
+/// `spawn_blocking` worker and tested without a Tauri runtime.
+pub(crate) fn scan_pdf_annotation_file(
+    plan: &PdfAnnotationScanPlan,
+) -> std::result::Result<PdfAnnotationWorkerResult, String> {
+    if !plan.path.is_file() {
+        return Ok(PdfAnnotationWorkerResult::Missing { stored_sha256: plan.stored_sha256.clone() });
+    }
+    let current_sha256 = sha256_file(&plan.path).map_err(|_| "annotation_hash_failed".to_string())?;
+    if !plan.force
+        && plan.status != "never_scanned"
+        && plan.status != "missing_attachment"
+        && plan
+            .scanned_at
+            .as_deref()
+            .is_some_and(|value| value >= plan.extractor_rescan_before.as_str())
+        && plan.stored_sha256.as_deref().is_some_and(|hash| hash == current_sha256)
+    {
+        return Ok(PdfAnnotationWorkerResult::Skipped { current_sha256 });
+    }
+    let scan = crate::pdf_annotations::scan_path(&plan.path);
+    // Refuse to commit a scan if the source changed while PDFium/lopdf was
+    // reading it. The second hash is still off the UI thread and prevents a
+    // stale worker from writing results for a replaced attachment.
+    let final_sha256 = sha256_file(&plan.path).map_err(|_| "annotation_hash_failed".to_string())?;
+    if final_sha256 != current_sha256 {
+        return Err("attachment_changed_during_scan".to_string());
+    }
+    Ok(PdfAnnotationWorkerResult::Scanned { source_sha256: current_sha256, scan })
+}
+
+/// Apply only the worker result to the still-current attachment. This is the
+/// short DB phase: it verifies attachment identity, writes annotation rows in
+/// one transaction, and refreshes the canonical Library search projection.
+pub(crate) fn finish_pdf_annotation_scan(
+    conn: &Connection,
+    plan: &PdfAnnotationScanPlan,
+    result: PdfAnnotationWorkerResult,
+) -> Result<crate::models::PdfAnnotationRefreshResult> {
+    let current: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT paper_id, absolute_path FROM paper_attachments WHERE id=?1",
+            params![plan.attachment_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((paper_id, path)) = current else {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    };
+    if paper_id != plan.paper_id || Path::new(&path) != plan.path.as_path() {
+        return Err(rusqlite::Error::InvalidParameterName("attachment_changed_during_scan".into()));
+    }
+
+    match result {
+        PdfAnnotationWorkerResult::Missing { stored_sha256 } => {
+            let now = now_utc();
+            conn.execute(
+                "UPDATE paper_attachments SET annotation_status='missing_attachment',
+                 annotation_error=?1, annotation_scanned_at=?2 WHERE id=?3",
+                params!["attachment_missing", now, plan.attachment_id],
+            )?;
+            Ok(crate::models::PdfAnnotationRefreshResult {
+                attachment_id: plan.attachment_id,
+                source_sha256: stored_sha256,
+                status: "missing_attachment".into(),
+                error: Some("attachment_missing".into()),
+                ..Default::default()
+            })
+        }
+        PdfAnnotationWorkerResult::Skipped { current_sha256 } => Ok(crate::models::PdfAnnotationRefreshResult {
+            attachment_id: plan.attachment_id,
+            source_sha256: Some(current_sha256),
+            status: plan.status.clone(),
+            error: plan.error.clone(),
+            skipped: true,
+            ..Default::default()
+        }),
+        PdfAnnotationWorkerResult::Scanned { source_sha256, scan } => {
+            let now = now_utc();
+            if scan.status != "completed" {
+                conn.execute(
+                    "UPDATE paper_attachments SET annotation_status=?1, annotation_error=?2,
+                     annotation_scanned_at=?3, sha256=?4 WHERE id=?5",
+                    params![scan.status, scan.error, now, source_sha256, plan.attachment_id],
+                )?;
+                return Ok(crate::models::PdfAnnotationRefreshResult {
+                    attachment_id: plan.attachment_id,
+                    source_sha256: Some(source_sha256),
+                    status: scan.status,
+                    error: scan.error,
+                    unsupported: scan.unsupported_count,
+                    ..Default::default()
+                });
+            }
+
+            let mut external_counts = HashMap::<(i64, String), usize>::new();
+            for item in &scan.annotations {
+                if let Some(external_id) = item.external_annotation_id.as_deref().filter(|id| !id.is_empty()) {
+                    *external_counts.entry((item.page_index, external_id.to_string())).or_default() += 1;
+                }
+            }
+            let tx = conn.unchecked_transaction()?;
+            let existing: HashMap<i64, (String, String)> = {
+                let mut stmt = tx.prepare("SELECT id, source_sha256, extraction_status FROM paper_annotations WHERE attachment_id=?1")?;
+                let rows = stmt
+                    .query_map(params![plan.attachment_id], |row| Ok((row.get(0)?, (row.get(1)?, row.get(2)?))))?
+                    .collect::<Result<HashMap<_, _>>>()?;
+                rows
+            };
+            let mut seen_ids = std::collections::HashSet::new();
+            let mut imported = 0_i64;
+            let mut updated = 0_i64;
+            let mut unchanged = 0_i64;
+            for item in &scan.annotations {
+                let normalized_kind = item.kind.to_ascii_lowercase();
+                let input = PaperAnnotationInput {
+                    external_annotation_id: item.external_annotation_id.clone(),
+                    kind: normalized_kind,
+                    page_index: item.page_index,
+                    color: item.color.clone(),
+                    quoted_text: item.quoted_text.clone(),
+                    comment: item.comment.clone(),
+                    author: item.author.clone(),
+                    created_at: item.pdf_created_at.clone(),
+                    modified_at: item.pdf_modified_at.clone(),
+                    extraction_status: item.extraction_status.clone(),
+                    source_app: None,
+                    raw_metadata_json: Some(item.raw_metadata_json.clone()),
+                    quadpoints: item.quadpoints.clone(),
+                    rect: item.rect.clone(),
+                };
+                let external_is_unique = input
+                    .external_annotation_id
+                    .as_deref()
+                    .filter(|id| !id.is_empty())
+                    .and_then(|id| external_counts.get(&(input.page_index, id.to_string())))
+                    .map_or(true, |count| *count == 1);
+                let (fingerprint, geometry_fingerprint) = annotation_fingerprints(plan.attachment_id, &input, external_is_unique);
+                let matching_ids = matching_annotation_ids(
+                    &tx,
+                    paper_id,
+                    plan.attachment_id,
+                    &input,
+                    &fingerprint,
+                    geometry_fingerprint.as_deref(),
+                    external_is_unique,
+                )?;
+                let existing_id = matching_ids.first().copied();
+                let was_present = existing_id.and_then(|id| existing.get(&id).cloned());
+                for duplicate_id in matching_ids.iter().skip(1) {
+                    tx.execute(
+                        "DELETE FROM paper_annotations WHERE id=?1 AND paper_id=?2 AND attachment_id=?3",
+                        params![duplicate_id, paper_id, plan.attachment_id],
+                    )?;
+                }
+                let id = upsert_paper_annotation_inner(&tx, paper_id, plan.attachment_id, &input, external_is_unique)?;
+                tx.execute(
+                    "UPDATE paper_annotations SET source_sha256=?1 WHERE id=?2 AND attachment_id=?3",
+                    params![source_sha256, id, plan.attachment_id],
+                )?;
+                seen_ids.insert(id);
+                match was_present {
+                    None => imported += 1,
+                    Some((old_hash, old_status)) if old_hash == source_sha256 && old_status == item.extraction_status => unchanged += 1,
+                    Some(_) => updated += 1,
+                }
+            }
+            let mut stale = 0_i64;
+            for (id, (_, status)) in existing {
+                if !seen_ids.contains(&id) && status != "stale" {
+                    stale += tx.execute(
+                        "UPDATE paper_annotations SET extraction_status='stale', updated_at=?1
+                         WHERE attachment_id=?2 AND id=?3",
+                        params![now, plan.attachment_id, id],
+                    )? as i64;
+                }
+            }
+            tx.execute(
+                "UPDATE paper_attachments SET annotation_status='completed',
+                 annotation_error=NULL, annotation_scanned_at=?1, sha256=?2 WHERE id=?3",
+                params![now, source_sha256, plan.attachment_id],
+            )?;
+            tx.commit()?;
+            refresh_library_search_document(conn, paper_id)?;
+            Ok(crate::models::PdfAnnotationRefreshResult {
+                attachment_id: plan.attachment_id,
+                source_sha256: Some(source_sha256),
+                status: "completed".into(),
+                error: None,
+                skipped: false,
+                imported,
+                updated,
+                unchanged,
+                stale,
+                unsupported: scan.unsupported_count,
+            })
+        }
+    }
+}
+
 /// Re-scan one attachment without ever writing to its source PDF. Annotation
 /// identity is attachment-local and prefers page-scoped PDF /NM; the fallback
-/// fingerprint is geometry/content based. Refresh is safe for malformed PDFs:
-/// it records a visible attachment error and retains prior imported rows.
+/// fingerprint is geometry/content based. This synchronous DB API remains for
+/// direct callers/tests; the Tauri command uses the same phases asynchronously.
 pub fn refresh_pdf_annotations(
     conn: &Connection,
     attachment_id: i64,
 ) -> Result<crate::models::PdfAnnotationRefreshResult> {
-    let attachment: Option<(i64, String, Option<String>)> = conn
-        .query_row(
-            "SELECT paper_id, absolute_path, sha256 FROM paper_attachments WHERE id=?1",
-            params![attachment_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .optional()?;
-    let Some((paper_id, path, stored_sha256)) = attachment else {
-        return Err(rusqlite::Error::QueryReturnedNoRows);
-    };
-    // A scan initiated by the current code (including a new attachment or an
-    // explicit force refresh) is current for this extractor version. Creating
-    // the fence here also prevents a just-imported PDF from being needlessly
-    // scanned twice when the Annotation tab is opened immediately afterwards.
-    let _ = annotation_extractor_rescan_before(conn)?;
-    let Some(_scan_guard) = claim_annotation_scan(conn, attachment_id)? else {
-        return Ok(crate::models::PdfAnnotationRefreshResult {
-            attachment_id,
-            source_sha256: stored_sha256,
-            status: "in_progress".into(),
-            error: None,
-            ..Default::default()
-        });
-    };
-    let now = now_utc();
-    if !Path::new(&path).is_file() {
-        conn.execute(
-            "UPDATE paper_attachments SET annotation_status='missing_attachment',
-             annotation_error=?1, annotation_scanned_at=?2 WHERE id=?3",
-            params!["attachment_missing", now, attachment_id],
-        )?;
-        return Ok(crate::models::PdfAnnotationRefreshResult {
-            attachment_id,
-            source_sha256: stored_sha256,
-            status: "missing_attachment".into(),
-            error: Some("attachment_missing".into()),
-            ..Default::default()
-        });
+    let reservation = prepare_pdf_annotation_scan(conn, attachment_id, true)?;
+    if reservation.already_running() {
+        return Ok(reservation.in_progress_result());
     }
-    let source_sha256 = sha256_file(Path::new(&path))?;
-    let scan = crate::pdf_annotations::scan_path(Path::new(&path));
-    if scan.status != "completed" {
-        conn.execute(
-            "UPDATE paper_attachments SET annotation_status=?1, annotation_error=?2,
-             annotation_scanned_at=?3, sha256=?4 WHERE id=?5",
-            params![scan.status, scan.error, now, source_sha256, attachment_id],
-        )?;
-        return Ok(crate::models::PdfAnnotationRefreshResult {
-            attachment_id,
-            source_sha256: Some(source_sha256),
-            status: scan.status,
-            error: scan.error,
-            unsupported: scan.unsupported_count,
-            ..Default::default()
-        });
-    }
-
-    let mut external_counts = HashMap::<(i64, String), usize>::new();
-    for item in &scan.annotations {
-        if let Some(external_id) = item.external_annotation_id.as_deref().filter(|id| !id.is_empty()) {
-            *external_counts.entry((item.page_index, external_id.to_string())).or_default() += 1;
-        }
-    }
-    let tx = conn.unchecked_transaction()?;
-    let existing: HashMap<i64, (String, String)> = {
-        let mut stmt = tx.prepare("SELECT id, source_sha256, extraction_status FROM paper_annotations WHERE attachment_id=?1")?;
-        let rows = stmt
-            .query_map(params![attachment_id], |row| Ok((row.get(0)?, (row.get(1)?, row.get(2)?))))?
-            .collect::<Result<HashMap<_, _>>>()?;
-        rows
-    };
-    let mut seen_ids = std::collections::HashSet::new();
-    let mut imported = 0_i64;
-    let mut updated = 0_i64;
-    let mut unchanged = 0_i64;
-    for item in &scan.annotations {
-        let normalized_kind = item.kind.to_ascii_lowercase();
-        let input = PaperAnnotationInput {
-            external_annotation_id: item.external_annotation_id.clone(),
-            kind: normalized_kind,
-            page_index: item.page_index,
-            color: item.color.clone(),
-            quoted_text: item.quoted_text.clone(),
-            comment: item.comment.clone(),
-            author: item.author.clone(),
-            created_at: item.pdf_created_at.clone(),
-            modified_at: item.pdf_modified_at.clone(),
-            extraction_status: item.extraction_status.clone(),
-            source_app: None,
-            raw_metadata_json: Some(item.raw_metadata_json.clone()),
-            quadpoints: item.quadpoints.clone(),
-            rect: item.rect.clone(),
-        };
-        let external_is_unique = input
-            .external_annotation_id
-            .as_deref()
-            .filter(|id| !id.is_empty())
-            .and_then(|id| external_counts.get(&(input.page_index, id.to_string())))
-            .map_or(true, |count| *count == 1);
-        let (fingerprint, geometry_fingerprint) = annotation_fingerprints(attachment_id, &input, external_is_unique);
-        let matching_ids = matching_annotation_ids(
-            &tx,
-            paper_id,
-            attachment_id,
-            &input,
-            &fingerprint,
-            geometry_fingerprint.as_deref(),
-            external_is_unique,
-        )?;
-        let existing_id = matching_ids.first().copied();
-        let was_present = existing_id.and_then(|id| existing.get(&id).cloned());
-        for duplicate_id in matching_ids.iter().skip(1) {
-            tx.execute(
-                "DELETE FROM paper_annotations WHERE id=?1 AND paper_id=?2 AND attachment_id=?3",
-                params![duplicate_id, paper_id, attachment_id],
-            )?;
-        }
-        let id = upsert_paper_annotation_inner(&tx, paper_id, attachment_id, &input, external_is_unique)?;
-        tx.execute(
-            "UPDATE paper_annotations SET source_sha256=?1 WHERE id=?2 AND attachment_id=?3",
-            params![source_sha256, id, attachment_id],
-        )?;
-        seen_ids.insert(id);
-        match was_present {
-            None => imported += 1,
-            Some((old_hash, old_status)) if old_hash == source_sha256 && old_status == item.extraction_status => unchanged += 1,
-            Some(_) => updated += 1,
-        }
-    }
-    let mut stale = 0_i64;
-    for (id, (_, status)) in existing {
-        if !seen_ids.contains(&id) && status != "stale" {
-            stale += tx.execute(
-                "UPDATE paper_annotations SET extraction_status='stale', updated_at=?1
-                 WHERE attachment_id=?2 AND id=?3",
-                params![now, attachment_id, id],
-            )? as i64;
-        }
-    }
-    tx.execute(
-        "UPDATE paper_attachments SET annotation_status='completed',
-         annotation_error=NULL, annotation_scanned_at=?1, sha256=?2 WHERE id=?3",
-        params![now, source_sha256, attachment_id],
-    )?;
-    tx.commit()?;
-    refresh_library_search_document(conn, paper_id)?;
-    Ok(crate::models::PdfAnnotationRefreshResult {
-        attachment_id,
-        source_sha256: Some(source_sha256),
-        status: "completed".into(),
-        error: None,
-        skipped: false,
-        imported,
-        updated,
-        unchanged,
-        stale,
-        unsupported: scan.unsupported_count,
-    })
+    let worker = scan_pdf_annotation_file(&reservation.plan)
+        .map_err(|_| rusqlite::Error::InvalidQuery)?;
+    finish_pdf_annotation_scan(conn, &reservation.plan, worker)
 }
 
 /// Ensure that one attachment has a current annotation extraction without
@@ -4220,50 +4350,13 @@ pub fn ensure_pdf_annotations(
     conn: &Connection,
     attachment_id: i64,
 ) -> Result<crate::models::PdfAnnotationRefreshResult> {
-    // DB21 already persists the attachment content fingerprint and the time of
-    // the last scan. Use an app_state cutoff per extractor version to lazily
-    // invalidate results produced by an older algorithm without scanning the
-    // whole Library at startup and without adding a v22 column. Every scan
-    // performed after the cutoff is current for this extractor version.
-    let extractor_rescan_before = annotation_extractor_rescan_before(conn)?;
-    let attachment: Option<(String, Option<String>, String, Option<String>, Option<String>)> = conn
-        .query_row(
-            "SELECT absolute_path, sha256, annotation_status, annotation_error, annotation_scanned_at
-             FROM paper_attachments WHERE id=?1",
-            params![attachment_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
-        )
-        .optional()?;
-    let Some((path, stored_sha256, status, error, scanned_at)) = attachment else {
-        return Err(rusqlite::Error::QueryReturnedNoRows);
-    };
-    if Path::new(&path).is_file() {
-        let current_sha256 = sha256_file(Path::new(&path))?;
-        // Every non-never-scanned status is terminal for this exact file. In
-        // particular, failed/malformed scans must not retry forever on every
-        // startup or tab visit; a changed file is the explicit retry signal.
-        if status != "never_scanned"
-            // A missing file is a recoverable locator state, not a terminal
-            // extraction result. If the same file becomes available again,
-            // run the lazy scan even when its bytes match the old attachment
-            // hash.
-            && status != "missing_attachment"
-            && scanned_at
-                .as_deref()
-                .is_some_and(|value| value >= extractor_rescan_before.as_str())
-            && stored_sha256.as_deref().is_some_and(|hash| hash == current_sha256)
-        {
-            return Ok(crate::models::PdfAnnotationRefreshResult {
-                attachment_id,
-                source_sha256: Some(current_sha256),
-                status,
-                error,
-                skipped: true,
-                ..Default::default()
-            });
-        }
+    let reservation = prepare_pdf_annotation_scan(conn, attachment_id, false)?;
+    if reservation.already_running() {
+        return Ok(reservation.in_progress_result());
     }
-    refresh_pdf_annotations(conn, attachment_id)
+    let worker = scan_pdf_annotation_file(&reservation.plan)
+        .map_err(|_| rusqlite::Error::InvalidQuery)?;
+    finish_pdf_annotation_scan(conn, &reservation.plan, worker)
 }
 
 const PDF_ANNOTATION_EXTRACTOR_VERSION: &str = "pdfium-v1";
