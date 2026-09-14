@@ -1073,6 +1073,15 @@ pub fn upsert_paper(conn: &Connection, journal_id: i64, c: &PaperCandidate) -> R
 /// explicit UI confirmation. It prevents the generic title/year fallback in
 /// `upsert_paper` from silently merging an unconfirmed PDF.
 fn insert_paper_without_identity_merge(conn: &Connection, journal_id: i64, c: &PaperCandidate) -> Result<i64> {
+    insert_paper_without_identity_merge_at(conn, journal_id, c, &chrono::Local::now())
+}
+
+fn insert_paper_without_identity_merge_at(
+    conn: &Connection,
+    journal_id: i64,
+    c: &PaperCandidate,
+    now_local: &chrono::DateTime<chrono::Local>,
+) -> Result<i64> {
     let authors_json = serde_json::to_string(&c.authors).unwrap_or_else(|_| "[]".to_string());
     let title_norm = c.title.as_deref().map(normalize_title);
     // 摘要质量（本地判定）决定初始 analysis_status：
@@ -1109,8 +1118,8 @@ fn insert_paper_without_identity_merge(conn: &Connection, journal_id: i64, c: &P
     );
     let has_abstract = abs_quality != crate::models::ABQ_MISSING;
     let abstract_status = crate::content_kind::abstract_status_for(&ck.kind, has_abstract);
-    let now = now_utc();
-    let first_seen_cycle = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let now = now_local.with_timezone(&chrono::Utc).to_rfc3339();
+    let first_seen_cycle = discovery_cycle_key_at(conn, now_local);
 
     conn.execute(
         "INSERT INTO papers (
@@ -1159,6 +1168,16 @@ fn insert_paper_without_identity_merge(conn: &Connection, journal_id: i64, c: &P
         let _ = record_abstract_source(conn, id, src, t, q, r);
     }
     Ok(id)
+}
+
+#[cfg(test)]
+pub(crate) fn insert_paper_at(
+    conn: &Connection,
+    journal_id: i64,
+    c: &PaperCandidate,
+    now_local: &chrono::DateTime<chrono::Local>,
+) -> Result<i64> {
+    insert_paper_without_identity_merge_at(conn, journal_id, c, now_local)
 }
 
 pub fn insert_source_record(
@@ -1514,10 +1533,17 @@ pub fn current_discovery_batch_paper_ids(conn: &Connection, cycle_key: &str) -> 
 /// The one persisted positive membership key used by current Discovery UI and
 /// queue bookkeeping. This deliberately follows the recommendation cutoff,
 /// rather than the wall-clock calendar date.
-pub fn current_discovery_cycle_key(conn: &Connection) -> String {
+pub fn discovery_cycle_key_at(
+    conn: &Connection,
+    now: &chrono::DateTime<chrono::Local>,
+) -> String {
     let daily_check_time = get_setting(conn, "settings.daily_sync_time")
         .unwrap_or_else(|| "09:00".to_string());
-    crate::recommendation::cycle_key_for(&chrono::Local::now(), &daily_check_time)
+    crate::recommendation::cycle_key_for(now, &daily_check_time)
+}
+
+pub fn current_discovery_cycle_key(conn: &Connection) -> String {
+    discovery_cycle_key_at(conn, &chrono::Local::now())
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -8108,6 +8134,10 @@ pub fn list_queued_ids_in_current_discovery_batch(
 /// 仅把 pendingAnalysis 论文入队（已成功/已入队的不重复入队）。
 pub fn enqueue_paper(conn: &Connection, id: i64) -> Result<()> {
     let cycle_key = current_discovery_cycle_key(conn);
+    enqueue_paper_in_cycle(conn, id, &cycle_key)
+}
+
+pub(crate) fn enqueue_paper_in_cycle(conn: &Connection, id: i64, cycle_key: &str) -> Result<()> {
     conn.execute(
         &format!(
             "UPDATE papers AS p SET analysis_status = 'queued', queued_at = ?1, retry_count = 0, updated_at = ?1
@@ -8575,6 +8605,15 @@ pub fn cancel_queued_items(conn: &Connection, batch_id: i64) -> Result<()> {
 /// record enough before/after provenance to prove that a saved result belongs
 /// exclusively to this batch.
 pub fn stop_analysis_batch(conn: &Connection, batch_id: i64) -> Result<()> {
+    let cycle_key = current_discovery_cycle_key(conn);
+    stop_analysis_batch_in_cycle(conn, batch_id, &cycle_key)
+}
+
+pub(crate) fn stop_analysis_batch_in_cycle(
+    conn: &Connection,
+    batch_id: i64,
+    cycle_key: &str,
+) -> Result<()> {
     if batch_id <= 0 {
         return Ok(());
     }
@@ -8582,8 +8621,7 @@ pub fn stop_analysis_batch(conn: &Connection, batch_id: i64) -> Result<()> {
     // Resolve Today membership before opening the write transaction. This is
     // the same explicit positive membership used by Discovery queue queries;
     // no date or history-negative heuristic is introduced here.
-    let cycle_key = current_discovery_cycle_key(conn);
-    let current_ids: HashSet<i64> = current_discovery_batch_paper_ids(conn, &cycle_key)?
+    let current_ids: HashSet<i64> = current_discovery_batch_paper_ids(conn, cycle_key)?
         .into_iter()
         .collect();
 

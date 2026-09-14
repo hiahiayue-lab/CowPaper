@@ -734,10 +734,8 @@ fn get_tag_config_baseline(state: State<Db>) -> Result<models::TagBaseline, Stri
 fn save_tag_config(items: Vec<models::TagDraftItem>, mode: String, state: State<Db>, queue: State<AiQueue>) -> Result<models::SaveTagConfigResult, String> {
     if mode == "scheduled" {
         let conn = state.inner().lock().unwrap();
-        let now = chrono::Local::now();
-        let dtime = current_daily_check_time(&conn);
         // 下一推荐周期 key（当前 cycle 的下一天 cutoff 后）
-        let cur_key = recommendation::cycle_key_for(&now, &dtime);
+        let cur_key = db::current_discovery_cycle_key(&conn);
         let next_key = next_cycle_key(&cur_key);
         return tag_config::save_scheduled_config(&conn, &items, &next_key);
     }
@@ -746,8 +744,7 @@ fn save_tag_config(items: Vec<models::TagDraftItem>, mode: String, state: State<
     }
     // immediate：先持久化（diff 需要新 active 生成）
     let conn = state.inner().lock().unwrap();
-    let dtime = current_daily_check_time(&conn);
-    let current_cycle_key = recommendation::cycle_key_for(&chrono::Local::now(), &dtime);
+    let current_cycle_key = db::current_discovery_cycle_key(&conn);
     let mut res = tag_config::save_immediate_config_in_current_discovery_batch(&conn, &items, &current_cycle_key)?;
     // AI-needed：added + semanticChanged（active tags 语义）
     let need_ai: Vec<String> = res
@@ -912,7 +909,7 @@ fn next_cycle_key(cur: &str) -> String {
     if let Ok(d) = chrono::NaiveDate::parse_from_str(cur, "%Y-%m-%d") {
         (d + chrono::Days::new(1)).format("%Y-%m-%d").to_string()
     } else {
-        chrono::Local::now().format("%Y-%m-%d").to_string()
+        cur.to_string()
     }
 }
 
@@ -1550,7 +1547,8 @@ fn import_pdf(
 #[tauri::command]
 fn list_today_missing_papers(state: State<Db>) -> Result<Vec<models::Paper>, String> {
     let c = state.inner().lock().unwrap();
-    db::list_current_missing_papers_for_cycle(&c, &chrono::Local::now().format("%Y-%m-%d").to_string()).map_err(|e| e.to_string())
+    let cycle_key = db::current_discovery_cycle_key(&c);
+    db::list_current_missing_papers_for_cycle(&c, &cycle_key).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -2336,17 +2334,24 @@ fn valid_daily_sync_time(value: &str) -> bool {
 /// 与 last_analysis（上一次批次的 total）严格区分，杜绝"上次 7 篇"被误读成"待处理 7 篇"。
 /// 缺摘要只属于当前 Today Discovery cycle，并按 canonical paper id 去重。
 pub(crate) fn build_activity_state(conn: &Connection) -> Result<models::ActivityState, String> {
-    let retry_waiting = db::get_setting(conn, "queue.retry_waiting").unwrap_or_default() == "1";
     let cycle_key = db::current_discovery_cycle_key(conn);
+    build_activity_state_for_cycle(conn, &cycle_key)
+}
+
+pub(crate) fn build_activity_state_for_cycle(
+    conn: &Connection,
+    cycle_key: &str,
+) -> Result<models::ActivityState, String> {
+    let retry_waiting = db::get_setting(conn, "queue.retry_waiting").unwrap_or_default() == "1";
     Ok(models::ActivityState {
         sync_batch: db::get_running_sync_batch(conn).map_err(|e| e.to_string())?,
         analysis_batch: db::get_current_analysis_batch(conn).map_err(|e| e.to_string())?,
         last_sync: db::last_finished_sync_batch(conn).map_err(|e| e.to_string())?,
         last_analysis: db::last_finished_analysis_batch(conn).map_err(|e| e.to_string())?,
         retry_waiting,
-        pending_analysis: db::count_pending_papers_in_current_discovery_batch(conn, &cycle_key).unwrap_or(0),
-        analysis_failed: db::count_by_status_in_current_discovery_batch(conn, "analysisFailed", &cycle_key).unwrap_or(0),
-        waiting_for_abstract: db::count_waiting_for_abstract_in_current_discovery_batch(conn, &cycle_key).unwrap_or(0),
+        pending_analysis: db::count_pending_papers_in_current_discovery_batch(conn, cycle_key).unwrap_or(0),
+        analysis_failed: db::count_by_status_in_current_discovery_batch(conn, "analysisFailed", cycle_key).unwrap_or(0),
+        waiting_for_abstract: db::count_waiting_for_abstract_in_current_discovery_batch(conn, cycle_key).unwrap_or(0),
     })
 }
 
@@ -2479,10 +2484,7 @@ pub fn run() {
             // 激活到期 scheduled Tag 配置（需 queue 已 manage；仅本地 + 队列，不调旧周期重排）
             {
                 let c = db_arc.lock().unwrap();
-                let now = chrono::Local::now();
-                let dtime = db::get_setting(&c, "settings.daily_sync_time")
-                    .unwrap_or_else(|| "09:00".into());
-                let key = recommendation::cycle_key_for(&now, &dtime);
+                let key = db::current_discovery_cycle_key(&c);
                 let _ = activate_scheduled_tag_config_if_due(&c, &queue_handle, &key);
             }
             {

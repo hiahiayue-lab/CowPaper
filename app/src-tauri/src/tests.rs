@@ -2851,8 +2851,11 @@ fn activity_missing_abstract_counts_only_today_discovery_papers_once() {
     let today_a = make_missing("10.1000/activity-a");
     let today_b = make_missing("10.1000/activity-b");
     let yesterday = make_missing("10.1000/activity-yesterday");
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let old_day = (chrono::Local::now() - chrono::Duration::days(1)).format("%Y-%m-%d").to_string();
+    let today = db::current_discovery_cycle_key(&conn);
+    let old_day = (chrono::NaiveDate::parse_from_str(&today, "%Y-%m-%d").unwrap()
+        - chrono::Days::new(1))
+        .format("%Y-%m-%d")
+        .to_string();
 
     let today_batch = db::create_sync_batch(&conn, "manual").unwrap();
     let old_batch = db::create_sync_batch(&conn, "daily").unwrap();
@@ -4614,9 +4617,20 @@ fn test_live_hbr_sync() {
 // ================= Round 6：Daily Recommendation Timeline & History =================
 
 fn local_dt(y: i32, m: u32, d: u32, h: u32, min: u32) -> chrono::DateTime<chrono::Local> {
+    local_dt_with_seconds(y, m, d, h, min, 0)
+}
+
+fn local_dt_with_seconds(
+    y: i32,
+    m: u32,
+    d: u32,
+    h: u32,
+    min: u32,
+    sec: u32,
+) -> chrono::DateTime<chrono::Local> {
     use chrono::TimeZone;
     chrono::Local
-        .with_ymd_and_hms(y, m, d, h, min, 0)
+        .with_ymd_and_hms(y, m, d, h, min, sec)
         .single()
         .expect("valid local datetime")
 }
@@ -4642,16 +4656,155 @@ fn test_existing_journal_sync_keeps_24_hour_overlap() {
 #[test]
 fn test_recommendation_cycle_key() {
     use crate::recommendation::cycle_key_for;
-    // cutoff 09:00：当天 15:00 → 当天；次日 08:59 → 仍前一天；09:00 → 当天
+    // cutoff 09:00：00:30/08:59:59 仍属于前一天；09:00:00 起进入新周期。
     assert_eq!(cycle_key_for(&local_dt(2026, 8, 26, 15, 0), "09:00"), "2026-08-26");
-    assert_eq!(cycle_key_for(&local_dt(2026, 8, 27, 8, 59), "09:00"), "2026-08-26");
+    assert_eq!(cycle_key_for(&local_dt(2026, 8, 27, 0, 30), "09:00"), "2026-08-26");
+    assert_eq!(cycle_key_for(&local_dt_with_seconds(2026, 8, 27, 8, 59, 59), "09:00"), "2026-08-26");
     assert_eq!(cycle_key_for(&local_dt(2026, 8, 27, 9, 0), "09:00"), "2026-08-27");
-    assert_eq!(cycle_key_for(&local_dt(2026, 8, 27, 9, 1), "09:00"), "2026-08-27");
+    assert_eq!(cycle_key_for(&local_dt_with_seconds(2026, 8, 27, 9, 0, 1), "09:00"), "2026-08-27");
+    assert_eq!(cycle_key_for(&local_dt(2026, 8, 27, 23, 59), "09:00"), "2026-08-27");
     // 非法时间回退 09:00
     assert_eq!(cycle_key_for(&local_dt(2026, 8, 27, 10, 0), "garbage"), "2026-08-27");
     // 其他 cutoff
     assert_eq!(cycle_key_for(&local_dt(2026, 8, 27, 7, 59), "08:00"), "2026-08-26");
     assert_eq!(cycle_key_for(&local_dt(2026, 8, 27, 8, 0), "08:00"), "2026-08-27");
+}
+
+#[test]
+fn discovery_cycle_boundaries_persist_and_query_the_same_key() {
+    let cases = [
+        (local_dt(2026, 8, 27, 0, 30), "2026-08-26"),
+        (local_dt_with_seconds(2026, 8, 27, 8, 59, 59), "2026-08-26"),
+        (local_dt(2026, 8, 27, 9, 0), "2026-08-27"),
+        (local_dt_with_seconds(2026, 8, 27, 9, 0, 1), "2026-08-27"),
+        (local_dt(2026, 8, 27, 23, 59), "2026-08-27"),
+    ];
+
+    for (index, (now, expected_cycle)) in cases.into_iter().enumerate() {
+        let conn = mem_db();
+        db::set_setting(&conn, "settings.daily_sync_time", "09:00").unwrap();
+        let jid = db::insert_journal(&conn, "Cycle boundary", Some("0025-1909"), None, None, None).unwrap();
+        let paper = candidate(
+            Some(&format!("10.1000/cycle-boundary-{index}")),
+            &format!("Cycle boundary {index}"),
+            Some("complete abstract"),
+            Some("crossref"),
+        );
+        let paper_id = db::insert_paper_at(&conn, jid, &paper, &now).unwrap();
+        let sync_batch = db::create_sync_batch(&conn, "boundary").unwrap();
+        db::add_sync_batch_papers(&conn, sync_batch, &[paper_id], &[], &[]).unwrap();
+
+        let stored: String = conn
+            .query_row(
+                "SELECT first_seen_cycle FROM papers WHERE id=?1",
+                params![paper_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, expected_cycle);
+        let cycle_key = db::discovery_cycle_key_at(&conn, &now);
+        assert_eq!(cycle_key, expected_cycle);
+        assert_eq!(db::current_discovery_batch_paper_ids(&conn, &cycle_key).unwrap(), vec![paper_id]);
+    }
+}
+
+#[test]
+fn pre_cutoff_cycle_drives_queue_rerank_activity_reconciliation_and_stop() {
+    let conn = mem_db();
+    db::set_setting(&conn, "settings.daily_sync_time", "09:00").unwrap();
+    let now = local_dt(2026, 8, 27, 8, 30);
+    let cycle_key = db::discovery_cycle_key_at(&conn, &now);
+    assert_eq!(cycle_key, "2026-08-26");
+    let jid = db::insert_journal(&conn, "Pre-cutoff", Some("0025-1909"), None, None, None).unwrap();
+
+    let mut current = Vec::new();
+    for index in 0..3 {
+        let paper = candidate(
+            Some(&format!("10.1000/pre-cutoff-current-{index}")),
+            &format!("Pre-cutoff current {index}"),
+            Some("complete abstract"),
+            Some("crossref"),
+        );
+        current.push(db::insert_paper_at(&conn, jid, &paper, &now).unwrap());
+    }
+    let current_sync = db::create_sync_batch(&conn, "pre-cutoff-current").unwrap();
+    db::add_sync_batch_papers(&conn, current_sync, &current, &[], &[]).unwrap();
+
+    let history = db::insert_paper_at(
+        &conn,
+        jid,
+        &candidate(
+            Some("10.1000/pre-cutoff-history"),
+            "Pre-cutoff history",
+            Some("complete abstract"),
+            Some("crossref"),
+        ),
+        &now,
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE papers SET first_seen_cycle='2000-01-01' WHERE id=?1",
+        params![history],
+    )
+    .unwrap();
+    let history_sync = db::create_sync_batch(&conn, "pre-cutoff-history").unwrap();
+    db::add_sync_batch_papers(&conn, history_sync, &[history], &[], &[]).unwrap();
+
+    assert_eq!(db::current_discovery_batch_paper_ids(&conn, &cycle_key).unwrap(), current);
+    let activity = crate::build_activity_state_for_cycle(&conn, &cycle_key).unwrap();
+    assert_eq!(activity.pending_analysis, 3);
+
+    db::enqueue_paper_in_cycle(&conn, current[0], &cycle_key).unwrap();
+    db::enqueue_paper_in_cycle(&conn, history, &cycle_key).unwrap();
+    assert_eq!(db::get_analysis_status(&conn, history).unwrap().as_deref(), Some("pendingAnalysis"));
+
+    let stop_batch = db::create_analysis_batch(
+        &conn,
+        "manual",
+        Some("m"),
+        Some("v1"),
+        None,
+        None,
+        &[current[0]],
+    )
+    .unwrap();
+    db::set_paper_status(&conn, current[0], "analyzing").unwrap();
+    db::set_item_started(&conn, stop_batch, current[0], 1).unwrap();
+    db::stop_analysis_batch_in_cycle(&conn, stop_batch, &cycle_key).unwrap();
+    assert_eq!(db::get_analysis_status(&conn, current[0]).unwrap().as_deref(), Some("pendingAnalysis"));
+    assert!(!db::analysis_item_is_active(&conn, stop_batch, current[0]).unwrap());
+    assert!(!db::save_analysis_if_batch_active(
+        &conn,
+        Some(stop_batch),
+        current[0],
+        "late title",
+        "late abstract",
+        "late summary",
+        "[]",
+        5.0,
+        "m",
+        "v1",
+        "late-hash",
+    )
+    .unwrap());
+
+    db::set_paper_status(&conn, current[1], "queued").unwrap();
+    db::set_paper_status(&conn, history, "queued").unwrap();
+    let contaminated = db::create_analysis_batch(
+        &conn,
+        "tagConfigUpdate",
+        Some("m"),
+        Some("v1"),
+        None,
+        None,
+        &[current[1], history],
+    )
+    .unwrap();
+    let report = db::reconcile_legacy_discovery_analysis_queue(&conn, &cycle_key).unwrap();
+    assert_eq!(report.batches_stopped, 1);
+    assert_eq!(db::get_analysis_status(&conn, current[1]).unwrap().as_deref(), Some("queued"));
+    assert_ne!(db::get_analysis_status(&conn, history).unwrap().as_deref(), Some("queued"));
+    assert_eq!(db::get_analysis_batch(&conn, contaminated).unwrap().unwrap().status, "stopped");
 }
 
 fn seed_paper_with_score(conn: &rusqlite::Connection, jid: i64, doi: &str, title: &str, score: f64) -> i64 {
@@ -5372,7 +5525,7 @@ fn test_tag_only_merge_and_papers_needing() {
 fn test_current_discovery_batch_rerank_scope_excludes_history_and_library() {
     let conn = mem_db();
     let jid = db::insert_journal(&conn, "Rerank scope", Some("0025-1909"), None, None, None).unwrap();
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let today = db::current_discovery_cycle_key(&conn);
     let history = "2000-01-01";
     let make = |doi: &str, title: &str| seed_paper_with_score(&conn, jid, doi, title, 1.0);
 
