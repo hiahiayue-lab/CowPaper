@@ -4037,6 +4037,11 @@ pub fn refresh_pdf_annotations(
     let Some((paper_id, path, stored_sha256)) = attachment else {
         return Err(rusqlite::Error::QueryReturnedNoRows);
     };
+    // A scan initiated by the current code (including a new attachment or an
+    // explicit force refresh) is current for this extractor version. Creating
+    // the fence here also prevents a just-imported PDF from being needlessly
+    // scanned twice when the Annotation tab is opened immediately afterwards.
+    let _ = annotation_extractor_rescan_before(conn)?;
     let Some(_scan_guard) = claim_annotation_scan(conn, attachment_id)? else {
         return Ok(crate::models::PdfAnnotationRefreshResult {
             attachment_id,
@@ -4189,15 +4194,21 @@ pub fn ensure_pdf_annotations(
     conn: &Connection,
     attachment_id: i64,
 ) -> Result<crate::models::PdfAnnotationRefreshResult> {
-    let attachment: Option<(String, Option<String>, String, Option<String>)> = conn
+    // DB21 already persists the attachment content fingerprint and the time of
+    // the last scan. Use an app_state cutoff per extractor version to lazily
+    // invalidate results produced by an older algorithm without scanning the
+    // whole Library at startup and without adding a v22 column. Every scan
+    // performed after the cutoff is current for this extractor version.
+    let extractor_rescan_before = annotation_extractor_rescan_before(conn)?;
+    let attachment: Option<(String, Option<String>, String, Option<String>, Option<String>)> = conn
         .query_row(
-            "SELECT absolute_path, sha256, annotation_status, annotation_error
+            "SELECT absolute_path, sha256, annotation_status, annotation_error, annotation_scanned_at
              FROM paper_attachments WHERE id=?1",
             params![attachment_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )
         .optional()?;
-    let Some((path, stored_sha256, status, error)) = attachment else {
+    let Some((path, stored_sha256, status, error, scanned_at)) = attachment else {
         return Err(rusqlite::Error::QueryReturnedNoRows);
     };
     if Path::new(&path).is_file() {
@@ -4211,6 +4222,9 @@ pub fn ensure_pdf_annotations(
             // run the lazy scan even when its bytes match the old attachment
             // hash.
             && status != "missing_attachment"
+            && scanned_at
+                .as_deref()
+                .is_some_and(|value| value >= extractor_rescan_before.as_str())
             && stored_sha256.as_deref().is_some_and(|hash| hash == current_sha256)
         {
             return Ok(crate::models::PdfAnnotationRefreshResult {
@@ -4224,6 +4238,24 @@ pub fn ensure_pdf_annotations(
         }
     }
     refresh_pdf_annotations(conn, attachment_id)
+}
+
+const PDF_ANNOTATION_EXTRACTOR_VERSION: &str = "pdfium-v1";
+
+/// Returns the timestamp before which an attachment scan belongs to an older
+/// extractor version. This is a lazy, DB21-compatible version fence: it is
+/// created on the first attachment ensure after an upgrade, and individual
+/// attachments are re-scanned only when they are opened in the Annotation tab.
+fn annotation_extractor_rescan_before(conn: &Connection) -> Result<String> {
+    let key = format!(
+        "pdf_annotation_extractor_rescan_before.{PDF_ANNOTATION_EXTRACTOR_VERSION}"
+    );
+    if let Some(value) = get_setting(conn, &key) {
+        return Ok(value);
+    }
+    let cutoff = now_utc();
+    set_setting(conn, &key, &cutoff)?;
+    Ok(cutoff)
 }
 
 fn prepare_current_pdf_storage(

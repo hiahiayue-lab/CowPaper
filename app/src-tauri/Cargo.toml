@@ -5,6 +5,14 @@ description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
 
+[features]
+default = ["pdfium-embedded"]
+# The binary is embedded at build time for the target platform by
+# pdfium-bundled. This keeps production extraction independent of a developer's
+# system PDFium installation while retaining an explicit feature boundary for
+# packaging/CI.
+pdfium-embedded = ["pdfium-bundled/bundled"]
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [lib]
@@ -36,5 +44,7 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "1"
 lopdf = "0.44"
+pdfium-bundled = { version = "0.1.1", default-features = false }
 quick-xml = "0.41"
 unicode-normalization = "0.1.25"
+log = "0.4"

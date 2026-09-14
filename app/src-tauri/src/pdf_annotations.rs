@@ -1,15 +1,20 @@
 //! Read-only extraction of standard PDF annotations.
 //!
 //! This module deliberately has no writer, renderer, OCR, network, or AI
-//! dependency. It reads the page /Annots dictionaries and uses lopdf's
-//! bounded text/content APIs to recover text when a text layer and usable
-//! geometry are available. The source PDF is never opened for writing.
+//! dependency. It reads the page /Annots dictionaries with lopdf and prefers
+//! PDFium's Unicode text layer and character bounds for quote recovery. The
+//! conservative lopdf content walker remains a secondary fallback for
+//! installations or documents where PDFium cannot provide a usable text page.
+//! The source PDF is never opened for writing.
 
 use lopdf::{Dictionary, Document, Encoding, LoadOptions, Object, ObjectId};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::OnceLock;
+
+use pdfium_bundled::pdfium_render::prelude::*;
 
 const MAX_DECOMPRESSED_PDF_BYTES: usize = 16 * 1024 * 1024;
 const MARKUP_KINDS: &[&str] = &["Highlight", "Underline", "StrikeOut"];
@@ -183,11 +188,16 @@ pub(crate) fn scan_path(path: &Path) -> PdfAnnotationScan {
     };
 
     let pages = doc.get_pages();
+    let pdfium_glyphs = pdfium_glyphs(path);
     let mut extracted = Vec::new();
     let mut unsupported_count = 0_i64;
     for (page_number, page_id) in pages {
         let entries = page_annotation_entries(&doc, page_id);
-        let glyphs = page_glyphs(&doc, page_id);
+        let glyphs = pdfium_glyphs
+            .as_ref()
+            .and_then(|pages| pages.get(page_number.saturating_sub(1) as usize))
+            .cloned()
+            .unwrap_or_else(|| page_glyphs(&doc, page_id));
         let page_has_text = !glyphs.is_empty();
         for (object_id, annotation) in entries {
             let Some(kind) = object_name(&doc, annotation.get(b"Subtype").ok()) else {
@@ -242,6 +252,7 @@ pub(crate) fn scan_path(path: &Path) -> PdfAnnotationScan {
                 "popup": reference_value(annotation.get(b"Popup").ok()),
                 "inReplyTo": reference_value(annotation.get(b"IRT").ok()),
                 "subtype": kind,
+                "textEngine": if pdfium_glyphs.is_some() { "pdfium" } else { "lopdf" },
             });
             let identity_material = stable_identity_material(
                 page_number.saturating_sub(1),
@@ -307,6 +318,117 @@ pub(crate) fn scan_path(path: &Path) -> PdfAnnotationScan {
         annotations: extracted,
         unsupported_count,
     }
+}
+
+/// PDFium is loaded once per process. `pdfium-bundled` embeds the matching
+/// platform library in the application binary and extracts it to its private
+/// cache only when text recovery first needs it. A failed bind is deliberately
+/// remembered as unavailable so a malformed or unsupported local runtime does
+/// not turn every annotation into repeated loader work; lopdf remains the
+/// safe secondary path.
+fn bound_pdfium() -> Option<&'static Pdfium> {
+    static PDFIUM: OnceLock<Option<Pdfium>> = OnceLock::new();
+
+    PDFIUM
+        .get_or_init(|| match pdfium_bundled::bind_bundled() {
+            Ok(pdfium) => Some(pdfium),
+            Err(error) => {
+                log::debug!("PDFium unavailable; using conservative lopdf fallback: {error}");
+                None
+            }
+        })
+        .as_ref()
+}
+
+/// Returns one glyph vector per page from PDFium's text page. The returned
+/// bounds are already in PDF default user space (bottom-left origin), which is
+/// the same coordinate space used by /QuadPoints and /Rect. Page rotation is a
+/// rendering transform in PDFium, not a reason to rotate annotation geometry;
+/// reading and explicitly matching all four rotation values here prevents a
+/// future caller from silently assuming zero rotation.
+fn pdfium_glyphs(path: &Path) -> Option<Vec<Vec<Glyph>>> {
+    let pdfium = bound_pdfium()?;
+    let document = pdfium.load_pdf_from_file(path, None).ok()?;
+    let mut pages = Vec::with_capacity(document.pages().len().max(0) as usize);
+
+    for page_index in 0..document.pages().len() {
+        let page = document.pages().get(page_index).ok()?;
+        let page_bounds = page
+            .boundaries()
+            .crop()
+            .or_else(|_| page.boundaries().media())
+            .map(|boundary| boundary.bounds)
+            .unwrap_or_else(|_| page.page_size());
+        let rotation = page.rotation().ok()?;
+        let text = page.text().ok()?;
+        let mut glyphs = Vec::with_capacity(text.len().max(0) as usize);
+
+        for character in text.chars().iter() {
+            let bounds = character.loose_bounds().ok()?;
+            let (x0, y0, x1, y1) = pdfium_user_space_bounds(bounds, page_bounds, rotation)?;
+            let unicode = character.unicode_string();
+            let text_value = unicode.clone().unwrap_or_else(|| "\u{FFFD}".to_string());
+            let render_mode = match character.render_mode().ok() {
+                Some(PdfPageTextRenderMode::Invisible | PdfPageTextRenderMode::InvisibleClipping) => 3,
+                _ => 0,
+            };
+            let font_size = character.scaled_font_size().value.abs().max(0.1);
+            glyphs.push(Glyph {
+                text: text_value,
+                x0,
+                y0,
+                x1,
+                y1,
+                size: font_size,
+                certain: unicode.is_some(),
+                render_mode,
+                // PDFium exposes the page's visual character order. A single
+                // logical run keeps the old interleaving guard from treating
+                // adjacent characters as conflicting PDF content streams.
+                run: 1,
+            });
+        }
+        pages.push(glyphs);
+    }
+
+    Some(pages)
+}
+
+/// PDFium's text APIs and PDF annotation coordinates both use unrotated PDF
+/// default user space. Keep this conversion explicit and validate against the
+/// page box so a future API change cannot silently feed display-space values to
+/// the quote selector.
+fn pdfium_user_space_bounds(
+    bounds: PdfRect,
+    page_bounds: PdfRect,
+    rotation: PdfPageRenderRotation,
+) -> Option<(f32, f32, f32, f32)> {
+    // Keep every supported rotation explicit. PDFium's character bounds and
+    // annotation coordinates are both in unrotated PDF user space, so no
+    // coordinate rotation is required here.
+    match rotation {
+        PdfPageRenderRotation::None
+        | PdfPageRenderRotation::Degrees90
+        | PdfPageRenderRotation::Degrees180
+        | PdfPageRenderRotation::Degrees270 => {}
+    }
+    let values = [
+        bounds.left().value,
+        bounds.bottom().value,
+        bounds.right().value,
+        bounds.top().value,
+    ];
+    if values.iter().any(|value| !value.is_finite())
+        || bounds.width().value <= 0.0
+        || bounds.height().value <= 0.0
+        || bounds.right().value < page_bounds.left().value - 2.0
+        || bounds.left().value > page_bounds.right().value + 2.0
+        || bounds.top().value < page_bounds.bottom().value - 2.0
+        || bounds.bottom().value > page_bounds.top().value + 2.0
+    {
+        return None;
+    }
+    Some((values[0], values[1], values[2], values[3]))
 }
 
 fn page_annotation_entries(doc: &Document, page_id: ObjectId) -> Vec<(Option<ObjectId>, lopdf::Dictionary)> {
@@ -1018,6 +1140,23 @@ mod tests {
         let rect = rect_from_quad(&[10.0, 30.0, 50.0, 30.0, 10.0, 10.0, 50.0, 10.0]).unwrap();
         assert_eq!((rect.x0, rect.y0, rect.x1, rect.y1), (10.0, 10.0, 50.0, 30.0));
         assert!(rect_from_quad(&[1.0, 2.0]).is_none());
+    }
+
+    #[test]
+    fn pdfium_user_space_mapping_handles_all_page_rotations() {
+        let page = PdfRect::new_from_values(0.0, 0.0, 100.0, 100.0);
+        let bounds = PdfRect::new_from_values(10.0, 20.0, 30.0, 50.0);
+        for rotation in [
+            PdfPageRenderRotation::None,
+            PdfPageRenderRotation::Degrees90,
+            PdfPageRenderRotation::Degrees180,
+            PdfPageRenderRotation::Degrees270,
+        ] {
+            assert_eq!(
+                pdfium_user_space_bounds(bounds, page, rotation),
+                Some((20.0, 10.0, 50.0, 30.0))
+            );
+        }
     }
 
     fn test_glyph(text: &str, x0: f32, x1: f32, y0: f32, y1: f32) -> Glyph {

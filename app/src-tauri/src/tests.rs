@@ -315,8 +315,11 @@ fn annotated_pdf_path(label: &str) -> std::path::PathBuf {
             "M" => Object::string_literal("D:20260912120000Z"),
         })
     };
-    let highlight_id = make_annotation("Highlight", "highlight-1", 54, 174, "Reviewer comment", vec![1.into(), 0.into(), 0.into()]);
-    let underline_id = make_annotation("Underline", "underline-1", 54, 174, "Underline note", vec![0.into(), 1.into(), 0.into()]);
+    // PDFium reports the actual Courier 12pt advance (7.2pt per glyph), so
+    // the fixture quad covers all 20 characters instead of encoding the old
+    // lopdf nominal-width assumption.
+    let highlight_id = make_annotation("Highlight", "highlight-1", 54, 198, "Reviewer comment", vec![1.into(), 0.into(), 0.into()]);
+    let underline_id = make_annotation("Underline", "underline-1", 54, 198, "Underline note", vec![0.into(), 1.into(), 0.into()]);
     let text_id = doc.add_object(dictionary! {
         "Type" => "Annot",
         "Subtype" => "Text",
@@ -7438,6 +7441,24 @@ fn test_pdf_annotations_extract_fields_deduplicate_refresh_and_preserve_source()
 }
 
 #[test]
+fn test_pdfium_is_primary_text_source_without_mutating_the_pdf() {
+    let source = annotated_pdf_path("annotation-pdfium-primary");
+    let before = std::fs::read(&source).unwrap();
+    let scan = crate::pdf_annotations::scan_path(&source);
+    assert_eq!(scan.status, "completed");
+    assert!(scan.annotations.iter().any(|item| {
+        item.kind == "Highlight" || item.kind == "Underline"
+    }));
+    assert!(scan
+        .annotations
+        .iter()
+        .filter(|item| item.kind == "Highlight" || item.kind == "Underline")
+        .all(|item| item.raw_metadata_json.contains("\"textEngine\":\"pdfium\"")));
+    assert_eq!(before, std::fs::read(&source).unwrap());
+    let _ = std::fs::remove_file(source);
+}
+
+#[test]
 fn test_pdf_annotations_malformed_pdf_is_visible_and_does_not_break_attachment() {
     let conn = mem_db();
     let pid = test_paper(&conn, "10.1000/annotation-malformed", "Malformed Annotation Paper");
@@ -7495,6 +7516,37 @@ fn test_pdf_annotations_ensure_skips_unchanged_success_and_failed_files() {
     assert!(failed_unchanged.skipped);
     assert_eq!(failed_unchanged.status, "malformed");
     let _ = std::fs::remove_file(failed_source);
+}
+
+#[test]
+fn test_pdf_annotations_lazily_rescans_once_after_extractor_upgrade() {
+    let conn = mem_db();
+    let paper = test_paper(&conn, "10.1000/annotation-extractor-upgrade", "Extractor upgrade");
+    let source = empty_pdf_path("annotation-extractor-upgrade");
+    let attachment = db::attach_pdf_to_paper(&conn, paper, source.to_str().unwrap()).unwrap();
+
+    // Simulate a DB21 row scanned by the pre-PDFium extractor. The attachment
+    // hash remains valid, but its durable scan timestamp predates the current
+    // extractor fence.
+    conn.execute(
+        "UPDATE paper_attachments
+         SET annotation_status='completed', annotation_scanned_at='2000-01-01T00:00:00Z'
+         WHERE id=?1",
+        params![attachment.id],
+    )
+    .unwrap();
+    conn.execute(
+        "DELETE FROM app_state WHERE key='pdf_annotation_extractor_rescan_before.pdfium-v1'",
+        [],
+    )
+    .unwrap();
+
+    let rescanned = db::ensure_pdf_annotations(&conn, attachment.id).unwrap();
+    assert!(!rescanned.skipped, "an old extractor result must be rescanned lazily");
+    let current = db::ensure_pdf_annotations(&conn, attachment.id).unwrap();
+    assert!(current.skipped, "the upgraded extractor must not rescan the same PDF twice");
+
+    let _ = std::fs::remove_file(source);
 }
 
 #[test]
