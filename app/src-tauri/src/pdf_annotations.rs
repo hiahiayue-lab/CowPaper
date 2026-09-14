@@ -46,6 +46,12 @@ pub(crate) struct PdfAnnotationScan {
     pub unsupported_count: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GlyphSource {
+    Pdfium,
+    Lopdf,
+}
+
 /// One glyph placed in PDF *default user space* (the same space annotation
 /// /Rect and /QuadPoints use, so page /Rotate never has to be re-applied here).
 /// `certain` is false when the byte could not be mapped through an encoding we
@@ -68,6 +74,7 @@ struct Glyph {
     /// its reading order (OCR text layers, multi-column overlays), and the quote
     /// geometry is then ambiguous.
     run: u32,
+    source: GlyphSource,
 }
 
 /// PDF text matrix, stored as the `[a b c d e f]` operands.
@@ -352,20 +359,33 @@ fn pdfium_glyphs(path: &Path) -> Option<Vec<Vec<Glyph>>> {
     let mut pages = Vec::with_capacity(document.pages().len().max(0) as usize);
 
     for page_index in 0..document.pages().len() {
-        let page = document.pages().get(page_index).ok()?;
+        let Ok(page) = document.pages().get(page_index) else {
+            pages.push(Vec::new());
+            continue;
+        };
         let page_bounds = page
             .boundaries()
             .crop()
             .or_else(|_| page.boundaries().media())
             .map(|boundary| boundary.bounds)
             .unwrap_or_else(|_| page.page_size());
-        let rotation = page.rotation().ok()?;
-        let text = page.text().ok()?;
+        let Ok(rotation) = page.rotation() else {
+            pages.push(Vec::new());
+            continue;
+        };
+        let Ok(text) = page.text() else {
+            pages.push(Vec::new());
+            continue;
+        };
         let mut glyphs = Vec::with_capacity(text.len().max(0) as usize);
 
         for character in text.chars().iter() {
-            let bounds = character.loose_bounds().ok()?;
-            let (x0, y0, x1, y1) = pdfium_user_space_bounds(bounds, page_bounds, rotation)?;
+            // PDFium can expose zero-area pseudo characters (usually layout or
+            // invisible markers) and occasional glyph boxes outside the page.
+            // They are not selectable text; skip only that character instead
+            // of abandoning the complete document and falling back to lopdf.
+            let Ok(bounds) = character.loose_bounds() else { continue };
+            let Some((x0, y0, x1, y1)) = pdfium_user_space_bounds(bounds, page_bounds, rotation) else { continue };
             let unicode = character.unicode_string();
             let text_value = unicode.clone().unwrap_or_else(|| "\u{FFFD}".to_string());
             let render_mode = match character.render_mode().ok() {
@@ -386,6 +406,7 @@ fn pdfium_glyphs(path: &Path) -> Option<Vec<Vec<Glyph>>> {
                 // logical run keeps the old interleaving guard from treating
                 // adjacent characters as conflicting PDF content streams.
                 run: 1,
+                source: GlyphSource::Pdfium,
             });
         }
         pages.push(glyphs);
@@ -823,7 +844,7 @@ fn show_text(
         let width = font.widths.width(code).unwrap_or(if text.chars().all(char::is_whitespace) { 250.0 } else { 500.0 });
         let advance = width + char_spacing + if text.chars().all(char::is_whitespace) { word_spacing } else { 0.0 };
         let (x0, y0, x1, y1) = glyph_box(tm, *pen, *pen + width, size, h_scale, rise);
-        glyphs.push(Glyph { text, x0, y0, x1, y1, size, certain, render_mode, run: *run });
+        glyphs.push(Glyph { text, x0, y0, x1, y1, size, certain, render_mode, run: *run, source: GlyphSource::Lopdf });
         *pen += advance;
     }
 }
@@ -1005,16 +1026,33 @@ fn polygon_intersection_area_with_rect(quad: &[Point; 4], glyph: &Glyph) -> f32 
 /// Refuse a quote when the quad ends inside a decoded text run. PDF writers
 /// occasionally emit a quad that visually covers a complete phrase while the
 /// recovered glyph geometry stops in the middle of the final word. Saving that
-/// prefix is worse than losing the quote, so only a whitespace boundary (or
-/// the end of the line) is accepted.
+/// prefix is worse than losing the quote, so only a word boundary (or the end
+/// of the line) is accepted. Punctuation immediately after a complete word is
+/// not evidence of truncation.
 fn has_tight_text_continuation(all_glyphs: &[&Glyph], selected: &[&Glyph], right: f32) -> bool {
-    let Some(last) = selected.last() else { return false };
+    let Some(last) = selected.iter().rev().find(|glyph| !glyph.text.chars().all(char::is_whitespace)) else { return false };
+    let is_word = |glyph: &Glyph| glyph.text.chars().any(|character| character.is_alphanumeric() || character == '_');
+    if !is_word(last) { return false }
     let tolerance = last.size.max(1.0) * 0.12;
     all_glyphs.iter().any(|glyph| {
-        !glyph.text.chars().all(char::is_whitespace)
+        is_word(glyph)
+            && !selected.iter().any(|selected_glyph| std::ptr::eq(*selected_glyph, *glyph))
             && glyph.x0 >= right - tolerance
             && (glyph.y0 - last.y0).abs() <= last.size.max(glyph.size).max(1.0) * 0.5
             && glyph.x0 - right <= tolerance
+            && !all_glyphs.iter().any(|between| {
+                between.text.chars().all(char::is_whitespace)
+                    && between.x0 >= last.x1 - tolerance
+                    && between.x1 <= glyph.x0 + tolerance
+                    && (between.y0 - last.y0).abs() <= last.size.max(between.size).max(1.0) * 0.5
+            })
+            && !all_glyphs.iter().any(|between| {
+                !between.text.chars().all(char::is_whitespace)
+                    && !is_word(between)
+                    && between.x0 >= last.x1 - tolerance
+                    && between.x1 <= glyph.x0 + tolerance
+                    && (between.y0 - last.y0).abs() <= last.size.max(between.size).max(1.0) * 0.5
+            })
     })
 }
 
@@ -1056,14 +1094,17 @@ fn quote_for_quads(glyphs: &[Glyph], quads: &[Rect]) -> Option<String> {
             // reconstruction would be a guess. Refuse instead of inventing text.
             return None;
         }
-        selected.sort_by(|a, b| {
-            let line = (a.y0 - b.y0).abs();
-            if line > a.size.max(b.size).max(1.0) * 0.5 {
-                b.y0.total_cmp(&a.y0)
-            } else {
-                a.x0.total_cmp(&b.x0)
-            }
-        });
+        let pdfium_order = selected.iter().all(|glyph| glyph.source == GlyphSource::Pdfium);
+        if !pdfium_order {
+            selected.sort_by(|a, b| {
+                let line = (a.y0 - b.y0).abs();
+                if line > a.size.max(b.size).max(1.0) * 0.5 {
+                    b.y0.total_cmp(&a.y0)
+                } else {
+                    a.x0.total_cmp(&b.x0)
+                }
+            });
+        }
         let min_y = selected.iter().map(|glyph| glyph.y0).fold(f32::INFINITY, f32::min);
         let max_y = selected.iter().map(|glyph| glyph.y1).fold(f32::NEG_INFINITY, f32::max);
         let line_height = selected.iter().map(|glyph| glyph.size).fold(1.0, f32::max);
@@ -1076,7 +1117,7 @@ fn quote_for_quads(glyphs: &[Glyph], quads: &[Rect]) -> Option<String> {
             if let Some(previous) = previous {
                 let new_line = (glyph.y0 - previous.y0).abs() > previous.size.max(1.0) * 0.5;
                 let gap = glyph.x0 - previous.x1;
-                if new_line || gap < -previous.size.max(1.0) * 0.20 {
+                if new_line || (!pdfium_order && gap < -previous.size.max(1.0) * 0.20) {
                     return None;
                 }
                 if (new_line || gap > previous.size.max(1.0) * 0.22) && !text.ends_with(' ') {
@@ -1089,6 +1130,12 @@ fn quote_for_quads(glyphs: &[Glyph], quads: &[Rect]) -> Option<String> {
         let text = text.trim().to_string();
         if text.is_empty() {
             continue;
+        }
+        // PDFium may expose an unmapped control code from a malformed or
+        // non-scholarly ToUnicode entry. It is not safe to turn that code into
+        // a guessed character; keep this quote conservative instead.
+        if text.chars().any(|character| character.is_control() && !character.is_whitespace()) {
+            return None;
         }
         let left = selected.iter().map(|glyph| glyph.x0).fold(f32::INFINITY, f32::min);
         let right = selected.iter().map(|glyph| glyph.x1).fold(f32::NEG_INFINITY, f32::max);
@@ -1160,6 +1207,10 @@ mod tests {
     }
 
     fn test_glyph(text: &str, x0: f32, x1: f32, y0: f32, y1: f32) -> Glyph {
+        test_glyph_from_source(text, x0, x1, y0, y1, GlyphSource::Lopdf)
+    }
+
+    fn test_glyph_from_source(text: &str, x0: f32, x1: f32, y0: f32, y1: f32, source: GlyphSource) -> Glyph {
         Glyph {
             text: text.to_string(),
             x0,
@@ -1170,7 +1221,44 @@ mod tests {
             certain: true,
             render_mode: 0,
             run: 1,
+            source,
         }
+    }
+
+    #[test]
+    fn quote_accepts_pdfium_complete_word_before_punctuation() {
+        let glyphs = vec![
+            test_glyph_from_source("scope", 0.0, 25.0, 0.0, 8.0, GlyphSource::Pdfium),
+            test_glyph_from_source(" ", 25.0, 29.0, 0.0, 8.0, GlyphSource::Pdfium),
+            test_glyph_from_source("and", 29.0, 44.0, 0.0, 8.0, GlyphSource::Pdfium),
+            test_glyph_from_source(" ", 44.0, 48.0, 0.0, 8.0, GlyphSource::Pdfium),
+            test_glyph_from_source("intensity", 48.0, 85.0, 0.0, 8.0, GlyphSource::Pdfium),
+            test_glyph_from_source("\"", 85.0, 89.0, 0.0, 8.0, GlyphSource::Pdfium),
+        ];
+        let quad = Rect { x0: 0.0, y0: 0.0, x1: 85.0, y1: 8.0, points: None };
+        assert_eq!(quote_for_quads(&glyphs, &[quad]).as_deref(), Some("scope and intensity"));
+    }
+
+    #[test]
+    fn quote_accepts_normal_pdfium_loose_box_overlap_in_visual_order() {
+        let glyphs = vec![
+            test_glyph_from_source("4", 0.0, 7.0, 0.0, 8.0, GlyphSource::Pdfium),
+            test_glyph_from_source(".", 7.0, 10.0, 0.0, 8.0, GlyphSource::Pdfium),
+            test_glyph_from_source("3", 9.8, 17.0, 0.0, 8.0, GlyphSource::Pdfium),
+            test_glyph_from_source(" ", 17.0, 21.0, 0.0, 8.0, GlyphSource::Pdfium),
+            test_glyph_from_source("W", 20.8, 31.0, 0.0, 8.0, GlyphSource::Pdfium),
+            test_glyph_from_source("h", 30.0, 38.0, 0.0, 8.0, GlyphSource::Pdfium),
+            test_glyph_from_source("y", 38.0, 46.0, 0.0, 8.0, GlyphSource::Pdfium),
+        ];
+        let quad = Rect { x0: 0.0, y0: 0.0, x1: 46.0, y1: 8.0, points: None };
+        assert_eq!(quote_for_quads(&glyphs, &[quad]).as_deref(), Some("4.3 Why"));
+    }
+
+    #[test]
+    fn quote_rejects_untrusted_control_code_from_pdfium() {
+        let glyphs = vec![test_glyph_from_source("\u{2}", 0.0, 8.0, 0.0, 8.0, GlyphSource::Pdfium)];
+        let quad = Rect { x0: 0.0, y0: 0.0, x1: 8.0, y1: 8.0, points: None };
+        assert_eq!(quote_for_quads(&glyphs, &[quad]), None);
     }
 
     #[test]
