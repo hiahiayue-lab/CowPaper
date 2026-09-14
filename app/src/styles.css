@@ -3356,3 +3356,82 @@ body.settings-workspace #view-settings .settings-group h3 {
 body.settings-workspace #view-settings > .settings {
   padding-bottom: var(--ui-space-6);
 }
+
+/* PDF identity candidates stay compact and require an explicit choice. */
+.pdf-candidate-modal-card {
+  width: 520px;
+  max-height: min(680px, calc(100vh - 48px));
+  overflow: auto;
+  text-align: left;
+}
+
+.pdf-candidate-modal-card .modal-message {
+  max-width: none;
+  text-align: left;
+}
+
+.pdf-candidate-current {
+  margin-top: 14px;
+  padding: 9px 10px;
+  border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-row);
+  background: var(--ui-surface-subtle);
+  color: var(--ui-secondary);
+  font-size: 12px;
+  line-height: 18px;
+  white-space: pre-line;
+}
+
+.pdf-candidate-list {
+  display: grid;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.pdf-candidate-option {
+  display: block;
+  width: 100%;
+  padding: 9px 10px;
+  border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-row);
+  background: var(--ui-surface);
+  color: var(--ui-text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.pdf-candidate-option:hover,
+.pdf-candidate-option[aria-pressed="true"] {
+  border-color: var(--ui-focus);
+  background: var(--ui-selected);
+}
+
+.pdf-candidate-option:focus-visible {
+  outline: 2px solid var(--ui-focus);
+  outline-offset: 1px;
+}
+
+.pdf-candidate-option-title {
+  display: block;
+  font-size: 13px;
+  line-height: 18px;
+  font-weight: 600;
+}
+
+.pdf-candidate-option-meta {
+  display: block;
+  margin-top: 2px;
+  color: var(--ui-secondary);
+  font-size: 11px;
+  line-height: 16px;
+}
+
+.pdf-candidate-actions {
+  flex-wrap: wrap;
+}
+
+.pdf-candidate-actions #pdf-candidate-use:disabled {
+  cursor: not-allowed;
+  opacity: .48;
+}

@@ -308,6 +308,9 @@ interface ExternalPdfCandidate {
   title: string | null;
   authors: Author[];
   year: number | null;
+  journal: string | null;
+  hasPdf: boolean;
+  inLibrary: boolean;
 }
 
 interface ExternalPdfImportResult {
@@ -319,6 +322,7 @@ interface ExternalPdfImportResult {
     title: string | null;
     authors: Author[];
     year: number | null;
+    journal: string | null;
     doi: string | null;
     scholarlyId: string | null;
     abstractText: string | null;
@@ -3070,11 +3074,150 @@ function updatePdfActionUi() {
   });
 }
 
-function formatPdfCandidate(candidate: ExternalPdfCandidate): string {
-  const title = candidate.title?.trim() || "（无标题）";
-  const authors = authorText(candidate.authors);
-  const year = candidate.year == null ? "年份未知" : String(candidate.year);
-  return `标题：${title}\n作者：${authors}\n年份：${year}`;
+function formatPdfMetadata(metadata: ExternalPdfImportResult["metadata"]): string {
+  const title = metadata.title?.trim() || "（无法可靠识别标题）";
+  const authors = authorText(metadata.authors) || "作者未知";
+  const year = metadata.year == null ? "年份未知" : String(metadata.year);
+  const journal = metadata.journal?.trim() || "期刊未知";
+  return `当前 PDF 识别结果\n标题：${title}\n作者：${authors}\n年份：${year}\n期刊：${journal}`;
+}
+
+type ExternalPdfCandidateChoice = { kind: "existing"; paperId: number } | { kind: "create" } | null;
+
+function showExternalPdfCandidateModal(
+  metadata: ExternalPdfImportResult["metadata"],
+  candidates: ExternalPdfCandidate[],
+): Promise<ExternalPdfCandidateChoice> {
+  const overlay = $("pdf-candidate-modal");
+  const message = $("pdf-candidate-modal-message");
+  const current = $("pdf-candidate-current");
+  const list = $("pdf-candidate-list");
+  const cancel = $("pdf-candidate-cancel") as HTMLButtonElement;
+  const create = $("pdf-candidate-create") as HTMLButtonElement;
+  const use = $("pdf-candidate-use") as HTMLButtonElement;
+  const invoker = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  let selectedPaperId: number | null = null;
+  let done = false;
+
+  message.textContent = "本地资料显示这份 PDF 可能对应已有文献。请选择候选，或明确创建新文献。CowPaper 不会自动合并。";
+  current.textContent = formatPdfMetadata(metadata);
+  list.innerHTML = candidates.map((candidate) => {
+    const title = candidate.title?.trim() || "（无标题）";
+    const authors = authorText(candidate.authors) || "作者未知";
+    const year = candidate.year == null ? "年份未知" : String(candidate.year);
+    const journal = candidate.journal?.trim() || "期刊未知";
+    const state = [candidate.hasPdf ? "已有 PDF" : "尚无 PDF", candidate.inLibrary ? "已在文献库" : "未在文献库"].join(" · ");
+    return `<button type="button" class="pdf-candidate-option" role="option" aria-selected="false" data-paper-id="${candidate.paperId}">
+      <span class="pdf-candidate-option-title">${escapeHtml(title)}</span>
+      <span class="pdf-candidate-option-meta">${escapeHtml(`${authors} · ${year} · ${journal} · ${state}`)}</span>
+    </button>`;
+  }).join("");
+  use.disabled = true;
+  overlay.classList.remove("hidden");
+
+  return new Promise((resolve) => {
+    const finish = (choice: ExternalPdfCandidateChoice) => {
+      if (done) return;
+      done = true;
+      overlay.classList.add("hidden");
+      list.innerHTML = "";
+      cancel.removeEventListener("click", onCancel);
+      create.removeEventListener("click", onCreate);
+      use.removeEventListener("click", onUse);
+      list.removeEventListener("click", onCandidateClick);
+      overlay.removeEventListener("click", onOverlay);
+      window.removeEventListener("keydown", onKey);
+      if (invoker?.isConnected) invoker.focus();
+      resolve(choice);
+    };
+    const onCancel = () => finish(null);
+    const onCreate = () => finish({ kind: "create" });
+    const onUse = () => {
+      if (selectedPaperId != null) finish({ kind: "existing", paperId: selectedPaperId });
+    };
+    const onCandidateClick = (event: MouseEvent) => {
+      const target = event.target instanceof HTMLElement ? event.target.closest<HTMLButtonElement>("[data-paper-id]") : null;
+      if (!target) return;
+      selectedPaperId = Number(target.dataset.paperId);
+      list.querySelectorAll<HTMLButtonElement>("[data-paper-id]").forEach((button) => {
+        const selected = Number(button.dataset.paperId) === selectedPaperId;
+        button.setAttribute("aria-selected", String(selected));
+        button.setAttribute("aria-pressed", String(selected));
+      });
+      use.disabled = !Number.isInteger(selectedPaperId);
+    };
+    const onOverlay = (event: MouseEvent) => {
+      if (event.target === overlay) finish(null);
+    };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        finish(null);
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = [
+        ...list.querySelectorAll<HTMLButtonElement>("[data-paper-id]"),
+        cancel,
+        create,
+        use,
+      ].filter((element) => !element.disabled);
+      if (!focusable.length) return;
+      const index = focusable.findIndex((element) => element === document.activeElement);
+      const next = event.shiftKey
+        ? focusable[(index <= 0 ? focusable.length : index) - 1]
+        : focusable[(index + 1) % focusable.length];
+      event.preventDefault();
+      next.focus();
+    };
+    cancel.addEventListener("click", onCancel);
+    create.addEventListener("click", onCreate);
+    use.addEventListener("click", onUse);
+    list.addEventListener("click", onCandidateClick);
+    overlay.addEventListener("click", onOverlay);
+    window.addEventListener("keydown", onKey);
+    cancel.focus();
+  });
+}
+
+async function importExternalPdfPath(path: string): Promise<ExternalPdfImportResult> {
+  let selectedCandidateInLibrary: boolean | undefined;
+  let result = await invoke<ExternalPdfImportResult>("import_pdf", {
+    path,
+    confirmedPaperId: null,
+    createNew: false,
+  });
+  if (result.paperId != null && result.attachment == null && result.outcome.includes("AttachmentConflict")) {
+    const attachment = await attachPdfPathToPaper(result.paperId, path, libraryPaperIds.has(result.paperId));
+    return { ...result, attachment, requiresConfirmation: false };
+  }
+  if (result.requiresConfirmation) {
+    const candidates = result.candidates.length ? result.candidates : (result.candidate ? [result.candidate] : []);
+    if (!candidates.length) throw new Error("PDF 返回了待确认状态，但没有可确认的论文候选");
+    const choice = await showExternalPdfCandidateModal(result.metadata, candidates);
+    if (!choice) throw new Error("已取消 PDF 关联");
+    const selectedCandidate = choice.kind === "existing"
+      ? candidates.find((candidate) => candidate.paperId === choice.paperId)
+      : undefined;
+    result = await invoke<ExternalPdfImportResult>("import_pdf", {
+      path,
+      confirmedPaperId: choice.kind === "existing" ? choice.paperId : null,
+      createNew: choice.kind === "create",
+    });
+    if (selectedCandidate) {
+      // A non-Library candidate with an existing PDF must use the discovery
+      // attach path so replacement also establishes Library membership.
+      selectedCandidateInLibrary = selectedCandidate.inLibrary;
+    }
+  }
+  // Candidate confirmation can select a Paper that already has a PDF. The
+  // backend intentionally returns the same conflict outcome used by the
+  // normal import path so the existing replace/cancel flow remains the only
+  // place that changes the attachment relation.
+  if (result.paperId != null && result.attachment == null && result.outcome.includes("AttachmentConflict")) {
+    const attachment = await attachPdfPathToPaper(result.paperId, path, selectedCandidateInLibrary ?? libraryPaperIds.has(result.paperId));
+    return { ...result, attachment, requiresConfirmation: false };
+  }
+  return result;
 }
 
 function externalPdfOutcomeLabel(outcome: string): string {
@@ -3168,26 +3311,7 @@ async function importExternalPdf() {
   updatePdfActionUi();
   setStatus("正在读取并导入 PDF…", "running");
   try {
-    let result = await invoke<ExternalPdfImportResult>("import_pdf", { path, confirmedPaperId: null });
-    if (result.paperId != null && result.attachment == null && result.outcome.includes("AttachmentConflict")) {
-      const attachment = await attachPdfPathToPaper(result.paperId, path, true);
-      result = { ...result, attachment, requiresConfirmation: false };
-    }
-    if (result.requiresConfirmation) {
-      const candidate = result.candidate || result.candidates[0];
-      if (!candidate) throw new Error("PDF 返回了待确认状态，但没有可确认的论文候选");
-      const confirmed = await showConfirmModal({
-        title: "确认关联现有论文",
-        message: `PDF 元数据与一篇现有论文可能匹配：\n\n${formatPdfCandidate(candidate)}\n\nCowPaper 不会根据模糊标题自动合并。确认后只会新增 PDF 关联，不会复制 Paper。`,
-        confirmText: "关联并导入",
-        cancelText: "取消",
-      });
-      if (!confirmed) {
-        setStatus("已取消 PDF 导入", "idle");
-        return;
-      }
-      result = await invoke<ExternalPdfImportResult>("import_pdf", { path, confirmedPaperId: candidate.paperId });
-    }
+    const result = await importExternalPdfPath(path);
     if (result.paperId == null || result.attachment == null) {
       throw new Error("PDF 导入未返回 Paper 或 attachment identity");
     }
@@ -3365,23 +3489,7 @@ interface LibraryDroppedFile {
 }
 
 async function importDroppedPdf(path: string): Promise<ExternalPdfImportResult> {
-  let result = await invoke<ExternalPdfImportResult>("import_pdf", { path, confirmedPaperId: null });
-  if (result.paperId != null && result.attachment == null && result.outcome.includes("AttachmentConflict")) {
-    const attachment = await attachPdfPathToPaper(result.paperId, path, true);
-    return { ...result, attachment, requiresConfirmation: false };
-  }
-  if (result.requiresConfirmation) {
-    const candidate = result.candidate || result.candidates[0];
-    if (!candidate) throw new Error("PDF 返回待确认状态，但没有可确认的论文候选");
-    const confirmed = await showConfirmModal({
-      title: "确认关联现有论文",
-      message: `PDF 元数据与一篇现有论文可能匹配：\n\n${formatPdfCandidate(candidate)}\n\n只新增 PDF 关联，不复制 Paper。`,
-      confirmText: "关联并导入",
-      cancelText: "跳过此文件",
-    });
-    if (!confirmed) throw new Error("已取消关联");
-    result = await invoke<ExternalPdfImportResult>("import_pdf", { path, confirmedPaperId: candidate.paperId });
-  }
+  const result = await importExternalPdfPath(path);
   if (result.paperId == null || result.attachment == null) throw new Error("PDF 导入未返回 Paper 或 attachment identity");
   return result;
 }

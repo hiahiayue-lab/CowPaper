@@ -1505,11 +1505,12 @@ fn reveal_pdf(
 fn import_pdf(
     path: String,
     confirmed_paper_id: Option<i64>,
+    create_new: Option<bool>,
     app: AppHandle,
     state: State<Db>,
 ) -> Result<models::ExternalPdfImportResult, String> {
     let conn = state.inner().lock().unwrap();
-    let mut result = db::import_external_pdf_fast(&conn, &path, confirmed_paper_id).map_err(|e| e.to_string())?;
+    let mut result = db::import_external_pdf_fast_with_options(&conn, &path, confirmed_paper_id, create_new.unwrap_or(false)).map_err(|e| e.to_string())?;
     if result.enrichment_status == "queued" {
         if let (Some(paper_id), Some(attachment)) = (
             result.paper_id,

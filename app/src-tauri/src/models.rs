@@ -795,6 +795,9 @@ pub struct ExternalPdfCandidate {
     pub title: Option<String>,
     pub authors: Vec<Author>,
     pub year: Option<i32>,
+    pub journal: Option<String>,
+    pub has_pdf: bool,
+    pub in_library: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

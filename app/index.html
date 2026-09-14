@@ -352,5 +352,20 @@
         </div>
       </div>
     </div>
+
+    <!-- PDF identity candidate sheet: choosing an existing Paper is always an explicit action. -->
+    <div id="pdf-candidate-modal" class="modal-overlay hidden">
+      <div class="modal-card pdf-candidate-modal-card" role="dialog" aria-modal="true" aria-labelledby="pdf-candidate-modal-title">
+        <h3 id="pdf-candidate-modal-title" class="modal-title">可能已存在这篇文献</h3>
+        <p id="pdf-candidate-modal-message" class="modal-message"></p>
+        <div id="pdf-candidate-current" class="pdf-candidate-current"></div>
+        <div id="pdf-candidate-list" class="pdf-candidate-list" role="listbox" aria-label="现有文献候选"></div>
+        <div class="modal-actions pdf-candidate-actions">
+          <button id="pdf-candidate-cancel" class="ghost">取消</button>
+          <button id="pdf-candidate-create" class="ghost">创建新文献</button>
+          <button id="pdf-candidate-use" class="primary" disabled>使用已有文献</button>
+        </div>
+      </div>
+    </div>
   </body>
 </html>

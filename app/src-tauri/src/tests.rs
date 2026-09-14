@@ -7820,6 +7820,8 @@ fn test_external_pdf_doi_import_does_not_duplicate_canonical_paper() {
     );
     let result = db::import_external_pdf(&conn, path.to_str().unwrap(), None).unwrap();
     assert_eq!(result.outcome, "existingDoi");
+    assert!(!result.requires_confirmation, "exact DOI 必须绕过 candidate confirmation");
+    assert!(result.candidates.is_empty());
     assert_eq!(result.paper_id, Some(pid));
     assert_eq!(conn.query_row("SELECT COUNT(*) FROM papers", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
     assert!(db::get_library_membership(&conn, pid).unwrap().is_some());
@@ -7912,9 +7914,14 @@ fn test_external_pdf_without_reliable_identity_does_not_title_merge() {
         "same-title-no-author",
         "%PDF-1.7\n1 0 obj << /Title (Same External Title) /CreationDate (D:2024) >>\n",
     );
-    let result = db::import_external_pdf(&conn, path.to_str().unwrap(), None).unwrap();
+    let pending = db::import_external_pdf(&conn, path.to_str().unwrap(), None).unwrap();
+    assert_eq!(pending.outcome, "needsManualConfirmation");
+    assert!(pending.requires_confirmation, "可疑的 title-only candidate 必须等待人工确认");
+    assert_eq!(pending.candidates[0].paper_id, existing);
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM papers", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    let result = db::import_external_pdf_fast_with_options(&conn, path.to_str().unwrap(), None, true).unwrap();
     assert_eq!(result.outcome, "createdExternalPaper");
-    assert_ne!(result.paper_id, Some(existing), "无可靠 identity 不得按标题静默合并");
+    assert_ne!(result.paper_id, Some(existing), "明确创建新文献不得静默合并到候选");
     assert_eq!(conn.query_row("SELECT COUNT(*) FROM papers", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
     let _ = std::fs::remove_file(path);
 }
@@ -7946,7 +7953,7 @@ fn test_external_pdf_title_author_year_is_manual_candidate_only() {
 }
 
 #[test]
-fn rc5_fast_import_does_not_block_on_title_author_year_candidate() {
+fn rc7_fast_import_requires_manual_confirmation_for_title_candidate() {
     let conn = mem_db();
     let jid = db::insert_journal(&conn, "Candidate J", Some("0025-1909"), None, None, None).unwrap();
     let mut existing = candidate(None, "Fast Candidate Paper", None, None);
@@ -7960,11 +7967,122 @@ fn rc5_fast_import_does_not_block_on_title_author_year_candidate() {
         "%PDF-1.7\n1 0 obj << /Title (Fast Candidate Paper) /Author (Alice Smith) /Year (2025) /CreationDate (D:2099) >>\n",
     );
     let result = db::import_external_pdf_fast(&conn, path.to_str().unwrap(), None).unwrap();
-    assert_eq!(result.outcome, "createdExternalPaper");
-    assert!(!result.requires_confirmation);
-    assert_ne!(result.paper_id, Some(existing_id), "标题候选不得阻塞或静默合并 fast import");
-    assert!(db::get_library_membership(&conn, result.paper_id.unwrap()).unwrap().is_some());
+    assert_eq!(result.outcome, "needsManualConfirmation");
+    assert!(result.requires_confirmation);
+    assert_eq!(result.candidates.len(), 1);
+    assert_eq!(result.candidates[0].paper_id, existing_id);
+    assert_eq!(result.candidates[0].journal.as_deref(), Some("Candidate J"));
+    assert!(!result.candidates[0].has_pdf);
+    assert!(!result.candidates[0].in_library);
+    assert!(result.paper_id.is_none(), "候选确认前不得创建 Paper 或 Library membership");
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM papers", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
     let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn rc7_candidate_existing_new_and_scope_safety() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "Candidate J", Some("0025-1909"), None, None, None).unwrap();
+    let mut existing = candidate(None, "Reusable Candidate", None, None);
+    existing.authors = vec![Author { given: None, family: None, name: Some("Alice Smith".into()) }];
+    existing.year = Some(2025);
+    let existing_id = match db::upsert_paper(&conn, jid, &existing).unwrap() {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new paper"),
+    };
+    db::add_paper_to_library(&conn, existing_id, &[], &[], "manual").unwrap();
+    db::set_library_item_metadata(&conn, existing_id, &crate::models::LibraryItemMetadataInput {
+        title_override: Some("My Local Candidate Title".into()),
+        ..Default::default()
+    }).unwrap();
+    let current_membership_count = || conn.query_row(
+        "SELECT COUNT(*) FROM library_items WHERE paper_id=?1",
+        params![existing_id],
+        |row| row.get::<_, i64>(0),
+    ).unwrap();
+
+    let path = test_pdf_path(
+        "candidate-existing",
+        "%PDF-1.7\n1 0 obj << /Title (Reusable Candidate) /Author (Alice Smith) /Year (2025) >>\n",
+    );
+    let pending = db::import_external_pdf_fast(&conn, path.to_str().unwrap(), None).unwrap();
+    assert_eq!(pending.outcome, "needsManualConfirmation");
+    assert!(pending.candidates[0].in_library);
+    let reused = db::import_external_pdf_fast(&conn, path.to_str().unwrap(), Some(existing_id)).unwrap();
+    assert_eq!(reused.outcome, "manualConfirmation");
+    assert_eq!(current_membership_count(), 1, "复用已有 Library Paper 不得重复 membership");
+    assert_eq!(db::get_library_paper(&conn, existing_id).unwrap().unwrap().effective_title.as_deref(), Some("My Local Candidate Title"));
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM papers", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    assert_eq!(db::list_discovery_papers(&conn, None, 100).unwrap().len(), 0, "Library import 不得创建 Discovery membership");
+    std::fs::remove_file(&path).unwrap();
+
+    let create_path = test_pdf_path(
+        "candidate-create-new",
+        "%PDF-1.7\n1 0 obj << /Title (Reusable Candidate) /Author (Alice Smith) /Year (2025) >>\ncreate-new\n",
+    );
+    let created = db::import_external_pdf_fast_with_options(&conn, create_path.to_str().unwrap(), None, true).unwrap();
+    assert_eq!(created.outcome, "createdExternalPaper");
+    assert_ne!(created.paper_id, Some(existing_id), "明确创建新文献必须尊重用户选择");
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM papers", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
+    std::fs::remove_file(create_path).unwrap();
+}
+
+#[test]
+fn rc7_candidate_preserves_discovery_and_existing_pdf_conflict() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "Candidate J", Some("0025-1909"), None, None, None).unwrap();
+    let mut existing = candidate(None, "Discovery Candidate", None, None);
+    existing.authors = vec![Author { given: None, family: None, name: Some("Alice Smith".into()) }];
+    existing.year = Some(2025);
+    let paper_id = match db::upsert_paper(&conn, jid, &existing).unwrap() {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new paper"),
+    };
+    let batch = db::create_sync_batch(&conn, "candidate").unwrap();
+    db::add_sync_batch_papers(&conn, batch, &[paper_id], &[], &[]).unwrap();
+    let first = test_pdf_path("candidate-existing-first", "%PDF-1.7\nfirst\n");
+    db::attach_pdf_to_paper(&conn, paper_id, first.to_str().unwrap()).unwrap();
+    let second = test_pdf_path(
+        "candidate-existing-second",
+        "%PDF-1.7\n1 0 obj << /Title (Discovery Candidate) /Author (Alice Smith) /Year (2025) >>\nsecond\n",
+    );
+    let pending = db::import_external_pdf_fast(&conn, second.to_str().unwrap(), None).unwrap();
+    assert_eq!(pending.outcome, "needsManualConfirmation");
+    assert!(pending.candidates[0].has_pdf);
+    let conflict = db::import_external_pdf_fast(&conn, second.to_str().unwrap(), Some(paper_id)).unwrap();
+    assert_eq!(conflict.outcome, "confirmedAttachmentConflict");
+    assert!(conflict.attachment.is_none(), "已有 PDF 必须进入现有 replace/cancel 流程");
+    assert_eq!(db::list_discovery_papers(&conn, None, 100).unwrap().iter().filter(|paper| paper.id == paper_id).count(), 1);
+    assert_eq!(db::list_paper_attachments(&conn, paper_id).unwrap().len(), 1);
+    std::fs::remove_file(first).unwrap();
+    std::fs::remove_file(second).unwrap();
+}
+
+#[test]
+fn rc7_candidate_does_not_match_garbage_title_and_preserves_library_override() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "Candidate J", Some("0025-1909"), None, None, None).unwrap();
+    let mut existing = candidate(None, "Microsoft Word", None, None);
+    existing.authors = vec![Author { given: None, family: None, name: Some("Alice Smith".into()) }];
+    existing.year = Some(2025);
+    let existing_id = match db::upsert_paper(&conn, jid, &existing).unwrap() {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new paper"),
+    };
+    db::add_paper_to_library(&conn, existing_id, &[], &[], "manual").unwrap();
+    db::set_library_item_metadata(&conn, existing_id, &crate::models::LibraryItemMetadataInput {
+        title_override: Some("My Local Title".into()),
+        ..Default::default()
+    }).unwrap();
+    let path = test_pdf_path(
+        "candidate-garbage-title",
+        "%PDF-1.7\n1 0 obj << /Title (Microsoft Word) /Author (Alice Smith) /Year (2025) >>\n",
+    );
+    let result = db::import_external_pdf_fast(&conn, path.to_str().unwrap(), None).unwrap();
+    assert_eq!(result.outcome, "createdExternalPaper", "垃圾 title 不得驱动 candidate matching");
+    assert_ne!(result.paper_id, Some(existing_id));
+    assert_eq!(db::get_library_paper(&conn, existing_id).unwrap().unwrap().effective_title.as_deref(), Some("My Local Title"));
+    std::fs::remove_file(path).unwrap();
 }
 
 #[test]

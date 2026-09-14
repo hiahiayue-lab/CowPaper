@@ -4950,6 +4950,9 @@ pub fn recover_pdf_metadata(path: &Path, filename: &str) -> Result<crate::models
         .or_else(|| xml_metadata_value(&xmp, &["dc:title", "title"]));
     let xmp_author = xmp_element_values(&xmp, &["creator"]).into_iter().next()
         .or_else(|| xml_metadata_value(&xmp, &["dc:creator", "creator", "Author"]));
+    let journal = pdf_info_value(&raw_text, "Journal")
+        .or_else(|| xmp_element_values(&xmp, &["journal", "publicationName", "containerTitle"]).into_iter().next())
+        .and_then(|value| clean_pdf_candidate_text(Some(&value)));
     let title = info.as_ref().and_then(|value| value.title.as_deref().and_then(|value| clean_pdf_title(Some(value), filename)))
         .or_else(|| pdf_info_value(&raw_text, "Title").and_then(|value| clean_pdf_title(Some(&value), filename)))
         .or_else(|| xmp_title.as_deref().and_then(|value| clean_pdf_title(Some(value), filename)))
@@ -5020,6 +5023,7 @@ pub fn recover_pdf_metadata(path: &Path, filename: &str) -> Result<crate::models
         authors: if authors.is_empty() { first_page_authors(&first_page) } else { authors },
         year,
         doi,
+        journal,
         doi_source,
         doi_candidates,
         scholarly_id: clean_optional_text(scholarly_id.as_deref()),
@@ -5040,11 +5044,11 @@ fn title_author_year_candidates(
     conn: &Connection,
     metadata: &crate::models::ExternalPdfMetadata,
 ) -> Result<Vec<crate::models::ExternalPdfCandidate>> {
-    let (Some(title), Some(year)) = (metadata.title.as_deref(), metadata.year) else {
+    let Some(title) = metadata.title.as_deref() else {
         return Ok(Vec::new());
     };
     let title_norm = normalize_title(title);
-    if title_norm.is_empty() || metadata.authors.is_empty() {
+    if title_norm.is_empty() {
         return Ok(Vec::new());
     }
     let imported_authors: std::collections::HashSet<String> = metadata
@@ -5053,13 +5057,19 @@ fn title_author_year_candidates(
         .map(author_key)
         .filter(|value| !value.is_empty())
         .collect();
-    if imported_authors.is_empty() {
-        return Ok(Vec::new());
-    }
+    let imported_first_author = metadata.authors.iter().map(author_key).find(|value| !value.is_empty());
     let mut stmt = conn.prepare(
-        "SELECT id, title, authors_json, year FROM papers WHERE title_norm=?1 AND year=?2 ORDER BY id",
+        "SELECT p.id, p.title, p.authors_json, p.year,
+                COALESCE(NULLIF(trim(p.container_title), ''), NULLIF(j.name, 'External PDF Import')),
+                EXISTS(SELECT 1 FROM paper_attachments a WHERE a.paper_id=p.id),
+                EXISTS(SELECT 1 FROM library_items li WHERE li.paper_id=p.id)
+         FROM papers p
+         LEFT JOIN journals j ON j.id=p.journal_id
+         WHERE p.title_norm=?1 OR (?2 IS NOT NULL AND p.year=?2)
+         ORDER BY CASE WHEN p.title_norm=?1 THEN 0 ELSE 1 END, p.id
+         LIMIT 500",
     )?;
-    let rows = stmt.query_map(params![title_norm, year], |row| {
+    let rows = stmt.query_map(params![title_norm, metadata.year], |row| {
         let paper_id: i64 = row.get(0)?;
         let title: Option<String> = row.get(1)?;
         let authors_json: Option<String> = row.get(2)?;
@@ -5067,17 +5077,51 @@ fn title_author_year_candidates(
             .as_deref()
             .and_then(|value| serde_json::from_str::<Vec<crate::models::Author>>(value).ok())
             .unwrap_or_default();
-        Ok((paper_id, title, authors, row.get::<_, Option<i32>>(3)?))
+        Ok((
+            paper_id,
+            title,
+            authors,
+            row.get::<_, Option<i32>>(3)?,
+            row.get::<_, Option<String>>(4)?,
+            row.get::<_, bool>(5)?,
+            row.get::<_, bool>(6)?,
+        ))
     })?;
-    let mut candidates = Vec::new();
+    let mut ranked = Vec::new();
     for row in rows {
-        let (paper_id, title, authors, candidate_year) = row?;
-        let matches_author = authors.iter().map(author_key).any(|key| imported_authors.contains(&key));
-        if matches_author {
-            candidates.push(crate::models::ExternalPdfCandidate { paper_id, title, authors, year: candidate_year });
+        let (paper_id, candidate_title, authors, candidate_year, journal, has_pdf, in_library) = row?;
+        let candidate_title_norm = candidate_title.as_deref().map(normalize_title).unwrap_or_default();
+        let exact_title = candidate_title_norm == title_norm;
+        let author_keys = authors.iter().map(author_key).filter(|value| !value.is_empty()).collect::<Vec<_>>();
+        let author_overlap = author_keys.iter().filter(|key| imported_authors.contains(*key)).count();
+        let first_author_match = imported_first_author.as_ref().is_some_and(|first| author_keys.iter().any(|key| key == first));
+        let year_match = metadata.year.is_some() && metadata.year == candidate_year;
+        // An exact normalized title is enough to surface a candidate. A
+        // title variation must also share an author and year; this keeps the
+        // local candidate list useful without turning fuzzy matching into an
+        // identity decision.
+        if !exact_title && (!year_match || author_overlap == 0) {
+            continue;
         }
+        let journal_match = metadata.journal.as_deref().zip(journal.as_deref())
+            .is_some_and(|(left, right)| normalize_title(left) == normalize_title(right));
+        let score = (exact_title as i32) * 1_000
+            + (year_match as i32) * 100
+            + (first_author_match as i32) * 50
+            + (author_overlap.min(10) as i32) * 20
+            + (journal_match as i32) * 30;
+        ranked.push((score, paper_id, crate::models::ExternalPdfCandidate {
+            paper_id,
+            title: candidate_title,
+            authors,
+            year: candidate_year,
+            journal,
+            has_pdf,
+            in_library,
+        }));
     }
-    Ok(candidates)
+    ranked.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    Ok(ranked.into_iter().take(5).map(|(_, _, candidate)| candidate).collect())
 }
 
 fn find_paper_by_exact_scholarly_id(conn: &Connection, id: &str) -> Result<Option<i64>> {
@@ -5450,12 +5494,24 @@ pub fn import_external_pdf_fast(
     path: &str,
     confirmed_paper_id: Option<i64>,
 ) -> Result<crate::models::ExternalPdfImportResult> {
+    import_external_pdf_fast_with_options(conn, path, confirmed_paper_id, false)
+}
+
+/// Fast import with an explicit identity decision. `create_new` is only set
+/// after the user has seen local candidates and chosen to create a new Paper;
+/// it bypasses candidate presentation but never changes exact DOI or exact
+/// scholarly-ID identity handling.
+pub fn import_external_pdf_fast_with_options(
+    conn: &Connection,
+    path: &str,
+    confirmed_paper_id: Option<i64>,
+    create_new: bool,
+) -> Result<crate::models::ExternalPdfImportResult> {
     let file = linked_file(path)?;
-    // Fast import deliberately skips title/author/year candidate gating. A
-    // provisional shell is cheaper and safer than putting the Library row
-    // behind a confirmation dialog; exact DOI identity remains the only
-    // automatic reuse rule.
-    let mut result = import_prepared_external_pdf(conn, file, confirmed_paper_id, Vec::new(), false)?;
+    // A provisional shell is still used when there is no local candidate;
+    // exact DOI/scholarly identity remains the only automatic reuse rule.
+    let allow_candidate_confirmation = !create_new && confirmed_paper_id.is_none();
+    let mut result = import_prepared_external_pdf(conn, file, confirmed_paper_id, Vec::new(), allow_candidate_confirmation)?;
     if let (Some(paper_id), Some(attachment)) = (
         result.paper_id,
         result.attachment.as_ref(),
