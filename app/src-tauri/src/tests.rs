@@ -6433,6 +6433,44 @@ fn test_title_translation_candidate_batch_limit_is_twenty_five_without_state_fil
     assert_eq!(db::TITLE_TRANSLATION_BATCH_LIMIT, 25);
 }
 
+#[test]
+fn test_current_discovery_title_translation_scope_excludes_history_and_library() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "Current title translation", Some("0025-1909"), None, None, None).unwrap();
+    let make = |doi: &str, title: &str| match db::upsert_paper(&conn, jid, &candidate(Some(doi), title, None, None)).unwrap() {
+        UpsertOutcome::New(id) => id,
+        _ => panic!("expected new paper"),
+    };
+    let a = make("10.1000/title-current-a", "Current A");
+    let b = make("10.1000/title-current-b", "Current B");
+    let history = make("10.1000/title-history", "History only");
+    let library = make("10.1000/title-library", "Library only");
+    let overridden = make("10.1000/title-overridden", "Current override");
+    let today = db::current_discovery_cycle_key(&conn);
+    conn.execute("UPDATE papers SET first_seen_cycle=?1 WHERE id=?2", params![&today, a]).unwrap();
+    conn.execute("UPDATE papers SET first_seen_cycle=?1 WHERE id=?2", params![&today, b]).unwrap();
+    conn.execute("UPDATE papers SET first_seen_cycle='2000-01-01' WHERE id=?1", params![history]).unwrap();
+    let sync = db::create_sync_batch(&conn, "title-scope").unwrap();
+    db::add_sync_batch_papers(&conn, sync, &[a, b, history, overridden], &[], &[]).unwrap();
+    db::add_paper_to_library(&conn, library, &[], &[], "external_pdf_import").unwrap();
+    conn.execute(
+        "INSERT INTO library_item_metadata(paper_id,chinese_title_override,updated_at) VALUES(?1,?2,?3)",
+        params![overridden, "用户指定中文标题", db::now_utc()],
+    ).unwrap();
+
+    let candidates = db::list_missing_title_translation_candidates_in_current_discovery_batch(&conn, &today, None).unwrap();
+    let ids: Vec<i64> = candidates.iter().map(|(id, _)| *id).collect();
+    assert!(ids.contains(&a) && ids.contains(&b));
+    assert!(!ids.contains(&history), "历史 Discovery 论文不得进入自动标题翻译");
+    assert!(!ids.contains(&library), "Library-only 论文不得进入自动标题翻译");
+    assert!(!ids.contains(&overridden), "Library 中文标题 override 不得被自动翻译覆盖");
+    assert!(!db::save_title_translation(&conn, overridden, "错误的自动翻译").unwrap());
+    assert_eq!(db::get_paper(&conn, overridden).unwrap().unwrap().chinese_title, None);
+
+    let narrowed = db::list_missing_title_translation_candidates_in_current_discovery_batch(&conn, &today, Some(&[history, a])).unwrap();
+    assert_eq!(narrowed.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![a]);
+}
+
 // J. 已有真实摘要 → migration backfill 不覆盖
 #[test]
 fn test_r7_backfill_does_not_overwrite_existing_abstract() {
@@ -7424,6 +7462,56 @@ fn test_pdf_annotations_empty_valid_pdf_completes_with_zero_rows() {
     assert_eq!(loaded.annotation_status, "completed");
     assert!(loaded.annotation_error.is_none());
     assert!(db::list_paper_annotations(&conn, pid, None).unwrap().is_empty());
+    let _ = std::fs::remove_file(source);
+}
+
+#[test]
+fn test_pdf_annotations_ensure_skips_unchanged_success_and_failed_files() {
+    let conn = mem_db();
+    let success_paper = test_paper(&conn, "10.1000/annotation-ensure-success", "Ensure success");
+    let success_source = empty_pdf_path("annotation-ensure-success");
+    let success_attachment = db::attach_pdf_to_paper(&conn, success_paper, success_source.to_str().unwrap()).unwrap();
+    let unchanged = db::ensure_pdf_annotations(&conn, success_attachment.id).unwrap();
+    assert!(unchanged.skipped, "completed attachment with unchanged bytes must not be parsed again");
+    assert_eq!(unchanged.status, "completed");
+    assert_eq!(unchanged.imported, 0);
+
+    // A changed file is the positive signal for one automatic retry, even if
+    // the new bytes are malformed. The failed fingerprint is then persisted
+    // so subsequent starts do not retry the same failure indefinitely.
+    std::fs::write(&success_source, b"%PDF-1.7\nchanged-invalid").unwrap();
+    let changed = db::ensure_pdf_annotations(&conn, success_attachment.id).unwrap();
+    assert!(!changed.skipped);
+    assert_eq!(changed.status, "malformed");
+    let failed_same_file = db::ensure_pdf_annotations(&conn, success_attachment.id).unwrap();
+    assert!(failed_same_file.skipped);
+    assert_eq!(failed_same_file.status, "malformed");
+    let _ = std::fs::remove_file(success_source);
+
+    let failed_paper = test_paper(&conn, "10.1000/annotation-ensure-failed", "Ensure failed");
+    let failed_source = test_pdf_path("annotation-ensure-failed", "%PDF-1.7\nnot valid");
+    let failed_attachment = db::attach_pdf_to_paper(&conn, failed_paper, failed_source.to_str().unwrap()).unwrap();
+    let failed_unchanged = db::ensure_pdf_annotations(&conn, failed_attachment.id).unwrap();
+    assert!(failed_unchanged.skipped);
+    assert_eq!(failed_unchanged.status, "malformed");
+    let _ = std::fs::remove_file(failed_source);
+}
+
+#[test]
+fn test_pdf_annotations_missing_file_retries_when_file_returns() {
+    let conn = mem_db();
+    let paper = test_paper(&conn, "10.1000/annotation-missing-return", "Missing return");
+    let source = empty_pdf_path("annotation-missing-return");
+    let attachment = db::attach_pdf_to_paper(&conn, paper, source.to_str().unwrap()).unwrap();
+    let original_sha = db::get_paper_attachment(&conn, attachment.id).unwrap().unwrap().sha256;
+    std::fs::remove_file(&source).unwrap();
+    let missing = db::refresh_pdf_annotations(&conn, attachment.id).unwrap();
+    assert_eq!(missing.status, "missing_attachment");
+    std::fs::write(&source, b"%PDF-1.7\nchanged-but-still-invalid").unwrap();
+    let returned = db::ensure_pdf_annotations(&conn, attachment.id).unwrap();
+    assert!(!returned.skipped);
+    assert_ne!(returned.source_sha256.as_deref(), original_sha.as_deref());
+    assert_eq!(returned.status, "malformed");
     let _ = std::fs::remove_file(source);
 }
 

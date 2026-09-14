@@ -8,7 +8,7 @@ use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tauri::{AppHandle, Emitter, Runtime};
 
 use crate::models::{
@@ -106,6 +106,47 @@ pub fn open(path: &Path) -> Result<Connection> {
 /// 生产构建中仅由迁移系统隐式使用；测试中直接断言。
 #[allow(dead_code)]
 pub const SCHEMA_VERSION: i64 = 21;
+
+/// One PDF annotation extractor per attachment. Tauri commands normally
+/// serialize on the shared DB mutex, but this guard also protects direct
+/// callers and future background workers from starting duplicate scans after
+/// the first caller has released the DB lock.
+static ANNOTATION_SCANS_IN_FLIGHT: OnceLock<Mutex<HashSet<(String, i64)>>> = OnceLock::new();
+
+struct AnnotationScanGuard {
+    database_key: String,
+    attachment_id: i64,
+}
+
+impl Drop for AnnotationScanGuard {
+    fn drop(&mut self) {
+        if let Some(scans) = ANNOTATION_SCANS_IN_FLIGHT.get() {
+            if let Ok(mut scans) = scans.lock() {
+                scans.remove(&(self.database_key.clone(), self.attachment_id));
+            }
+        }
+    }
+}
+
+fn annotation_database_key(conn: &Connection) -> String {
+    // File-backed connections share a key across callers. Independent
+    // in-memory test databases have no path and must not collide merely
+    // because SQLite starts each attachment id at 1.
+    conn.query_row("PRAGMA database_list", [], |row| row.get::<_, String>(2))
+        .ok()
+        .filter(|path| !path.is_empty())
+        .unwrap_or_else(|| format!("memory:{:p}", conn))
+}
+
+fn claim_annotation_scan(conn: &Connection, attachment_id: i64) -> Result<Option<AnnotationScanGuard>> {
+    let scans = ANNOTATION_SCANS_IN_FLIGHT.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut scans = scans.lock().map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let database_key = annotation_database_key(conn);
+    if !scans.insert((database_key.clone(), attachment_id)) {
+        return Ok(None);
+    }
+    Ok(Some(AnnotationScanGuard { database_key, attachment_id }))
+}
 
 pub fn init(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
@@ -3996,6 +4037,15 @@ pub fn refresh_pdf_annotations(
     let Some((paper_id, path, stored_sha256)) = attachment else {
         return Err(rusqlite::Error::QueryReturnedNoRows);
     };
+    let Some(_scan_guard) = claim_annotation_scan(conn, attachment_id)? else {
+        return Ok(crate::models::PdfAnnotationRefreshResult {
+            attachment_id,
+            source_sha256: stored_sha256,
+            status: "in_progress".into(),
+            error: None,
+            ..Default::default()
+        });
+    };
     let now = now_utc();
     if !Path::new(&path).is_file() {
         conn.execute(
@@ -4016,8 +4066,8 @@ pub fn refresh_pdf_annotations(
     if scan.status != "completed" {
         conn.execute(
             "UPDATE paper_attachments SET annotation_status=?1, annotation_error=?2,
-             annotation_scanned_at=?3 WHERE id=?4",
-            params![scan.status, scan.error, now, attachment_id],
+             annotation_scanned_at=?3, sha256=?4 WHERE id=?5",
+            params![scan.status, scan.error, now, source_sha256, attachment_id],
         )?;
         return Ok(crate::models::PdfAnnotationRefreshResult {
             attachment_id,
@@ -4113,8 +4163,8 @@ pub fn refresh_pdf_annotations(
     }
     tx.execute(
         "UPDATE paper_attachments SET annotation_status='completed',
-         annotation_error=NULL, annotation_scanned_at=?1 WHERE id=?2",
-        params![now, attachment_id],
+         annotation_error=NULL, annotation_scanned_at=?1, sha256=?2 WHERE id=?3",
+        params![now, source_sha256, attachment_id],
     )?;
     tx.commit()?;
     refresh_library_search_document(conn, paper_id)?;
@@ -4123,12 +4173,57 @@ pub fn refresh_pdf_annotations(
         source_sha256: Some(source_sha256),
         status: "completed".into(),
         error: None,
+        skipped: false,
         imported,
         updated,
         unchanged,
         stale,
         unsupported: scan.unsupported_count,
     })
+}
+
+/// Ensure that one attachment has a current annotation extraction without
+/// turning every Inspector render or process restart into a PDF parse.
+/// `refresh_pdf_annotations()` remains the explicit force-refresh path.
+pub fn ensure_pdf_annotations(
+    conn: &Connection,
+    attachment_id: i64,
+) -> Result<crate::models::PdfAnnotationRefreshResult> {
+    let attachment: Option<(String, Option<String>, String, Option<String>)> = conn
+        .query_row(
+            "SELECT absolute_path, sha256, annotation_status, annotation_error
+             FROM paper_attachments WHERE id=?1",
+            params![attachment_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((path, stored_sha256, status, error)) = attachment else {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    };
+    if Path::new(&path).is_file() {
+        let current_sha256 = sha256_file(Path::new(&path))?;
+        // Every non-never-scanned status is terminal for this exact file. In
+        // particular, failed/malformed scans must not retry forever on every
+        // startup or tab visit; a changed file is the explicit retry signal.
+        if status != "never_scanned"
+            // A missing file is a recoverable locator state, not a terminal
+            // extraction result. If the same file becomes available again,
+            // run the lazy scan even when its bytes match the old attachment
+            // hash.
+            && status != "missing_attachment"
+            && stored_sha256.as_deref().is_some_and(|hash| hash == current_sha256)
+        {
+            return Ok(crate::models::PdfAnnotationRefreshResult {
+                attachment_id,
+                source_sha256: Some(current_sha256),
+                status,
+                error,
+                skipped: true,
+                ..Default::default()
+            });
+        }
+    }
+    refresh_pdf_annotations(conn, attachment_id)
 }
 
 fn prepare_current_pdf_storage(
@@ -7650,6 +7745,40 @@ pub fn list_missing_title_translation_candidates(
     Ok(candidates)
 }
 
+/// Automatic Discovery title translation is deliberately narrower than the
+/// historical/manual backlog above: only the explicit current Today cycle is
+/// eligible. The Library metadata override is checked here as well as in the
+/// save path so a user's Chinese title can never be replaced by an automatic
+/// result.
+pub fn list_missing_title_translation_candidates_in_current_discovery_batch(
+    conn: &Connection,
+    cycle_key: &str,
+    paper_ids: Option<&[i64]>,
+) -> Result<Vec<(i64, String)>> {
+    let mut sql = format!(
+        "SELECT p.id, p.title
+         FROM papers p
+         LEFT JOIN library_item_metadata m ON m.paper_id = p.id
+         WHERE p.first_seen_cycle = ?1
+           AND p.title IS NOT NULL AND TRIM(p.title) != ''
+           AND (p.chinese_title IS NULL OR TRIM(p.chinese_title) = '')
+           AND (m.chinese_title_override IS NULL OR TRIM(m.chinese_title_override) = '')
+           AND {}",
+        DISCOVERY_MEMBERSHIP_PREDICATE
+    );
+    if let Some(ids) = paper_ids {
+        if ids.is_empty() { return Ok(vec![]); }
+        sql.push_str(" AND p.id IN (");
+        sql.push_str(&ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(","));
+        sql.push(')');
+    }
+    sql.push_str(" ORDER BY p.created_at DESC, p.id DESC LIMIT ");
+    sql.push_str(&TITLE_TRANSLATION_BATCH_LIMIT.to_string());
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![cycle_key], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    rows.collect()
+}
+
 /// Validate a caller-provided recovery scope.  Recovery is deliberately never
 /// allowed to discover its own database-wide target set: the current UI view
 /// owns the scope, while this query protects against stale, duplicate, or
@@ -7675,6 +7804,18 @@ pub fn list_recoverable_paper_ids(conn: &Connection, paper_ids: &[i64]) -> Resul
 /// Persist only a translated title. In particular, this must never create
 /// evidence, scores, summaries, or a completed-analysis status.
 pub fn save_title_translation(conn: &Connection, id: i64, chinese_title: &str) -> Result<bool> {
+    let has_library_override: bool = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM library_item_metadata
+            WHERE paper_id=?1 AND chinese_title_override IS NOT NULL
+              AND TRIM(chinese_title_override) != ''
+        )",
+        params![id],
+        |row| row.get(0),
+    )?;
+    if has_library_override {
+        return Ok(false);
+    }
     let changed = conn.execute(
         "UPDATE papers SET chinese_title = ?1, updated_at = ?2
          WHERE id = ?3

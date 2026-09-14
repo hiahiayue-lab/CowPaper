@@ -1395,6 +1395,15 @@ fn refresh_pdf_annotations(
 }
 
 #[tauri::command]
+fn ensure_pdf_annotations(
+    attachment_id: i64,
+    state: State<Db>,
+) -> Result<models::PdfAnnotationRefreshResult, String> {
+    let conn = state.inner().lock().unwrap();
+    db::ensure_pdf_annotations(&conn, attachment_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn attach_pdf(
     paper_id: i64,
     path: String,
@@ -1878,10 +1887,11 @@ fn start_ai(
         .map_err(|e| e.to_string())
 }
 
-/// Run an explicitly requested title-only translation batch for
-/// missing-abstract papers. This is kept outside the full AnalysisBatch state
-/// machine because those papers must stay waitingForAbstract and ineligible
-/// for recommendation. There is no automatic caller for this command.
+/// Run a bounded title-only translation batch for the explicit current
+/// Discovery cycle. This remains outside the full AnalysisBatch state machine:
+/// missing-abstract papers stay waitingForAbstract and ineligible for
+/// recommendation. The backend owns the positive Today scope even when a
+/// stale frontend supplies paper ids.
 #[tauri::command]
 fn translate_missing_titles(
     app: AppHandle,
@@ -1899,7 +1909,8 @@ fn translate_missing_titles(
         .ok_or_else(|| "未保存 API Key，请先在设置中保存".to_string())?;
     let candidates = {
         let conn = state.inner().lock().unwrap();
-        db::list_missing_title_translation_candidates(&conn, paper_ids.as_deref())
+        let cycle_key = db::current_discovery_cycle_key(&conn);
+        db::list_missing_title_translation_candidates_in_current_discovery_batch(&conn, &cycle_key, paper_ids.as_deref())
             .map_err(|e| e.to_string())?
     };
     let scheduled = candidates.len() as i64;
@@ -2578,6 +2589,7 @@ pub fn run() {
             list_paper_annotations,
             list_attachment_annotations,
             refresh_pdf_annotations,
+            ensure_pdf_annotations,
             attach_pdf,
             attach_discovery_pdf,
             detach_pdf,

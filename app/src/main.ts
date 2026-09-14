@@ -217,6 +217,9 @@ interface PaperAttachment {
   createdAt: string;
   updatedAt: string;
   missing: boolean;
+  annotationStatus: string;
+  annotationError: string | null;
+  annotationScannedAt: string | null;
 }
 
 interface LibraryItemMetadata {
@@ -1905,6 +1908,10 @@ async function renderRecommend() {
     list.innerHTML = todayView === "recommend"
       ? (view.items.length ? view.items.map((v) => renderPaperCard(v.paper, { withAbstract: true, context: `today:recommend:${view.run.id}` })).join("") : '<li class="empty">今天暂无新的推荐论文。</li>')
       : (missing.length ? missing.map((p) => renderPaperCard(p, { withAbstract: true, context: `today:missing:${view.run.id}` })).join("") : '<li class="empty">今天没有缺失摘要的新增论文。</li>');
+    // Missing abstracts no longer suppress the narrow, title-only translation
+    // capability. Rust re-validates the explicit current cycle, so this never
+    // turns historical Discovery or Library-only rows into DeepSeek work.
+    void maybeAutoTranslateCurrentDiscoveryTitles(view.run.cycleKey);
   } catch (err) {
     console.error("renderRecommend 失败:", err);
     list.innerHTML = '<li class="empty">暂无推荐。保存 API Key 后点「AI 分析」，或同步新论文后自动分析。</li>';
@@ -2782,7 +2789,8 @@ async function loadLibraryAnnotations(paperId: number, force = false): Promise<b
   const currentState = libraryAnnotationState.get(paperId);
   if (!force && (currentState === "loading" || currentState === "loaded")) return currentState === "loaded";
   const requestId = ++libraryAnnotationRequestSeq;
-  libraryAnnotationState.set(paperId, "loading");
+  const hasNeverScannedAttachment = item.attachments.some((attachment) => !attachment.missing && attachment.annotationStatus === "never_scanned");
+  libraryAnnotationState.set(paperId, force || hasNeverScannedAttachment ? "loading" : "loaded");
   libraryAnnotationErrors.delete(paperId);
   if (selectedLibraryPaperId === paperId) renderLibraryInspector(item);
   try {
@@ -2791,8 +2799,30 @@ async function loadLibraryAnnotations(paperId: number, force = false): Promise<b
     const attachmentNames = new Map(item.attachments.map((attachment) => [attachment.id, attachment.filename]));
     const attachmentOrder = new Map(item.attachments.map((attachment, index) => [attachment.id, index]));
     libraryAnnotations.set(paperId, normalizeLibraryAnnotations(result, { attachmentNames, attachmentOrder }));
-    libraryAnnotationState.set(paperId, "loaded");
-    const currentItem = libraryPapers.find((candidate) => candidate.paper.id === paperId);
+    // Persisted rows are available immediately. The attachment-level ensure
+    // below hashes the current PDF and skips parsing when the bytes are the
+    // same, so an App restart never becomes a Library-wide extraction pass.
+    if (!force && !hasNeverScannedAttachment) libraryAnnotationState.set(paperId, "loaded");
+    let currentItem = libraryPapers.find((candidate) => candidate.paper.id === paperId);
+    if (selectedLibraryPaperId === paperId && currentItem) renderLibraryInspector(currentItem);
+    const outcomes = await Promise.all(item.attachments
+      .filter((attachment) => !attachment.missing)
+      .map((attachment) => invoke<{ status?: string; error?: string | null; skipped?: boolean }>("ensure_pdf_annotations", { attachmentId: attachment.id })));
+    if (requestId !== libraryAnnotationRequestSeq) return false;
+    const failed = outcomes.find((outcome) => outcome.status && outcome.status !== "completed" && outcome.status !== "in_progress");
+    if (failed) {
+      libraryAnnotationErrors.set(paperId, failed.error || failed.status || "未知错误");
+      libraryAnnotationState.set(paperId, "error");
+    } else {
+      const scanned = outcomes.some((outcome) => !outcome.skipped && outcome.status !== "in_progress");
+      if (scanned) {
+        const refreshed = await invoke<unknown>("list_paper_annotations", { paperId });
+        if (requestId !== libraryAnnotationRequestSeq) return false;
+        libraryAnnotations.set(paperId, normalizeLibraryAnnotations(refreshed, { attachmentNames, attachmentOrder }));
+      }
+      libraryAnnotationState.set(paperId, "loaded");
+    }
+    currentItem = libraryPapers.find((candidate) => candidate.paper.id === paperId);
     if (selectedLibraryPaperId === paperId && currentItem) renderLibraryInspector(currentItem);
     return true;
   } catch (error) {
@@ -3015,6 +3045,7 @@ function renderLibraryInspector(item: LibraryPaper) {
     <section class="inspector-group inspector-citation"><div class="inspector-section-head"><h3>引用格式</h3></div><p>${escapeHtml(citation)}</p></section>`;
   const metadataPanel = `<div class="inspector-panel" id="library-inspector-panel" role="tabpanel" aria-label="元数据">${metadataBody}</div>`;
   $("library-inspector").innerHTML = `${renderInspectorTabs(activeTab, p.id)}<div class="inspector-head"><span class="muted small">期刊论文</span><button type="button" class="ghost small danger" data-action="library-remove" data-paper-id="${p.id}">移出文献库</button></div>${activeTab === "annotations" ? renderLibraryAnnotationTab(item) : metadataPanel}`;
+  if (activeTab === "annotations") void loadLibraryAnnotations(p.id);
 }
 
 async function refreshLibraryMetadata(paperId: number): Promise<void> {
@@ -4684,11 +4715,12 @@ async function requireKey(): Promise<boolean> {
 }
 
 /**
- * Run one bounded title-only backlog batch.  The backend selects both newly
- * discovered and historical missing-abstract papers, so callers must not
- * restrict this to the current sync result.
+ * Run one bounded title-only batch for the current Discovery cycle. The
+ * backend owns the positive membership predicate; callers cannot widen this
+ * into a historical or Library-only backlog.
  */
 let missingTitleBacklogInFlight = false;
+let automaticTitleTranslationCycle: string | null = null;
 let missingTitleLastProgressAt = 0;
 let missingTitleLivenessTimer: number | null = null;
 // Rust bounds one title request at 45 seconds and retries it at most once.
@@ -4750,6 +4782,13 @@ async function startMissingTitleTranslation(): Promise<number> {
     console.error("translate_missing_titles invoke failed", err);
     return 0;
   }
+}
+
+async function maybeAutoTranslateCurrentDiscoveryTitles(cycleKey: string): Promise<void> {
+  if (!cycleKey || automaticTitleTranslationCycle === cycleKey || missingTitleBacklogInFlight) return;
+  if (!(await hasKey())) return;
+  automaticTitleTranslationCycle = cycleKey;
+  await startMissingTitleTranslation();
 }
 
 /// 统一的 start_ai 调用（所有入口必须走这里）：带 trigger + 错误捕获 + 即时反馈。

@@ -576,6 +576,9 @@ pub struct PdfAnnotationRefreshResult {
     pub source_sha256: Option<String>,
     pub status: String,
     pub error: Option<String>,
+    /// True when an automatic ensure found a terminal result for the same
+    /// attachment bytes and deliberately did not parse the PDF again.
+    pub skipped: bool,
     pub imported: i64,
     pub updated: i64,
     pub unchanged: i64,

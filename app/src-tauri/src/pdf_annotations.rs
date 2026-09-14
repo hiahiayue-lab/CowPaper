@@ -149,11 +149,21 @@ fn is_two_byte(font: &Dictionary) -> bool {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct Point {
+    x: f32,
+    y: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
 struct Rect {
     x0: f32,
     y0: f32,
     x1: f32,
     y1: f32,
+    /// The original text-markup quad in polygon order. `None` is used only by
+    /// unit-test rectangles; production text-markup regions preserve their
+    /// four points instead of reducing them to a bounding box.
+    points: Option<[Point; 4]>,
 }
 
 pub(crate) fn scan_path(path: &Path) -> PdfAnnotationScan {
@@ -349,11 +359,21 @@ fn rect_from_quad(points: &[f32]) -> Option<Rect> {
     if points.len() != 8 { return None }
     let xs = [points[0], points[2], points[4], points[6]];
     let ys = [points[1], points[3], points[5], points[7]];
+    // PDF text-markup points are upper-left, upper-right, lower-left,
+    // lower-right (a Z order), not polygon order. Preserve the exact quad as
+    // UL -> UR -> LR -> LL for geometric clipping below.
+    let polygon = Some([
+        Point { x: points[0], y: points[1] },
+        Point { x: points[2], y: points[3] },
+        Point { x: points[6], y: points[7] },
+        Point { x: points[4], y: points[5] },
+    ]);
     Some(Rect {
         x0: xs.into_iter().fold(f32::INFINITY, f32::min),
         y0: ys.into_iter().fold(f32::INFINITY, f32::min),
         x1: xs.into_iter().fold(f32::NEG_INFINITY, f32::max),
         y1: ys.into_iter().fold(f32::NEG_INFINITY, f32::max),
+        points: polygon,
     })
 }
 
@@ -753,31 +773,111 @@ fn runs_interleave(selected: &[&Glyph]) -> bool {
 }
 
 fn glyph_in_quad(glyph: &Glyph, quad: &Rect) -> bool {
-    let width = (glyph.x1 - glyph.x0).max(0.001);
-    let height = (glyph.y1 - glyph.y0).max(0.001);
-    let intersection_width = glyph.x1.min(quad.x1) - glyph.x0.max(quad.x0);
-    let intersection_height = glyph.y1.min(quad.y1) - glyph.y0.max(quad.y0);
-    let intersection = intersection_width.max(0.0) * intersection_height.max(0.0);
     let centre_x = (glyph.x0 + glyph.x1) / 2.0;
     let centre_y = (glyph.y0 + glyph.y1) / 2.0;
-    let tolerance = glyph.size.max(1.0) * 0.05;
     // QuadPoints usually follow the font's visible ascent/descent rather than
     // the synthetic full glyph box used by a content-stream walker. A 65%
     // glyph-area floor remains strict about cut characters without rejecting
     // valid annotations whose quad is shorter than that synthetic box.
-    intersection >= width * height * 0.65
-        && centre_x >= quad.x0 - tolerance
-        && centre_x <= quad.x1 + tolerance
-        && centre_y >= quad.y0 - tolerance
-        && centre_y <= quad.y1 + tolerance
+    glyph_overlap_ratio(glyph, quad) >= 0.65
+        && match quad.points {
+            Some(points) => point_in_convex_quad(Point { x: centre_x, y: centre_y }, &points),
+            None => {
+                let tolerance = glyph.size.max(1.0) * 0.05;
+                centre_x >= quad.x0 - tolerance
+                    && centre_x <= quad.x1 + tolerance
+                    && centre_y >= quad.y0 - tolerance
+                    && centre_y <= quad.y1 + tolerance
+            }
+        }
 }
 
 fn glyph_overlap_ratio(glyph: &Glyph, quad: &Rect) -> f32 {
     let width = (glyph.x1 - glyph.x0).max(0.001);
     let height = (glyph.y1 - glyph.y0).max(0.001);
+    if let Some(points) = quad.points {
+        return polygon_intersection_area_with_rect(&points, glyph) / (width * height);
+    }
     let intersection_width = glyph.x1.min(quad.x1) - glyph.x0.max(quad.x0);
     let intersection_height = glyph.y1.min(quad.y1) - glyph.y0.max(quad.y0);
     (intersection_width.max(0.0) * intersection_height.max(0.0)) / (width * height)
+}
+
+fn signed_polygon_area(points: &[Point]) -> f32 {
+    points
+        .iter()
+        .zip(points.iter().cycle().skip(1))
+        .take(points.len())
+        .map(|(left, right)| left.x * right.y - right.x * left.y)
+        .sum::<f32>()
+        * 0.5
+}
+
+fn point_in_convex_quad(point: Point, quad: &[Point; 4]) -> bool {
+    let orientation = signed_polygon_area(quad).signum();
+    if orientation == 0.0 {
+        return false;
+    }
+    quad.iter()
+        .zip(quad.iter().cycle().skip(1))
+        .take(quad.len())
+        .all(|(start, end)| {
+            let cross = (end.x - start.x) * (point.y - start.y)
+                - (end.y - start.y) * (point.x - start.x);
+            cross * orientation >= -0.001
+        })
+}
+
+fn clip_polygon_to_rect(mut polygon: Vec<Point>, edge: usize, boundary: f32, keep_greater: bool) -> Vec<Point> {
+    if polygon.is_empty() {
+        return polygon;
+    }
+    let inside = |point: Point| {
+        let value = if edge < 2 { point.x } else { point.y };
+        if keep_greater { value >= boundary } else { value <= boundary }
+    };
+    let intersection = |from: Point, to: Point| {
+        let from_value = if edge < 2 { from.x } else { from.y };
+        let to_value = if edge < 2 { to.x } else { to.y };
+        let denominator = to_value - from_value;
+        let ratio = if denominator.abs() < f32::EPSILON {
+            0.0
+        } else {
+            (boundary - from_value) / denominator
+        };
+        Point {
+            x: from.x + (to.x - from.x) * ratio,
+            y: from.y + (to.y - from.y) * ratio,
+        }
+    };
+    let mut output = Vec::with_capacity(polygon.len() + 1);
+    let mut previous = *polygon.last().unwrap();
+    let mut previous_inside = inside(previous);
+    for current in polygon.drain(..) {
+        let current_inside = inside(current);
+        if current_inside != previous_inside {
+            output.push(intersection(previous, current));
+        }
+        if current_inside {
+            output.push(current);
+        }
+        previous = current;
+        previous_inside = current_inside;
+    }
+    output
+}
+
+fn polygon_intersection_area_with_rect(quad: &[Point; 4], glyph: &Glyph) -> f32 {
+    let mut clipped = quad.to_vec();
+    for (edge, boundary, keep_greater) in [
+        (0, glyph.x0, true),
+        (1, glyph.x1, false),
+        (2, glyph.y0, true),
+        (3, glyph.y1, false),
+    ] {
+        clipped = clip_polygon_to_rect(clipped, edge, boundary, keep_greater);
+    }
+    signed_polygon_area(&clipped).abs()
 }
 
 /// Refuse a quote when the quad ends inside a decoded text run. PDF writers
@@ -944,7 +1044,7 @@ mod tests {
             test_glyph("no", 74.0, 84.0, 0.0, 8.0),
             test_glyph("t", 84.0, 89.0, 0.0, 8.0),
         ];
-        let quad = Rect { x0: 0.0, y0: 0.0, x1: 84.0, y1: 8.0 };
+        let quad = Rect { x0: 0.0, y0: 0.0, x1: 84.0, y1: 8.0, points: None };
         assert_eq!(quote_for_quads(&glyphs, &[quad]), None);
     }
 
@@ -961,7 +1061,7 @@ mod tests {
             test_glyph(" ", 10.0, 14.0, 0.0, 8.0),
             test_glyph("develop", 14.0, 38.0, 0.0, 8.0),
         ];
-        let quad = Rect { x0: 40.0, y0: 0.0, x1: 125.0, y1: 8.0 };
+        let quad = Rect { x0: 40.0, y0: 0.0, x1: 125.0, y1: 8.0, points: None };
         assert_eq!(quote_for_quads(&glyphs, &[quad]), None);
     }
 
@@ -971,8 +1071,29 @@ mod tests {
             test_glyph("second", 0.0, 30.0, 0.0, 8.0),
             test_glyph("first", 0.0, 25.0, 20.0, 28.0),
         ];
-        let lower = Rect { x0: 0.0, y0: 0.0, x1: 30.0, y1: 8.0 };
-        let upper = Rect { x0: 0.0, y0: 20.0, x1: 25.0, y1: 28.0 };
+        let lower = Rect { x0: 0.0, y0: 0.0, x1: 30.0, y1: 8.0, points: None };
+        let upper = Rect { x0: 0.0, y0: 20.0, x1: 25.0, y1: 28.0, points: None };
         assert_eq!(quote_for_quads(&glyphs, &[lower, upper]).as_deref(), Some("first second"));
+    }
+
+    #[test]
+    fn quote_uses_quad_polygon_not_its_bounding_box() {
+        let glyphs = vec![test_glyph("diagonal", 0.0, 10.0, 0.0, 2.0)];
+        // A diamond has the same 0..10 bounding box, but only half of this
+        // glyph band lies inside it. Bounding-box selection would incorrectly
+        // save the text; polygon clipping rejects the low-confidence span.
+        let quad = Rect {
+            x0: 0.0,
+            y0: 0.0,
+            x1: 10.0,
+            y1: 10.0,
+            points: Some([
+                Point { x: 5.0, y: 10.0 },
+                Point { x: 10.0, y: 5.0 },
+                Point { x: 5.0, y: 0.0 },
+                Point { x: 0.0, y: 5.0 },
+            ]),
+        };
+        assert_eq!(quote_for_quads(&glyphs, &[quad]), None);
     }
 }
