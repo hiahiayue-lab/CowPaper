@@ -2,15 +2,22 @@ name: Signed Updater Release
 
 on:
   push:
-    tags:
-      - "v*"
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish after validation (requires dispatch from the version tag)
+        type: boolean
+        required: true
+        default: false
 
 permissions:
-  contents: write
+  contents: read
 
-# Keep the platform jobs ordered. The second tauri-action invocation sees the
-# first platform's assets and refreshes latest.json with both entries instead
-# of racing two independent metadata uploads.
+concurrency:
+  group: updater-release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   macos-arm64:
     runs-on: macos-14
@@ -18,90 +25,253 @@ jobs:
       run:
         working-directory: app
     steps:
-      - name: Check out release SHA
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
           cache-dependency-path: app/package-lock.json
-      - name: Set up Rust arm64
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin
-      - name: Install frontend dependencies
-        run: npm ci
-      - name: Build and publish signed macOS updater artifact
-        uses: tauri-apps/tauri-action@v0
+      - run: npm ci
+      - name: Build signed updater
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npx tauri build --target aarch64-apple-darwin --bundles app
+      - name: Package DMG and collect assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          bundle="src-tauri/target/aarch64-apple-darwin/release/bundle"
+          app="$bundle/macos/CowPaper.app"
+          test -d "$app"
+          test "$(plutil -extract CFBundleShortVersionString raw "$app/Contents/Info.plist")" = "$version"
+          codesign --verify --deep --strict "$app"
+          file "$app/Contents/MacOS/app" | grep -q arm64
+          staging="$(mktemp -d)"
+          trap 'rm -rf "$staging"' EXIT
+          cp -R "$app" "$staging/CowPaper.app"
+          ln -s /Applications "$staging/Applications"
+          mkdir -p "$bundle/dmg"
+          hdiutil create -volname CowPaper -srcfolder "$staging" -ov -format UDZO "$bundle/dmg/CowPaper_${version}_aarch64.dmg"
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, shutil
+          version = json.loads(pathlib.Path('src-tauri/tauri.conf.json').read_text())['version']
+          bundle = pathlib.Path('src-tauri/target/aarch64-apple-darwin/release/bundle')
+          updaters = list(bundle.glob('macos/CowPaper*.app.tar.gz'))
+          assert len(updaters) == 1, updaters
+          updater = updaters[0]
+          sources = [updater, pathlib.Path(str(updater) + '.sig'), bundle / f'dmg/CowPaper_{version}_aarch64.dmg']
+          out = pathlib.Path('../release-assets/macos')
+          out.mkdir(parents=True, exist_ok=True)
+          records = []
+          for source in sources:
+              assert source.is_file() and source.stat().st_size > 0, source
+              target = out / source.name
+              shutil.copyfile(source, target)
+              records.append({'name': target.name, 'size': target.stat().st_size,
+                              'sha256': hashlib.sha256(target.read_bytes()).hexdigest()})
+          assert len({item['name'] for item in records}) == 3
+          (out / 'manifest.json').write_text(json.dumps({
+              'platform': 'darwin-aarch64', 'sha': os.environ['GITHUB_SHA'],
+              'version': version, 'files': records}, indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
         with:
-          projectPath: app
-          tagName: ${{ github.ref_name }}
-          releaseName: CowPaper ${{ github.ref_name }} Beta
-          releaseBody: |
-            Beta release with signed CowPaper updater artifacts.
-          releaseDraft: true
-          prerelease: false
-          args: --target aarch64-apple-darwin
-          includeUpdaterJson: true
+          name: updater-macos-arm64
+          path: release-assets/macos/
+          if-no-files-found: error
+          retention-days: 7
 
   windows-x64:
-    needs: macos-arm64
     runs-on: windows-latest
     defaults:
       run:
         working-directory: app
     steps:
-      - name: Check out release SHA
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
           cache-dependency-path: app/package-lock.json
-      - name: Set up Rust MSVC
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
-      - name: Install frontend dependencies
-        run: npm ci
-      - name: Build and publish signed Windows updater artifact
-        uses: tauri-apps/tauri-action@v0
+      - run: npm ci
+      - name: Build signed NSIS updater
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npx tauri build --config src-tauri/tauri.windows.conf.json --target x86_64-pc-windows-msvc --bundles nsis
+      - name: Collect assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib, json, os, pathlib, shutil
+          version = json.loads(pathlib.Path('src-tauri/tauri.conf.json').read_text())['version']
+          bundle = pathlib.Path('src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis')
+          stem = f'CowPaper_{version}_x64-setup'
+          sources = [bundle / (stem + ext) for ext in ('.exe', '.nsis.zip', '.nsis.zip.sig')]
+          assert len(list(bundle.glob('CowPaper*'))) == 3, 'Unexpected NSIS bundle files'
+          out = pathlib.Path('../release-assets/windows')
+          out.mkdir(parents=True, exist_ok=True)
+          records = []
+          for source in sources:
+              assert source.is_file() and source.stat().st_size > 0, source
+              target = out / source.name
+              shutil.copyfile(source, target)
+              records.append({'name': target.name, 'size': target.stat().st_size,
+                              'sha256': hashlib.sha256(target.read_bytes()).hexdigest()})
+          (out / 'manifest.json').write_text(json.dumps({
+              'platform': 'windows-x86_64', 'sha': os.environ['GITHUB_SHA'],
+              'version': version, 'files': records}, indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
         with:
-          projectPath: app
-          tagName: ${{ github.ref_name }}
-          releaseName: CowPaper ${{ github.ref_name }} Beta
-          releaseBody: |
-            Beta release with signed CowPaper updater artifacts.
-          releaseDraft: true
-          prerelease: false
-          args: --config src-tauri/tauri.windows.conf.json --target x86_64-pc-windows-msvc
-          updaterJsonPreferNsis: true
-          includeUpdaterJson: true
+          name: updater-windows-x64
+          path: release-assets/windows/
+          if-no-files-found: error
+          retention-days: 7
 
   publish-release:
-    needs:
-      - macos-arm64
-      - windows-x64
+    needs: [macos-arm64, windows-x64]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Publish complete release
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: updater-macos-arm64
+          path: incoming/macos
+      - uses: actions/download-artifact@v4
+        with:
+          name: updater-windows-x64
+          path: incoming/windows
+      - name: Install signature verifier
+        run: sudo apt-get update && sudo apt-get install -y minisign
+      - name: Validate both builds and generate latest.json
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          PUBLISH: ${{ github.event_name == 'push' || inputs.publish == true }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, hashlib, json, os, pathlib, re, shutil, subprocess, tempfile
+          root = pathlib.Path.cwd()
+          config = json.loads((root / 'app/src-tauri/tauri.conf.json').read_text())
+          win_config = json.loads((root / 'app/src-tauri/tauri.windows.conf.json').read_text())
+          version, sha = config['version'], os.environ['GITHUB_SHA']
+          tag = 'v' + version
+          assert re.fullmatch(r'[0-9a-f]{40}', sha)
+          assert re.fullmatch(r'\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?', version)
+          assert config['bundle']['createUpdaterArtifacts'] is True
+          assert win_config['bundle']['targets'] == ['nsis']
+          assert os.environ['REF_TYPE'] != 'tag' or os.environ['REF_NAME'] == tag
+          assert os.environ['PUBLISH'] != 'true' or os.environ['REF_TYPE'] == 'tag'
+          assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() == sha
+          if os.environ['REF_TYPE'] == 'tag':
+              assert subprocess.check_output(['git', 'rev-parse', f'refs/tags/{tag}^{{commit}}'], text=True).strip() == sha
+
+          assets = root / 'release-assets'
+          assets.mkdir()
+          seen, selected = set(), {}
+          for folder, platform in (('macos', 'darwin-aarch64'), ('windows', 'windows-x86_64')):
+              source = root / 'incoming' / folder
+              manifest = json.loads((source / 'manifest.json').read_text())
+              assert (manifest['platform'], manifest['sha'], manifest['version']) == (platform, sha, version)
+              records = manifest['files']
+              assert len(records) == 3
+              names = {item['name'] for item in records}
+              assert len(names) == 3 and {p.name for p in source.iterdir()} == names | {'manifest.json'}
+              for item in records:
+                  name = item['name']
+                  assert name == pathlib.Path(name).name and name not in seen
+                  path = source / name
+                  assert path.is_file() and path.stat().st_size == item['size'] and item['size'] > 0
+                  assert hashlib.sha256(path.read_bytes()).hexdigest() == item['sha256']
+                  shutil.copyfile(path, assets / name)
+                  seen.add(name)
+              if folder == 'macos':
+                  updater = [n for n in names if n.startswith('CowPaper') and n.endswith('.app.tar.gz')]
+                  assert len(updater) == 1
+                  assert names == {updater[0], updater[0] + '.sig', f'CowPaper_{version}_aarch64.dmg'}
+              else:
+                  updater = [f'CowPaper_{version}_x64-setup.nsis.zip']
+                  assert names == {f'CowPaper_{version}_x64-setup.exe', updater[0], updater[0] + '.sig'}
+              selected[platform] = updater[0]
+
+          public_key = base64.b64decode(config['plugins']['updater']['pubkey'], validate=True)
+          with tempfile.TemporaryDirectory() as tmp:
+              key = pathlib.Path(tmp) / 'updater.pub'
+              key.write_bytes(public_key)
+              for updater in selected.values():
+                  signature = (assets / (updater + '.sig')).read_text().strip()
+                  assert signature
+                  sig = pathlib.Path(tmp) / 'updater.minisig'
+                  sig.write_bytes(base64.b64decode(signature, validate=True))
+                  subprocess.run(['minisign', '-Vm', str(assets / updater), '-p', str(key), '-x', str(sig)], check=True)
+
+          base_url = f'https://github.com/{os.environ["GITHUB_REPOSITORY"]}/releases/download/{tag}/'
+          metadata = {'version': version, 'platforms': {
+              platform: {'url': base_url + updater,
+                         'signature': (assets / (updater + '.sig')).read_text().strip()}
+              for platform, updater in selected.items()}}
+          assert set(metadata['platforms']) == {'darwin-aarch64', 'windows-x86_64'}
+          (assets / 'latest.json').write_text(json.dumps(metadata, indent=2) + '\n')
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              env.write(f'RELEASE_TAG={tag}\n')
+          print(f'Validated both platforms for {tag} at {sha}; publish={os.environ["PUBLISH"]}')
+          PY
+      - name: Save dry-run assets
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish == false }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: updater-release-dry-run
+          path: release-assets/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Create one draft and upload all assets
+        if: ${{ github.event_name == 'push' || inputs.publish == true }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease=false
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists; refusing to alter it." >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft --title "CowPaper $RELEASE_TAG Beta" --notes "Beta release with signed CowPaper updater artifacts."
+          gh release upload "$RELEASE_TAG" release-assets/* --repo "$GITHUB_REPOSITORY"
+      - name: Verify uploaded bytes and publish
+        if: ${{ github.event_name == 'push' || inputs.publish == true }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          test "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true
+          mkdir verified-download
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir verified-download
+          python3 - <<'PY'
+          import hashlib, pathlib
+          local, remote = pathlib.Path('release-assets'), pathlib.Path('verified-download')
+          assert {p.name for p in local.iterdir()} == {p.name for p in remote.iterdir()}
+          for source in local.iterdir():
+              assert source.is_file()
+              assert hashlib.sha256(source.read_bytes()).digest() == hashlib.sha256((remote / source.name).read_bytes()).digest(), source.name
+          print('Every draft asset matches its validated local copy.')
+          PY
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease=false
