@@ -16,6 +16,8 @@ import {
   LIBRARY_SEARCH_FIELD_DEFINITIONS,
   createLibrarySearchState,
   hasLibrarySearchInput,
+  libraryBrowseScopeForQuery,
+  libraryDataViewForQuery,
   librarySearchFieldLabel,
   matchLibrarySearchPaper,
   matchesLibrarySearchQuery,
@@ -675,7 +677,6 @@ function clearLibraryScope(): void {
   librarySelectedTagIds = [];
   librarySearchState = {
     ...librarySearchState,
-    query: normalizeLibrarySearchQuery({ ...librarySearchState.query, collectionIds: [], libraryTagIds: [] }),
     activeSuggestionIndex: -1,
     requestVersion: librarySearchState.requestVersion + 1,
   };
@@ -948,18 +949,16 @@ async function loadLibraryData(view: "all" | "recent" | "unfiled" = libraryView)
   libraryView = view;
   try {
     const searchQuery = normalizeLibrarySearchQuery(librarySearchState.query);
-    const hasSearchScope = hasLibrarySearchInput(searchQuery);
-    // Once the Search Box owns a scope, load the unscoped view and let the
-    // canonical search result ids determine the visible rows. This keeps
-    // multiple Collection tokens (OR) from being clipped by the old sidebar
-    // singleton scope.
-    const collectionId = hasSearchScope ? null : scopedLibraryCollectionId();
-    const tagIds = hasSearchScope ? [] : [...librarySelectedTagIds];
-    const facetCollectionId = libraryScope?.kind === "collection"
-      ? libraryScope.id
-      : searchQuery.collectionIds.length === 1 ? searchQuery.collectionIds[0] : null;
+    // The sidebar is browse state. Any Search Box expression searches the
+    // whole Library, constrained only by tokens explicitly chosen there.
+    const { collectionId, tagIds } = libraryBrowseScopeForQuery(searchQuery, {
+      collectionId: scopedLibraryCollectionId(), tagIds: librarySelectedTagIds,
+    });
+    const facetCollectionId = hasLibrarySearchInput(searchQuery)
+      ? searchQuery.collectionIds.length === 1 ? searchQuery.collectionIds[0] : null
+      : scopedLibraryCollectionId();
     [libraryPapers, libraryCollections, libraryTags, libraryTagFacets] = await Promise.all([
-      invoke<LibraryPaper[]>("list_library_papers", { view, collectionId, tagIds }),
+      invoke<LibraryPaper[]>("list_library_papers", { view: libraryDataViewForQuery(searchQuery, view), collectionId, tagIds }),
       invoke<LibraryCollection[]>("list_library_collections"),
       invoke<LibraryTag[]>("list_library_tags"),
       invoke<LibraryTagFacet[]>("list_library_tag_facets", { collectionId: facetCollectionId }),
@@ -2536,6 +2535,13 @@ async function executeLibrarySearch(): Promise<void> {
       librarySearchResultIds = null;
       librarySearchMatches.clear();
       await loadLibraryData(libraryView);
+      if (requestVersion !== librarySearchState.requestVersion) return;
+      refreshLibrarySearchSuggestions();
+    } else {
+      librarySearchResultIds = null;
+      librarySearchMatches.clear();
+      await loadLibraryData(libraryView);
+      return;
     }
     if (requestVersion !== librarySearchState.requestVersion) return;
     const result = await getLibrarySearchAdapter().search({ ...query, view: libraryView });
@@ -2563,16 +2569,8 @@ async function selectLibrarySearchSuggestion(suggestion: LibrarySearchState["sug
   }
   clearLibrarySelection();
   librarySearchState = reduceLibrarySearchState(librarySearchState, { type: "SELECT_SUGGESTION", suggestion });
-  // A token chosen from suggestions is the Search Box scope. Do not leave a
-  // stale singleton Sidebar highlight suggesting an additional hidden filter.
-  if (suggestion.kind === "collection" || suggestion.kind === "libraryTag") {
-    libraryScope = null;
-    librarySelectedTagIds = [];
-    // The input remains focused throughout token selection. renderLibrarySearch
-    // normally preserves the active input value, but a selected suggestion is
-    // a deliberate boundary: discard the temporary label query before the
-    // user continues composing the next token or text query.
-  }
+  // Keep the browse selection so clearing Search returns to the same place.
+  // The selected suggestion alone becomes a Search Box scope token.
   const input = $("library-search-input") as HTMLInputElement | null;
   if (input && (suggestion.kind === "collection" || suggestion.kind === "libraryTag" || suggestion.kind === "field")) {
     input.value = librarySearchState.query.freeTextQuery;
@@ -2587,8 +2585,6 @@ async function selectLibrarySearchSuggestion(suggestion: LibrarySearchState["sug
 function clearLibrarySearch(): void {
   clearLibrarySelection();
   librarySearchState = reduceLibrarySearchState(librarySearchState, { type: "CLEAR" });
-  libraryScope = null;
-  librarySelectedTagIds = [];
   librarySearchResultIds = null;
   librarySearchMatches.clear();
   const input = $("library-search-input") as HTMLInputElement | null;
@@ -2677,8 +2673,8 @@ function renderLibraryNavigation() {
       // malformed data renderable and bounded.
       if (renderedCollectionIds.has(collection.id)) return "";
       renderedCollectionIds.add(collection.id);
-      const active = (libraryScope?.kind === "collection" && libraryScope.id === collection.id)
-        || Boolean(librarySearchState.query.collectionIds?.includes(collection.id));
+      const active = !hasLibrarySearchInput(librarySearchState.query)
+        && libraryScope?.kind === "collection" && libraryScope.id === collection.id;
       return `<div class="library-nav-item" data-library-context-kind="collection" data-library-context-id="${collection.id}" data-library-parent-id="${collection.parentId ?? ""}"><button class="library-nav-row${active ? " active" : ""}" style="padding-left:${12 + depth * 14}px" data-drop-kind="collection" data-action="library-filter-collection" data-collection-id="${collection.id}" data-library-context-kind="collection" data-library-context-id="${collection.id}" data-library-drag-kind="collection" data-library-parent-id="${collection.parentId ?? ""}" draggable="true"><span class="nav-symbol folder-symbol" aria-hidden="true"></span><span class="nav-label">${escapeHtml(collection.name)}</span><span class="nav-count">${collectionCount(collection.id)}</span></button>${depth < 1 ? `<button class="nav-child" title="在此文集下新建子文集" aria-label="在此文集下新建子文集" data-action="library-create-child" data-parent-id="${collection.id}">＋</button>` : ""}<button class="nav-manage" title="重命名文集" aria-label="重命名文集" data-action="library-rename-collection" data-collection-id="${collection.id}">✎</button><button class="nav-manage danger" title="删除文集" aria-label="删除文集" data-action="library-delete-collection" data-collection-id="${collection.id}">×</button></div>${children(collection.id, depth + 1)}`;
     }).join("");
   };
@@ -2689,7 +2685,7 @@ function renderLibraryNavigation() {
   const tagRows = libraryTags.map((tag) => {
     const paperCount = tagCounts.get(tag.id) ?? 0;
     const dimmed = paperCount === 0 ? " dimmed" : "";
-    const active = librarySearchState.query.libraryTagIds?.includes(tag.id) || librarySelectedTagIds.includes(tag.id);
+    const active = !hasLibrarySearchInput(librarySearchState.query) && librarySelectedTagIds.includes(tag.id);
     return `<div class="library-nav-item${dimmed}" data-library-context-kind="tag" data-library-context-id="${tag.id}"><button class="library-nav-row${active ? " active" : ""}" data-drop-kind="tag" data-action="library-filter-tag" data-tag-id="${tag.id}" aria-label="${escapeHtml(tag.name)}，${paperCount} 篇" data-library-context-kind="tag" data-library-context-id="${tag.id}" data-library-drag-kind="tag" draggable="true"><span class="tag-dot" style="background:${escapeHtml(tag.color || "#9ca3af")}"></span><span class="nav-label">${escapeHtml(tag.name)}</span><span class="nav-count">${paperCount}</span></button><button class="nav-manage" title="重命名 Library Tag" aria-label="重命名 Library Tag" data-action="library-rename-tag" data-tag-id="${tag.id}">✎</button><button class="nav-manage danger" title="删除 Library Tag" aria-label="删除 Library Tag" data-action="library-delete-tag" data-tag-id="${tag.id}">×</button></div>`;
   }).join("");
   $("library-tag-nav").innerHTML = libraryInlineCreateRow("tag", null) + (tagRows || '<span class="muted small nav-empty">暂无文献标签</span>');
@@ -2846,7 +2842,9 @@ function renderLibrary() {
   renderLibraryColumnMenu();
   renderLibraryFacets();
   applyLibraryLayoutMetrics();
-  if (titleEl) titleEl.textContent = libraryScope?.kind === "collection" ? libraryCollections.find(c => c.id === libraryScope?.id)?.name || title : librarySelectedTagIds.length ? `${title} · ${librarySelectedTagIds.length} 个标签` : title;
+  if (titleEl) titleEl.textContent = hasLibrarySearchInput(librarySearchState.query)
+    ? "全部文献"
+    : libraryScope?.kind === "collection" ? libraryCollections.find(c => c.id === libraryScope?.id)?.name || title : librarySelectedTagIds.length ? `${title} · ${librarySelectedTagIds.length} 个标签` : title;
   const count = $("library-count");
   // Filtering is owned by list_library_papers; do not reimplement scope in
   // the browser where Collection+Tag could accidentally become OR semantics.
@@ -4686,7 +4684,9 @@ function doSwitch(name: string, options: { preserveLibraryState?: boolean; refre
   if (name === "tags") loadTagEditor();
   if (isLibrary && options.refreshLibrary !== false) {
     const view = name === "library-recent" ? "recent" : name === "library-unfiled" ? "unfiled" : "all";
-    loadLibraryData(view);
+    libraryView = view;
+    if (hasLibrarySearchInput(librarySearchState.query)) void executeLibrarySearch();
+    else void loadLibraryData(view);
   }
 }
 
@@ -5518,8 +5518,6 @@ async function setupListeners() {
         return;
       }
       if (!Number.isInteger(id)) return;
-      if (kind === "collection" && libraryScope?.id === id) libraryScope = null;
-      if (kind === "tag") librarySelectedTagIds = librarySelectedTagIds.filter((value) => value !== id);
       librarySearchState = {
         ...librarySearchState,
         query: normalizeLibrarySearchQuery({
@@ -5774,15 +5772,11 @@ async function setupListeners() {
       const id = parseInt(collectionFilter.dataset.collectionId!, 10);
       clearLibrarySelection();
       libraryScope = { kind: "collection", id };
-      librarySearchState = {
-        ...librarySearchState,
-        query: normalizeLibrarySearchQuery({ ...librarySearchState.query, collectionIds: [id], libraryTagIds: [...(librarySearchState.query.libraryTagIds || librarySelectedTagIds)] }),
-        activeSuggestionIndex: -1,
-        requestVersion: librarySearchState.requestVersion + 1,
-      };
+      librarySearchState = { ...librarySearchState, activeSuggestionIndex: -1, requestVersion: librarySearchState.requestVersion + 1 };
       librarySearchResultIds = null;
       librarySearchMatches.clear();
-      await executeLibrarySearch();
+      if (hasLibrarySearchInput(librarySearchState.query)) await executeLibrarySearch();
+      else await loadLibraryData(libraryView);
       return;
     }
     const navigateCollection = t.closest("[data-action='library-navigate-collection']") as HTMLElement | null;
@@ -5792,15 +5786,11 @@ async function setupListeners() {
       clearLibrarySelection();
       libraryScope = { kind: "collection", id };
       librarySelectedTagIds = [];
-      librarySearchState = {
-        ...librarySearchState,
-        query: normalizeLibrarySearchQuery({ ...librarySearchState.query, collectionIds: [id], libraryTagIds: [] }),
-        activeSuggestionIndex: -1,
-        requestVersion: librarySearchState.requestVersion + 1,
-      };
+      librarySearchState = { ...librarySearchState, activeSuggestionIndex: -1, requestVersion: librarySearchState.requestVersion + 1 };
       librarySearchResultIds = null;
       librarySearchMatches.clear();
-      await executeLibrarySearch();
+      if (hasLibrarySearchInput(librarySearchState.query)) await executeLibrarySearch();
+      else await loadLibraryData(libraryView);
       return;
     }
     const navigateTag = t.closest("[data-action='library-navigate-tag']") as HTMLElement | null;
@@ -5809,15 +5799,11 @@ async function setupListeners() {
       if (!Number.isInteger(id)) return;
       clearLibrarySelection();
       librarySelectedTagIds = librarySelectedTagIds.includes(id) ? librarySelectedTagIds : [...librarySelectedTagIds, id];
-      librarySearchState = {
-        ...librarySearchState,
-        query: normalizeLibrarySearchQuery({ ...librarySearchState.query, libraryTagIds: [...librarySelectedTagIds] }),
-        activeSuggestionIndex: -1,
-        requestVersion: librarySearchState.requestVersion + 1,
-      };
+      librarySearchState = { ...librarySearchState, activeSuggestionIndex: -1, requestVersion: librarySearchState.requestVersion + 1 };
       librarySearchResultIds = null;
       librarySearchMatches.clear();
-      await executeLibrarySearch();
+      if (hasLibrarySearchInput(librarySearchState.query)) await executeLibrarySearch();
+      else await loadLibraryData(libraryView);
       return;
     }
     if (t.closest("[data-action='library-clear-scope']")) {
@@ -5866,19 +5852,14 @@ async function setupListeners() {
     if (tagFilter) {
       const id = parseInt(tagFilter.dataset.tagId!, 10);
       clearLibrarySelection();
-      const activeTagIds = librarySearchState.query.libraryTagIds || librarySelectedTagIds;
-      librarySelectedTagIds = activeTagIds.includes(id)
-        ? activeTagIds.filter((tagId) => tagId !== id)
-        : [...activeTagIds, id];
-      librarySearchState = {
-        ...librarySearchState,
-        query: normalizeLibrarySearchQuery({ ...librarySearchState.query, collectionIds: libraryScope ? [libraryScope.id] : librarySearchState.query.collectionIds, libraryTagIds: [...librarySelectedTagIds] }),
-        activeSuggestionIndex: -1,
-        requestVersion: librarySearchState.requestVersion + 1,
-      };
+      librarySelectedTagIds = librarySelectedTagIds.includes(id)
+        ? librarySelectedTagIds.filter((tagId) => tagId !== id)
+        : [...librarySelectedTagIds, id];
+      librarySearchState = { ...librarySearchState, activeSuggestionIndex: -1, requestVersion: librarySearchState.requestVersion + 1 };
       librarySearchResultIds = null;
       librarySearchMatches.clear();
-      await executeLibrarySearch();
+      if (hasLibrarySearchInput(librarySearchState.query)) await executeLibrarySearch();
+      else await loadLibraryData(libraryView);
       return;
     }
     const renameLibraryTag = t.closest("[data-action='library-rename-tag']") as HTMLElement | null;

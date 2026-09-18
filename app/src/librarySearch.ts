@@ -344,6 +344,23 @@ export function hasLibrarySearchInput(query: LibrarySearchQueryInput): boolean {
   return Boolean(normalized.freeTextQuery || normalized.fieldClauses.length || normalized.collectionIds.length || normalized.libraryTagIds.length);
 }
 
+/** Browsing filters apply only while the Search Box has no expression. */
+export function libraryBrowseScopeForQuery(
+  query: LibrarySearchQueryInput,
+  browse: { collectionId: number | null; tagIds: readonly number[] },
+): { collectionId: number | null; tagIds: number[] } {
+  return hasLibrarySearchInput(query)
+    ? { collectionId: null, tagIds: [] }
+    : { collectionId: browse.collectionId, tagIds: [...browse.tagIds] };
+}
+
+export function libraryDataViewForQuery(
+  query: LibrarySearchQueryInput,
+  browseView: "all" | "recent" | "unfiled",
+): "all" | "recent" | "unfiled" {
+  return hasLibrarySearchInput(query) ? "all" : browseView;
+}
+
 /** Expand selected parent collections without duplicating papers or looping on malformed trees. */
 export function expandCollectionIds(collections: readonly SearchCollection[], selectedIds: readonly number[]): number[] {
   const children = new Map<number, number[]>();
