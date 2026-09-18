@@ -230,7 +230,13 @@ jobs:
               platform: {'url': base_url + updater,
                          'signature': (assets / (updater + '.sig')).read_text().strip()}
               for platform, updater in selected.items()}}
-          assert set(metadata['platforms']) == {'darwin-aarch64', 'windows-x86_64'}
+          # Tauri's updater schema exposes the Windows NSIS target under both
+          # aliases.  Keep the payload and signature identical while emitting
+          # both keys from the single aggregated manifest.
+          metadata['platforms']['windows-x86_64-nsis'] = dict(
+              metadata['platforms']['windows-x86_64'])
+          assert set(metadata['platforms']) == {
+              'darwin-aarch64', 'windows-x86_64', 'windows-x86_64-nsis'}
           (assets / 'latest.json').write_text(json.dumps(metadata, indent=2) + '\n')
           with open(os.environ['GITHUB_ENV'], 'a') as env:
               env.write(f'RELEASE_TAG={tag}\n')
@@ -254,7 +260,7 @@ jobs:
             echo "Release $RELEASE_TAG already exists; refusing to alter it." >&2
             exit 1
           fi
-          gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft --title "CowPaper $RELEASE_TAG Beta" --notes "Beta release with signed CowPaper updater artifacts."
+          gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft --title "CowPaper $RELEASE_TAG" --notes-file docs/release-notes-v0.4.1.md
           gh release upload "$RELEASE_TAG" release-assets/* --repo "$GITHUB_REPOSITORY"
       - name: Verify uploaded bytes and publish
         if: ${{ github.event_name == 'push' || inputs.publish == true }}

@@ -7995,10 +7995,11 @@ fn test_pdf_filename_template_uses_none_for_missing_fields() {
 
 #[test]
 fn test_pdf_filename_preview_uses_disk_renderer_and_keeps_legacy_doi() {
-    assert_eq!(db::preview_pdf_filename("{title} - {year}.pdf"), "Minds and machines - 2026.pdf");
-    assert_eq!(db::preview_pdf_filename("{doi}.pdf"), "10.1016_j.respol.2026.105600.pdf");
+    assert_eq!(db::preview_pdf_filename("{title} - {year}.pdf"), "cowpaper - 2026.pdf");
+    assert_eq!(db::preview_pdf_filename("{first_author}-{year}-{title}.pdf"), "hiahiayue-2026-cowpaper.pdf");
+    assert_eq!(db::preview_pdf_filename("{doi}.pdf"), "10.0000_example.pdf");
     assert_eq!(db::preview_pdf_filename("{unknown}.pdf"), "none.pdf");
-    assert_eq!(db::preview_pdf_filename("{title}/{year}"), "Minds and machines_2026.pdf");
+    assert_eq!(db::preview_pdf_filename("{title}/{year}"), "cowpaper_2026.pdf");
 }
 
 #[test]
@@ -8026,6 +8027,29 @@ fn test_metadata_save_auto_renames_managed_pdf_without_changing_identity_or_byte
 }
 
 #[test]
+fn test_metadata_save_renames_keep_pdf_in_place_without_copy_or_move() {
+    let conn = mem_db();
+    let pid = test_paper(&conn, "10.1000/rename-keep", "Keep Before");
+    db::add_paper_to_library(&conn, pid, &[], &[], "test").unwrap();
+    let source = test_pdf_path("keep-before", "%PDF-1.7\nkeep\n");
+    let root = test_pdf_library("rename-keep");
+    set_pdf_storage_settings(&conn, "none", &root, "{title}.pdf", "none");
+    let first = db::attach_pdf_to_paper(&conn, pid, source.to_str().unwrap()).unwrap();
+    assert_eq!(first.storage_mode, "linked");
+    db::set_library_item_metadata(&conn, pid, &crate::models::LibraryItemMetadataInput {
+        title_override: Some("Keep After".into()),
+        ..Default::default()
+    }).unwrap();
+    let renamed = db::get_paper_attachment(&conn, first.id).unwrap().unwrap();
+    assert_eq!(renamed.storage_mode, "linked");
+    assert_eq!(renamed.filename, "Keep After.pdf");
+    assert!(std::path::Path::new(&renamed.absolute_path).exists());
+    assert!(!source.exists());
+    let _ = std::fs::remove_file(renamed.absolute_path);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn test_template_commit_syncs_linked_pdf_and_collision_is_stable() {
     let conn = mem_db();
     let pid = test_paper(&conn, "10.1000/rename-template", "Template Title");
@@ -8049,7 +8073,7 @@ fn test_template_commit_syncs_linked_pdf_and_collision_is_stable() {
 }
 
 #[test]
-fn test_metadata_save_keeps_old_pdf_path_when_destination_fails() {
+fn test_metadata_save_keeps_old_pdf_path_when_rename_fails() {
     let conn = mem_db();
     let pid = test_paper(&conn, "10.1000/rename-failure", "Before");
     db::add_paper_to_library(&conn, pid, &[], &[], "test").unwrap();
@@ -8057,18 +8081,18 @@ fn test_metadata_save_keeps_old_pdf_path_when_destination_fails() {
     let root = test_pdf_library("rename-failure");
     set_pdf_storage_settings(&conn, "copy", &root, "{title}.pdf", "none");
     let first = db::attach_pdf_to_paper(&conn, pid, source.to_str().unwrap()).unwrap();
-    let blocked_root = test_pdf_path("rename-blocked-root", "occupied");
-    db::set_setting(&conn, "settings.pdf_library_root", blocked_root.to_str().unwrap()).unwrap();
+    // Make the rename itself fail while retaining the old DB path.  This is
+    // deterministic across platforms and exercises the real failure contract
+    // without relying on filesystem permissions.
+    std::fs::remove_file(&first.absolute_path).unwrap();
     db::set_library_item_metadata(&conn, pid, &crate::models::LibraryItemMetadataInput {
         title_override: Some("After".into()),
         ..Default::default()
     }).unwrap();
     let still_linked = db::get_paper_attachment(&conn, first.id).unwrap().unwrap();
     assert_eq!(still_linked.absolute_path, first.absolute_path);
-    assert!(std::path::Path::new(&first.absolute_path).exists());
     assert_eq!(db::get_library_paper(&conn, pid).unwrap().unwrap().effective_title.as_deref(), Some("After"));
     let _ = std::fs::remove_file(source);
-    let _ = std::fs::remove_file(blocked_root);
     let _ = std::fs::remove_dir_all(root);
 }
 

@@ -3297,13 +3297,13 @@ fn render_pdf_filename(template: &str, context: &PdfNamingContext) -> String {
 /// The Settings example uses the same renderer as every filesystem path.
 pub fn preview_pdf_filename(template: &str) -> String {
     render_pdf_filename(template, &PdfNamingContext {
-        title: "Minds and machines".into(),
-        journal: "Research Policy".into(),
-        source: "Research Policy".into(),
+        title: "cowpaper".into(),
+        journal: "research-policy".into(),
+        source: "openalex".into(),
         year: "2026".into(),
-        authors: "Mattia Pedota, John Smith".into(),
-        first_author: "Mattia Pedota".into(),
-        doi: "10.1016/j.respol.2026.105600".into(),
+        authors: "hiahiayue".into(),
+        first_author: "hiahiayue".into(),
+        doi: "10.0000/example".into(),
     })
 }
 
@@ -4556,30 +4556,86 @@ fn canonical_path_is_inside(root: &Path, path: &Path) -> bool {
 }
 
 fn attachment_has_current_name(conn: &Connection, attachment: &crate::models::PaperAttachment) -> Result<bool> {
-    if attachment.storage_mode != "managed" { return Ok(false); }
     let config = pdf_storage_config(conn)?;
-    let root = PathBuf::from(config.library_root.trim());
-    let Ok(root) = std::fs::canonicalize(root) else { return Ok(false); };
     let context = paper_naming_context(conn, attachment.paper_id)?;
-    let directory = managed_destination_directory(&root, &config.subfolder_rule, &context);
-    let path = Path::new(&attachment.absolute_path);
-    if path.parent() != Some(directory.as_path()) { return Ok(false); }
     let desired = render_pdf_filename(&config.naming_template, &context);
     if attachment.filename == desired { return Ok(true); }
     // Keep an existing collision number stable on subsequent saves.
     Ok((2..=10_000).any(|number| attachment.filename == collision_filename(&desired, number)))
 }
 
+/// Rename a linked or managed PDF in its existing directory without changing
+/// storage mode. Metadata edits and template saves must never turn a KEEP
+/// attachment into a COPY/MOVE operation.
+fn rename_attachment_in_place(
+    conn: &Connection,
+    attachment_id: i64,
+) -> Result<crate::models::PaperAttachment> {
+    let current = get_paper_attachment(conn, attachment_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+    let source = PathBuf::from(&current.absolute_path);
+    if !source.is_file() {
+        return Err(rusqlite::Error::InvalidParameterName("missing_attachment".into()));
+    }
+    let context = paper_naming_context(conn, current.paper_id)?;
+    let desired = render_pdf_filename(&pdf_storage_config(conn)?.naming_template, &context);
+    if current.filename == desired {
+        return Ok(current);
+    }
+    let parent = source.parent().ok_or(rusqlite::Error::InvalidQuery)?;
+    let mut destination = parent.join(&desired);
+    if destination != source && destination.exists() {
+        let mut selected = None;
+        for number in 2..=10_000_usize {
+            let candidate = parent.join(collision_filename(&desired, number));
+            if candidate == source || !candidate.exists() {
+                selected = Some(candidate);
+                break;
+            }
+        }
+        destination = selected.ok_or(rusqlite::Error::InvalidQuery)?;
+    }
+    let config = pdf_storage_config(conn)?;
+    // Validate the managed relative path before touching the filesystem. If
+    // settings point at an incompatible root, the old path must remain both
+    // on disk and in the database.
+    let relative_path = if current.storage_mode == "managed" {
+        let root = std::fs::canonicalize(PathBuf::from(config.library_root.trim()))
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        Some(managed_relative_path(&root, &destination)?)
+    } else {
+        None
+    };
+    if destination != source {
+        std::fs::rename(&source, &destination).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    }
+    let result = conn.execute(
+        "UPDATE paper_attachments SET absolute_path=?1, relative_path=?2, filename=?3, updated_at=?4 WHERE id=?5",
+        params![
+            destination.to_string_lossy().as_ref(),
+            relative_path.as_deref(),
+            destination.file_name().and_then(|value| value.to_str()).unwrap_or(&desired),
+            now_utc(),
+            attachment_id,
+        ],
+    );
+    if let Err(error) = result {
+        // Keep the database and filesystem consistent if the short DB write
+        // fails after the filesystem rename.
+        if destination != source {
+            let _ = std::fs::rename(&destination, &source);
+        }
+        return Err(error);
+    }
+    get_paper_attachment(conn, attachment_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
+}
+
 fn sync_paper_pdf_filenames(conn: &Connection, paper_id: i64) {
-    let Ok(config) = pdf_storage_config(conn) else { return; };
-    if config.mode == "none" { return; }
     let Ok(ids) = conn.prepare("SELECT id FROM paper_attachments WHERE paper_id=?1 AND kind='pdf' ORDER BY id")
         .and_then(|mut stmt| stmt.query_map(params![paper_id], |row| row.get::<_, i64>(0))?.collect::<Result<Vec<_>>>()) else { return; };
     for id in ids {
         let Ok(Some(attachment)) = get_paper_attachment(conn, id) else { continue; };
         if attachment_has_current_name(conn, &attachment).unwrap_or(false) { continue; }
-        let mode = if attachment.storage_mode == "managed" { "move" } else { &config.mode };
-        let _ = manage_existing_attachment(conn, id, mode);
+        let _ = rename_attachment_in_place(conn, id);
     }
 }
 
@@ -4590,7 +4646,7 @@ pub fn sync_library_pdf_filenames(conn: &Connection) {
     for id in ids {
         let Ok(Some(attachment)) = get_paper_attachment(conn, id) else { continue; };
         if attachment_has_current_name(conn, &attachment).unwrap_or(false) { continue; }
-        sync_paper_pdf_filenames(conn, attachment.paper_id);
+        let _ = rename_attachment_in_place(conn, id);
     }
 }
 
