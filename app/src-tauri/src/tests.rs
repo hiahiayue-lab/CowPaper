@@ -7939,7 +7939,7 @@ fn test_pdf_filename_sanitization_collision_and_empty_fields() {
 }
 
 #[test]
-fn test_pdf_filename_template_cleans_missing_middle_fields_and_falls_back_to_source_stem() {
+fn test_pdf_filename_template_uses_none_for_missing_fields() {
     let conn = mem_db();
     let pid = test_paper(&conn, "10.1000/storage-template-fallback", "Paper Title");
     db::add_paper_to_library(&conn, pid, &[], &[], "test").unwrap();
@@ -7955,7 +7955,7 @@ fn test_pdf_filename_template_cleans_missing_middle_fields_and_falls_back_to_sou
         params![pid],
     ).unwrap();
     let attachment = db::attach_pdf_to_paper(&conn, pid, source.to_str().unwrap()).unwrap();
-    assert_eq!(attachment.filename, "Paper Title.pdf");
+    assert_eq!(attachment.filename, "Paper Title - none - none.pdf");
     assert!(!attachment.filename.contains("  "));
 
     db::set_library_item_metadata(&conn, pid, &crate::models::LibraryItemMetadataInput {
@@ -7980,9 +7980,8 @@ fn test_pdf_filename_template_cleans_missing_middle_fields_and_falls_back_to_sou
         params![pid_without_metadata],
     ).unwrap();
     let source_without_metadata = test_pdf_path("source-stem-fallback", "%PDF-1.7\n");
-    let source_stem = source_without_metadata.file_stem().unwrap().to_str().unwrap().to_string();
     let fallback = db::attach_pdf_to_paper(&conn, pid_without_metadata, source_without_metadata.to_str().unwrap()).unwrap();
-    assert_eq!(fallback.filename, format!("{source_stem}.pdf"));
+    assert_eq!(fallback.filename, "none.pdf");
     assert!(source_without_metadata.exists());
 
     let _ = std::fs::remove_file(source);
@@ -7991,6 +7990,85 @@ fn test_pdf_filename_template_cleans_missing_middle_fields_and_falls_back_to_sou
     let _ = std::fs::remove_file(attachment.absolute_path);
     let _ = std::fs::remove_file(with_overrides.absolute_path);
     let _ = std::fs::remove_file(fallback.absolute_path);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn test_pdf_filename_preview_uses_disk_renderer_and_keeps_legacy_doi() {
+    assert_eq!(db::preview_pdf_filename("{title} - {year}.pdf"), "Minds and machines - 2026.pdf");
+    assert_eq!(db::preview_pdf_filename("{doi}.pdf"), "10.1016_j.respol.2026.105600.pdf");
+    assert_eq!(db::preview_pdf_filename("{unknown}.pdf"), "none.pdf");
+    assert_eq!(db::preview_pdf_filename("{title}/{year}"), "Minds and machines_2026.pdf");
+}
+
+#[test]
+fn test_metadata_save_auto_renames_managed_pdf_without_changing_identity_or_bytes() {
+    let conn = mem_db();
+    let pid = test_paper(&conn, "10.1000/rename-metadata", "Original Title");
+    db::add_paper_to_library(&conn, pid, &[], &[], "test").unwrap();
+    let source = test_pdf_path("rename-metadata", "%PDF-1.7\nidentity\n");
+    let root = test_pdf_library("rename-metadata");
+    set_pdf_storage_settings(&conn, "copy", &root, "{title}.pdf", "none");
+    let first = db::attach_pdf_to_paper(&conn, pid, source.to_str().unwrap()).unwrap();
+    let original_hash = sha256_file_for_test(std::path::Path::new(&first.absolute_path));
+    db::set_library_item_metadata(&conn, pid, &crate::models::LibraryItemMetadataInput {
+        title_override: Some("Updated Title".into()),
+        ..Default::default()
+    }).unwrap();
+    let renamed = db::get_paper_attachment(&conn, first.id).unwrap().unwrap();
+    assert_eq!(renamed.id, first.id);
+    assert_eq!(renamed.filename, "Updated Title.pdf");
+    assert_eq!(sha256_file_for_test(std::path::Path::new(&renamed.absolute_path)), original_hash);
+    assert!(!std::path::Path::new(&first.absolute_path).exists());
+    assert!(source.exists(), "copy keeps the original linked source");
+    let _ = std::fs::remove_file(source);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn test_template_commit_syncs_linked_pdf_and_collision_is_stable() {
+    let conn = mem_db();
+    let pid = test_paper(&conn, "10.1000/rename-template", "Template Title");
+    db::add_paper_to_library(&conn, pid, &[], &[], "test").unwrap();
+    let source = test_pdf_path("rename-template", "%PDF-1.7\n");
+    let root = test_pdf_library("rename-template");
+    set_pdf_storage_settings(&conn, "copy", &root, "{title}.pdf", "none");
+    let first = db::attach_pdf_to_paper(&conn, pid, source.to_str().unwrap()).unwrap();
+    let second = db::attach_pdf_to_paper(&conn, pid, source.to_str().unwrap()).unwrap();
+    db::set_setting(&conn, "settings.pdf_naming_template", "{title} - {year}.pdf").unwrap();
+    db::sync_library_pdf_filenames(&conn);
+    let first_after = db::get_paper_attachment(&conn, first.id).unwrap().unwrap();
+    let second_after = db::get_paper_attachment(&conn, second.id).unwrap().unwrap();
+    assert_ne!(first_after.absolute_path, second_after.absolute_path);
+    assert!(first_after.filename.starts_with("Template Title - "));
+    assert!(second_after.filename.contains("(2).pdf"));
+    db::sync_library_pdf_filenames(&conn);
+    assert_eq!(db::get_paper_attachment(&conn, second.id).unwrap().unwrap().absolute_path, second_after.absolute_path);
+    let _ = std::fs::remove_file(source);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn test_metadata_save_keeps_old_pdf_path_when_destination_fails() {
+    let conn = mem_db();
+    let pid = test_paper(&conn, "10.1000/rename-failure", "Before");
+    db::add_paper_to_library(&conn, pid, &[], &[], "test").unwrap();
+    let source = test_pdf_path("rename-failure", "%PDF-1.7\n");
+    let root = test_pdf_library("rename-failure");
+    set_pdf_storage_settings(&conn, "copy", &root, "{title}.pdf", "none");
+    let first = db::attach_pdf_to_paper(&conn, pid, source.to_str().unwrap()).unwrap();
+    let blocked_root = test_pdf_path("rename-blocked-root", "occupied");
+    db::set_setting(&conn, "settings.pdf_library_root", blocked_root.to_str().unwrap()).unwrap();
+    db::set_library_item_metadata(&conn, pid, &crate::models::LibraryItemMetadataInput {
+        title_override: Some("After".into()),
+        ..Default::default()
+    }).unwrap();
+    let still_linked = db::get_paper_attachment(&conn, first.id).unwrap().unwrap();
+    assert_eq!(still_linked.absolute_path, first.absolute_path);
+    assert!(std::path::Path::new(&first.absolute_path).exists());
+    assert_eq!(db::get_library_paper(&conn, pid).unwrap().unwrap().effective_title.as_deref(), Some("After"));
+    let _ = std::fs::remove_file(source);
+    let _ = std::fs::remove_file(blocked_root);
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -8291,7 +8369,7 @@ fn test_external_pdf_import_uses_managed_storage_without_second_canonical_paper(
     assert!(path.exists(), "external import 的 copy 必须保留源 PDF");
     assert!(std::path::Path::new(&attachment.absolute_path).is_file());
     assert_eq!(conn.query_row("SELECT COUNT(*) FROM papers", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
-    let expected_relative = std::path::Path::new("Unknown").join("External Managed Paper.pdf");
+    let expected_relative = std::path::Path::new("Unknown").join("External Managed Paper - none.pdf");
     assert_eq!(std::path::Path::new(attachment.relative_path.as_deref().unwrap()), expected_relative);
     assert_eq!(
         std::path::Path::new(&attachment.absolute_path),
@@ -8707,7 +8785,7 @@ fn rc6_fast_import_keeps_copy_on_staging_until_finalization() {
     assert!(path.is_file(), "staging copy must preserve the source");
     db::finalize_import_managed_filename(&conn, attachment_id).unwrap();
     let finalized = db::get_paper_attachment(&conn, attachment_id).unwrap().unwrap();
-    assert_eq!(finalized.filename, "Staged Local Title.pdf");
+    assert_eq!(finalized.filename, "Staged Local Title - none.pdf");
     assert!(std::path::Path::new(&finalized.absolute_path).is_file());
     assert!(!std::path::Path::new(&staged.absolute_path).exists());
     assert!(path.is_file());

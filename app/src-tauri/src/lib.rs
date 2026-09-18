@@ -2317,6 +2317,11 @@ fn get_settings(state: State<Db>) -> Result<models::Settings, String> {
 }
 
 #[tauri::command]
+fn preview_pdf_filename(template: String) -> String {
+    db::preview_pdf_filename(&template)
+}
+
+#[tauri::command]
 fn set_settings(s: models::Settings, state: State<Db>) -> Result<(), String> {
     if !valid_daily_sync_time(&s.daily_sync_time) {
         return Err("每日检查时间必须为 HH:MM".to_string());
@@ -2329,6 +2334,7 @@ fn set_settings(s: models::Settings, state: State<Db>) -> Result<(), String> {
     )?;
     db::validate_preferred_pdf_reader(&s.preferred_pdf_reader)?;
     let conn = state.inner().lock().unwrap();
+    let previous_template = db::get_setting(&conn, "settings.pdf_naming_template");
     db::set_setting(
         &conn,
         "settings.startup_auto_sync",
@@ -2358,6 +2364,9 @@ fn set_settings(s: models::Settings, state: State<Db>) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     db::set_setting(&conn, "settings.preferred_pdf_reader", &s.preferred_pdf_reader)
         .map_err(|e| e.to_string())?;
+    if previous_template.as_deref() != Some(s.pdf_naming_template.as_str()) {
+        db::sync_library_pdf_filenames(&conn);
+    }
     Ok(())
 }
 
@@ -2649,6 +2658,7 @@ pub fn run() {
             reorganize_pdf,
             manage_pdf_attachment,
             organize_library_pdfs,
+            preview_pdf_filename,
             rename_managed_pdf,
             open_pdf,
             open_pdf_with_preferred_reader,

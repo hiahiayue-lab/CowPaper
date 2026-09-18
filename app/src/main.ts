@@ -990,39 +990,30 @@ async function loadAiStatus() {
 }
 
 const DEFAULT_PDF_NAMING_TEMPLATE = "{title} - {journal} - {first_author} - {year}.pdf";
-const PDF_TEMPLATE_TOKENS = ["title", "journal", "source", "first_author", "authors", "year", "doi"] as const;
-const PDF_TEMPLATE_EXAMPLE: Record<typeof PDF_TEMPLATE_TOKENS[number], string> = {
-  title: "Minds and machines",
-  journal: "Research Policy",
-  source: "Research Policy",
-  first_author: "Mattia Pedota",
-  authors: "Mattia Pedota - John Smith",
-  year: "2026",
-  doi: "10.1016/j.respol.2026.105600",
-};
+const PDF_TEMPLATE_TOKENS = ["title", "journal", "source", "first_author", "authors", "year"] as const;
+let pdfPreviewRequest = 0;
 
-function renderPdfTemplateExample(): string {
+async function renderPdfTemplateExample(): Promise<void> {
   const templateInput = $("set-pdf-naming-template") as HTMLInputElement | null;
   const modeInput = $("set-pdf-file-handling-mode") as HTMLSelectElement | null;
-  const rootInput = $("set-pdf-library-root") as HTMLInputElement | null;
-  const folderInput = $("set-pdf-subfolder-rule") as HTMLSelectElement | null;
-  if (!templateInput || !modeInput || !rootInput || !folderInput) return "";
+  if (!templateInput || !modeInput) return;
   const template = templateInput.value.trim() || DEFAULT_PDF_NAMING_TEMPLATE;
-  const unknownTokens = [...template.matchAll(/\{([^{}]+)\}/g)].map((match) => match[1]).filter((token) => !(PDF_TEMPLATE_TOKENS as readonly string[]).includes(token));
-  const filename = template.replace(/\{([^{}]+)\}/g, (_match, token: string) => (PDF_TEMPLATE_EXAMPLE as Record<string, string>)[token] ?? "");
-  const folder = folderInput.value === "year" ? PDF_TEMPLATE_EXAMPLE.year : folderInput.value === "journal/source" ? `${PDF_TEMPLATE_EXAMPLE.journal}/${PDF_TEMPLATE_EXAMPLE.source}` : "";
-  const root = rootInput.value.trim() || "Library root";
-  const previewPath = [root, folder, filename || "document.pdf"].filter(Boolean).join("/");
+  const unknownTokens = [...template.matchAll(/\{([^{}]+)\}/g)].map((match) => match[1]).filter((token) => token !== "doi" && !(PDF_TEMPLATE_TOKENS as readonly string[]).includes(token));
   const preview = $("pdf-template-preview");
-  if (preview) preview.textContent = modeInput.value === "none" ? `链接模式 · ${filename || "document.pdf"}` : previewPath;
+  const request = ++pdfPreviewRequest;
+  try {
+    const filename = await invoke<string>("preview_pdf_filename", { template });
+    if (preview && request === pdfPreviewRequest) preview.textContent = filename;
+  } catch {
+    if (preview && request === pdfPreviewRequest) preview.textContent = "";
+  }
   const warning = $("pdf-template-warning");
   if (warning) {
-    warning.textContent = unknownTokens.length ? `未知 token 将留空：${unknownTokens.map((token) => `{${token}}`).join(", ")}` : "";
+    warning.textContent = unknownTokens.length ? `未知 token 将显示为 none：${unknownTokens.map((token) => `{${token}}`).join(", ")}` : "";
     warning.classList.toggle("hidden", unknownTokens.length === 0);
   }
   const moveWarning = $("pdf-move-warning");
   if (moveWarning) moveWarning.classList.toggle("hidden", modeInput.value !== "move");
-  return previewPath;
 }
 
 function renderPreferredReader(): void {

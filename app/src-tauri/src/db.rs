@@ -3018,6 +3018,9 @@ pub fn set_library_item_metadata(
     }
     tx.commit()?;
     refresh_library_search_document(conn, paper_id)?;
+    // A failed file operation must never roll back a successfully saved edit.
+    // The attachment keeps its old path until a verified replacement exists.
+    sync_paper_pdf_filenames(conn, paper_id);
     get_library_item_metadata(conn, paper_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
 }
 
@@ -3060,6 +3063,7 @@ pub fn clear_library_item_overrides(
         params![now_utc(), paper_id],
     )?;
     refresh_library_search_document(conn, paper_id)?;
+    sync_paper_pdf_filenames(conn, paper_id);
     get_library_item_metadata(conn, paper_id)
 }
 
@@ -3263,114 +3267,44 @@ fn template_token_value<'a>(token: &str, context: &'a PdfNamingContext) -> Optio
     }
 }
 
-fn is_template_separator(ch: char) -> bool {
-    matches!(ch, '-' | '–' | '—' | '_')
-}
-
-fn strip_leading_template_separator(value: &str) -> String {
-    let mut chars = value.char_indices();
-    while let Some((index, ch)) = chars.next() {
-        if ch.is_whitespace() {
-            continue;
-        } else if is_template_separator(ch) {
-            let mut end = index + ch.len_utf8();
-            while let Some((next_index, next)) = chars.next() {
-                if !next.is_whitespace() {
-                    return value[next_index..].to_string();
-                }
-                end = next_index + next.len_utf8();
-            }
-            return value[end..].to_string();
-        } else {
-            break;
-        }
-    }
-    value.to_string()
-}
-
-fn trim_trailing_template_separator_before_extension(value: &mut String) {
-    let Some(extension_start) = value.to_ascii_lowercase().rfind(".pdf") else { return; };
-    let mut stem = value[..extension_start].trim_end().to_string();
-    while stem.chars().last().is_some_and(is_template_separator) {
-        stem.pop();
-        while stem.chars().last().is_some_and(|ch| ch.is_whitespace()) {
-            stem.pop();
-        }
-    }
-    *value = format!("{}{}", stem.trim_end(), &value[extension_start..]);
-}
-
-fn trim_trailing_template_separator(value: &mut String) {
-    let mut trimmed = value.trim_end().to_string();
-    while trimmed.chars().last().is_some_and(is_template_separator) {
-        trimmed.pop();
-        while trimmed.chars().last().is_some_and(|ch| ch.is_whitespace()) {
-            trimmed.pop();
-        }
-    }
-    *value = trimmed;
-}
-
-fn rendered_filename_has_component(value: &str) -> bool {
-    let extension_start = value.to_ascii_lowercase().rfind(".pdf").unwrap_or(value.len());
-    value[..extension_start]
-        .chars()
-        .any(|ch| !ch.is_whitespace() && !is_template_separator(ch))
-}
-
 fn render_pdf_filename(template: &str, context: &PdfNamingContext) -> String {
     let mut output = String::new();
     let mut cursor = 0;
-    let mut skip_leading_separator = false;
+    let mut referenced = 0;
+    let mut present = 0;
     while cursor < template.len() {
         let Some(open_offset) = template[cursor..].find('{') else {
-            let literal = &template[cursor..];
-            if skip_leading_separator {
-                let stripped = strip_leading_template_separator(literal);
-                output.push_str(&stripped);
-            } else {
-                output.push_str(literal);
-            }
+            output.push_str(&template[cursor..]);
             break;
         };
         let open = cursor + open_offset;
-        let literal = &template[cursor..open];
-        if skip_leading_separator {
-            output.push_str(&strip_leading_template_separator(literal));
-        } else {
-            output.push_str(literal);
-        }
+        output.push_str(&template[cursor..open]);
         let Some(close_offset) = template[open + 1..].find('}') else {
             output.push_str(&template[open..]);
             break;
         };
         let close = open + 1 + close_offset;
         let token = &template[open + 1..close];
-        if let Some(value) = template_token_value(token, context) {
-            if value.trim().is_empty() {
-                let had_content = !output.trim().is_empty();
-                trim_trailing_template_separator(&mut output);
-                // A missing first field must also remove the separator that
-                // follows it. For a missing middle field, retain the next
-                // separator so `Title - {journal} - 2025` becomes
-                // `Title - 2025`, not `Title2025`.
-                skip_leading_separator = !had_content;
-            } else {
-                output.push_str(value.trim());
-                skip_leading_separator = false;
-            }
-        } else {
-            // Unknown tokens are treated as empty fields so a future template
-            // token can never leak braces or an unsafe path component to disk.
-            let had_content = !output.trim().is_empty();
-            trim_trailing_template_separator(&mut output);
-            skip_leading_separator = !had_content;
-        }
+        referenced += 1;
+        let value = template_token_value(token, context).unwrap_or("").trim();
+        if !value.is_empty() { present += 1; }
+        output.push_str(if value.is_empty() { "none" } else { value });
         cursor = close + 1;
     }
-    trim_trailing_template_separator_before_extension(&mut output);
-    let output = output.trim().to_string();
-    output
+    if referenced > 0 && present == 0 { "none.pdf".to_string() } else { sanitize_filename(output.trim()) }
+}
+
+/// The Settings example uses the same renderer as every filesystem path.
+pub fn preview_pdf_filename(template: &str) -> String {
+    render_pdf_filename(template, &PdfNamingContext {
+        title: "Minds and machines".into(),
+        journal: "Research Policy".into(),
+        source: "Research Policy".into(),
+        year: "2026".into(),
+        authors: "Mattia Pedota, John Smith".into(),
+        first_author: "Mattia Pedota".into(),
+        doi: "10.1016/j.respol.2026.105600".into(),
+    })
 }
 
 fn truncate_utf8(value: &str, max_bytes: usize) -> String {
@@ -3437,16 +3371,6 @@ fn collision_filename(filename: &str, number: usize) -> String {
     format!("{}{}{}", truncate_utf8(stem, max_stem_bytes), suffix, extension)
 }
 
-fn staged_original_stem(source_path: &Path, source_sha256: &str, paper_id: i64) -> Option<String> {
-    let stem = source_path.file_stem()?.to_str()?;
-    let prefix = format!(".cowpaper-staging-{paper_id}-");
-    let body = stem.strip_prefix(&prefix)?;
-    let hash_prefix = source_sha256.chars().take(12).collect::<String>();
-    body.strip_suffix(&format!("-{hash_prefix}"))
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_string)
-}
-
 fn copy_file_verified(source: &Path, source_sha256: &str, directory: &Path, filename: &str) -> Result<PathBuf> {
     std::fs::create_dir_all(directory).map_err(|_| rusqlite::Error::InvalidQuery)?;
     for number in 1..=10_000_usize {
@@ -3503,15 +3427,7 @@ fn prepare_managed_pdf(
     let directory = managed_destination_directory(&root, &config.subfolder_rule, &context);
     std::fs::create_dir_all(&directory).map_err(|_| rusqlite::Error::InvalidQuery)?;
     let directory = std::fs::canonicalize(&directory).map_err(|_| rusqlite::Error::InvalidQuery)?;
-    let rendered = render_pdf_filename(&config.naming_template, &context);
-    let fallback = staged_original_stem(source_path, source_sha256, paper_id)
-        .or_else(|| source_path
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .filter(|value| !value.trim().is_empty())
-            .map(str::to_string))
-        .unwrap_or_else(|| format!("paper-{paper_id}"));
-    let filename = sanitize_filename(if rendered_filename_has_component(&rendered) { &rendered } else { &fallback });
+    let filename = render_pdf_filename(&config.naming_template, &context);
     let preferred = directory.join(&filename);
     let source_is_preferred = source_path == preferred.as_path()
         || std::fs::canonicalize(&preferred).ok().is_some_and(|path| path.as_path() == source_path);
@@ -4639,6 +4555,45 @@ fn canonical_path_is_inside(root: &Path, path: &Path) -> bool {
         .is_some_and(|canonical| canonical.starts_with(root))
 }
 
+fn attachment_has_current_name(conn: &Connection, attachment: &crate::models::PaperAttachment) -> Result<bool> {
+    if attachment.storage_mode != "managed" { return Ok(false); }
+    let config = pdf_storage_config(conn)?;
+    let root = PathBuf::from(config.library_root.trim());
+    let Ok(root) = std::fs::canonicalize(root) else { return Ok(false); };
+    let context = paper_naming_context(conn, attachment.paper_id)?;
+    let directory = managed_destination_directory(&root, &config.subfolder_rule, &context);
+    let path = Path::new(&attachment.absolute_path);
+    if path.parent() != Some(directory.as_path()) { return Ok(false); }
+    let desired = render_pdf_filename(&config.naming_template, &context);
+    if attachment.filename == desired { return Ok(true); }
+    // Keep an existing collision number stable on subsequent saves.
+    Ok((2..=10_000).any(|number| attachment.filename == collision_filename(&desired, number)))
+}
+
+fn sync_paper_pdf_filenames(conn: &Connection, paper_id: i64) {
+    let Ok(config) = pdf_storage_config(conn) else { return; };
+    if config.mode == "none" { return; }
+    let Ok(ids) = conn.prepare("SELECT id FROM paper_attachments WHERE paper_id=?1 AND kind='pdf' ORDER BY id")
+        .and_then(|mut stmt| stmt.query_map(params![paper_id], |row| row.get::<_, i64>(0))?.collect::<Result<Vec<_>>>()) else { return; };
+    for id in ids {
+        let Ok(Some(attachment)) = get_paper_attachment(conn, id) else { continue; };
+        if attachment_has_current_name(conn, &attachment).unwrap_or(false) { continue; }
+        let mode = if attachment.storage_mode == "managed" { "move" } else { &config.mode };
+        let _ = manage_existing_attachment(conn, id, mode);
+    }
+}
+
+/// Apply a committed naming-template change to the Library's linked PDFs.
+/// Individual filesystem failures leave their existing attachment path intact.
+pub fn sync_library_pdf_filenames(conn: &Connection) {
+    let Ok(ids) = library_pdf_attachment_ids(conn) else { return; };
+    for id in ids {
+        let Ok(Some(attachment)) = get_paper_attachment(conn, id) else { continue; };
+        if attachment_has_current_name(conn, &attachment).unwrap_or(false) { continue; }
+        sync_paper_pdf_filenames(conn, attachment.paper_id);
+    }
+}
+
 /// Explicitly organize every PDF currently attached to a Library Paper.
 ///
 /// This is intentionally separate from the single-attachment action and is
@@ -4678,12 +4633,14 @@ pub fn organize_library_pdfs(conn: &Connection) -> Result<crate::models::PdfOrga
             continue;
         };
         let already_managed = current.storage_mode == "managed"
-            && canonical_path_is_inside(&root, Path::new(&current.absolute_path));
+            && canonical_path_is_inside(&root, Path::new(&current.absolute_path))
+            && attachment_has_current_name(conn, &current).unwrap_or(false);
         if already_managed {
             skipped += 1;
             continue;
         }
-        match manage_existing_attachment(conn, attachment_id, &config.mode) {
+        let mode = if current.storage_mode == "managed" { "move" } else { &config.mode };
+        match manage_existing_attachment(conn, attachment_id, mode) {
             Ok(_) => organized += 1,
             Err(error) => failures.push(crate::models::PdfOrganizationFailure {
                 attachment_id,
