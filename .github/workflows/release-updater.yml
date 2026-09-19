@@ -69,7 +69,7 @@ jobs:
           hdiutil create -volname CowPaper -srcfolder "$staging" -ov -format UDZO "$bundle/dmg/CowPaper_${version}_aarch64.dmg"
           python3 - <<'PY'
           import hashlib, json, os, pathlib, shutil
-          version = json.loads(pathlib.Path('src-tauri/tauri.conf.json').read_text())['version']
+          version = json.loads(pathlib.Path('src-tauri/tauri.conf.json').read_text(encoding='utf-8'))['version']
           bundle = pathlib.Path('src-tauri/target/aarch64-apple-darwin/release/bundle')
           updaters = list(bundle.glob('macos/CowPaper*.app.tar.gz'))
           assert len(updaters) == 1, updaters
@@ -125,7 +125,7 @@ jobs:
           set -euo pipefail
           python - <<'PY'
           import hashlib, json, os, pathlib, shutil
-          version = json.loads(pathlib.Path('src-tauri/tauri.conf.json').read_text())['version']
+          version = json.loads(pathlib.Path('src-tauri/tauri.conf.json').read_text(encoding='utf-8'))['version']
           bundle = pathlib.Path('src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis')
           stem = f'CowPaper_{version}_x64-setup'
           sources = [bundle / (stem + ext) for ext in ('.exe', '.nsis.zip', '.nsis.zip.sig')]
@@ -180,8 +180,8 @@ jobs:
           python3 - <<'PY'
           import base64, hashlib, json, os, pathlib, re, shutil, subprocess, tempfile
           root = pathlib.Path.cwd()
-          config = json.loads((root / 'app/src-tauri/tauri.conf.json').read_text())
-          win_config = json.loads((root / 'app/src-tauri/tauri.windows.conf.json').read_text())
+          config = json.loads((root / 'app/src-tauri/tauri.conf.json').read_text(encoding='utf-8'))
+          win_config = json.loads((root / 'app/src-tauri/tauri.windows.conf.json').read_text(encoding='utf-8'))
           version, sha = config['version'], os.environ['GITHUB_SHA']
           tag = 'v' + version
           assert re.fullmatch(r'[0-9a-f]{40}', sha)
