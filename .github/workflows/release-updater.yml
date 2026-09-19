@@ -128,8 +128,8 @@ jobs:
           version = json.loads(pathlib.Path('src-tauri/tauri.conf.json').read_text(encoding='utf-8'))['version']
           bundle = pathlib.Path('src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis')
           stem = f'CowPaper_{version}_x64-setup'
-          sources = [bundle / (stem + ext) for ext in ('.exe', '.nsis.zip', '.nsis.zip.sig')]
-          assert len(list(bundle.glob('CowPaper*'))) == 3, 'Unexpected NSIS bundle files'
+          sources = [bundle / (stem + ext) for ext in ('.exe', '.exe.sig')]
+          assert {path.name for path in bundle.glob('CowPaper*')} == {path.name for path in sources}, 'Unexpected NSIS bundle files'
           out = pathlib.Path('../release-assets/windows')
           out.mkdir(parents=True, exist_ok=True)
           records = []
@@ -202,9 +202,10 @@ jobs:
               manifest = json.loads((source / 'manifest.json').read_text())
               assert (manifest['platform'], manifest['sha'], manifest['version']) == (platform, sha, version)
               records = manifest['files']
-              assert len(records) == 3
+              expected_count = 3 if folder == 'macos' else 2
+              assert len(records) == expected_count
               names = {item['name'] for item in records}
-              assert len(names) == 3 and {p.name for p in source.iterdir()} == names | {'manifest.json'}
+              assert len(names) == expected_count and {p.name for p in source.iterdir()} == names | {'manifest.json'}
               for item in records:
                   name = item['name']
                   assert name == pathlib.Path(name).name and name not in seen
@@ -218,8 +219,9 @@ jobs:
                   assert len(updater) == 1
                   assert names == {updater[0], updater[0] + '.sig', f'CowPaper_{version}_aarch64.dmg'}
               else:
-                  updater = [f'CowPaper_{version}_x64-setup.nsis.zip']
-                  assert names == {f'CowPaper_{version}_x64-setup.exe', updater[0], updater[0] + '.sig'}
+                  updater = [n for n in names if n == f'CowPaper_{version}_x64-setup.exe']
+                  assert len(updater) == 1
+                  assert names == {updater[0], updater[0] + '.sig'}
               selected[platform] = updater[0]
 
           public_key = base64.b64decode(config['plugins']['updater']['pubkey'], validate=True)
