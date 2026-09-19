@@ -8809,7 +8809,7 @@ fn rc6_fast_import_keeps_copy_on_staging_until_finalization() {
     assert!(path.is_file(), "staging copy must preserve the source");
     db::finalize_import_managed_filename(&conn, attachment_id).unwrap();
     let finalized = db::get_paper_attachment(&conn, attachment_id).unwrap().unwrap();
-    assert_eq!(finalized.filename, "Staged Local Title - none.pdf");
+    assert_eq!(finalized.filename, "Staged Local Title.pdf");
     assert!(std::path::Path::new(&finalized.absolute_path).is_file());
     assert!(!std::path::Path::new(&staged.absolute_path).exists());
     assert!(path.is_file());
