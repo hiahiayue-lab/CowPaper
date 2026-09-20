@@ -135,16 +135,11 @@ jobs:
           updater_cdhash="$(codesign -dvvv "$updater_extract/CowPaper.app" 2>&1 | awk -F= '/^CDHash=/{print $2}')"
           test "$updater_cdhash" = "$app_cdhash"
 
-          brew list --versions minisign >/dev/null 2>&1 || brew install minisign
-          python3 - "$RUNNER_TEMP/cowpaper-updater.pub" <<'PY'
-          import base64
-          import json
-          import pathlib
-          import sys
-          config = json.loads(pathlib.Path('src-tauri/tauri.conf.json').read_text(encoding='utf-8'))
-          pathlib.Path(sys.argv[1]).write_bytes(base64.b64decode(config['plugins']['updater']['pubkey']))
-          PY
-          minisign -Vm "$updater" -p "$RUNNER_TEMP/cowpaper-updater.pub" -x "$updater.sig"
+          rsign_root="$RUNNER_TEMP/rsign2"
+          cargo install rsign2 --version 0.6.6 --locked --root "$rsign_root"
+          updater_pubkey="$(node -p "require('./src-tauri/tauri.conf.json').plugins.updater.pubkey")"
+          "$rsign_root/bin/rsign" verify --allow-legacy "$updater" \
+            --public-key-string "$updater_pubkey" --sig-file "$updater.sig"
 
           staging="$(mktemp -d)"
           cp -R "$app" "$staging/CowPaper.app"
@@ -294,7 +289,10 @@ jobs:
           name: updater-windows-x64
           path: incoming/windows
       - name: Install signature verifier
-        run: sudo apt-get update && sudo apt-get install -y minisign
+        run: |
+          rsign_root="$RUNNER_TEMP/rsign2"
+          cargo install rsign2 --version 0.6.6 --locked --root "$rsign_root"
+          echo "RSIGN_BIN=$rsign_root/bin/rsign" >> "$GITHUB_ENV"
       - name: Validate both builds and generate latest.json
         env:
           REF_TYPE: ${{ github.ref_type }}
@@ -359,16 +357,17 @@ jobs:
                   assert names == {updater[0], updater[0] + '.sig'}
               selected[platform] = updater[0]
 
-          public_key = base64.b64decode(config['plugins']['updater']['pubkey'], validate=True)
+          public_key = config['plugins']['updater']['pubkey']
           with tempfile.TemporaryDirectory() as tmp:
-              key = pathlib.Path(tmp) / 'updater.pub'
-              key.write_bytes(public_key)
               for updater in selected.values():
                   signature = (assets / (updater + '.sig')).read_text().strip()
                   assert signature
                   sig = pathlib.Path(tmp) / 'updater.minisig'
                   sig.write_bytes(base64.b64decode(signature, validate=True))
-                  subprocess.run(['minisign', '-Vm', str(assets / updater), '-p', str(key), '-x', str(sig)], check=True)
+                  subprocess.run([
+                      os.environ['RSIGN_BIN'], 'verify', '--allow-legacy',
+                      str(assets / updater), '--public-key-string', public_key,
+                      '--sig-file', str(sig)], check=True)
 
           base_url = f'https://github.com/{os.environ["GITHUB_REPOSITORY"]}/releases/download/{tag}/'
           metadata = {'version': version, 'platforms': {
