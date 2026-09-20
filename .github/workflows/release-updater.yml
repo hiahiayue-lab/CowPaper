@@ -132,7 +132,7 @@ jobs:
           updater_extract="$(mktemp -d)"
           tar -xzf "$updater" -C "$updater_extract"
           codesign --verify --deep --strict --verbose=4 "$updater_extract/CowPaper.app"
-          updater_cdhash="$(codesign -dv "$updater_extract/CowPaper.app" 2>&1 | awk -F= '/^CDHash=/{print $2}')"
+          updater_cdhash="$(codesign -dvvv "$updater_extract/CowPaper.app" 2>&1 | awk -F= '/^CDHash=/{print $2}')"
           test "$updater_cdhash" = "$app_cdhash"
 
           brew list --versions minisign >/dev/null 2>&1 || brew install minisign
@@ -163,7 +163,7 @@ jobs:
           test "$(readlink "$mount_dir/Applications")" = "/Applications"
           test -f "$mount_dir/CowPaper.app/Contents/_CodeSignature/CodeResources"
           codesign --verify --deep --strict --verbose=4 "$mount_dir/CowPaper.app"
-          dmg_cdhash="$(codesign -dv "$mount_dir/CowPaper.app" 2>&1 | awk -F= '/^CDHash=/{print $2}')"
+          dmg_cdhash="$(codesign -dvvv "$mount_dir/CowPaper.app" 2>&1 | awk -F= '/^CDHash=/{print $2}')"
           test "$dmg_cdhash" = "$app_cdhash"
 
           set +e
