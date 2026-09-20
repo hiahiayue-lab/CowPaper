@@ -855,14 +855,14 @@ const LIBRARY_COLUMN_LABELS: Record<LibraryColumn, string> = { title: "标题", 
 function renderLibraryTableHeader(): void {
   const head = $("library-table-head");
   if (!head) return;
-  head.innerHTML = libraryVisibleColumns().map((column) => `<span class="library-column-header" data-column="${column}" data-column-drag="${column}" title="拖动以重排列"><span>${LIBRARY_COLUMN_LABELS[column]}</span><span class="column-resizer" data-column-resize="${column}" aria-hidden="true"></span></span>`).join("");
+  head.innerHTML = libraryVisibleColumns().map((column) => `<span class="library-column-header" data-column="${column}" title="调整列宽"><span>${LIBRARY_COLUMN_LABELS[column]}</span><span class="column-resizer" data-column-resize="${column}" aria-hidden="true"></span></span>`).join("");
 }
 
 function renderLibraryColumnMenu(): void {
   const menu = $("library-column-menu");
   if (!menu) return;
   const visibleCount = libraryVisibleColumns().length;
-  menu.innerHTML = `<div class="library-column-menu-title">显示列 · 拖动表头可重排</div>${libraryColumnOrder.map((column) => `<label class="library-column-option"><input type="checkbox" data-action="library-toggle-column" data-column="${column}" ${libraryHiddenColumns.has(column) ? "" : "checked"} ${column === "title" || (visibleCount === 1 && !libraryHiddenColumns.has(column)) ? "disabled" : ""}/> <span>${LIBRARY_COLUMN_LABELS[column]}</span></label>`).join("")}<button type="button" class="library-column-reset" data-action="library-reset-columns">恢复默认列</button>`;
+  menu.innerHTML = `<div class="library-column-menu-title">显示列 · 拖动右侧手柄重排</div>${libraryColumnOrder.map((column) => `<div class="library-column-option" data-column-drag="${column}"><label><input type="checkbox" data-action="library-toggle-column" data-column="${column}" ${libraryHiddenColumns.has(column) ? "" : "checked"} ${column === "title" || (visibleCount === 1 && !libraryHiddenColumns.has(column)) ? "disabled" : ""}/> <span>${LIBRARY_COLUMN_LABELS[column]}</span></label><span class="library-column-drag-handle" data-column-drag-handle="${column}" aria-hidden="true">≡</span></div>`).join("")}<button type="button" class="library-column-reset" data-action="library-reset-columns">恢复默认列</button>`;
 }
 
 function toggleLibraryColumnMenu(): void {
@@ -2699,6 +2699,7 @@ function renderLibraryNavigation() {
       if (renderedCollectionIds.has(collection.id)) return "";
       renderedCollectionIds.add(collection.id);
       const active = !hasLibrarySearchInput(librarySearchState.query)
+        && librarySelectedTagIds.length === 0
         && libraryScope?.kind === "collection" && libraryScope.id === collection.id;
       return `<div class="library-nav-item" data-library-context-kind="collection" data-library-context-id="${collection.id}" data-library-parent-id="${collection.parentId ?? ""}"><button class="library-nav-row${active ? " active" : ""}" style="padding-left:${12 + depth * 14}px" data-drop-kind="collection" data-action="library-filter-collection" data-collection-id="${collection.id}" data-library-context-kind="collection" data-library-context-id="${collection.id}" data-library-drag-kind="collection" data-library-parent-id="${collection.parentId ?? ""}" draggable="true"><span class="nav-symbol folder-symbol" aria-hidden="true"></span><span class="nav-label">${escapeHtml(collection.name)}</span><span class="nav-count">${collectionCount(collection.id)}</span></button>${depth < 1 ? `<button class="nav-child" title="在此文集下新建子文集" aria-label="在此文集下新建子文集" data-action="library-create-child" data-parent-id="${collection.id}">＋</button>` : ""}<button class="nav-manage" title="重命名文集" aria-label="重命名文集" data-action="library-rename-collection" data-collection-id="${collection.id}">✎</button><button class="nav-manage danger" title="删除文集" aria-label="删除文集" data-action="library-delete-collection" data-collection-id="${collection.id}">×</button></div>${children(collection.id, depth + 1)}`;
     }).join("");
@@ -2710,7 +2711,10 @@ function renderLibraryNavigation() {
   const tagRows = libraryTags.map((tag) => {
     const paperCount = tagCounts.get(tag.id) ?? 0;
     const dimmed = paperCount === 0 ? " dimmed" : "";
-    const active = !hasLibrarySearchInput(librarySearchState.query) && librarySelectedTagIds.includes(tag.id);
+    const active = !hasLibrarySearchInput(librarySearchState.query)
+      && libraryScope == null
+      && librarySelectedTagIds.length === 1
+      && librarySelectedTagIds[0] === tag.id;
     return `<div class="library-nav-item${dimmed}" data-library-context-kind="tag" data-library-context-id="${tag.id}"><button class="library-nav-row${active ? " active" : ""}" data-drop-kind="tag" data-action="library-filter-tag" data-tag-id="${tag.id}" aria-label="${escapeHtml(tag.name)}，${paperCount} 篇" data-library-context-kind="tag" data-library-context-id="${tag.id}" data-library-drag-kind="tag" draggable="true"><span class="tag-dot" style="background:${escapeHtml(tag.color || "#9ca3af")}"></span><span class="nav-label">${escapeHtml(tag.name)}</span><span class="nav-count">${paperCount}</span></button><button class="nav-manage" title="重命名 Library Tag" aria-label="重命名 Library Tag" data-action="library-rename-tag" data-tag-id="${tag.id}">✎</button><button class="nav-manage danger" title="删除 Library Tag" aria-label="删除 Library Tag" data-action="library-delete-tag" data-tag-id="${tag.id}">×</button></div>`;
   }).join("");
   $("library-tag-nav").innerHTML = libraryInlineCreateRow("tag", null) + (tagRows || '<span class="muted small nav-empty">暂无文献标签</span>');
@@ -3784,8 +3788,9 @@ class ColumnHeaderDrag {
       event.preventDefault();
       return;
     }
+    const handle = target.closest<HTMLElement>("[data-column-drag-handle]");
     const header = target.closest<HTMLElement>("[data-column-drag]");
-    if (!header || !LIBRARY_COLUMNS.includes(header.dataset.columnDrag as LibraryColumn)) {
+    if (!handle || !header || !LIBRARY_COLUMNS.includes(header.dataset.columnDrag as LibraryColumn)) {
       releaseLibraryDrag("column-header");
       return;
     }
@@ -5802,6 +5807,7 @@ async function setupListeners() {
       const id = parseInt(collectionFilter.dataset.collectionId!, 10);
       clearLibrarySelection();
       libraryScope = { kind: "collection", id };
+      librarySelectedTagIds = [];
       librarySearchState = { ...librarySearchState, activeSuggestionIndex: -1, requestVersion: librarySearchState.requestVersion + 1 };
       librarySearchResultIds = null;
       librarySearchMatches.clear();
@@ -5828,7 +5834,8 @@ async function setupListeners() {
       const id = Number(navigateTag.dataset.id);
       if (!Number.isInteger(id)) return;
       clearLibrarySelection();
-      librarySelectedTagIds = librarySelectedTagIds.includes(id) ? librarySelectedTagIds : [...librarySelectedTagIds, id];
+      libraryScope = null;
+      librarySelectedTagIds = librarySelectedTagIds.includes(id) ? [] : [id];
       librarySearchState = { ...librarySearchState, activeSuggestionIndex: -1, requestVersion: librarySearchState.requestVersion + 1 };
       librarySearchResultIds = null;
       librarySearchMatches.clear();
@@ -5882,9 +5889,8 @@ async function setupListeners() {
     if (tagFilter) {
       const id = parseInt(tagFilter.dataset.tagId!, 10);
       clearLibrarySelection();
-      librarySelectedTagIds = librarySelectedTagIds.includes(id)
-        ? librarySelectedTagIds.filter((tagId) => tagId !== id)
-        : [...librarySelectedTagIds, id];
+      libraryScope = null;
+      librarySelectedTagIds = librarySelectedTagIds.includes(id) ? [] : [id];
       librarySearchState = { ...librarySearchState, activeSuggestionIndex: -1, requestVersion: librarySearchState.requestVersion + 1 };
       librarySearchResultIds = null;
       librarySearchMatches.clear();

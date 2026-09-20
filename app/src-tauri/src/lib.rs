@@ -11,6 +11,7 @@ mod db;
 mod models;
 mod pdf_annotations;
 mod secure_store;
+mod scholarly_ids;
 mod sync;
 mod sync_coordinator;
 mod util;

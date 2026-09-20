@@ -8767,6 +8767,50 @@ fn rc6_pdf_recovery_rejects_garbage_titles_and_ambiguous_dois() {
 }
 
 #[test]
+fn rc7_working_paper_identifiers_are_exact_and_versionless() {
+    let arxiv = test_pdf_path(
+        "rc7-arxiv-id",
+        "%PDF-1.7\n1 0 obj << /Title (Working Paper) /arXiv (arXiv:2501.12345v2) /Author (A Researcher) /Year (2025) >>\n",
+    );
+    let recovered = db::recover_pdf_metadata(&arxiv, "2501.12345v1.pdf").unwrap();
+    assert_eq!(recovered.scholarly_id.as_deref(), Some("arxiv:2501.12345"));
+    std::fs::remove_file(arxiv).unwrap();
+
+    let ssrn = test_pdf_path(
+        "rc7-ssrn-id",
+        "%PDF-1.7\nSSRN-id 1234567\nTitle: Working Paper\n",
+    );
+    let recovered = db::recover_pdf_metadata(&ssrn, "working-paper.pdf").unwrap();
+    assert_eq!(recovered.scholarly_id.as_deref(), Some("ssrn:1234567"));
+    std::fs::remove_file(ssrn).unwrap();
+}
+
+#[test]
+fn rc7_recent_library_is_a_rolling_72_hour_added_at_window() {
+    let conn = mem_db();
+    let jid = db::insert_journal(&conn, "Recent Journal", None, None, None, None).unwrap();
+    let ids = [
+        ("10.1000/recent-older", "Older", "2026-09-17T11:59:59Z"),
+        ("10.1000/recent-boundary", "Boundary", "2026-09-17T12:00:00Z"),
+        ("10.1000/recent-newer", "Newer", "2026-09-20T11:00:00Z"),
+    ];
+    for (doi, title, added_at) in ids {
+        let paper_id = match db::upsert_paper(&conn, jid, &candidate(Some(doi), title, Some("abstract"), Some("crossref"))).unwrap() {
+            UpsertOutcome::New(id) => id,
+            _ => panic!("expected new paper"),
+        };
+        db::add_paper_to_library(&conn, paper_id, &[], &[], "manual").unwrap();
+        conn.execute("UPDATE library_items SET added_at=?1 WHERE paper_id=?2", params![added_at, paper_id]).unwrap();
+    }
+    let now = chrono::DateTime::parse_from_rfc3339("2026-09-20T12:00:00Z").unwrap().with_timezone(&chrono::Utc);
+    let recent = db::list_library_papers_scoped_at(&conn, "recent", None, &[], 100, now).unwrap();
+    assert_eq!(recent.len(), 2, "exactly the last 72 hours is recent");
+    assert_eq!(recent[0].paper.title.as_deref(), Some("Newer"));
+    assert_eq!(recent[1].paper.title.as_deref(), Some("Boundary"));
+    assert_eq!(db::library_sidebar_counts_at(&conn, now).unwrap().recent_count, 2);
+}
+
+#[test]
 fn rc6_exact_provider_metadata_is_available_before_managed_filename() {
     let conn = mem_db();
     let root = test_pdf_library("rc6-provider-filename");

@@ -3468,3 +3468,77 @@ body.library-workspace .attachment-copy strong {
 body.library-workspace .attachment-main {
   align-items: flex-start;
 }
+
+/* v0.4.1: column order belongs to the compact Display Columns menu.  The
+   table header remains a display/sort surface and no longer advertises a
+   drag gesture. */
+body.library-workspace .library-column-header {
+  touch-action: auto;
+  cursor: default;
+  user-select: text;
+}
+
+body.library-workspace .library-column-option {
+  justify-content: space-between;
+  cursor: default;
+}
+
+body.library-workspace .library-column-option > label {
+  display: flex;
+  min-width: 0;
+  flex: 1 1 auto;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+
+body.library-workspace .library-column-drag-handle {
+  flex: 0 0 auto;
+  padding: 2px 4px;
+  color: var(--ui-secondary);
+  cursor: grab;
+  user-select: none;
+  line-height: 1;
+}
+
+body.library-workspace .library-column-drag-handle:active {
+  cursor: grabbing;
+}
+
+/* A composite Search control owns its focus geometry.  Its inner input and
+   accessory button must not paint a second rectangle over the outer ring. */
+body.library-workspace .library-search-toolbar {
+  border-radius: var(--ui-radius-control);
+}
+
+body.library-workspace .library-search-toolbar:focus-within {
+  border-color: var(--ui-focus);
+  outline: 2px solid var(--ui-focus);
+  outline-offset: 0;
+  box-shadow: none;
+}
+
+body.library-workspace .library-search-toolbar input:focus,
+body.library-workspace .library-search-toolbar input:focus-visible,
+body.library-workspace .library-search-toolbar button:focus,
+body.library-workspace .library-search-toolbar button:focus-visible {
+  outline: none;
+  box-shadow: none;
+}
+
+/* Standalone controls use their own border radius for the same reason: the
+   emphasis ring hugs the actual control rather than an unrelated rectangle. */
+body.settings-workspace .settings input:focus,
+body.settings-workspace .settings input:focus-visible,
+body.settings-workspace .settings select:focus,
+body.settings-workspace .settings select:focus-visible,
+body.settings-workspace .settings textarea:focus,
+body.settings-workspace .settings textarea:focus-visible,
+.edit-field-grid input:focus,
+.edit-field-grid textarea:focus,
+.relation-search:focus {
+  border-radius: inherit;
+  outline: 2px solid var(--ui-focus);
+  outline-offset: 0;
+  box-shadow: none;
+}

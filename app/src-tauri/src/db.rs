@@ -5236,10 +5236,21 @@ pub fn recover_pdf_metadata(path: &Path, filename: &str) -> Result<crate::models
     let first_page_dois = doi_candidates(Some(&first_page));
     let bounded_dois = doi_candidates(Some(&bounded_text));
     let (doi, doi_source, doi_candidates) = resolve_pdf_doi(&metadata_dois, &first_page_dois, &bounded_dois);
-    let scholarly_id = pdf_info_value(&raw_text, "OpenAlex")
+    // Working-paper identifiers are exact identity evidence.  Prefer the
+    // explicit arXiv/SSRN marker found in the filename, Info/XMP, or bounded
+    // first-page text, and keep the versionless arXiv id so v1/v2 cannot make
+    // duplicate canonical Papers.  No title-based inference happens here.
+    let scholarly_evidence = format!("{filename}\n{raw_text}\n{xmp}\n{first_page}");
+    let working_paper_ids = crate::scholarly_ids::extract_ids(&scholarly_evidence);
+    let filename_arxiv = crate::scholarly_ids::normalize_arxiv_id(filename);
+    let scholarly_id = filename_arxiv
+        .or(working_paper_ids.arxiv)
+        .map(|id| format!("arxiv:{id}"))
+        .or_else(|| working_paper_ids.ssrn)
+        .or_else(|| pdf_info_value(&raw_text, "OpenAlex"))
         .or_else(|| pdf_info_value(&raw_text, "PMID"))
         .or_else(|| pdf_info_value(&raw_text, "PMCID"))
-        .or_else(|| pdf_info_value(&raw_text, "arXiv"))
+        .or_else(|| pdf_info_value(&raw_text, "arXiv").and_then(|value| crate::scholarly_ids::normalize_arxiv_id(&value).map(|id| format!("arxiv:{id}"))))
         .or_else(|| xml_metadata_value(&xmp, &["openalex", "pmid", "pmcid", "arXiv"]));
     let abstract_text = extract_structured_pdf_abstract(&first_page);
     let abstract_provenance = if abstract_text.is_some() { "pdf_structured" } else { "missing" }.to_string();
@@ -5565,6 +5576,18 @@ fn external_provider_candidates(doi: &str) -> Vec<(String, PaperCandidate)> {
     }
 }
 
+fn arxiv_provider_candidate(id: &str) -> Option<PaperCandidate> {
+    #[cfg(test)]
+    {
+        let _ = id;
+        None
+    }
+    #[cfg(not(test))]
+    {
+        crate::api::arxiv::Arxiv::new().work_by_id(id)
+    }
+}
+
 pub(crate) fn fill_missing_canonical_metadata_from_candidate(
     conn: &Connection,
     paper_id: i64,
@@ -5883,6 +5906,13 @@ pub fn run_pdf_enrichment<R: Runtime>(
         }
     };
     let doi = requested_doi.map(str::to_string).or(metadata.doi.clone());
+    let arxiv_provider = if doi.is_none() {
+        metadata.scholarly_id.as_deref()
+            .and_then(|value| value.strip_prefix("arxiv:"))
+            .and_then(arxiv_provider_candidate)
+    } else {
+        None
+    };
     emit("pdf://enrichment-started", serde_json::json!({"paperId": paper_id, "attachmentId": attachment_id, "hasDoi": doi.is_some()}));
     let providers = doi.as_deref().filter(|value| !value.trim().is_empty()).map(external_provider_candidates).unwrap_or_default();
     emit("pdf://enrichment-progress", serde_json::json!({"paperId": paper_id, "attachmentId": attachment_id, "stage": "providersFetched", "providerCount": providers.len()}));
@@ -5933,6 +5963,10 @@ pub fn run_pdf_enrichment<R: Runtime>(
             raw_json: None,
         };
         fill_missing_canonical_metadata_from_candidate(&conn, paper_id, &local_candidate)?;
+        if let Some(candidate) = arxiv_provider.as_ref() {
+            fill_missing_canonical_metadata_from_candidate(&conn, paper_id, candidate)?;
+            insert_source_record(&conn, paper_id, "arxiv", candidate.source_id.as_deref(), candidate.raw_json.as_deref())?;
+        }
         let mut enriched = 0;
         for (index, (source, candidate)) in providers.iter().enumerate() {
             let same_doi = candidate.normalized_doi.as_deref().and_then(crate::util::normalize_doi)
@@ -6478,6 +6512,20 @@ pub fn list_library_papers_scoped(
     tag_ids: &[i64],
     limit: i64,
 ) -> Result<Vec<crate::models::LibraryPaper>> {
+    list_library_papers_scoped_at(conn, view, collection_id, tag_ids, limit, chrono::Utc::now())
+}
+
+/// Testable implementation of Library views.  Recent is a rolling window,
+/// not a calendar or publication-date bucket: only canonical Library
+/// membership added in the last 72 hours is included.
+pub fn list_library_papers_scoped_at(
+    conn: &Connection,
+    view: &str,
+    collection_id: Option<i64>,
+    tag_ids: &[i64],
+    limit: i64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<crate::models::LibraryPaper>> {
     let order = match view {
         "recent" => "li.added_at DESC, p.id DESC",
         "all" | "unfiled" => "COALESCE(p.published_date, p.created_at) DESC, p.id DESC",
@@ -6520,6 +6568,11 @@ pub fn list_library_papers_scoped(
         args.push(rusqlite::types::Value::Integer(*tag_id));
         let n = args.len();
         sql.push_str(&format!(" AND EXISTS (SELECT 1 FROM library_item_tags lit WHERE lit.paper_id=p.id AND lit.tag_id=?{n})"));
+    }
+    if view == "recent" {
+        args.push(rusqlite::types::Value::Text((now - chrono::Duration::hours(72)).to_rfc3339()));
+        let n = args.len();
+        sql.push_str(&format!(" AND li.added_at >= ?{n}"));
     }
     let limit_placeholder = args.len() + 1;
     args.push(rusqlite::types::Value::Integer(limit));
@@ -6676,14 +6729,21 @@ pub fn set_library_collection_parent(conn: &Connection, id: i64, parent_id: Opti
 /// A parent collection includes all descendants, matching the table/search
 /// scope while DISTINCT keeps a paper with multiple memberships at one.
 pub fn library_sidebar_counts(conn: &Connection) -> Result<crate::models::LibrarySidebarCounts> {
+    library_sidebar_counts_at(conn, chrono::Utc::now())
+}
+
+pub fn library_sidebar_counts_at(
+    conn: &Connection,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<crate::models::LibrarySidebarCounts> {
     let all_count: i64 = conn.query_row(
         "SELECT COUNT(DISTINCT li.paper_id) FROM library_items li",
         [],
         |row| row.get(0),
     )?;
     let recent_count: i64 = conn.query_row(
-        "SELECT COUNT(DISTINCT li.paper_id) FROM library_items li",
-        [],
+        "SELECT COUNT(DISTINCT li.paper_id) FROM library_items li WHERE li.added_at >= ?1",
+        params![(now - chrono::Duration::hours(72)).to_rfc3339()],
         |row| row.get(0),
     )?;
     let uncategorized_count: i64 = conn.query_row(
@@ -9473,7 +9533,7 @@ fn migrate_to_v17(conn: &Connection) -> Result<()> {
     }
     conn.execute_batch("UPDATE papers SET abstract_provenance=CASE
         WHEN abstract IS NULL OR trim(abstract)='' THEN 'missing'
-        WHEN abstract_source IN ('crossref','openalex','provider') OR abstract_source LIKE 'publisher%' THEN 'provider'
+        WHEN abstract_source IN ('crossref','openalex','arxiv','provider') OR abstract_source LIKE 'publisher%' THEN 'provider'
         WHEN abstract_source='pdf_structured' THEN 'pdf_structured'
         ELSE 'legacy_unverified' END;
         UPDATE papers SET legacy_abstract_unverified=1 WHERE abstract_provenance='legacy_unverified';")?;
@@ -9861,7 +9921,7 @@ pub fn title_translation_source_is_current(
     Ok(current.as_deref() == Some(source.trim()))
 }
 
-fn is_provider_abstract_source(source: &str) -> bool { matches!(source, "crossref" | "openalex" | "provider") || source.starts_with("publisher") }
+fn is_provider_abstract_source(source: &str) -> bool { matches!(source, "crossref" | "openalex" | "arxiv" | "provider") || source.starts_with("publisher") }
 
 /// Translation is allowed only for a real English abstract. This is a
 /// conservative language gate; it is never used to create or overwrite a
