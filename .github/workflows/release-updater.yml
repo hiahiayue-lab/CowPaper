@@ -37,13 +37,52 @@ jobs:
         with:
           targets: aarch64-apple-darwin
       - run: npm ci
+      - name: Require Apple distribution credentials
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "Missing required Apple distribution secret: $name" >&2
+              exit 1
+            fi
+          done
+      - name: Import Developer ID certificate
+        uses: apple-actions/import-codesign-certs@v3
+        with:
+          p12-file-base64: ${{ secrets.APPLE_CERTIFICATE }}
+          p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      - name: Type check frontend
+        run: npx tsc --noEmit
+      - name: Build frontend
+        run: npx vite build
+      - name: Check Rust application
+        working-directory: app/src-tauri
+        run: cargo check --target aarch64-apple-darwin
+      - name: Test Rust application
+        working-directory: app/src-tauri
+        run: cargo test --target aarch64-apple-darwin
       - name: Build signed updater
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         run: npx tauri build --target aarch64-apple-darwin --bundles app
-      - name: Package DMG and collect assets
+      - name: Sign, notarize, staple, and verify macOS distribution
         shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
           version="$(node -p "require('./src-tauri/tauri.conf.json').version")"
@@ -51,22 +90,82 @@ jobs:
           app="$bundle/macos/CowPaper.app"
           test -d "$app"
           test "$(plutil -extract CFBundleShortVersionString raw "$app/Contents/Info.plist")" = "$version"
-          # Tauri's current macOS build is linker/adhoc-signed: it exposes an
-          # embedded CodeDirectory but no sealed resource envelope. The
-          # installed runner's codesign verifier rejects this valid output
-          # with "code has no resources", so inspect the signature metadata
-          # and validate the bundle resources explicitly instead.
-          signature_info="$(codesign -dvvv "$app/Contents/MacOS/app" 2>&1)"
-          [[ "$signature_info" == *CodeDirectory* ]]
-          [[ "$signature_info" == *"Signature="* ]]
+
+          # Sign nested code from the deepest path outward. PDFium is
+          # statically linked today, but this also covers future Frameworks,
+          # dylibs, XPC services, helper apps, and WebView-related code.
+          python3 - "$app" "$APPLE_SIGNING_IDENTITY" <<'PY'
+          import pathlib
+          import subprocess
+          import sys
+
+          app = pathlib.Path(sys.argv[1])
+          identity = sys.argv[2]
+          nested = []
+          for path in app.joinpath('Contents').rglob('*'):
+              if path.is_file() and (path.suffix in {'.dylib', '.so'} or path.name in {'app'}):
+                  nested.append(path)
+              elif path.is_dir() and path.suffix in {'.framework', '.app', '.xpc'}:
+                  nested.append(path)
+          for path in sorted(set(nested), key=lambda item: len(item.parts), reverse=True):
+              subprocess.run([
+                  'codesign', '--force', '--options', 'runtime', '--timestamp',
+                  '--sign', identity, str(path),
+              ], check=True)
+          subprocess.run([
+              'codesign', '--force', '--options', 'runtime', '--timestamp',
+              '--sign', identity, str(app),
+          ], check=True)
+          PY
+
+          signature_info="$(codesign -dvvv "$app" 2>&1)"
+          [[ "$signature_info" == *"Authority=Developer ID Application:"* ]]
+          [[ "$signature_info" == *"TeamIdentifier="* ]]
+          [[ "$signature_info" == *"flags="*runtime* ]]
           test -d "$app/Contents/Resources"
           file "$app/Contents/MacOS/app" | grep -q arm64
+          codesign --verify --deep --strict --verbose=4 "$app"
+
+          # Notarize the app bundle itself so both the standalone updater app
+          # and the DMG copy can carry a stapled ticket.
+          notary_zip="$RUNNER_TEMP/CowPaper_${version}_aarch64.app.zip"
+          ditto -c -k --keepParent "$app" "$notary_zip"
+          xcrun notarytool submit "$notary_zip" \
+            --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
+          xcrun stapler staple "$app"
+          xcrun stapler validate "$app"
+
+          # Rebuild and re-sign the updater archive after app stapling so the
+          # minisign signature covers exactly the distributed bytes.
+          updater="$bundle/macos/CowPaper.app.tar.gz"
+          rm -f "$updater" "$updater.sig"
+          tar -czf "$updater" -C "$bundle/macos" CowPaper.app
+          npx tauri signer sign "$updater"
+
           staging="$(mktemp -d)"
           trap 'rm -rf "$staging"' EXIT
           cp -R "$app" "$staging/CowPaper.app"
           ln -s /Applications "$staging/Applications"
           mkdir -p "$bundle/dmg"
-          hdiutil create -volname CowPaper -srcfolder "$staging" -ov -format UDZO "$bundle/dmg/CowPaper_${version}_aarch64.dmg"
+          dmg="$bundle/dmg/CowPaper_${version}_aarch64.dmg"
+          hdiutil create -volname CowPaper -srcfolder "$staging" -ov -format UDZO "$dmg"
+          xcrun notarytool submit "$dmg" \
+            --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
+          xcrun stapler staple "$dmg"
+          xcrun stapler validate "$dmg"
+
+          mount_dir="$RUNNER_TEMP/cowpaper-mounted"
+          mkdir -p "$mount_dir"
+          hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mount_dir"
+          cleanup_mount() { hdiutil detach "$mount_dir" -quiet || true; }
+          trap cleanup_mount EXIT
+          test -d "$mount_dir/CowPaper.app"
+          test -L "$mount_dir/Applications"
+          test "$(readlink "$mount_dir/Applications")" = "/Applications"
+          codesign --verify --deep --strict --verbose=4 "$mount_dir/CowPaper.app"
+          xcrun stapler validate "$mount_dir/CowPaper.app"
+          spctl -a -vvv -t exec "$mount_dir/CowPaper.app"
+
           python3 - <<'PY'
           import hashlib, json, os, pathlib, shutil
           version = json.loads(pathlib.Path('src-tauri/tauri.conf.json').read_text(encoding='utf-8'))['version']
@@ -87,7 +186,15 @@ jobs:
           assert len({item['name'] for item in records}) == 3
           (out / 'manifest.json').write_text(json.dumps({
               'platform': 'darwin-aarch64', 'sha': os.environ['GITHUB_SHA'],
-              'version': version, 'files': records}, indent=2))
+              'version': version, 'files': records,
+              'verification': {
+                  'developerIdSigned': True,
+                  'hardenedRuntime': True,
+                  'notarization': 'PASS',
+                  'staple': 'PASS',
+                  'codesignStrict': 'PASS',
+                  'gatekeeperSpctl': 'ACCEPTED',
+              }}, indent=2))
           PY
       - uses: actions/upload-artifact@v4
         with:
@@ -215,6 +322,14 @@ jobs:
                   shutil.copyfile(path, assets / name)
                   seen.add(name)
               if folder == 'macos':
+                  assert manifest.get('verification') == {
+                      'developerIdSigned': True,
+                      'hardenedRuntime': True,
+                      'notarization': 'PASS',
+                      'staple': 'PASS',
+                      'codesignStrict': 'PASS',
+                      'gatekeeperSpctl': 'ACCEPTED',
+                  }
                   updater = [n for n in names if n.startswith('CowPaper') and n.endswith('.app.tar.gz')]
                   assert len(updater) == 1
                   assert names == {updater[0], updater[0] + '.sig', f'CowPaper_{version}_aarch64.dmg'}
