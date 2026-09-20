@@ -33,6 +33,14 @@ import {
   type SearchPaper,
 } from "./librarySearch";
 import {
+  emptyLibrarySidebarBrowseSelection,
+  isLibrarySidebarCollectionActive,
+  isLibrarySidebarTagActive,
+  selectLibrarySidebarCollection,
+  selectLibrarySidebarTag,
+  type LibrarySidebarBrowseSelection,
+} from "./librarySidebar";
+import {
   INSPECTOR_TABS,
   annotationFilterOptions,
   filterLibraryAnnotations,
@@ -569,6 +577,7 @@ let selectedLibraryPaperIds: number[] = [];
 let librarySelectionAnchorId: number | null = null;
 let libraryScope: { kind: "collection"; id: number } | null = null;
 let librarySelectedTagIds: number[] = [];
+let librarySidebarBrowseSelection: LibrarySidebarBrowseSelection = emptyLibrarySidebarBrowseSelection();
 let librarySearchState: LibrarySearchState = createLibrarySearchState();
 let librarySearchResultIds: Set<number> | null = null;
 let librarySearchMatches = new Map<number, LibrarySearchHit>();
@@ -680,6 +689,7 @@ function clearLibraryScope(): void {
   clearLibrarySelection();
   libraryScope = null;
   librarySelectedTagIds = [];
+  librarySidebarBrowseSelection = emptyLibrarySidebarBrowseSelection();
   librarySearchState = {
     ...librarySearchState,
     activeSuggestionIndex: -1,
@@ -708,8 +718,18 @@ function removeLibrarySearchScopeToken(kind: "collection" | "tag", id: number): 
     activeSuggestionIndex: -1,
     requestVersion: librarySearchState.requestVersion + 1,
   };
-  if (kind === "collection" && libraryScope?.id === id) libraryScope = null;
-  if (kind === "tag") librarySelectedTagIds = librarySelectedTagIds.filter((value) => value !== id);
+  if (kind === "collection" && libraryScope?.id === id) {
+    libraryScope = null;
+    if (librarySidebarBrowseSelection.kind === "collection" && librarySidebarBrowseSelection.id === id) {
+      librarySidebarBrowseSelection = emptyLibrarySidebarBrowseSelection();
+    }
+  }
+  if (kind === "tag") {
+    librarySelectedTagIds = librarySelectedTagIds.filter((value) => value !== id);
+    if (librarySidebarBrowseSelection.kind === "tag" && librarySidebarBrowseSelection.id === id) {
+      librarySidebarBrowseSelection = emptyLibrarySidebarBrowseSelection();
+    }
+  }
   librarySearchResultIds = null;
   librarySearchMatches.clear();
 }
@@ -2681,7 +2701,7 @@ function renderLibraryNavigation() {
   });
   document.querySelectorAll(".library-nav-item-view").forEach((item) => {
     const view = (item as HTMLElement).dataset.view;
-    const active = !libraryScope && librarySelectedTagIds.length === 0 && ((libraryView === "all" && view === "library-all") || (libraryView === "recent" && view === "library-recent") || (libraryView === "unfiled" && view === "library-unfiled"));
+    const active = librarySidebarBrowseSelection.kind === "none" && ((libraryView === "all" && view === "library-all") || (libraryView === "recent" && view === "library-recent") || (libraryView === "unfiled" && view === "library-unfiled"));
     item.classList.toggle("active", active);
   });
   const collections = $("library-collection-nav");
@@ -2698,9 +2718,7 @@ function renderLibraryNavigation() {
       // malformed data renderable and bounded.
       if (renderedCollectionIds.has(collection.id)) return "";
       renderedCollectionIds.add(collection.id);
-      const active = !hasLibrarySearchInput(librarySearchState.query)
-        && librarySelectedTagIds.length === 0
-        && libraryScope?.kind === "collection" && libraryScope.id === collection.id;
+      const active = isLibrarySidebarCollectionActive(librarySidebarBrowseSelection, collection.id);
       return `<div class="library-nav-item" data-library-context-kind="collection" data-library-context-id="${collection.id}" data-library-parent-id="${collection.parentId ?? ""}"><button class="library-nav-row${active ? " active" : ""}" style="padding-left:${12 + depth * 14}px" data-drop-kind="collection" data-action="library-filter-collection" data-collection-id="${collection.id}" data-library-context-kind="collection" data-library-context-id="${collection.id}" data-library-drag-kind="collection" data-library-parent-id="${collection.parentId ?? ""}" draggable="true"><span class="nav-symbol folder-symbol" aria-hidden="true"></span><span class="nav-label">${escapeHtml(collection.name)}</span><span class="nav-count">${collectionCount(collection.id)}</span></button>${depth < 1 ? `<button class="nav-child" title="在此文集下新建子文集" aria-label="在此文集下新建子文集" data-action="library-create-child" data-parent-id="${collection.id}">＋</button>` : ""}<button class="nav-manage" title="重命名文集" aria-label="重命名文集" data-action="library-rename-collection" data-collection-id="${collection.id}">✎</button><button class="nav-manage danger" title="删除文集" aria-label="删除文集" data-action="library-delete-collection" data-collection-id="${collection.id}">×</button></div>${children(collection.id, depth + 1)}`;
     }).join("");
   };
@@ -2711,10 +2729,7 @@ function renderLibraryNavigation() {
   const tagRows = libraryTags.map((tag) => {
     const paperCount = tagCounts.get(tag.id) ?? 0;
     const dimmed = paperCount === 0 ? " dimmed" : "";
-    const active = !hasLibrarySearchInput(librarySearchState.query)
-      && libraryScope == null
-      && librarySelectedTagIds.length === 1
-      && librarySelectedTagIds[0] === tag.id;
+    const active = isLibrarySidebarTagActive(librarySidebarBrowseSelection, tag.id);
     return `<div class="library-nav-item${dimmed}" data-library-context-kind="tag" data-library-context-id="${tag.id}"><button class="library-nav-row${active ? " active" : ""}" data-drop-kind="tag" data-action="library-filter-tag" data-tag-id="${tag.id}" aria-label="${escapeHtml(tag.name)}，${paperCount} 篇" data-library-context-kind="tag" data-library-context-id="${tag.id}" data-library-drag-kind="tag" draggable="true"><span class="tag-dot" style="background:${escapeHtml(tag.color || "#9ca3af")}"></span><span class="nav-label">${escapeHtml(tag.name)}</span><span class="nav-count">${paperCount}</span></button><button class="nav-manage" title="重命名 Library Tag" aria-label="重命名 Library Tag" data-action="library-rename-tag" data-tag-id="${tag.id}">✎</button><button class="nav-manage danger" title="删除 Library Tag" aria-label="删除 Library Tag" data-action="library-delete-tag" data-tag-id="${tag.id}">×</button></div>`;
   }).join("");
   $("library-tag-nav").innerHTML = libraryInlineCreateRow("tag", null) + (tagRows || '<span class="muted small nav-empty">暂无文献标签</span>');
@@ -5808,6 +5823,7 @@ async function setupListeners() {
       clearLibrarySelection();
       libraryScope = { kind: "collection", id };
       librarySelectedTagIds = [];
+      librarySidebarBrowseSelection = selectLibrarySidebarCollection(id);
       librarySearchState = { ...librarySearchState, activeSuggestionIndex: -1, requestVersion: librarySearchState.requestVersion + 1 };
       librarySearchResultIds = null;
       librarySearchMatches.clear();
@@ -5822,6 +5838,7 @@ async function setupListeners() {
       clearLibrarySelection();
       libraryScope = { kind: "collection", id };
       librarySelectedTagIds = [];
+      librarySidebarBrowseSelection = selectLibrarySidebarCollection(id);
       librarySearchState = { ...librarySearchState, activeSuggestionIndex: -1, requestVersion: librarySearchState.requestVersion + 1 };
       librarySearchResultIds = null;
       librarySearchMatches.clear();
@@ -5836,6 +5853,7 @@ async function setupListeners() {
       clearLibrarySelection();
       libraryScope = null;
       librarySelectedTagIds = librarySelectedTagIds.includes(id) ? [] : [id];
+      librarySidebarBrowseSelection = selectLibrarySidebarTag(librarySidebarBrowseSelection, id);
       librarySearchState = { ...librarySearchState, activeSuggestionIndex: -1, requestVersion: librarySearchState.requestVersion + 1 };
       librarySearchResultIds = null;
       librarySearchMatches.clear();
@@ -5891,6 +5909,7 @@ async function setupListeners() {
       clearLibrarySelection();
       libraryScope = null;
       librarySelectedTagIds = librarySelectedTagIds.includes(id) ? [] : [id];
+      librarySidebarBrowseSelection = selectLibrarySidebarTag(librarySidebarBrowseSelection, id);
       librarySearchState = { ...librarySearchState, activeSuggestionIndex: -1, requestVersion: librarySearchState.requestVersion + 1 };
       librarySearchResultIds = null;
       librarySearchMatches.clear();
