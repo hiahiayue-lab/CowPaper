@@ -55,6 +55,11 @@ import {
   type InspectorActionFeedback,
 } from "./titleTranslation";
 import { reduceLibrarySelection, resolveLibraryPaperDragIds } from "./librarySelection";
+import {
+  journalCatalogCanFilterUnsubscribed,
+  journalCatalogEmptyState,
+  journalCatalogViewForSelection,
+} from "./journalCatalog";
 
 interface Journal {
   id: number;
@@ -1284,6 +1289,7 @@ async function renderCatalogCollections() {
     box.innerHTML = '<div class="empty">期刊集合加载失败</div>';
     return;
   }
+  const subscribedView = journalCatalogViewForSelection(selectedCatalogCode) === "subscribed";
   const seg = catalogCollections
     .map(
       (c) => `
@@ -1295,13 +1301,14 @@ async function renderCatalogCollections() {
   const sel = catalogCollections.find((c) => c.code === selectedCatalogCode);
   box.innerHTML = `
     <div class="catalog-seg-row">
+      <button class="catalog-seg ${subscribedView ? "selected" : ""}" data-action="catalog-subscriptions">已订阅</button>
       ${seg}
       <button class="ghost small" data-action="create-collection">+ 新建集合</button>
     </div>
     <div class="catalog-seg-meta muted small">${
       sel
         ? `${escapeHtml(sel.name)}${sel.version && sel.version !== "current" ? " · " + escapeHtml(sel.version) : ""}${sel.effectiveFrom ? " · 更新 " + escapeHtml(sel.effectiveFrom) : ""} · ${escapeHtml(sel.sourceName || "")}`
-        : "选择一个期刊集合查看期刊"
+        : "已订阅期刊"
     }</div>
     ${
       sel && !isBuiltinCollection(sel.code)
@@ -1312,17 +1319,27 @@ async function renderCatalogCollections() {
           </div>`
         : ""
     }`;
+  if (subscribedView) {
+    catalogDetail = journals;
+    $("catalog-detail").classList.remove("hidden");
+    renderCatalogRows();
+  }
 }
 
 /// 渲染选中集合的期刊列表（受搜索框 / 仅显示未订阅过滤；不重新 invoke）。
 function renderCatalogRows() {
   const box = $("catalog-detail");
-  if (!selectedCatalogCode) return;
+  const subscribedView = journalCatalogViewForSelection(selectedCatalogCode) === "subscribed";
   const q = ($("catalog-search") as HTMLInputElement).value.trim().toLowerCase();
-  const unsubOnly = ($("catalog-unsub-only") as HTMLInputElement).checked;
+  const unsubFilter = $("catalog-unsub-only") as HTMLInputElement;
+  const canFilterUnsubscribed = journalCatalogCanFilterUnsubscribed(journalCatalogViewForSelection(selectedCatalogCode));
+  const unsubOnly = canFilterUnsubscribed && unsubFilter.checked;
+  unsubFilter.disabled = !canFilterUnsubscribed;
+  if (!canFilterUnsubscribed) unsubFilter.checked = false;
   const isUser = selectedCatalogCode != null && !isBuiltinCollection(selectedCatalogCode);
   const coll = catalogCollections.find((c) => c.code === selectedCatalogCode);
-  const filtered = catalogDetail.filter((j) => {
+  const source = subscribedView ? journals.filter((journal) => journal.enabled) : catalogDetail;
+  const filtered = source.filter((j) => {
     if (unsubOnly && j.enabled) return false;
     if (q) {
       const print = j.identifiers.find((i) => i.identifierType === "print")?.value ?? j.printIssn ?? "";
@@ -1335,7 +1352,7 @@ function renderCatalogRows() {
   const rows = filtered
     .map((j) => {
       const subscribed = j.enabled;
-      const disabled = subscribed;
+      const disabled = subscribedView || subscribed;
       const checked = subscribed ? "checked disabled" : "";
       const badge = j.collections.map((c) => `<span class="coll-badge">${escapeHtml(c)}</span>`).join("");
       const review = j.metadataNeedsReview ? '<span class="muted small">需复核</span>' : "";
@@ -1358,15 +1375,19 @@ function renderCatalogRows() {
         </li>`;
     })
     .join("");
-  box.innerHTML = `
-    <div class="catalog-tools">
-      <button class="ghost small" data-action="catalog-select-unsub">全选未订阅</button>
-    </div>
-    <ul class="list">${rows || (filtered.length === 0 && (q || unsubOnly) ? '<li class="empty">没有符合条件的期刊</li>' : '<li class="empty">无期刊</li>')}</ul>
-    <div class="catalog-actions"><span id="catalog-selected" class="muted small">已选择 0 本</span>
+  const catalogTools = subscribedView
+    ? '<span class="muted small">当前显示全部已订阅期刊</span>'
+    : '<button class="ghost small" data-action="catalog-select-unsub">全选未订阅</button>';
+  const catalogActions = subscribedView
+    ? ""
+    : `<div class="catalog-actions"><span id="catalog-selected" class="muted small">已选择 0 本</span>
       <button class="ghost small" data-action="catalog-clear">清除</button>
-      <button id="catalog-subscribe" class="primary" data-action="catalog-subscribe">订阅 0 本</button>
-    </div>`;
+      <button id="catalog-subscribe" class="primary" data-action="catalog-subscribe">订阅 0 本</button></div>`;
+  box.innerHTML = `
+    <div class="catalog-detail-head"><span class="title">${subscribedView ? "已订阅期刊" : escapeHtml(coll?.name || "期刊集合")}</span></div>
+    <div class="catalog-tools${subscribedView ? " subscribed-catalog-tools" : ""}">${catalogTools}</div>
+    <ul class="list">${rows || `<li class="empty">${escapeHtml(journalCatalogEmptyState(journalCatalogViewForSelection(selectedCatalogCode), source.length))}</li>`}</ul>
+    ${catalogActions}`;
   updateCatalogSelected();
 }
 
@@ -1386,11 +1407,24 @@ async function renderCatalogDetail(code: string) {
   renderCatalogRows();
 }
 
+function showSubscribedJournals(): void {
+  selectedCatalogCode = null;
+  catalogDetail = journals;
+  catalogChecked.clear();
+  closeAddMemberPanel();
+  $("catalog-detail").classList.remove("hidden");
+  void renderCatalogCollections();
+}
+
 function updateCatalogSelected() {
   const n = catalogChecked.size;
-  $("catalog-selected").textContent = `已选择 ${n} 本`;
-  ($("catalog-subscribe") as HTMLButtonElement).textContent = `订阅 ${n} 本`;
-  ($("catalog-subscribe") as HTMLButtonElement).disabled = n === 0;
+  const selected = document.getElementById("catalog-selected");
+  const subscribe = document.getElementById("catalog-subscribe") as HTMLButtonElement | null;
+  if (selected) selected.textContent = `已选择 ${n} 本`;
+  if (subscribe) {
+    subscribe.textContent = `订阅 ${n} 本`;
+    subscribe.disabled = n === 0;
+  }
 }
 
 /// 批量添加（只做订阅记录，不同步）；结果摘要 + 询问是否同步。
@@ -4665,7 +4699,12 @@ function doSwitch(name: string, options: { preserveLibraryState?: boolean; refre
   // 进入活动页时渲染 master-detail（数据来自统一 activity + 批次查询）
   if (name === "activity") renderActivityCenter().catch(() => {});
   // 进入期刊订阅页：保持当前 tab（互斥渲染）
-  if (name === "journals") setJournalTab(journalTab);
+  if (name === "journals") {
+    // Re-entry is intentionally predictable: collection selection is a browse
+    // choice, while the journal page itself starts at the user's subscriptions.
+    showSubscribedJournals();
+    setJournalTab(journalTab);
+  }
   // 进入历史推荐页时渲染快照
   if (name === "recommend-history") {
     historyCycleKey = null;
@@ -6325,6 +6364,10 @@ async function setupListeners() {
       await doCatalogSubscribe();
       return;
     }
+    if (t.closest("[data-action='catalog-subscriptions']")) {
+      showSubscribedJournals();
+      return;
+    }
     if (t.closest("[data-action='create-collection']")) {
       const name = await showPromptModal("新建期刊集合", "集合名称，如 数字平台");
       if (!name) return;
@@ -6577,7 +6620,10 @@ window.addEventListener("DOMContentLoaded", () => {
       renderCatalogRows();
     }
   });
-  $("tab-common").addEventListener("click", () => setJournalTab("catalog"));
+  $("tab-common").addEventListener("click", () => {
+    showSubscribedJournals();
+    setJournalTab("catalog");
+  });
   $("tab-manual").addEventListener("click", () => setJournalTab("manual"));
 
   // Key 保存在本地 secret 文件，不回填到输入框（输入框仅用于「替换 Key」时输入）

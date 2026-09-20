@@ -3435,3 +3435,36 @@ body.settings-workspace #view-settings > .settings {
   cursor: not-allowed;
   opacity: .48;
 }
+
+/* Post-v0.4.1: Collection and Library Tag navigation is a high-frequency
+   control. State changes must be immediate, including descendant labels and
+   counts; drag feedback remains owned by its existing drop-target rules. */
+body.library-workspace .workspace-nav .library-nav-item,
+body.library-workspace .workspace-nav .library-nav-row,
+body.library-workspace .workspace-nav .library-nav-row *,
+body.library-workspace .workspace-nav .library-nav-item .nav-manage,
+body.library-workspace .workspace-nav .library-nav-item .nav-child {
+  animation: none !important;
+  transition: none !important;
+}
+
+/* PDF attachment names are content, not a one-line navigation label. Keep
+   the icon and action row stable while allowing ordinary long filenames to
+   wrap naturally instead of hiding the ending behind an ellipsis. */
+body.library-workspace .library-attachment-child {
+  align-items: flex-start;
+}
+
+body.library-workspace .attachment-child-name,
+body.library-workspace .attachment-copy strong {
+  overflow: visible;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  text-overflow: clip;
+  white-space: normal;
+  line-height: 15px;
+}
+
+body.library-workspace .attachment-main {
+  align-items: flex-start;
+}
