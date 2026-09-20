@@ -29,7 +29,10 @@ SemVer. For the current targets:
 
 - macOS arm64: signed `CowPaper.app.tar.gz` and its `.sig`. The app bundle is
   distributed/installed as the update payload; the DMG remains the user-facing
-  installer.
+  installer. The app bundle is fully resource-sealed with a zero-cost ad-hoc
+  Apple signature before either artifact is created. This fixes bundle
+  integrity; it is not Developer ID signing, notarization, or a Gatekeeper
+  trust grant.
 - Windows x64: signed NSIS updater artifact (`.nsis.zip` and `.sig`) or the
   corresponding signed MSI updater artifact. The normal `.exe`/`.msi` is the
   installable bundle; the updater uses the generated signed payload.
@@ -45,12 +48,12 @@ rotating the private key without a migration plan prevents existing installs
 from accepting future updates.
 
 The existing beta workflows deliberately override
-`createUpdaterArtifacts` to `false`, because beta builds are currently
-unsigned. `release-updater.yml` enables the base setting, builds both
-platforms from the same tag SHA in sequence, signs both artifacts, and lets
-the official action generate/upload `latest.json`. It does not run until a
-future `v*` tag is pushed. This branch does not alter the v0.1.2 or v0.1.3
-tag/release.
+`createUpdaterArtifacts` to `false`. `release-updater.yml` enables the base
+setting, builds both platforms from the same tag SHA in sequence, resource-
+seals the macOS app with an ad-hoc signature, rebuilds the updater archive
+from that exact app, signs the updater bytes with Tauri's minisign key, and
+creates the DMG last. It does not run until a future `v*` tag is pushed. This
+branch does not alter historical tags/releases.
 
 ## User data locations and invariant
 
