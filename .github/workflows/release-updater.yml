@@ -281,7 +281,7 @@ jobs:
         env:
           REF_TYPE: ${{ github.ref_type }}
           REF_NAME: ${{ github.ref_name }}
-          PUBLISH: ${{ github.event_name == 'push' || inputs.publish == true }}
+          PUBLISH: ${{ inputs.publish == true }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -368,7 +368,7 @@ jobs:
           print(f'Validated both platforms for {tag} at {sha}; publish={os.environ["PUBLISH"]}')
           PY
       - name: Save dry-run assets
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish == false }}
+        if: ${{ inputs.publish != true }}
         uses: actions/upload-artifact@v4
         with:
           name: updater-release-dry-run
@@ -376,7 +376,7 @@ jobs:
           if-no-files-found: error
           retention-days: 7
       - name: Create one draft and upload all assets
-        if: ${{ github.event_name == 'push' || inputs.publish == true }}
+        if: ${{ inputs.publish == true }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -388,7 +388,7 @@ jobs:
           gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft --title "CowPaper $RELEASE_TAG" --notes-file docs/release-notes-v0.4.2.md
           gh release upload "$RELEASE_TAG" release-assets/* --repo "$GITHUB_REPOSITORY"
       - name: Verify uploaded bytes and publish
-        if: ${{ github.event_name == 'push' || inputs.publish == true }}
+        if: ${{ inputs.publish == true }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
