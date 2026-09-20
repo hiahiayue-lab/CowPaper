@@ -385,7 +385,7 @@ jobs:
             echo "Release $RELEASE_TAG already exists; refusing to alter it." >&2
             exit 1
           fi
-          gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft --title "CowPaper $RELEASE_TAG" --notes-file docs/release-notes-v0.4.1.md
+          gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft --title "CowPaper $RELEASE_TAG" --notes-file docs/release-notes-v0.4.2.md
           gh release upload "$RELEASE_TAG" release-assets/* --repo "$GITHUB_REPOSITORY"
       - name: Verify uploaded bytes and publish
         if: ${{ github.event_name == 'push' || inputs.publish == true }}

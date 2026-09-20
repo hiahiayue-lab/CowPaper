@@ -637,7 +637,7 @@ let librarySuppressNextClick = false;
 const expandedLibraryAttachmentPaperIds = new Set<number>();
 let libraryToastTimer = 0;
 let preferredPdfReader = "system";
-let currentAppVersion = "0.4.1";
+let currentAppVersion = "0.4.2";
 let pendingUpdate: Update | null = null;
 let updateBusy = false;
 

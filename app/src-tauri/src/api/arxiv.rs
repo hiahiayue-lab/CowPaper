@@ -16,7 +16,7 @@ impl Arxiv {
     pub fn new() -> Self {
         Self {
             client: Client::builder()
-                .user_agent("CowPaper/0.4.1")
+                .user_agent("CowPaper/0.4.2")
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .timeout(std::time::Duration::from_secs(20))
                 .build()
