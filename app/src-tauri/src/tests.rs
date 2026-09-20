@@ -9397,6 +9397,88 @@ fn rc5_fast_first_queues_provisional_shell_without_doi() {
     let _ = std::fs::remove_file(path);
 }
 
+fn run_pdf_enrichment_fixture(body: &str) -> (Connection, i64, i64, std::path::PathBuf) {
+    let conn = mem_db();
+    let path = test_pdf_path("rc7-enrichment", body);
+    let result = db::import_external_pdf_fast(&conn, path.to_str().unwrap(), None).unwrap();
+    assert_eq!(result.outcome, "createdExternalPaper");
+    assert_eq!(result.enrichment_status, "queued");
+    let paper_id = result.paper_id.unwrap();
+    let attachment_id = result.attachment.unwrap().id;
+    let db = Arc::new(std::sync::Mutex::new(conn));
+    let app = tauri::test::mock_app();
+    db::run_pdf_enrichment(&db, &app.handle().clone(), paper_id, attachment_id, result.metadata.doi.as_deref());
+    let conn = Arc::try_unwrap(db).unwrap().into_inner().unwrap();
+    (conn, paper_id, attachment_id, path)
+}
+
+#[test]
+fn rc7_pdf_enrichment_accepts_null_normalized_doi() {
+    let (conn, paper_id, attachment_id, path) = run_pdf_enrichment_fixture(
+        "%PDF-1.7\n/Title (A working paper without a DOI)\n",
+    );
+    let status: String = conn.query_row(
+        "SELECT status FROM pdf_enrichment_jobs WHERE attachment_id=?1",
+        params![attachment_id],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(status, "completed");
+    let doi: Option<String> = conn.query_row(
+        "SELECT normalized_doi FROM papers WHERE id=?1",
+        params![paper_id],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(doi, None);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn rc7_arxiv_only_without_doi_enriches_successfully() {
+    let (conn, paper_id, attachment_id, path) = run_pdf_enrichment_fixture(
+        "%PDF-1.7\n/arXiv (arXiv:2501.12345v2)\n/Title (An arXiv working paper)\n/Author (A Researcher)\n/Year (2025)\n",
+    );
+    let (status, doi, scholarly_id): (String, Option<String>, Option<String>) = conn.query_row(
+        "SELECT j.status,p.normalized_doi,p.publisher_article_id FROM pdf_enrichment_jobs j JOIN papers p ON p.id=?1 WHERE j.attachment_id=?2",
+        params![paper_id, attachment_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).unwrap();
+    assert_eq!(status, "completed");
+    assert_eq!(doi, None);
+    assert_eq!(scholarly_id.as_deref(), Some("arxiv:2501.12345"));
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn rc7_ssrn_without_doi_keeps_exact_scholarly_identity() {
+    let (conn, paper_id, attachment_id, path) = run_pdf_enrichment_fixture(
+        "%PDF-1.7\nSSRN-id 1234567\nTitle: SSRN working paper\n",
+    );
+    let (status, doi, scholarly_id): (String, Option<String>, Option<String>) = conn.query_row(
+        "SELECT j.status,p.normalized_doi,p.publisher_article_id FROM pdf_enrichment_jobs j JOIN papers p ON p.id=?1 WHERE j.attachment_id=?2",
+        params![paper_id, attachment_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).unwrap();
+    assert_eq!(status, "completed");
+    assert_eq!(doi, None);
+    assert_eq!(scholarly_id.as_deref(), Some("ssrn:1234567"));
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn rc7_pdf_enrichment_existing_doi_path_still_completes() {
+    let (conn, paper_id, attachment_id, path) = run_pdf_enrichment_fixture(
+        "%PDF-1.7\nDOI: 10.5555/enrichment-regression\n/Title (A DOI paper)\n",
+    );
+    let (status, doi): (String, String) = conn.query_row(
+        "SELECT j.status,p.normalized_doi FROM pdf_enrichment_jobs j JOIN papers p ON p.id=?1 WHERE j.attachment_id=?2",
+        params![paper_id, attachment_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).unwrap();
+    assert_eq!(status, "completed");
+    assert_eq!(doi, "10.5555/enrichment-regression");
+    let _ = std::fs::remove_file(path);
+}
+
 #[test]
 fn rc5_doi_url_overrides_are_library_only_and_effective() {
     let conn = mem_db();

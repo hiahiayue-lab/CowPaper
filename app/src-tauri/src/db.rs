@@ -5921,8 +5921,8 @@ pub fn run_pdf_enrichment<R: Runtime>(
         let current: Option<String> = conn.query_row(
             "SELECT normalized_doi FROM papers WHERE id=?1 AND EXISTS(SELECT 1 FROM paper_attachments WHERE id=?2 AND paper_id=?1)",
             params![paper_id, attachment_id],
-            |r| r.get(0),
-        ).optional()?;
+            |r| r.get::<_, Option<String>>(0),
+        ).optional()?.flatten();
         let requested_matches = requested_doi.is_none() || current.as_deref() == requested_doi;
         if !requested_matches {
             return Err(rusqlite::Error::InvalidParameterName("pdf_enrichment_doi_mismatch".into()));
