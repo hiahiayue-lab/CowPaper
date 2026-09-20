@@ -3505,6 +3505,16 @@ body.library-workspace .library-column-drag-handle:active {
   cursor: grabbing;
 }
 
+body.library-workspace.is-dragging-library-column .library-column-option {
+  transition: transform 140ms ease-out;
+  will-change: transform;
+}
+
+body.library-workspace.is-dragging-library-column .library-column-option.column-dragging {
+  position: relative;
+  z-index: 1;
+}
+
 /* A composite Search control owns its focus geometry.  Its inner input and
    accessory button must not paint a second rectangle over the outer ring. */
 body.library-workspace .library-search-toolbar {

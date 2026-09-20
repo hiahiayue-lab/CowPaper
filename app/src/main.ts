@@ -63,7 +63,7 @@ import {
   type InspectorActionFeedback,
 } from "./titleTranslation";
 import { reduceLibrarySelection, resolveLibraryPaperDragIds } from "./librarySelection";
-import { LIBRARY_COLUMNS, reorderLibraryColumnOrder, type LibraryColumn } from "./libraryColumns";
+import { canStartLibraryColumnReorder, LIBRARY_COLUMNS, reorderLibraryColumnOrder, targetLibraryColumnIndex, type LibraryColumn } from "./libraryColumns";
 import {
   journalCatalogCanFilterUnsubscribed,
   journalCatalogEmptyState,
@@ -3760,7 +3760,20 @@ class PaperRowDrag {
 }
 
 class ColumnHeaderDrag {
-  private state: { mode: "reorder" | "resize" | "inspector"; column?: LibraryColumn; next?: LibraryColumn; startX: number; startY: number; startWidth?: number; nextWidth?: number; active: boolean } | null = null;
+  private state: {
+    mode: "reorder" | "resize" | "inspector";
+    column?: LibraryColumn;
+    next?: LibraryColumn;
+    startX: number;
+    startY: number;
+    startWidth?: number;
+    nextWidth?: number;
+    active: boolean;
+    rows?: HTMLElement[];
+    initialRects?: Map<HTMLElement, DOMRect>;
+    sourceIndex?: number;
+    targetIndex?: number;
+  } | null = null;
 
   install(): void {
     document.addEventListener("pointerdown", this.onDown);
@@ -3806,12 +3819,68 @@ class ColumnHeaderDrag {
       event.preventDefault();
       return;
     }
-    if (!handle || !dragTarget || !LIBRARY_COLUMNS.includes(dragTarget.dataset.columnDrag as LibraryColumn)) {
+    if (!handle || !dragTarget || !canStartLibraryColumnReorder(true, dragTarget.dataset.columnDrag)) {
       releaseLibraryDrag("column-header");
       return;
     }
-    this.state = { mode: "reorder", column: dragTarget.dataset.columnDrag as LibraryColumn, startX: event.clientX, startY: event.clientY, active: false };
+    const menu = $("library-column-menu");
+    const rows = [...menu.querySelectorAll<HTMLElement>("[data-column-drag]")];
+    const sourceIndex = rows.indexOf(dragTarget);
+    if (sourceIndex < 0) {
+      releaseLibraryDrag("column-header");
+      return;
+    }
+    this.state = {
+      mode: "reorder",
+      column: dragTarget.dataset.columnDrag as LibraryColumn,
+      startX: event.clientX,
+      startY: event.clientY,
+      active: false,
+      rows,
+      initialRects: new Map(rows.map((row) => [row, row.getBoundingClientRect()])),
+      sourceIndex,
+      targetIndex: sourceIndex,
+    };
+    event.preventDefault();
   };
+
+  private clearReorderPreview(state: NonNullable<ColumnHeaderDrag["state"]>): void {
+    for (const row of state.rows || []) {
+      row.style.removeProperty("transform");
+      row.classList.remove("column-dragging");
+    }
+  }
+
+  private updateReorderPreview(state: NonNullable<ColumnHeaderDrag["state"]>, pointerY: number): void {
+    if (!state.rows || !state.initialRects || state.sourceIndex == null) return;
+    const rowMidpoints = state.rows.map((row) => {
+      const rect = state.initialRects!.get(row)!;
+      return rect.top + rect.height / 2;
+    });
+    const targetIndex = targetLibraryColumnIndex(rowMidpoints, state.sourceIndex, pointerY);
+    if (state.targetIndex === targetIndex) return;
+    state.targetIndex = targetIndex;
+    const source = state.rows[state.sourceIndex];
+    const previewRows = [...state.rows];
+    previewRows.splice(state.sourceIndex, 1);
+    previewRows.splice(targetIndex, 0, source);
+    const firstRect = state.initialRects.get(state.rows[0])!;
+    const gap = state.rows.length > 1
+      ? state.initialRects.get(state.rows[1])!.top - (firstRect.top + firstRect.height)
+      : 0;
+    let nextTop = firstRect.top;
+    const finalTops = new Map<HTMLElement, number>();
+    for (const row of previewRows) {
+      finalTops.set(row, nextTop);
+      nextTop += state.initialRects.get(row)!.height + gap;
+    }
+    for (const row of state.rows) {
+      const initialTop = state.initialRects.get(row)!.top;
+      const delta = initialTop - finalTops.get(row)!;
+      row.style.transform = delta ? `translateY(${delta}px)` : "";
+      row.classList.toggle("column-dragging", row === source);
+    }
+  }
 
   private onMove = (event: PointerEvent): void => {
     const state = this.state;
@@ -3839,17 +3908,15 @@ class ColumnHeaderDrag {
     if (!state.active && Math.hypot(event.clientX - state.startX, event.clientY - state.startY) < 6) return;
     state.active = true;
     document.body.classList.add("is-dragging-library-column");
-    document.querySelectorAll(".column-drag-over").forEach((el) => el.classList.remove("column-drag-over"));
-    const target = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>("[data-column-drag]");
-    if (target && target.dataset.columnDrag !== state.column) target.classList.add("column-drag-over");
+    if (state.rows && state.sourceIndex != null) state.rows[state.sourceIndex].classList.add("column-dragging");
+    this.updateReorderPreview(state, event.clientY);
     event.preventDefault();
   };
 
-  private onUp = (event: PointerEvent): void => {
+  private onUp = (): void => {
     const state = this.state;
     this.state = null;
     document.body.classList.remove("is-resizing-library", "is-dragging-library-column");
-    const target = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>("[data-column-drag]");
     clearLibraryDragFeedback();
     releaseLibraryDrag("column-header");
     if (!state) return;
@@ -3857,9 +3924,13 @@ class ColumnHeaderDrag {
       persistLibraryLayout();
       return;
     }
-    if (!state.active || !state.column || !target) return;
-    const destination = target.dataset.columnDrag as LibraryColumn;
+    if (!state.active || !state.column || state.targetIndex == null || !state.rows) {
+      this.clearReorderPreview(state);
+      return;
+    }
+    const destination = state.rows[state.targetIndex].dataset.columnDrag as LibraryColumn;
     const nextOrder = reorderLibraryColumnOrder(libraryColumnOrder, state.column, destination);
+    this.clearReorderPreview(state);
     if (JSON.stringify(nextOrder) === JSON.stringify(libraryColumnOrder)) return;
     libraryColumnOrder = nextOrder;
     persistLibraryLayout();
@@ -3868,8 +3939,10 @@ class ColumnHeaderDrag {
   };
 
   private onCancel = (): void => {
+    const state = this.state;
     this.state = null;
     document.body.classList.remove("is-resizing-library", "is-dragging-library-column");
+    if (state?.mode === "reorder") this.clearReorderPreview(state);
     clearLibraryDragFeedback();
     releaseLibraryDrag("column-header");
     applyLibraryLayoutMetrics();
