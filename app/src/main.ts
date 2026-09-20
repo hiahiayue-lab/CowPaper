@@ -63,6 +63,7 @@ import {
   type InspectorActionFeedback,
 } from "./titleTranslation";
 import { reduceLibrarySelection, resolveLibraryPaperDragIds } from "./librarySelection";
+import { LIBRARY_COLUMNS, reorderLibraryColumnOrder, type LibraryColumn } from "./libraryColumns";
 import {
   journalCatalogCanFilterUnsubscribed,
   journalCatalogEmptyState,
@@ -815,8 +816,6 @@ function setStatus(text: string, cls: "idle" | "running" | "error" | "done") {
   if (cls !== "idle" && cls !== "running") libraryToastTimer = window.setTimeout(() => el.classList.add("dismissed"), 5000);
 }
 
-const LIBRARY_COLUMNS = ["title", "note", "source", "year", "authors"] as const;
-type LibraryColumn = typeof LIBRARY_COLUMNS[number];
 const LIBRARY_COLUMN_MIN: Record<LibraryColumn, number> = { title: 100, note: 50, source: 80, year: 48, authors: 70 };
 const LIBRARY_COLUMN_DEFAULT: Record<LibraryColumn, number> = { title: 220, note: 120, source: 150, year: 68, authors: 140 };
 const LIBRARY_COLUMN_STORAGE_KEY = "cowpaper.library.columns.v2";
@@ -3772,19 +3771,23 @@ class ColumnHeaderDrag {
 
   private onDown = (event: PointerEvent): void => {
     if (event.button !== 0 || !claimLibraryDrag("column-header")) return;
-    const target = (event.target as HTMLElement).closest<HTMLElement>("[data-column-resize], [data-inspector-resize], [data-column-drag]");
-    if (!target) {
+    const eventTarget = event.target as HTMLElement;
+    const resizeTarget = eventTarget.closest<HTMLElement>("[data-column-resize]");
+    const inspectorTarget = eventTarget.closest<HTMLElement>("[data-inspector-resize]");
+    const handle = eventTarget.closest<HTMLElement>("[data-column-drag-handle]");
+    const dragTarget = handle?.closest<HTMLElement>("[data-column-drag]");
+    if (!resizeTarget && !inspectorTarget && !dragTarget) {
       releaseLibraryDrag("column-header");
       return;
     }
-    if (target.dataset.inspectorResize) {
+    if (inspectorTarget?.dataset.inspectorResize) {
       this.state = { mode: "inspector", startX: event.clientX, startY: event.clientY, startWidth: libraryInspectorWidth, active: true };
       document.body.classList.add("is-resizing-library");
       event.preventDefault();
       return;
     }
-    if (target.dataset.columnResize) {
-      const column = target.dataset.columnResize as LibraryColumn;
+    if (resizeTarget?.dataset.columnResize) {
+      const column = resizeTarget.dataset.columnResize as LibraryColumn;
       const visible = libraryVisibleColumns();
       const index = visible.indexOf(column);
       const next = visible[index + 1];
@@ -3803,13 +3806,11 @@ class ColumnHeaderDrag {
       event.preventDefault();
       return;
     }
-    const handle = target.closest<HTMLElement>("[data-column-drag-handle]");
-    const header = target.closest<HTMLElement>("[data-column-drag]");
-    if (!handle || !header || !LIBRARY_COLUMNS.includes(header.dataset.columnDrag as LibraryColumn)) {
+    if (!handle || !dragTarget || !LIBRARY_COLUMNS.includes(dragTarget.dataset.columnDrag as LibraryColumn)) {
       releaseLibraryDrag("column-header");
       return;
     }
-    this.state = { mode: "reorder", column: header.dataset.columnDrag as LibraryColumn, startX: event.clientX, startY: event.clientY, active: false };
+    this.state = { mode: "reorder", column: dragTarget.dataset.columnDrag as LibraryColumn, startX: event.clientX, startY: event.clientY, active: false };
   };
 
   private onMove = (event: PointerEvent): void => {
@@ -3858,11 +3859,9 @@ class ColumnHeaderDrag {
     }
     if (!state.active || !state.column || !target) return;
     const destination = target.dataset.columnDrag as LibraryColumn;
-    const from = libraryColumnOrder.indexOf(state.column);
-    const to = libraryColumnOrder.indexOf(destination);
-    if (from < 0 || to < 0 || from === to) return;
-    libraryColumnOrder.splice(from, 1);
-    libraryColumnOrder.splice(to, 0, state.column);
+    const nextOrder = reorderLibraryColumnOrder(libraryColumnOrder, state.column, destination);
+    if (JSON.stringify(nextOrder) === JSON.stringify(libraryColumnOrder)) return;
+    libraryColumnOrder = nextOrder;
     persistLibraryLayout();
     renderLibrary();
     setStatus("列顺序已保存", "done");
