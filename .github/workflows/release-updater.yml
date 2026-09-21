@@ -138,8 +138,25 @@ jobs:
           rsign_root="$RUNNER_TEMP/rsign2"
           cargo install rsign2 --version 0.6.6 --locked --root "$rsign_root"
           updater_pubkey="$(node -p "require('./src-tauri/tauri.conf.json').plugins.updater.pubkey")"
+          updater_pubkey_path="$RUNNER_TEMP/tauri-updater.pub"
+          python3 - "$updater_pubkey" "$updater_pubkey_path" <<'PY'
+          import base64
+          import pathlib
+          import sys
+
+          pathlib.Path(sys.argv[2]).write_bytes(base64.b64decode(sys.argv[1], validate=True))
+          PY
+          updater_sig_path="$RUNNER_TEMP/updater.minisig"
+          python3 - "$updater.sig" "$updater_sig_path" <<'PY'
+          import base64
+          import pathlib
+          import sys
+
+          encoded = pathlib.Path(sys.argv[1]).read_text(encoding='utf-8').strip()
+          pathlib.Path(sys.argv[2]).write_bytes(base64.b64decode(encoded, validate=True))
+          PY
           "$rsign_root/bin/rsign" verify --allow-legacy "$updater" \
-            --public-key-string "$updater_pubkey" --sig-file "$updater.sig"
+            --public-key-path "$updater_pubkey_path" --sig-file "$updater_sig_path"
 
           staging="$(mktemp -d)"
           cp -R "$app" "$staging/CowPaper.app"
@@ -357,8 +374,10 @@ jobs:
                   assert names == {updater[0], updater[0] + '.sig'}
               selected[platform] = updater[0]
 
-          public_key = config['plugins']['updater']['pubkey']
+          public_key = base64.b64decode(config['plugins']['updater']['pubkey'], validate=True)
           with tempfile.TemporaryDirectory() as tmp:
+              public_key_path = pathlib.Path(tmp) / 'tauri-updater.pub'
+              public_key_path.write_bytes(public_key)
               for updater in selected.values():
                   signature = (assets / (updater + '.sig')).read_text().strip()
                   assert signature
@@ -366,7 +385,7 @@ jobs:
                   sig.write_bytes(base64.b64decode(signature, validate=True))
                   subprocess.run([
                       os.environ['RSIGN_BIN'], 'verify', '--allow-legacy',
-                      str(assets / updater), '--public-key-string', public_key,
+                      str(assets / updater), '--public-key-path', str(public_key_path),
                       '--sig-file', str(sig)], check=True)
 
           base_url = f'https://github.com/{os.environ["GITHUB_REPOSITORY"]}/releases/download/{tag}/'
